@@ -281,7 +281,7 @@ pub fn create_stream(since_when: u64, paths: &[&str], latency_s: f64) -> FSEvent
 // 在 Task 15 收口为正式实现。本文件 Step 1-2 只需能建流、收回调、打事件 ID。
 ```
 
-- [ ] **Step 2: 补 runloop 接线与事件打印(spike 不求封装美,求行为观测)——完整代码在 Task 15 收口,本步允许 spike 版临时实现:订阅后打印每批 `flags` 的十六进制与 `ids`,重点观测 `kFSEventStreamEventFlagHistoryDone`(0x20000)出现时机与事件 ID 连续性**
+- [ ] **Step 2: 补 runloop 接线与事件打印(spike 不求封装美,求行为观测)——完整代码在 Task 15 收口,本步允许 spike 版临时实现:订阅后打印每批 `flags` 的十六进制与 `ids`,重点观测 HistoryDone flag(spike 结论已实证其值为 0x10,非早期草案误写的 0x20000)出现时机与事件 ID 连续性**
 - [ ] **Step 3: 写 `examples/spike_fsevents.rs`:① 以 `kFSEventStreamEventIdSinceNow` 建流,记当前 id;② 在观察目录建 3 个文件,确认收到事件与 id 递增;③ 用「当前 id 减 10 亿」(模拟过旧 sinceWhen)重建流,观测:是否收到历史事件?HistoryDone 后是否静默从 now 开始?有无特定 flag?把三问的观测结果写进命令输出**
 - [ ] **Step 4: 跑 spike,结论回填 tech.md ADR-5(「spike 结论:信号 有/无,判定器按 X 设计」),若无可靠信号,保守判定器(零事件+48h)为唯一路径**
 - [ ] **Step 5: 提交(spike 代码保留,fsevents.rs 雏形后续 Task 演化)**
@@ -1929,7 +1929,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub const SINCE_NOW: u64 = kFSEventStreamEventIdSinceNow;
-pub const FLAG_HISTORY_DONE: u32 = 0x20000; // kFSEventStreamEventFlagHistoryDone
+pub const FLAG_HISTORY_DONE: u32 = 0x00000010; // kFSEventStreamEventFlagHistoryDone(Task 3 spike 实证:0x20000 实为 ItemIsDir,SDK FSEvents.h L435/536 双源确认)
 pub const FLAG_RESCAN: u32 = 0x400000;      // kFSEventStreamEventFlagUserDropped|KernelDropped 近似,精确值 spike 定稿
 
 #[derive(Debug, Clone)]
