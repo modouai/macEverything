@@ -165,6 +165,9 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
     // 聚合(单线程):根先登记;第一轮全部目录(父必已登记——子目录记录产生于父被
     // 弹出遍历时,父作为目录记录先于其子记录进入 records,两轮法再兜一层);
     // 第二轮全部文件。
+    // 键语义挂账:dir_map 键 = 原始父路径.join(lossy 名)。目录名非 UTF-8 时该键与
+    // 弹队原始路径不等 → 下标 panic。macOS 不可达(APFS 拒绝非 UTF-8 目录名,实测
+    // Errno 92);Linux ext4 可触发——跨平台时改为 records 携带原始 OsString 名。
     let mut index = Index::new();
     let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
     for root in roots {
@@ -321,5 +324,28 @@ mod tests {
             "权限缺口数一致"
         );
         assert_eq!(s_gaps.io_errors, p_gaps.io_errors, "IO 错误计数一致");
+    }
+
+    /// 并行臂权限分支钉:threads=8 下只读目录同样单独归类 permission
+    /// (防「错误分类只在串行臂被钉住」的回归盲区;迭代中 IO 错误受控树
+    /// 不可造,仍依赖代码审查——见 scan 测试内注释)。
+    #[cfg(unix)]
+    #[test]
+    fn parallel_permission_denied_goes_to_gaps() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = fixture();
+        let locked = t.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // root/越权环境无意义,同串行钉
+        }
+        let (index, gaps) = scan_roots(&[t.path().to_path_buf()], &[], 8);
+        assert_eq!(gaps.permission.len(), 1, "并行臂权限缺口单独归类");
+        assert_eq!(gaps.permission[0].0, locked);
+        assert_eq!(gaps.io_errors, 0);
+        assert!(index.entry_count() > 0);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
