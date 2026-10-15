@@ -80,7 +80,8 @@ pub fn parse(query: &str) -> Result<QueryPlan, ParseError> {
     for word in words {
         match word {
             Word::Name(w) => plan.name_terms.push(compile_pattern(&w, case_sensitive)),
-            Word::Path(w) => plan.path_terms.push(compile_pattern(&w, case_sensitive)),
+            // 路径词恒折叠编译:路径池只存折叠形态,case: 只作用于文件名侧
+            Word::Path(w) => plan.path_terms.push(compile_pattern(&w, false)),
         }
     }
     Ok(plan)
@@ -144,7 +145,7 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     let entries = view.entries();
 
     // path 命中目录集:目录条目的路径池段命中全部 path_terms。池段是折叠形态,
-    // 故路径匹配恒按折叠语义(`case:` 只作用于文件名侧;路径池不存 display 形态)。
+    // 路径词在解析侧恒按折叠编译(case: 只作用于文件名侧),此处比对两侧同形态。
     // 墓碑目录的池段可能是改名前的陈旧值,不参与;其子项必同为墓碑,无行为差。
     let dir_hits: Vec<bool> = if plan.path_terms.is_empty() {
         Vec::new()
@@ -427,6 +428,18 @@ mod match_tests {
     }
 
     #[test]
+    fn case_flag_leaves_path_terms_folded() {
+        // path 词恒折叠编译:路径池只存折叠形态,case: 只作用于文件名侧——
+        // `case: path:Documents` 与 `path:Documents` 同命中数(大小写不影响路径定位)
+        let i = sample();
+        assert_eq!(execute(&i, &parse("path:Documents").unwrap(), 100).total, 2);
+        assert_eq!(
+            execute(&i, &parse("case: path:Documents").unwrap(), 100).total,
+            2
+        );
+    }
+
+    #[test]
     fn case_nfc_but_sensitive() {
         // 索引侧 NFD 形态输入;case: 仅 NFC 归一、不做小写折叠:
         // 大小写敏感不中,NFD 输入与 NFC pattern 归一后相等 → 命中(别名互搜)
@@ -536,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn mid_wildcard_splits_unanchored() {
+    fn mid_wildcard_splits_ends_anchored() {
         // 本语法无转义:词中 * 就是通配符,按序切分(非字面);中段 * 自身不带锚,
         // 锚只属于首/末段——本例首尾皆字面,故双锚置位
         let p = parse("path:my*dir").unwrap();
