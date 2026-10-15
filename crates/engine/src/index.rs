@@ -7,7 +7,8 @@ use crate::entry::*;
 /// 目录现项清单:名称 -> 是否目录(watcher/reconcile 从磁盘读取后传入)。
 pub type DirListing = BTreeMap<String, bool>;
 
-/// 一次 diff_dir 的增删统计。
+/// 一次 diff_dir 的增删统计。removed 计清单级条目数:目录被删时其子树的级联
+/// 墓碑不逐条计入(计数语义为目录项数,与磁盘清单增量一一对应)。
 #[derive(Debug, Clone, Copy)]
 pub struct DiffStats {
     pub added: u32,
@@ -23,6 +24,9 @@ pub struct Index {
     pub path_offsets: Vec<(u32, u32)>,
     live_count: u32,
     tombstones: u32,
+    /// rename/级联重写产生的 arena 孤儿字节(双名称池 + 路径池被替换的旧段)。
+    /// 整理触发条件之一(纯 rename 零墓碑,单靠墓碑占比永不触发)。
+    orphan_pool_bytes: u64,
 }
 
 impl Index {
@@ -35,6 +39,7 @@ impl Index {
             path_offsets: vec![],
             live_count: 0,
             tombstones: 0,
+            orphan_pool_bytes: 0,
         }
     }
 
@@ -145,13 +150,14 @@ impl Index {
 
     // —— Task 6:变更语义 ——
 
-    /// 改名。双 arena 追加新段(旧段成孤儿,整理时回收);
+    /// 改名。双 arena 追加新段(旧段成孤儿,计入 orphan_pool_bytes,整理时回收);
     /// 目录触发子树路径池级联重写,文件不进路径池(Task 12b)。
     pub fn rename_entry(&mut self, idx: u32, new_name: &str) {
         let m = normalize_for_match(new_name);
         let (ds, dl) = self.display_arena.push(new_name.as_bytes());
         let (ms, ml) = self.match_arena.push(m.as_bytes());
         let e = &mut self.entries[idx as usize];
+        self.orphan_pool_bytes += (e.display_len + e.match_len) as u64;
         e.display_start = ds;
         e.display_len = dl;
         e.match_start = ms;
@@ -161,32 +167,45 @@ impl Index {
         }
     }
 
+    /// 一趟 O(n) 构建 parent -> 活子项邻接表。子树遍历(rebuild/remove)查表取子项,
+    /// 总代价 O(n + S),替代逐层全量扫(后者在顶层目录改名时是 O(n×S),击穿写锁红线)。
+    fn children_table(&self) -> Vec<Vec<u32>> {
+        let mut table: Vec<Vec<u32>> = (0..self.entries.len()).map(|_| Vec::new()).collect();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.is_live() && e.parent != NO_PARENT {
+                table[e.parent as usize].push(i as u32);
+            }
+        }
+        table
+    }
+
     /// 重写 root 及其整棵子树的目录路径池条目(目录改名级联,ADR-2 风险表)。
-    /// 文件条目跳过(占位 (0,0) 不变);子项发现走 O(n) 全量扫,与 children_of 同一已知设计。
+    /// 文件条目跳过(占位 (0,0) 不变);被替换的旧路径段计入 orphan_pool_bytes。
     fn rebuild_paths_under(&mut self, root: u32) {
-        fn walk(ix: &mut Index, cur: u32) {
+        let mut table = self.children_table();
+        fn walk(ix: &mut Index, table: &mut Vec<Vec<u32>>, cur: u32) {
             if ix.entries[cur as usize].is_dir() {
+                let (_, old_len) = ix.path_offsets[cur as usize];
+                ix.orphan_pool_bytes += old_len as u64;
                 let pp = ix.dir_path_bytes(cur);
                 ix.path_offsets[cur as usize] = ix.path_pool.push(&pp);
             }
-            let kids: Vec<u32> = ix
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.parent == cur && e.is_live())
-                .map(|(i, _)| i as u32)
-                .collect();
+            let kids = std::mem::take(&mut table[cur as usize]);
             for k in kids {
-                walk(ix, k);
+                walk(ix, table, k);
             }
         }
-        walk(self, root);
+        walk(self, &mut table, root);
     }
 
     /// 删除(墓碑制,不 swap-remove:保条目号与父指针稳定)。
     /// 子树级联:活子项一并打墓碑,保证「活条目的父必活」不变量。
     pub fn remove(&mut self, idx: u32) {
-        fn walk(ix: &mut Index, cur: u32) {
+        if !self.entries[idx as usize].is_live() {
+            return;
+        }
+        let mut table = self.children_table();
+        fn walk(ix: &mut Index, table: &mut Vec<Vec<u32>>, cur: u32) {
             let e = &mut ix.entries[cur as usize];
             if !e.is_live() {
                 return;
@@ -194,21 +213,15 @@ impl Index {
             e.flags |= FLAG_TOMBSTONE;
             ix.live_count -= 1;
             ix.tombstones += 1;
-            let kids: Vec<u32> = ix
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e2)| e2.parent == cur && e2.is_live())
-                .map(|(i, _)| i as u32)
-                .collect();
+            let kids = std::mem::take(&mut table[cur as usize]);
             for k in kids {
-                walk(ix, k);
+                walk(ix, table, k);
             }
         }
-        walk(self, idx);
+        walk(self, &mut table, idx);
     }
 
-    /// 墓碑占比(整理触发阈值 20%,ADR-2 风险表)。
+    /// 墓碑占比(整理触发条件之一,阈值 20%,ADR-2 风险表)。
     pub fn tombstone_ratio(&self) -> f64 {
         let total = self.live_count + self.tombstones;
         if total == 0 {
@@ -218,9 +231,20 @@ impl Index {
         }
     }
 
+    /// 整理判定:墓碑占比超 20%,或 rename/级联重写累计的 arena 孤儿字节超 32MB
+    /// (纯 rename 零墓碑,单靠占比永不触发;孤儿字节同样占内存,一并进触发条件)。
+    pub fn needs_compaction(&self) -> bool {
+        const ORPHAN_POOL_LIMIT: u64 = 32 * 1024 * 1024;
+        self.tombstone_ratio() > 0.2 || self.orphan_pool_bytes > ORPHAN_POOL_LIMIT
+    }
+
     /// 唯一真相机制:按磁盘现目录项 diff 该目录(parent == dir_idx 的活条目)。
     /// 索引中有而磁盘无 → 墓碑;磁盘有而索引无 → 插入;类型不符 → 删+增。
     pub fn diff_dir(&mut self, dir_idx: u32, on_disk: &DirListing) -> DiffStats {
+        debug_assert!(
+            self.entries[dir_idx as usize].is_live(),
+            "对墓碑目录执行 diff"
+        );
         let mut added = 0u32;
         let mut removed = 0u32;
         let mut on_disk = on_disk.clone();
@@ -262,7 +286,6 @@ impl Index {
                 continue;
             }
             let dname = String::from_utf8_lossy(old.display_name_of(i as u32)).into_owned();
-            let is_dir = e.is_dir();
             let old_parent = e.parent;
             let m = normalize_for_match(&dname);
             let (ds, dl) = new.display_arena.push(dname.as_bytes());
@@ -273,7 +296,7 @@ impl Index {
                 match_start: ms,
                 match_len: ml,
                 parent: old_parent,
-                flags: if is_dir { FLAG_DIR } else { 0 },
+                flags: e.flags & !FLAG_TOMBSTONE, // 保留未来 flag 位,只剥墓碑
             });
             map[i] = new.entries.len() as u32 - 1;
             new.live_count += 1;
@@ -281,12 +304,13 @@ impl Index {
         for e in new.entries.iter_mut() {
             if e.parent != NO_PARENT {
                 // remove 的子树级联保证「活条目的父必活」,此处映射必命中活条目;
-                // 违反即静默再定根,debug 断言在测试期暴露。
-                debug_assert!(
-                    map[e.parent as usize] != NO_PARENT,
+                // 违反即索引静默腐化,release 崩溃优于腐化。
+                let mapped = map[e.parent as usize];
+                assert!(
+                    mapped != NO_PARENT,
                     "compact 前存在父为墓碑的活条目,违反 remove 级联不变量"
                 );
-                e.parent = map[e.parent as usize];
+                e.parent = mapped;
             }
         }
         // path_offsets 按条目号对齐(目录真值/其余占位)——先 resize 占位再填目录
@@ -297,6 +321,7 @@ impl Index {
                 new.path_offsets[i] = new.path_pool.push(&pp);
             }
         }
+        new.orphan_pool_bytes = 0; // 全量重建,孤儿字节清零
         *self = new;
     }
 }
@@ -421,5 +446,80 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert_eq!(i.full_path(kids[0]).to_string_lossy(), "d/f9.txt");
         assert_eq!(i.dir_path(d), b"d".to_vec());
+    }
+
+    // —— quality review 钉 ——
+
+    // I1 位移钉:compact 后存活条目前移,父指针必须重映射到新条目号
+    #[test]
+    fn compact_remaps_shifted_entries() {
+        let mut i = ix();
+        let gone = i.insert("gone", NO_PARENT, true); // 0
+        let d = i.insert("d", NO_PARENT, true); // 1
+        i.insert("f.txt", d, false); // 2
+        i.remove(gone);
+        i.compact();
+        assert_eq!(i.entries.len(), 2);
+        assert!(i.entries[0].is_dir(), "d 位移到 0 号");
+        assert_eq!(i.entries[1].parent, 0, "f.parent 重映射为 d 的新号");
+        assert_eq!(i.full_path(1).to_string_lossy(), "d/f.txt");
+        assert_eq!(i.children_of(0), vec![1u32]);
+        assert_eq!(i.dir_path(0), b"d".to_vec());
+    }
+
+    // I2 级联钉:remove 顶层目录,子树(含嵌套两层)全部打墓碑,整理后彻底回收
+    #[test]
+    fn remove_cascades_subtree() {
+        let mut i = ix();
+        let root = i.insert("root", NO_PARENT, true); // 0
+        let mid = i.insert("mid", root, true); // 1
+        let leaf_f = i.insert("leaf.txt", mid, false); // 2
+        let leaf_d = i.insert("leafdir", mid, true); // 3
+        let deep = i.insert("deep.txt", leaf_d, false); // 4
+        assert_eq!(i.entry_count(), 5);
+        i.remove(root);
+        for idx in [root, mid, leaf_f, leaf_d, deep] {
+            assert!(!i.entries[idx as usize].is_live(), "条目 {idx} 应为墓碑");
+        }
+        assert_eq!(i.entry_count(), 0);
+        assert_eq!(i.tombstone_count(), 5);
+        i.compact();
+        assert!(i.entries.is_empty(), "整理后墓碑条目全部回收");
+        assert_eq!(i.entry_count(), 0);
+    }
+
+    // I3 池膨胀钉:纯 rename 零墓碑,孤儿 arena 字节达阈值即触发整理判定
+    #[test]
+    fn needs_compaction_triggers_on_rename_pool_growth() {
+        let mut i = ix();
+        let p = i.insert("projects", NO_PARENT, true);
+        for k in 0..50 {
+            i.insert(&format!("sub{k:02}"), p, true);
+        }
+        assert!(!i.needs_compaction());
+        for _ in 0..40_000 {
+            i.rename_entry(p, "workspace-x");
+        }
+        assert_eq!(i.tombstone_count(), 0, "纯 rename 不产生墓碑");
+        assert!(i.needs_compaction(), "孤儿池字节超 32MB 阈值");
+        i.compact();
+        assert!(!i.needs_compaction(), "整理后孤儿字节清零");
+    }
+
+    // M3 类型变化钉:file↔dir 翻转按删+增处理,旧条目墓碑、新条目入位
+    #[test]
+    fn diff_dir_handles_type_flip() {
+        let mut i = ix();
+        let d = i.insert("docs", NO_PARENT, true);
+        let old = i.insert("item", d, false); // 索引里是文件
+        let stats = i.diff_dir(d, &listing(&[("item", true)])); // 磁盘上是目录
+        assert_eq!((stats.added, stats.removed), (1, 1));
+        assert!(!i.entries[old as usize].is_live(), "旧条目被墓碑");
+        let kids = i.children_of(d);
+        assert_eq!(kids.len(), 1);
+        assert_ne!(kids[0], old, "新条目重新入位");
+        assert!(i.entries[kids[0] as usize].is_dir(), "新条目为目录");
+        assert_eq!(i.tombstone_count(), 1);
+        assert_eq!(i.entry_count(), 2); // docs + 新 item
     }
 }

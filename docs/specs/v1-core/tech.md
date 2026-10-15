@@ -168,7 +168,7 @@ socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0
 |---|---|
 | FSEvents 语义粗粒度,丢事件 | 设计已内建:目录 diff 唯一真相 + RESCAN 标记/监听器失效触发全量重扫;增量时效验收(≤500ms)含风暴场景 |
 | mmap 视图与运行中变更不一致 | 两段式:Shared(只读)期间增量暂存队列,物化完成后统一应用;重扫兜底 |
-| 墓碑膨胀(长期高频删改) | 墓碑占比 > 20% 触发整理;整理走压缩遍历,毫秒级/万条,后台执行 |
+| 墓碑膨胀(长期高频删改) | 墓碑占比 > 20% 触发整理;rename/级联重写的 arena 孤儿字节同样进触发条件(orphan_pool_bytes > 32MB);整理走压缩遍历,毫秒级/万条,后台执行 |
 | FFI 封装缺陷(自调 FSEvents C API) | unsafe 集中于 `fsevents.rs` 单文件;集成测试覆盖增删改/改名/RESCAN/重放/回退六类路径;`fsevent-sys` 绑定与 notify 同源,成熟度有背书 |
 | `.fseventsd` 日志滚动(停机过久事件 ID 失效) | spike 证实滚动无可观测信号(ADR-5),不设信号路径;保守判定器(零事件长停机)触发即回退全量重扫;回退路径有测试;重扫期间旧索引可查,产品语义已定义 |
 | 权限探测误判(把慢当拒绝) | 缺口分类只认 `PermissionDenied` 实际错误码;超时类错误计数但不进缺口清单 |
