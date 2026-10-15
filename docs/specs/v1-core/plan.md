@@ -1676,7 +1676,7 @@ pub fn load_mmap(path: &Path) -> Result<Box<SharedView>, LoadError> {
 }
 ```
 
-- [ ] **Step 4: 布局补丁(写读两端同步改)**——Task 11 的 header 中 display/match/path_pool 三段长度未记录,读侧无法切界。修正:**header 末尾补 3 个 u64(三段长度)**,写侧 `write_atomic` 在 excluded 后 `put_u64` 三个 `data.len()`;读侧依次读取并切界,`entries_off = path_offsets_off + n_path_segs*8`,`need(entries_off, n_entries*24)`。同步更新 Task 11 测试(布局变化不影响其断言,无需改)。
+- [ ] **Step 4: 布局补丁(写读两端同步改)**——Task 11 的 header 中 display/match/path_pool 三段长度未记录,读侧无法切界。修正:**header 末尾补 3 个 u64(三段长度)**,写侧 `write_atomic` 在 excluded 后 `put_u64` 三个 `data.len()`;读侧依次读取并切界,**`entries_off = align_up(path_offsets 段末, 4)`(写侧在 entries 前补零至 4B 对齐——mmap 裸转型 `*const Entry` 的对齐前提,规则以 persist.rs `write_atomic` doc-comment 为契约,切界公式必须与之一致,否则条目名全错)**,`need(entries_off, n_entries*24)`。同步更新 Task 11 测试(布局变化不影响其断言,无需改)。
 - [ ] **Step 5: 跑通过 + `<check>` + 提交**
 
 ```bash
