@@ -1,0 +1,6 @@
+[package]
+name = "spike-readdir"
+version = "0.1.0"
+edition = "2021"
+
+# 独立小 crate:不在 workspace members 内,专用于首扫预算 spike(tech.md 性能预算表)。
