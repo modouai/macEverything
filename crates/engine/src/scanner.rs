@@ -209,8 +209,8 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
         }
     });
 
-    // 聚合(单线程):根先登记;第一轮全部目录(父必已登记——子目录记录产生于父
-    // 被弹出遍历时,因果序 + 两轮法双保险);第二轮全部文件。
+    // 聚合(单线程):根先登记;记录经深度拓扑排序(见下),父目录必先于子处理;
+    // 第一轮全部目录、第二轮全部文件为冗余兜底。
     let mut index = Index::new();
     let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
     for root in roots {
@@ -221,7 +221,15 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
         let idx = index.insert(&name, NO_PARENT, true);
         dir_map.insert(root.clone(), idx);
     }
-    let recs: Vec<Rec> = shards.into_iter().flatten().collect();
+    let mut recs: Vec<Rec> = shards.into_iter().flatten().collect();
+    // 分片交织破坏 shard 内「父先于子」的因果序:子目录记录可能落在序号更小的
+    // shard,flatten 后先于父被消费,dir_map 查父即 miss panic(全量套件实测
+    // flake)。按路径深度稳定排序恢复拓扑序——父路径段数恒少于子,深度相同者
+    // 互不为祖先、顺序无关。
+    recs.sort_by_key(|r| match r {
+        Rec::Dir { raw, .. } => raw.components().count(),
+        Rec::File { parent, .. } => parent.components().count(),
+    });
     for rec in &recs {
         if let Rec::Dir { parent, name, raw } = rec {
             let pidx = dir_map[parent];
@@ -408,6 +416,24 @@ mod tests {
         let t = fixture();
         let root = t.path().to_path_buf();
         scan_roots(&[root.clone(), root], &[], 8);
+    }
+
+    /// 分片交织拓扑序压力钉:跨 shard 时子目录记录可先于父被消费(深度排序
+    /// 修复前,全量套件 9 轮 1 次 dir_map miss panic)。深层嵌套 × 重复采样,
+    /// 不 panic 即过;顺带钉条目数稳定。
+    #[test]
+    fn parallel_aggregation_topological_order_stress() {
+        for round in 0..32 {
+            let t = fixture();
+            fs::create_dir_all(t.path().join("a/b/c/d/e")).unwrap();
+            fs::write(t.path().join("a/b/c/d/e/x.txt"), "").unwrap();
+            fs::create_dir_all(t.path().join("p/q/r")).unwrap();
+            let roots = vec![t.path().to_path_buf()];
+            let (idx, _) = scan_roots(&roots, &[], 8);
+            // fixture 6(根/src/main.rs/README.md/.git/config)+ node_modules/pkg/i.js 3
+            // + a/b/c/d/e/x 6 + p/q/r 3(无排除,全部入索引)
+            assert_eq!(idx.entry_count(), 18, "round {round}");
+        }
     }
 
     /// 并行臂权限分支钉:threads=8 下只读目录同样单独归类 permission
