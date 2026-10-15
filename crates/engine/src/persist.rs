@@ -105,7 +105,7 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
 /// 临时文件名 = 目标文件名整体加 .tmp 后缀,恒与目标不同。
 /// 禁 with_extension:目标名本身以 .tmp 结尾时退化为同名(tmp == path),
 /// 「写临时 + rename 替换」塌缩成原地截断写,原子性消失。
-fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
