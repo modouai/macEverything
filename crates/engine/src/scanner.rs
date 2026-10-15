@@ -4,13 +4,16 @@
 //! - 排除按路径前缀命中,整棵子树剪枝(目录既不入索引也不入队);
 //! - 符号链接一律不入索引、不跟随(防环 + 不跨根);
 //! - `read_dir` 的 PermissionDenied 单独归类 `gaps.permission`,其余 IO 错误计数
-//!   `gaps.io_errors` 不中断——扫描对不可读子树降级为「缺口」,不整体失败。
+//!   `gaps.io_errors` 不中断——扫描对不可读子树降级为「缺口」,不整体失败;
+//! - 非 UTF-8 文件名按 `to_string_lossy`(U+FFFD 替换)收录;条目数不丢,名称字节
+//!   与磁盘非严格一致。
 use crate::entry::NO_PARENT;
 use crate::index::Index;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// 扫描缺口:权限类逐条留痕(目录 + errno 文案),其余 IO 错误只计数。
+/// `io_errors` 含 `read_dir` 打开与迭代中途两类失败。
 #[derive(Default, Debug)]
 pub struct ScanGaps {
     pub permission: Vec<(PathBuf, String)>, // (目录, errno 文案)
@@ -54,7 +57,15 @@ pub fn scan_roots(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (I
                 continue;
             }
         };
-        for entry in rd.flatten() {
+        for entry in rd {
+            // ReadDir 迭代中途 readdir 失败产出 Err 项:计数不中断(flatten 会静默丢弃)
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => {
+                    gaps.io_errors += 1;
+                    continue;
+                }
+            };
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(_) => {
@@ -132,6 +143,9 @@ mod tests {
             1,
         );
         assert_eq!(gaps.permission.len(), 0);
+        // io_errors 含两类失败:read_dir 打开失败(fixture 不可控,权限钉单列)与
+        // 迭代中途 readdir 失败(受控树难造,错误注入测试不可行,依赖代码审查——
+        // review 时须确认迭代循环对 Err 项显式计数,勿回退 flatten 静默丢弃)
         assert_eq!(gaps.io_errors, 0);
         let names = top_level_names(&index);
         assert!(
