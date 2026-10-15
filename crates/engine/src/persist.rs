@@ -31,8 +31,18 @@ fn put_u64(v: &mut Vec<u8>, x: u64) {
 ///         u64 display_arena_len | u64 match_arena_len | u64 path_pool_len
 /// body(顺序):display_arena | match_arena | path_pool |
 ///         path_offsets 逐对 (u32, u32)(与条目号全量对齐,含 (0,0) 占位)|
+///         [4B 对齐填充] |
 ///         entries 逐条 24 字节(五 u32 LE + flags u8 + 3 字节 0 填充)
+/// 对齐规则:entries 段起始向上对齐到 4B,写侧补零;读侧同规则
+/// entries_off = align_up(path_offsets 段末, 4)(mmap 裸转型 *const Entry 的对齐前提)。
+/// 取舍:rename 原子替换保证崩溃不损坏——断电最坏整体回滚 rename,旧文件复活,数据不损坏;
+/// 「断电必达」需 F_FULLFSYNC + 目录 fsync,暂不做(product 边界外)。
 pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Result<()> {
+    debug_assert_eq!(
+        index.path_offsets.len(),
+        index.entries.len(),
+        "path_offsets 与条目号全量对齐是落盘布局不变量"
+    );
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
     buf.extend_from_slice(MAGIC);
     put_u32(&mut buf, FORMAT_VERSION);
@@ -62,6 +72,11 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
         put_u32(&mut buf, *s);
         put_u32(&mut buf, *l);
     }
+    // entries 段起始向上对齐到 4B(mmap 裸转型 *const Entry 的对齐前提);
+    // 读侧同规则:entries_off = align_up(path_offsets 段末, 4)
+    while !buf.len().is_multiple_of(4) {
+        buf.push(0);
+    }
     // 逐字段 LE 写,禁裸内存拷贝:repr(C) 的 3 字节填充内容未定义,
     // 裸拷贝会把未初始化垃圾写进文件(不可复现、且污染同构布局假设)
     for e in &index.entries {
@@ -74,7 +89,7 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
         buf.extend_from_slice(&[0u8; 3]); // 对齐填充
     }
 
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path_for(path)?;
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&buf)?;
@@ -84,12 +99,25 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
     Ok(())
 }
 
+/// 临时文件名 = 目标文件名整体加 .tmp 后缀,恒与目标不同。
+/// 禁 with_extension:目标名本身以 .tmp 结尾时退化为同名(tmp == path),
+/// 「写临时 + rename 替换」塌缩成原地截断写,原子性消失。
+fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "路径无文件名,无法构造临时文件",
+        )
+    })?;
+    Ok(path.with_file_name(format!("{}.tmp", name.to_string_lossy())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn write_then_magic_version_roundtrip() {
+    fn write_header_magic_version() {
         let mut i = Index::new();
         let d = i.insert("docs", crate::entry::NO_PARENT, true);
         i.insert("a.txt", d, false);
@@ -108,6 +136,28 @@ mod tests {
             u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
             FORMAT_VERSION
         );
+        // last_event_id 落位:header 固定前段 20B + built_at(20..28)+ last_event_id(28..36)
+        assert_eq!(u64::from_le_bytes(bytes[28..36].try_into().unwrap()), 42);
+    }
+
+    // 确定性双钉:同一索引写两次字节级一致(逐字段 LE 写无 padding 垃圾、无随机源的回归钉)
+    #[test]
+    fn write_is_deterministic_byte_for_byte() {
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        i.insert("a.txt", d, false);
+        let dir = tempfile::tempdir().unwrap();
+        let meta = IndexMeta {
+            built_at: 1,
+            last_event_id: 2,
+            scan_roots: vec![],
+            excluded: vec![],
+        };
+        let p1 = dir.path().join("a.bin");
+        let p2 = dir.path().join("b.bin");
+        write_atomic(&i, &meta, &p1).unwrap();
+        write_atomic(&i, &meta, &p2).unwrap();
+        assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap());
     }
 
     #[test]
@@ -123,5 +173,17 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(left.len(), 1); // 无 .tmp 残留
+    }
+
+    // 临时文件名钉:目标名本身以 .tmp 结尾时,临时文件不得与目标同名
+    // (回退成 with_extension 即红:with_extension("out.tmp") == "out.tmp" 同名塌缩)
+    #[test]
+    fn tmp_name_never_collides_with_tmp_suffixed_target() {
+        let target = Path::new("/data/out.tmp");
+        assert_ne!(tmp_path_for(target).unwrap(), target);
+        assert_ne!(
+            tmp_path_for(Path::new("/data/index.bin")).unwrap(),
+            Path::new("/data/index.bin")
+        );
     }
 }
