@@ -226,7 +226,9 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
     // shard,flatten 后先于父被消费,dir_map 查父即 miss panic(全量套件实测
     // flake)。按路径深度稳定排序恢复拓扑序——父路径段数恒少于子,深度相同者
     // 互不为祖先、顺序无关。
-    recs.sort_by_key(|r| match r {
+    // sort_by_cached_key:key 为整路径 components 遍历,cached 版每记录只算一次
+    // (sort_by_key 会按比较次数重复解析路径,百万记录下聚合段多付千万次遍历)
+    recs.sort_by_cached_key(|r| match r {
         Rec::Dir { raw, .. } => raw.components().count(),
         Rec::File { parent, .. } => parent.components().count(),
     });

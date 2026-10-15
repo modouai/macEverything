@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// 应用配置。
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+/// 双默认语义:`Default` derive 未实现(空 excluded 误用即漏扫 ~/Library),
+/// 唯一默认入口是 [`default_config()`](三条基线排除)。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     /// 排除目录列表(条目语义由扫描侧解释)。
     #[serde(default)]
@@ -25,18 +27,20 @@ pub fn default_config() -> Config {
 pub fn load(path: &Path) -> Config {
     match std::fs::read_to_string(path) {
         Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("config.toml 解析失败,用默认配置: {e}");
+            log::warn!("{} 解析失败,用默认配置: {e}", path.display());
             default_config()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_config(),
         Err(e) => {
-            log::warn!("config.toml 读取失败,用默认配置: {e}");
+            log::warn!("{} 读取失败,用默认配置: {e}", path.display());
             default_config()
         }
     }
 }
 
 /// 原子保存:先建父目录,写 `<目标>.tmp` 后 rename 替换,不留半写文件。
+/// 原子保存(临时文件 + rename,复用 persist::tmp_path_for)。
+/// 取舍:不做 fsync——最坏断电配置损坏,load 的降级路径已兜住(回默认三条)。
 pub fn save(cfg: &Config, path: &Path) -> std::io::Result<()> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
