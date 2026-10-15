@@ -43,6 +43,30 @@ impl Index {
         }
     }
 
+    /// crate 内装配构造:persist::SharedView::materialize 从 mmap 逐字节拷出的字段直接组装,
+    /// 绕过逐条 insert(条目号 1:1 保持)。live/tombstone 计数由调用方统计;
+    /// 孤儿字节恒 0(全量重建,与 compact 同理)。仅限同构数据源,不对 crate 外暴露。
+    pub(crate) fn from_parts(
+        entries: Vec<Entry>,
+        display_arena: ArenaBuilder,
+        match_arena: ArenaBuilder,
+        path_pool: ArenaBuilder,
+        path_offsets: Vec<(u32, u32)>,
+        live_count: u32,
+        tombstones: u32,
+    ) -> Self {
+        Self {
+            entries,
+            display_arena,
+            match_arena,
+            path_pool,
+            path_offsets,
+            live_count,
+            tombstones,
+            orphan_pool_bytes: 0,
+        }
+    }
+
     pub fn entry_count(&self) -> u32 {
         self.live_count
     }
@@ -86,7 +110,8 @@ impl Index {
     }
 
     /// 目录条目的完整路径(match 形态,path_pool 用);idx 必须是目录。
-    fn dir_path_bytes(&self, idx: u32) -> Vec<u8> {
+    /// pub(crate):persist::SharedView::materialize 重建路径池复用同一父链拼接(唯此一份)。
+    pub(crate) fn dir_path_bytes(&self, idx: u32) -> Vec<u8> {
         let mut parts: Vec<&[u8]> = vec![];
         let mut cur = idx;
         loop {

@@ -1,9 +1,12 @@
 //! 落盘:布局与内存同构(ADR-3),mmap 零反序列化加载的前提;
 //! last_event_id 供停机重放(ADR-5);写 = 临时文件 + fsync + rename 原子替换。
+//! 读侧:load_mmap 产出 SharedView(mmap 只读视图,立即可查),materialize 物化为可变 Index。
 use std::io::Write;
 use std::path::Path;
 
-use crate::index::Index;
+use crate::arena::ArenaBuilder;
+use crate::entry::Entry;
+use crate::index::{Index, IndexView};
 
 pub const MAGIC: &[u8; 4] = b"MCEI";
 pub const FORMAT_VERSION: u32 = 1;
@@ -112,6 +115,239 @@ fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
     Ok(path.with_file_name(format!("{}.tmp", name.to_string_lossy())))
 }
 
+// —— 读侧:mmap 零反序列化加载(ADR-3) ——
+
+/// 编译期钉:Entry 定长 24B 是 mmap 裸转型 *const Entry 的前提(布局同构契约),
+/// Entry 布局改动时此处先红,防线前移到编译期。
+const _: () = assert!(std::mem::size_of::<Entry>() == 24, "Entry 必须 24 字节");
+
+#[derive(thiserror::Error, Debug)]
+pub enum LoadError {
+    #[error("magic 不符")]
+    BadMagic,
+    #[error("版本不识别: {0}")]
+    BadVersion(u32),
+    #[error("文件过短或布局损坏")]
+    Truncated,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// mmap 只读视图:五原语直切 mmap 区段,零反序列化。冷启动两段式第一步——
+/// load_mmap 后立即可查(query::execute 直消费 &dyn IndexView,零分支扩散);
+/// 第二步 materialize() 物化为可变 Index。
+///
+/// 一致性信任级别:load 侧对 magic/version/段长做 need 全覆盖校验;
+/// 条目内 arena 偏移与 path_seg 的 idx 不逐一校验——越界属文件损坏或调用方 bug,
+/// 表现为切片 panic(与内存 Index 同一信任级别),不做运行时防御。
+pub struct SharedView {
+    mmap: memmap2::Mmap,
+    pub meta: IndexMeta,
+    entries_off: usize,
+    display_off: usize,
+    match_off: usize,
+    path_pool_off: usize,
+    path_offsets_off: usize,
+    n_entries: usize,
+}
+
+impl IndexView for SharedView {
+    fn entries(&self) -> &[Entry] {
+        // SAFETY:三前提在 load_mmap 已逐一成立——
+        // 1) 对齐:mmap 基址页对齐,entries_off 经 align_up(…, 4) 且 Entry 对齐值 = 4(repr(C) 全 u32);
+        // 2) 边界:need(entries_off, n_entries*24) 校验通过,切片不越出 mmap;
+        // 3) 位型合法:Entry 全字段 u32/u8,任意位型皆合法值(repr(C) 无失效位型)。
+        // 生命周期:返回切片借用 &self,与 mmap 同寿,不出借圈。
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap[self.entries_off..].as_ptr() as *const Entry,
+                self.n_entries,
+            )
+        }
+    }
+    fn display_arena(&self) -> &[u8] {
+        &self.mmap[self.display_off..self.match_off]
+    }
+    fn match_arena(&self) -> &[u8] {
+        &self.mmap[self.match_off..self.path_pool_off]
+    }
+    fn path_pool(&self) -> &[u8] {
+        &self.mmap[self.path_pool_off..self.path_offsets_off]
+    }
+    fn path_seg(&self, idx: u32) -> (u32, u32) {
+        let off = self.path_offsets_off + idx as usize * 8;
+        (
+            u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap()),
+            u32::from_le_bytes(self.mmap[off + 4..off + 8].try_into().unwrap()),
+        )
+    }
+}
+
+impl SharedView {
+    /// 冷启动两段式第二步:从 mmap 物化为可变 Index(零逻辑重建——直接拷字节)。
+    /// 条目 1:1 拷贝(条目号不变、墓碑保留),父指针无需重映射;
+    /// live 目录路径池经父链重建(与 compact 同法,复用 dir_path_bytes 唯一实现),
+    /// 墓碑目录的陈旧池段不重建(置 (0,0) 占位)——查询只读活目录段,行为无差。
+    pub fn materialize(&self) -> Index {
+        let entries = self.entries();
+        let display = self.display_arena();
+        let match_arena = self.match_arena();
+        let mut new_entries: Vec<Entry> = Vec::with_capacity(entries.len());
+        let mut display_out = ArenaBuilder::default();
+        let mut match_out = ArenaBuilder::default();
+        let mut live = 0u32;
+        let mut tombstones = 0u32;
+        for e in entries {
+            let d = &display[e.display_start as usize..(e.display_start + e.display_len) as usize];
+            let m = &match_arena[e.match_start as usize..(e.match_start + e.match_len) as usize];
+            let (ds, dl) = display_out.push(d);
+            let (ms, ml) = match_out.push(m);
+            new_entries.push(Entry {
+                display_start: ds,
+                display_len: dl,
+                match_start: ms,
+                match_len: ml,
+                parent: e.parent,
+                flags: e.flags,
+            });
+            if e.is_live() {
+                live += 1;
+            } else {
+                tombstones += 1;
+            }
+        }
+        let mut i = Index::from_parts(
+            new_entries,
+            display_out,
+            match_out,
+            ArenaBuilder::default(),
+            vec![(0, 0); entries.len()],
+            live,
+            tombstones,
+        );
+        // 顺序约束与 compact 一致:先拷好父链再建路径池(dir_path_bytes 依赖父链)
+        for n in 0..i.entries.len() {
+            if i.entries[n].is_dir() && i.entries[n].is_live() {
+                let pp = i.dir_path_bytes(n as u32);
+                i.path_offsets[n] = i.path_pool.push(&pp);
+            }
+        }
+        i
+    }
+}
+
+/// mmap 零拷贝加载:File::open → Mmap::map → header 逐字段读取(全部 need 边界校验)。
+/// 段切界与写侧同规则:entries_off = align_up(path_offsets 段末, 4)。
+pub fn load_mmap(path: &Path) -> Result<Box<SharedView>, LoadError> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Err(LoadError::Truncated);
+    }
+    // SAFETY:文件只读打开;写侧走「临时文件 + rename」原子替换,映射期间 inode 不会被原地改写
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let buf = &mmap[..];
+
+    let mut cur = 0usize;
+    need(buf, cur, 4)?;
+    if &buf[0..4] != MAGIC {
+        return Err(LoadError::BadMagic);
+    }
+    cur = 4;
+    let version = rd_u32(buf, &mut cur)?;
+    if version != FORMAT_VERSION {
+        return Err(LoadError::BadVersion(version));
+    }
+    let n_entries = rd_u32(buf, &mut cur)?;
+    let _tombstone_count = rd_u32(buf, &mut cur)?; // header 计数,读出即弃(读取面以条目 flags 为准)
+    let n_path_offsets = rd_u32(buf, &mut cur)?;
+    let built_at = rd_u64(buf, &mut cur)?;
+    let last_event_id = rd_u64(buf, &mut cur)?;
+
+    let mut scan_roots = Vec::new();
+    let n_roots = rd_u32(buf, &mut cur)?;
+    for _ in 0..n_roots {
+        scan_roots.push(rd_bytes(buf, &mut cur)?);
+    }
+    let mut excluded = Vec::new();
+    let n_excluded = rd_u32(buf, &mut cur)?;
+    for _ in 0..n_excluded {
+        excluded.push(rd_bytes(buf, &mut cur)?);
+    }
+
+    let display_len = rd_u64(buf, &mut cur)?;
+    let match_len = rd_u64(buf, &mut cur)?;
+    let pool_len = rd_u64(buf, &mut cur)?;
+
+    let display_off = cur;
+    need(buf, display_off, display_len)?;
+    let match_off = display_off + display_len as usize;
+    need(buf, match_off, match_len)?;
+    let path_pool_off = match_off + match_len as usize;
+    need(buf, path_pool_off, pool_len)?;
+    let path_offsets_off = path_pool_off + pool_len as usize;
+
+    // path_offsets 与条目号全量对齐是布局不变量(写侧同源落盘),违反即布局损坏
+    if n_path_offsets != n_entries {
+        return Err(LoadError::Truncated);
+    }
+    let offsets_bytes = n_path_offsets as u64 * 8;
+    need(buf, path_offsets_off, offsets_bytes)?;
+    let offsets_end = path_offsets_off + offsets_bytes as usize;
+
+    // 与写侧同规则:entries 段起始向上对齐 4B(写侧补零,读侧同公式切界)
+    let entries_off = offsets_end.next_multiple_of(4);
+    need(buf, entries_off, n_entries as u64 * 24)?;
+
+    Ok(Box::new(SharedView {
+        mmap,
+        meta: IndexMeta {
+            built_at,
+            last_event_id,
+            scan_roots,
+            excluded,
+        },
+        entries_off,
+        display_off,
+        match_off,
+        path_pool_off,
+        path_offsets_off,
+        n_entries: n_entries as usize,
+    }))
+}
+
+/// 边界检查:off..off+len 必须是 buf 内的合法区间(off 越过文件尾同样拒绝,含 0 长度请求)。
+/// 全 u64 域比较长度,无溢出面;len/offset 来自文件,通过后才允许切片。
+fn need(buf: &[u8], off: usize, len: u64) -> Result<(), LoadError> {
+    if off > buf.len() || len > (buf.len() - off) as u64 {
+        return Err(LoadError::Truncated);
+    }
+    Ok(())
+}
+
+/// 读取助手自检边界:每读必查,header 中段截断返回 Truncated 而非切片 panic。
+fn rd_u32(buf: &[u8], cur: &mut usize) -> Result<u32, LoadError> {
+    need(buf, *cur, 4)?;
+    let v = u32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
+    *cur += 4;
+    Ok(v)
+}
+
+fn rd_u64(buf: &[u8], cur: &mut usize) -> Result<u64, LoadError> {
+    need(buf, *cur, 8)?;
+    let v = u64::from_le_bytes(buf[*cur..*cur + 8].try_into().unwrap());
+    *cur += 8;
+    Ok(v)
+}
+
+/// 读「u32 长度 + 字节串」段(roots/excluded 逐个);长度越界返回 Truncated。
+fn rd_bytes(buf: &[u8], cur: &mut usize) -> Result<Vec<u8>, LoadError> {
+    let len = rd_u32(buf, cur)? as u64;
+    need(buf, *cur, len)?;
+    let v = buf[*cur..*cur + len as usize].to_vec();
+    *cur += len as usize;
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +421,125 @@ mod tests {
             tmp_path_for(Path::new("/data/index.bin")).unwrap(),
             Path::new("/data/index.bin")
         );
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use crate::index::{Index, IndexView};
+
+    fn build_and_save(dir: &tempfile::TempDir, last_id: u64) -> (Index, std::path::PathBuf) {
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        i.insert("résumé.txt", d, false);
+        // 1 字节名子目录 + 1 字节名文件:display/match 各 16B、路径池 10B,
+        // 池末偏移 110 ≡ 2 (mod 4) 非 4 对齐——钉住 entries 段 align_up 切界
+        // (删读侧 next_multiple_of(4) 或写侧补零,此 fixture 下必红)
+        i.insert("x", d, true);
+        i.insert("y", d, false);
+        let path = dir.path().join("index.bin");
+        let meta = IndexMeta {
+            built_at: 1,
+            last_event_id: last_id,
+            scan_roots: vec![],
+            excluded: vec![],
+        };
+        write_atomic(&i, &meta, &path).unwrap();
+        (i, path)
+    }
+
+    #[test]
+    fn mmap_view_reads_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, path) = build_and_save(&dir, 7);
+        let view = load_mmap(&path).unwrap();
+        let v: &dyn IndexView = &*view;
+        assert_eq!(
+            v.entries().len() as u32,
+            src.entry_count() + src.tombstone_count()
+        );
+        assert_eq!(v.match_name(1), src.match_name_of(1));
+        assert_eq!(v.display_name(1), src.display_name_of(1));
+        assert_eq!(view.meta.last_event_id, 7);
+        // 查询直跑共享视图(Task 8 的 execute 零改动消费)。
+        // 词用 résumé:normalize_for_match 只做 NFC+小写折叠不去变音符,"resume" 必不命中
+        let out = crate::query::execute(v, &crate::query::parse("résumé").unwrap(), 10);
+        assert_eq!(out.total, 1);
+        // path: 查询走 mmap 视图的 path_seg + path_pool 切段(docs 的子项:résumé.txt + x + y)
+        let path_out = crate::query::execute(v, &crate::query::parse("path:docs").unwrap(), 10);
+        assert_eq!(path_out.total, 3);
+    }
+
+    #[test]
+    fn bad_magic_and_version_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.bin");
+        std::fs::write(&p, b"XXXXgarbage-which-is-long-enough").unwrap();
+        assert!(matches!(load_mmap(&p), Err(LoadError::BadMagic)));
+        let (_, path) = build_and_save(&dir, 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(load_mmap(&path), Err(LoadError::BadVersion(99))));
+    }
+
+    // materialize 全码的行为钉:物化索引与源索引路径全集等价、可变操作可用
+    #[test]
+    fn materialize_produces_equivalent_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, path) = build_and_save(&dir, 3);
+        let view = load_mmap(&path).unwrap();
+        let m = view.materialize();
+        assert_eq!(m.entry_count(), src.entry_count());
+        let a: std::collections::BTreeSet<String> = (0..m.entries.len() as u32)
+            .map(|i| m.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        let b: std::collections::BTreeSet<String> = (0..src.entries.len() as u32)
+            .map(|i| src.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(a, b);
+        // 路径池重建钉:目录段经条目号可取且与源一致(删此重建代码此行必红)
+        assert_eq!(m.dir_path(0), src.dir_path(0));
+        // 物化后可变操作可用
+        let docs = m.children_of(0);
+        let _ = docs;
+    }
+
+    // live/tombstone 计数拆分钉:物化把计数全记进 live 时此测必红
+    #[test]
+    fn materialize_preserves_tombstone_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        let gone = i.insert("gone.txt", d, false);
+        i.insert("kept.txt", d, false);
+        i.remove(gone);
+        let path = dir.path().join("tomb.bin");
+        write_atomic(&i, &IndexMeta::default(), &path).unwrap();
+        let m = load_mmap(&path).unwrap().materialize();
+        assert_eq!(m.entry_count(), i.entry_count());
+        assert_eq!(m.tombstone_count(), i.tombstone_count());
+        assert_eq!(m.entries.len(), i.entries.len(), "条目 1:1 拷贝,墓碑保留");
+        // 穿插墓碑后父链与路径池仍一致
+        assert_eq!(m.dir_path(0), b"docs".to_vec());
+        assert_eq!(m.full_path(2).to_string_lossy(), "docs/kept.txt");
+    }
+
+    // 截断钉:合法文件的任意前缀都必须返回 Truncated,绝不 panic
+    // (读助手每读必查的全覆盖证明;删任一读点的边界检查,对应前缀长度即 panic)
+    #[test]
+    fn truncated_prefix_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, path) = build_and_save(&dir, 1);
+        let full = std::fs::read(&path).unwrap();
+        for len in 0..full.len() {
+            let p = dir.path().join("cut.bin");
+            std::fs::write(&p, &full[..len]).unwrap();
+            assert!(
+                matches!(load_mmap(&p), Err(LoadError::Truncated)),
+                "前缀长度 {len} 应返回 Truncated"
+            );
+        }
     }
 }
