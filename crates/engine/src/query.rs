@@ -144,6 +144,22 @@ mod tests {
         expected.push(QMARK);
         assert_eq!(p2.name_terms[0].parts, vec![expected]);
         assert!(p2.name_terms[0].suffix_anchor);
+        assert!(p2.name_terms[0].prefix_anchor); // ? 前是字面「报告」→ 前锚
+    }
+
+    #[test]
+    fn consecutive_stars_collapse_and_bare_star() {
+        // 连续 * 折叠,不产空段;首尾皆字面 → 双锚
+        let p = parse("a**b").unwrap();
+        assert_eq!(p.name_terms[0].parts, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(p.name_terms[0].prefix_anchor);
+        assert!(p.name_terms[0].suffix_anchor);
+
+        // 纯 * → 空段序列 + 双锚皆 false(匹配端恒真,全量命中)
+        let star = parse("*").unwrap();
+        assert!(star.name_terms[0].parts.is_empty());
+        assert!(!star.name_terms[0].prefix_anchor);
+        assert!(!star.name_terms[0].suffix_anchor);
     }
 
     #[test]
@@ -158,9 +174,13 @@ mod tests {
     }
 
     #[test]
-    fn syntax_chars_inside_term_are_literal() {
+    fn mid_wildcard_splits_unanchored() {
+        // 本语法无转义:词中 * 就是通配符,按序切分(非字面);中段 * 自身不带锚,
+        // 锚只属于首/末段——本例首尾皆字面,故双锚置位
         let p = parse("path:my*dir").unwrap();
-        assert_eq!(p.path_terms[0].parts.len(), 2); // my*dir → ["my", "dir"] 中锚
+        assert_eq!(p.path_terms[0].parts, vec![b"my".to_vec(), b"dir".to_vec()]);
+        assert!(p.path_terms[0].prefix_anchor);
+        assert!(p.path_terms[0].suffix_anchor);
     }
 
     #[test]
