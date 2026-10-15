@@ -45,9 +45,35 @@ pub struct FseEvent {
 /// `kFSEventStreamEventIdSinceNow`:建流时表示「从现在开始」。
 pub const SINCE_NOW: EventId = fs::kFSEventStreamEventIdSinceNow;
 
+/// `kFSEventStreamEventFlagHistoryDone`:历史重放段结束标记(Task 3 spike 实证
+/// 值为 0x10 并落定;重放追平判据,ADR-5)。
+pub const FLAG_HISTORY_DONE: EventFlags = fs::kFSEventStreamEventFlagHistoryDone;
+
+/// 便捷组合:文件级事件 + 使用 CFTypes 路径数组(本封装恒设 UseCFTypes)。
+pub const FILE_EVENTS: fs::FSEventStreamCreateFlags = fs::kFSEventStreamCreateFlagFileEvents;
+
+/// 事件是否携带历史重放结束标记。
+#[must_use]
+pub fn is_history_done(flags: EventFlags) -> bool {
+    flags & FLAG_HISTORY_DONE != 0
+}
+
+/// 事件是否携带「丢弃」类标记(事件被系统合并丢弃,调用方应转全量重扫兜底)。
+/// 位组合见 `fsevent_sys`:MustScanSubDirs/UserDropped/KernelDropped/EventIdsWrapped。
+#[must_use]
+pub fn is_dropped(flags: EventFlags) -> bool {
+    flags
+        & (fs::kFSEventStreamEventFlagMustScanSubDirs
+            | fs::kFSEventStreamEventFlagUserDropped
+            | fs::kFSEventStreamEventFlagKernelDropped
+            | fs::kFSEventStreamEventFlagEventIdsWrapped)
+        != 0
+}
+
 /// 最近一条已生成的全局事件 ID(`FSEventsGetCurrentEventId`)。
 #[must_use]
 pub fn current_event_id() -> EventId {
+    // SAFETY:无参只读查询,纯函数式 C API,无指针/生命周期涉及。
     unsafe { fs::FSEventsGetCurrentEventId() }
 }
 
@@ -59,6 +85,10 @@ struct CallbackCtx {
 /// 句柄全程单线程独占,不并发共享。
 #[derive(Clone, Copy)]
 struct SendPtr(*mut c_void);
+// SAFETY:SendPtr 只承载「所有权转移」语义(创建线程 → runloop 线程、或回收),
+// 不提供共享访问;两个句柄(stream/runloop)在任一时刻只被一个线程持有,
+// 转移后原线程不再触碰。CF 对象本身的线程契约(如 CFRunLoopStop 可跨线程)
+// 在调用点另行论证。
 unsafe impl Send for SendPtr {}
 
 /// 回调:批量取事件逐条发往通道。字符串提取失败(理论不可达)以空路径留痕,
@@ -73,9 +103,15 @@ extern "C" fn on_events(
     event_flags: *const fs::FSEventStreamEventFlags,
     event_ids: *const fs::FSEventStreamEventId,
 ) {
+    // SAFETY:info 即 FSEventStreamContext.info,由 start_stream 以 Box::into_raw
+    // 装入,在流存活期间恒有效;回调由 CF 在 stream 所属 runloop 线程串行调用,
+    // 与属主线程回收 ctx 的时间窗被「Stop+Invalidate 完毕 → join」隔开,无别名冲突。
     let ctx = unsafe { &*(info as *const CallbackCtx) };
     let paths = event_paths as cf::CFArrayRef;
     for i in 0..num_events {
+        // SAFETY:eventPaths 为 CFArrayRef(创建流恒设 UseCFTypes,见模块头)、
+        // eventFlags/eventIds 为长度 num_events 的 C 数组(框架契约),
+        // i < num_events 时索引合法;CFArrayGetValueAtIndex 借出的值在本次回调内有效。
         let (path, flags, id) = unsafe {
             let value = cf::CFArrayGetValueAtIndex(paths, i as cf::CFIndex);
             let mut buf = [0 as c_char; 4096];
@@ -101,12 +137,16 @@ extern "C" fn on_events(
 /// `stop()`/`Drop` 唤醒 runloop 后由该线程完成 Stop/Invalidate/Release,属主 join 后回收上下文。
 pub struct FseStream {
     run_loop: cf::CFRunLoopRef,
+    /// 流句柄副本,仅供属主线程做只读查询(`latest_event_id`);拆除动作仍全部
+    /// 在 runloop 线程执行。
+    stream: *mut c_void,
     ctx: *mut CallbackCtx,
     worker: Option<JoinHandle<()>>,
 }
 
-// SAFETY:run_loop / ctx / worker 由本结构独占拥有,对外只暴露 `stop()`;
-// `CFRunLoopStop` 官方文档保证可跨线程调用;ctx 在 join 回调线程之后才回收。
+// SAFETY:run_loop / ctx / worker 由本结构独占拥有,对外只暴露 `stop()`(排他借用)
+// 与 `latest_event_id()`(只读查询:CFRunLoopStop 与 FSEventStreamGetLatestEventId
+// 官方文档均保证可跨线程调用,后者为纯读);ctx 在 join 回调线程之后才回收。
 unsafe impl Send for FseStream {}
 
 /// 建流失败(创建返回空句柄,或 `FSEventStreamStart` 失败)。
@@ -144,6 +184,10 @@ pub fn start_stream(
         .iter()
         .map(|p| CString::new(*p).expect("路径含 NUL"))
         .collect();
+    // SAFETY:全程在属主线程、ctx 已 Box 化且未移交;CFArray/CFString 的 Create 遵循
+    // 「Create 归还调用方所有权」惯例——数组与临时字符串按次 Release,数组本身移交
+    // FSEventStreamCreate(创建后 CF 持有引用,无需再 Release)。context 为栈上值,
+    // 仅本次调用读取;info 裸指针在流存活期内由 stop() 回收,与回调的生命周期论证一致。
     let stream = unsafe {
         let array =
             cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 0, &cf::kCFTypeArrayCallBacks);
@@ -163,7 +207,7 @@ pub fn start_stream(
             release: None,
             copy_description: None,
         };
-        fs::FSEventStreamCreate(
+        let s = fs::FSEventStreamCreate(
             cf::kCFAllocatorDefault,
             on_events,
             &context,
@@ -171,9 +215,14 @@ pub fn start_stream(
             since_when,
             latency,
             extra_flags | fs::kFSEventStreamCreateFlagUseCFTypes,
-        )
+        );
+        // CF 惯例:被调用方按需自持,调用方引用必释——流存活与否都由流自己 retain,
+        // 此处无条件释放数组(修 spike 版每流一次的数组泄漏)。
+        cf::CFRelease(array);
+        s
     };
     if stream.is_null() {
+        // SAFETY:建流失败,ctx 从未交给任何流,无回调可能;独占回收唯一所有权。
         unsafe { drop(Box::from_raw(ctx)) };
         return Err(StreamStartError("FSEventStreamCreate 返回空句柄".into()));
     }
@@ -186,15 +235,23 @@ pub fn start_stream(
     let worker = Builder::new()
         .name("fsevents-runloop".into())
         .spawn(move || {
+            // 先整体绑定再进闭包:避免闭包按精确路径捕获裸指针字段,绕过 SendPtr 的 Send 实现。
             let sp = stream_ptr;
             let stream = sp.0;
+            // SAFETY:在本线程(即将成为流所调度的 runloop 线程)内取当前 runloop,
+            // 返回值在本线程存活期内恒有效。
             let run_loop = unsafe { cf::CFRunLoopGetCurrent() };
+            // SAFETY:stream 由本线程独占(所有权已随 SendPtr 移交);ScheduleWithRunLoop
+            // 要求在与后续 CFRunLoopRun 同线程调用,此处即该线程。
             unsafe {
                 fs::FSEventStreamScheduleWithRunLoop(stream, run_loop, cf::kCFRunLoopDefaultMode);
             }
+            // SAFETY:stream 已 schedule 到本线程 runloop,调用契约满足。
             let started = unsafe { fs::FSEventStreamStart(stream) };
             if started == 0 {
                 // start 失败:schedule 过的源要 invalidate,再 release,回报后退出。
+                // SAFETY:拆除序列(Invalidate→Release)按 Apple 契约在调度线程执行;
+                // 流已在 schedule 后取得 Release 的所有权(创建时归调用方,此处消费)。
                 unsafe {
                     fs::FSEventStreamInvalidate(stream);
                     fs::FSEventStreamRelease(stream);
@@ -204,12 +261,17 @@ pub fn start_stream(
             }
             if ready_tx.send(Ok(SendPtr(run_loop))).is_err() {
                 // 属主已放弃等待:自行收尾,防悬挂。
+                // SAFETY:CFRunLoopStop 官方文档保证可从任意线程调用(对尚未 Run 的 loop
+                // 无害,下一次 Run 立即返回)。
                 unsafe {
                     cf::CFRunLoopStop(run_loop);
                 }
             }
             // 阻塞至 stop() 调 CFRunLoopStop;退出后在源所在线程完成拆除。
+            // SAFETY:本线程专属的 runloop,无其他 owner。
             unsafe { cf::CFRunLoopRun() };
+            // SAFETY:Stop/Invalidate/Release 三连按契约在调度线程执行;每次 start_stream
+            // 只走到这里一次(worker 单次执行),无双重释放。
             unsafe {
                 fs::FSEventStreamStop(stream);
                 fs::FSEventStreamInvalidate(stream);
@@ -218,20 +280,31 @@ pub fn start_stream(
         })
         .expect("启动 fsevents-runloop 线程失败");
 
-    match ready_rx
-        .recv()
-        .expect("fsevents-runloop 线程在回报就绪前退出")
-    {
+    let ready = match ready_rx.recv() {
+        Ok(r) => r,
+        Err(_) => {
+            // worker 在回报前退出(panic):join 回收线程,再回收 ctx,报错而非连带 panic。
+            let _ = worker.join();
+            // SAFETY:worker 已终结,回调不可能再发生;独占回收 ctx 唯一所有权。
+            unsafe { drop(Box::from_raw(ctx)) };
+            return Err(StreamStartError(
+                "fsevents-runloop 线程在回报就绪前退出".into(),
+            ));
+        }
+    };
+    match ready {
         Ok(run_loop) => Ok((
             FseStream {
                 run_loop: run_loop.0,
+                stream,
                 ctx,
                 worker: Some(worker),
             },
             rx,
         )),
         Err(reason) => {
-            worker.join().expect("fsevents-runloop 线程 join 失败");
+            let _ = worker.join();
+            // SAFETY:同 ready Err 分支——start 失败路径 worker 已终结,回调不可能发生。
             unsafe { drop(Box::from_raw(ctx)) };
             Err(StreamStartError(reason))
         }
@@ -239,14 +312,31 @@ pub fn start_stream(
 }
 
 impl FseStream {
+    /// 流当前已处理到的事件 ID(`FSEventStreamGetLatestEventId`)。
+    /// 落盘时写入 `last_event_id`(ADR-5 停机重放起点);流已拆除后返回 0。
+    #[must_use]
+    pub fn latest_event_id(&self) -> EventId {
+        if self.worker.is_none() {
+            return 0;
+        }
+        // SAFETY:stream 句柄在进程内全局注册表有效(Apple 文档:该 API 可在任意线程
+        // 查询本进程创建的流);worker 尚未拆除(上面已判),句柄有效。
+        unsafe { fs::FSEventStreamGetLatestEventId(self.stream) }
+    }
+
     /// 停流:唤醒 runloop,拆除由 runloop 线程完成后 join,再回收回调上下文。
-    /// 幂等;`Drop` 复用。
+    /// 幂等;`Drop` 复用。worker panic 时记日志继续回收(不连带 panic)。
     pub fn stop(&mut self) {
         let Some(worker) = self.worker.take() else {
             return;
         };
+        // SAFETY:CFRunLoopStop 官方文档保证可跨线程调用;run_loop 在流存活期内有效
+        //(由 worker 持有并调度,stop 只在 join 前调用)。
         unsafe { cf::CFRunLoopStop(self.run_loop) };
-        worker.join().expect("fsevents-runloop 线程 join 失败");
+        if worker.join().is_err() {
+            log::error!("fsevents-runloop 线程 panic,stream 可能未完整释放");
+        }
+        // SAFETY:worker 已终结(join 返回),回调不可能再发生;独占回收 ctx。
         unsafe { drop(Box::from_raw(self.ctx)) };
     }
 }
