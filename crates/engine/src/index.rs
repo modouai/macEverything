@@ -1,6 +1,18 @@
 //! 内存索引:扁平 Entry 数组 + 双 arena + 目录路径池(ADR-2)。
+use std::collections::BTreeMap;
+
 use crate::arena::ArenaBuilder;
 use crate::entry::*;
+
+/// 目录现项清单:名称 -> 是否目录(watcher/reconcile 从磁盘读取后传入)。
+pub type DirListing = BTreeMap<String, bool>;
+
+/// 一次 diff_dir 的增删统计。
+#[derive(Debug, Clone, Copy)]
+pub struct DiffStats {
+    pub added: u32,
+    pub removed: u32,
+}
 
 pub struct Index {
     pub entries: Vec<Entry>,
@@ -33,13 +45,18 @@ impl Index {
         self.tombstones
     }
 
-    /// 插入条目,返回条目号。path_offsets 与条目号全量对齐:
-    /// 目录 push 真值段,非目录 push (0,0) 占位(Task 12b)。
+    /// 插入条目,返回条目号。不变量:`parent` 必须是 NO_PARENT 或已存在条目号
+    /// (严格小于返回值);违反将破坏父链上溯的终止性(debug 断言在测试期暴露)。
+    /// path_offsets 与条目号全量对齐:目录 push 真值段,非目录 push (0,0) 占位(Task 12b)。
     pub fn insert(&mut self, name: &str, parent: u32, is_dir: bool) -> u32 {
+        let idx = self.entries.len() as u32;
+        debug_assert!(
+            parent == NO_PARENT || parent < idx,
+            "parent 必须先于子条目存在"
+        );
         let m = normalize_for_match(name);
         let (ds, dl) = self.display_arena.push(name.as_bytes());
         let (ms, ml) = self.match_arena.push(m.as_bytes());
-        let idx = self.entries.len() as u32;
         let mut flags = 0;
         if is_dir {
             flags |= FLAG_DIR;
@@ -125,6 +142,163 @@ impl Index {
         let (s, l) = self.path_offsets[idx as usize];
         self.path_pool.data[s as usize..(s + l) as usize].to_vec()
     }
+
+    // —— Task 6:变更语义 ——
+
+    /// 改名。双 arena 追加新段(旧段成孤儿,整理时回收);
+    /// 目录触发子树路径池级联重写,文件不进路径池(Task 12b)。
+    pub fn rename_entry(&mut self, idx: u32, new_name: &str) {
+        let m = normalize_for_match(new_name);
+        let (ds, dl) = self.display_arena.push(new_name.as_bytes());
+        let (ms, ml) = self.match_arena.push(m.as_bytes());
+        let e = &mut self.entries[idx as usize];
+        e.display_start = ds;
+        e.display_len = dl;
+        e.match_start = ms;
+        e.match_len = ml;
+        if e.is_dir() {
+            self.rebuild_paths_under(idx); // 子树级联
+        }
+    }
+
+    /// 重写 root 及其整棵子树的目录路径池条目(目录改名级联,ADR-2 风险表)。
+    /// 文件条目跳过(占位 (0,0) 不变);子项发现走 O(n) 全量扫,与 children_of 同一已知设计。
+    fn rebuild_paths_under(&mut self, root: u32) {
+        fn walk(ix: &mut Index, cur: u32) {
+            if ix.entries[cur as usize].is_dir() {
+                let pp = ix.dir_path_bytes(cur);
+                ix.path_offsets[cur as usize] = ix.path_pool.push(&pp);
+            }
+            let kids: Vec<u32> = ix
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.parent == cur && e.is_live())
+                .map(|(i, _)| i as u32)
+                .collect();
+            for k in kids {
+                walk(ix, k);
+            }
+        }
+        walk(self, root);
+    }
+
+    /// 删除(墓碑制,不 swap-remove:保条目号与父指针稳定)。
+    /// 子树级联:活子项一并打墓碑,保证「活条目的父必活」不变量。
+    pub fn remove(&mut self, idx: u32) {
+        fn walk(ix: &mut Index, cur: u32) {
+            let e = &mut ix.entries[cur as usize];
+            if !e.is_live() {
+                return;
+            }
+            e.flags |= FLAG_TOMBSTONE;
+            ix.live_count -= 1;
+            ix.tombstones += 1;
+            let kids: Vec<u32> = ix
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e2)| e2.parent == cur && e2.is_live())
+                .map(|(i, _)| i as u32)
+                .collect();
+            for k in kids {
+                walk(ix, k);
+            }
+        }
+        walk(self, idx);
+    }
+
+    /// 墓碑占比(整理触发阈值 20%,ADR-2 风险表)。
+    pub fn tombstone_ratio(&self) -> f64 {
+        let total = self.live_count + self.tombstones;
+        if total == 0 {
+            0.0
+        } else {
+            self.tombstones as f64 / total as f64
+        }
+    }
+
+    /// 唯一真相机制:按磁盘现目录项 diff 该目录(parent == dir_idx 的活条目)。
+    /// 索引中有而磁盘无 → 墓碑;磁盘有而索引无 → 插入;类型不符 → 删+增。
+    pub fn diff_dir(&mut self, dir_idx: u32, on_disk: &DirListing) -> DiffStats {
+        let mut added = 0u32;
+        let mut removed = 0u32;
+        let mut on_disk = on_disk.clone();
+        let kids: Vec<u32> = self.children_of(dir_idx);
+        for k in kids {
+            let name = String::from_utf8_lossy(self.display_name_of(k)).into_owned();
+            match on_disk.remove(&name) {
+                Some(is_dir) => {
+                    let e = self.entries[k as usize];
+                    if e.is_dir() != is_dir {
+                        // 类型变化视为删+增
+                        self.remove(k);
+                        self.insert(&name, dir_idx, is_dir);
+                        added += 1;
+                        removed += 1;
+                    }
+                }
+                None => {
+                    self.remove(k);
+                    removed += 1;
+                }
+            }
+        }
+        for (name, is_dir) in on_disk {
+            self.insert(&name, dir_idx, is_dir);
+            added += 1;
+        }
+        DiffStats { added, removed }
+    }
+
+    /// 墓碑整理:重建 entries/双 arena/路径池,重写父指针。
+    /// 顺序约束:先修父指针再建路径池(dir_path_bytes 依赖已修好的父链)。
+    pub fn compact(&mut self) {
+        let old = std::mem::take(self);
+        let mut map = vec![NO_PARENT; old.entries.len()];
+        let mut new = Index::new();
+        for (i, e) in old.entries.iter().enumerate() {
+            if !e.is_live() {
+                continue;
+            }
+            let dname = String::from_utf8_lossy(old.display_name_of(i as u32)).into_owned();
+            let is_dir = e.is_dir();
+            let old_parent = e.parent;
+            let m = normalize_for_match(&dname);
+            let (ds, dl) = new.display_arena.push(dname.as_bytes());
+            let (ms, ml) = new.match_arena.push(m.as_bytes());
+            new.entries.push(Entry {
+                display_start: ds,
+                display_len: dl,
+                match_start: ms,
+                match_len: ml,
+                parent: old_parent,
+                flags: if is_dir { FLAG_DIR } else { 0 },
+            });
+            map[i] = new.entries.len() as u32 - 1;
+            new.live_count += 1;
+        }
+        for e in new.entries.iter_mut() {
+            if e.parent != NO_PARENT {
+                // remove 的子树级联保证「活条目的父必活」,此处映射必命中活条目;
+                // 违反即静默再定根,debug 断言在测试期暴露。
+                debug_assert!(
+                    map[e.parent as usize] != NO_PARENT,
+                    "compact 前存在父为墓碑的活条目,违反 remove 级联不变量"
+                );
+                e.parent = map[e.parent as usize];
+            }
+        }
+        // path_offsets 按条目号对齐(目录真值/其余占位)——先 resize 占位再填目录
+        new.path_offsets = vec![(0, 0); new.entries.len()];
+        for i in 0..new.entries.len() {
+            if new.entries[i].is_dir() {
+                let pp = new.dir_path_bytes(i as u32);
+                new.path_offsets[i] = new.path_pool.push(&pp);
+            }
+        }
+        *self = new;
+    }
 }
 
 impl Default for Index {
@@ -182,5 +356,70 @@ mod tests {
         assert!(i.path_offsets[d as usize].1 > 0); // 目录有真值
         assert_eq!(i.path_offsets[1], (0, 0)); // 文件占位
         assert_eq!(i.dir_path(sub), b"docs/sub".to_vec()); // 目录路径池按条目号可取
+    }
+
+    // —— Task 6:变更语义 ——
+    use std::collections::BTreeMap;
+
+    fn listing(files: &[(&str, bool)]) -> BTreeMap<String, bool> {
+        files.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    }
+
+    #[test]
+    fn diff_applies_add_remove_rename() {
+        let mut i = ix();
+        let d = i.insert("docs", NO_PARENT, true);
+        let _a = i.insert("a.txt", d, false);
+        i.diff_dir(d, &listing(&[("b.txt", false), ("a.txt", false)]));
+        // b 新增,a 保留
+        let kids: Vec<Vec<u8>> = i
+            .children_of(d)
+            .iter()
+            .map(|k| i.display_name_of(*k).to_vec())
+            .collect();
+        assert!(kids.contains(&b"b.txt".to_vec()) && kids.contains(&b"a.txt".to_vec()));
+        i.diff_dir(d, &listing(&[("b.txt", false)]));
+        let kids: Vec<Vec<u8>> = i
+            .children_of(d)
+            .iter()
+            .map(|k| i.display_name_of(*k).to_vec())
+            .collect();
+        assert_eq!(kids, vec![b"b.txt".to_vec()]); // a 被墓碑
+        assert_eq!(i.tombstone_count(), 1);
+    }
+
+    #[test]
+    fn dir_cascade_and_path_pool() {
+        let mut i = ix();
+        let p = i.insert("projects", NO_PARENT, true);
+        let sub = i.insert("alpha", p, true);
+        let _f = i.insert("x.rs", sub, false);
+        assert_eq!(i.dir_path(sub), b"projects/alpha".to_vec());
+        i.rename_entry(p, "workspace");
+        assert_eq!(i.dir_path(p), b"workspace".to_vec());
+        assert_eq!(i.dir_path(sub), b"workspace/alpha".to_vec()); // 目录:路径池级联重写
+                                                                  // 文件不进路径池(Task 12b 占位设计);其路径经父链求值:
+        assert_eq!(i.full_path(_f).to_string_lossy(), "workspace/alpha/x.rs");
+    }
+
+    #[test]
+    fn compact_reclaims_tombstones() {
+        let mut i = ix();
+        let d = i.insert("d", NO_PARENT, true);
+        for k in 0..10 {
+            let _ = i.insert(&format!("f{k}.txt"), d, false);
+        }
+        for _ in 0..9 {
+            i.remove(i.children_of(d)[0]);
+        } // 剩 1 活 + 9 墓碑
+        assert!(i.tombstone_ratio() > 0.2);
+        i.compact();
+        assert_eq!(i.tombstone_count(), 0);
+        assert_eq!(i.entry_count(), 2); // d + 存活 f9
+                                        // compact 后读侧语义不破:父链重映射 + 路径池重建仍一致
+        let kids = i.children_of(d);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(i.full_path(kids[0]).to_string_lossy(), "d/f9.txt");
+        assert_eq!(i.dir_path(d), b"d".to_vec());
     }
 }
