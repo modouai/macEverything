@@ -5,15 +5,20 @@
 //! - 符号链接一律不入索引、不跟随(防环 + 不跨根);
 //! - `read_dir` 的 PermissionDenied 单独归类 `gaps.permission`,其余 IO 错误计数
 //!   `gaps.io_errors` 不中断——扫描对不可读子树降级为「缺口」,不整体失败;
+//!   `io_errors` 含 `read_dir` 打开与迭代中途两类失败;
 //! - 非 UTF-8 文件名按 `to_string_lossy`(U+FFFD 替换)收录;条目数不丢,名称字节
-//!   与磁盘非严格一致。
+//!   与磁盘非严格一致;
+//! - **调用方契约:roots 之间不得互相重叠(含相等)**——重叠根会重复收录同一物理
+//!   子树且并行臂聚合键互相覆盖,与串行臂行为分歧;debug 构建断言拒绝(见
+//!   `assert_disjoint_roots`)。
+//!
+//! 两条路径(串行/并行)的分类语义由 `classify_entry` 单点保证。
 use crate::entry::NO_PARENT;
 use crate::index::Index;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// 扫描缺口:权限类逐条留痕(目录 + errno 文案),其余 IO 错误只计数。
-/// `io_errors` 含 `read_dir` 打开与迭代中途两类失败。
 #[derive(Default, Debug)]
 pub struct ScanGaps {
     pub permission: Vec<(PathBuf, String)>, // (目录, errno 文案)
@@ -24,15 +29,51 @@ fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
     excludes.iter().any(|x| p.starts_with(x))
 }
 
+/// 调用方契约(debug 期执法):roots 两两不得前缀重叠。
+fn assert_disjoint_roots(roots: &[PathBuf]) {
+    debug_assert!(
+        roots
+            .iter()
+            .all(|a| roots.iter().all(|b| a == b || !b.starts_with(a))),
+        "roots 不得互相重叠:重叠根会重复收录同一物理子树,且并行臂与串行臂行为分歧"
+    );
+}
+
 /// 扫描入口:`threads <= 1` 走串行 BFS;`> 1` 走并行遍历(ADR-6)。
-/// 两条路径的语义基线完全一致(见模块头),Task 10 验收即「路径集合与串行一致」。
+/// 两条路径的分类语义由 `classify_entry` 单点保证;验收 = 路径集合与串行一致。
 /// 根目录条目名取路径尾段,parent = NO_PARENT。
 pub fn scan_roots(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
+    assert_disjoint_roots(roots);
     if threads <= 1 {
         scan_serial(roots, excludes)
     } else {
         scan_parallel(roots, excludes, threads)
     }
+}
+
+/// 目录项分类(两臂共用的语义核心,副作用留调用方):
+/// symlink → `Skip`;排除目录 → `Skip`(整棵剪枝);IO 失败 → `Err`(调用方计 io_errors)。
+fn classify_entry(entry: std::fs::DirEntry, excludes: &[PathBuf]) -> Result<Step, ()> {
+    let ft = entry.file_type().map_err(|_| ())?;
+    if ft.is_symlink() {
+        return Ok(Step::Skip);
+    }
+    let path = entry.path();
+    let name = entry.file_name().to_string_lossy().into_owned();
+    if ft.is_dir() {
+        if is_excluded(&path, excludes) {
+            return Ok(Step::Skip);
+        }
+        Ok(Step::Dir { path, name })
+    } else {
+        Ok(Step::File { name })
+    }
+}
+
+enum Step {
+    Dir { path: PathBuf, name: String },
+    File { name: String },
+    Skip,
 }
 
 /// 串行 BFS 扫描(语义基线本体)。
@@ -69,50 +110,55 @@ fn scan_serial(roots: &[PathBuf], excludes: &[PathBuf]) -> (Index, ScanGaps) {
                     continue;
                 }
             };
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => {
-                    gaps.io_errors += 1;
-                    continue;
+            match classify_entry(entry, excludes) {
+                Ok(Step::Dir { path, name }) => {
+                    let idx = index.insert(&name, parent_idx, true);
+                    queue.push_back((path, idx));
                 }
-            };
-            if ft.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if ft.is_dir() {
-                if is_excluded(&path, excludes) {
-                    continue;
+                Ok(Step::File { name }) => {
+                    index.insert(&name, parent_idx, false);
                 }
-                let idx = index.insert(&name, parent_idx, true);
-                queue.push_back((path, idx));
-            } else {
-                index.insert(&name, parent_idx, false);
+                Ok(Step::Skip) => {}
+                Err(()) => gaps.io_errors += 1,
             }
         }
     }
     (index, gaps)
 }
 
-/// 并行遍历(ADR-6):共享目录队列(work-stealing),活跃线程 = min(threads, 物理核)。
-/// 各线程只产出「相对记录」(父目录绝对路径, 名, is_dir),目录同时回灌队列;
-/// 单线程两轮聚合(先全部目录、再全部文件)保证父条目号先于子,索引布局确定性不受
-/// 线程交织影响——验收 = 路径集合与串行一致(par_tests)。错误分类与串行逐字一致。
+/// 聚合记录:目录条目携带自身原始路径(`raw`,dir_map 键——目录名非 UTF-8 时
+/// lossy 名重建的键会与弹队原始路径漂移,macOS 不可达但 Linux ext4 可触发)。
+enum Rec {
+    Dir {
+        parent: PathBuf,
+        name: String,
+        raw: PathBuf,
+    },
+    File {
+        parent: PathBuf,
+        name: String,
+    },
+}
+
+/// 并行遍历(ADR-6):共享目录队列(work-sharing:纯 FIFO 消费,空队即退),
+/// 活跃线程 = min(threads, 可用逻辑核)。各线程把分类结果写入**线程本地分片**
+/// (无逐条全局锁),scope 结束一次性上收;单线程两轮聚合保证「父条目号先于子 +
+/// 路径集合确定」。注意:条目号/arena 布局随线程交织,不做字节级稳定——此为
+/// ADR-6「分片按队列顺序聚合」的已登记偏差(见 plan 实现偏差 #3)。
 fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
     use std::sync::Mutex;
 
     let queue: Mutex<VecDeque<PathBuf>> = Mutex::new(roots.iter().cloned().collect());
-    let records: Mutex<Vec<(PathBuf, String, bool)>> = Mutex::new(Vec::new());
     let gaps: Mutex<ScanGaps> = Mutex::new(ScanGaps::default());
     let nthreads = threads.min(
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8),
     );
+    let mut shards: Vec<Vec<Rec>> = (0..nthreads).map(|_| Vec::new()).collect();
 
     std::thread::scope(|s| {
-        for _ in 0..nthreads {
+        for shard in shards.iter_mut() {
             s.spawn(|| loop {
                 let Some(dir) = queue.lock().unwrap().pop_front() else {
                     break;
@@ -136,38 +182,33 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
                             continue;
                         }
                     };
-                    let ft = match entry.file_type() {
-                        Ok(ft) => ft,
-                        Err(_) => {
+                    match classify_entry(entry, excludes) {
+                        Ok(Step::Dir { path, name }) => {
+                            shard.push(Rec::Dir {
+                                parent: dir.clone(),
+                                name,
+                                raw: path.clone(),
+                            });
+                            queue.lock().unwrap().push_back(path);
+                        }
+                        Ok(Step::File { name }) => {
+                            shard.push(Rec::File {
+                                parent: dir.clone(),
+                                name,
+                            });
+                        }
+                        Ok(Step::Skip) => {}
+                        Err(()) => {
                             gaps.lock().unwrap().io_errors += 1;
-                            continue;
                         }
-                    };
-                    if ft.is_symlink() {
-                        continue;
-                    }
-                    let path = entry.path();
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if ft.is_dir() {
-                        if is_excluded(&path, excludes) {
-                            continue;
-                        }
-                        records.lock().unwrap().push((dir.clone(), name, true));
-                        queue.lock().unwrap().push_back(path);
-                    } else {
-                        records.lock().unwrap().push((dir.clone(), name, false));
                     }
                 }
             });
         }
     });
 
-    // 聚合(单线程):根先登记;第一轮全部目录(父必已登记——子目录记录产生于父被
-    // 弹出遍历时,父作为目录记录先于其子记录进入 records,两轮法再兜一层);
-    // 第二轮全部文件。
-    // 键语义挂账:dir_map 键 = 原始父路径.join(lossy 名)。目录名非 UTF-8 时该键与
-    // 弹队原始路径不等 → 下标 panic。macOS 不可达(APFS 拒绝非 UTF-8 目录名,实测
-    // Errno 92);Linux ext4 可触发——跨平台时改为 records 携带原始 OsString 名。
+    // 聚合(单线程):根先登记;第一轮全部目录(父必已登记——子目录记录产生于父
+    // 被弹出遍历时,因果序 + 两轮法双保险);第二轮全部文件。
     let mut index = Index::new();
     let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
     for root in roots {
@@ -178,18 +219,16 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
         let idx = index.insert(&name, NO_PARENT, true);
         dir_map.insert(root.clone(), idx);
     }
-    let recs = records.into_inner().unwrap();
-    for (parent, name, is_dir) in &recs {
-        if *is_dir {
+    let recs: Vec<Rec> = shards.into_iter().flatten().collect();
+    for rec in &recs {
+        if let Rec::Dir { parent, name, raw } = rec {
             let pidx = dir_map[parent];
             let idx = index.insert(name, pidx, true);
-            let mut path = parent.clone();
-            path.push(name);
-            dir_map.insert(path, idx);
+            dir_map.insert(raw.clone(), idx);
         }
     }
-    for (parent, name, is_dir) in &recs {
-        if !*is_dir {
+    for rec in &recs {
+        if let Rec::File { parent, name } = rec {
             let pidx = dir_map[parent];
             index.insert(name, pidx, false);
         }
@@ -299,7 +338,7 @@ mod tests {
     }
 
     /// Task 10:并行遍历结果必须与串行一致(ADR-6 验收)——
-    /// 条目数、全路径集合、权限缺口数三项全等。
+    /// 条目数、全路径集合、权限缺口数、IO 错误数四项全等。
     #[test]
     fn parallel_equals_serial() {
         let t = fixture();
@@ -324,6 +363,38 @@ mod tests {
             "权限缺口数一致"
         );
         assert_eq!(s_gaps.io_errors, p_gaps.io_errors, "IO 错误计数一致");
+    }
+
+    /// 多根 parity:两独立根,聚合时根登记顺序与 records 交织不得破坏结果。
+    #[test]
+    fn multi_root_parity() {
+        let t1 = fixture();
+        let t2 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t2.path().join("nested")).unwrap();
+        fs::write(t2.path().join("nested/other.txt"), "").unwrap();
+        fs::write(t2.path().join("top.txt"), "").unwrap();
+        let roots = vec![t1.path().to_path_buf(), t2.path().to_path_buf()];
+        let (s_idx, _) = scan_roots(&roots, &[], 1);
+        let (p_idx, _) = scan_roots(&roots, &[], 8);
+        assert_eq!(s_idx.entry_count(), p_idx.entry_count());
+        let s_paths: std::collections::BTreeSet<String> = (0..s_idx.entries.len() as u32)
+            .map(|i| s_idx.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        let p_paths: std::collections::BTreeSet<String> = (0..p_idx.entries.len() as u32)
+            .map(|i| p_idx.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(s_paths, p_paths);
+        // 两根各含自身子树(full_path 以根条目名(tempdir 尾段)开头,用 ends_with 判)
+        assert!(s_paths.iter().any(|p| p.ends_with("nested/other.txt")));
+        assert!(s_paths.iter().any(|p| p.ends_with("top.txt")));
+    }
+
+    /// 重叠根为调用方契约违规:debug 构建断言拒绝(模块头「调用方契约」)。
+    #[test]
+    #[should_panic(expected = "roots 不得互相重叠")]
+    fn overlapping_roots_rejected_in_debug() {
+        let t = fixture();
+        scan_roots(&[t.path().to_path_buf(), t.path().join("src")], &[], 8);
     }
 
     /// 并行臂权限分支钉:threads=8 下只读目录同样单独归类 permission
