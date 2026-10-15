@@ -332,6 +332,71 @@ impl Default for Index {
     }
 }
 
+/// 内存视图与 mmap 只读视图的统一读取面(ADR-3:查询代码无分支扩散)。
+/// 查询端只依赖本 trait:Task 12 的 mmap `SharedView` 实现同一组方法后自动获得查询能力。
+/// 必须实现的是五个存储访问原语;其余名称/路径读取有默认实现(按偏移切 arena)。
+pub trait IndexView: Sync {
+    fn entries(&self) -> &[Entry];
+    fn display_arena(&self) -> &[u8];
+    fn match_arena(&self) -> &[u8];
+    fn path_pool(&self) -> &[u8];
+    /// 条目在路径池中的段 (start, len);非目录条目为 (0, 0) 占位。
+    fn path_seg(&self, idx: u32) -> (u32, u32);
+
+    /// 匹配形态名(match arena 折叠段;case: 查询在查询端另取 display 归一)。
+    fn match_name(&self, idx: u32) -> &[u8] {
+        let e = &self.entries()[idx as usize];
+        &self.match_arena()[e.match_start as usize..(e.match_start + e.match_len) as usize]
+    }
+
+    /// 展示形态名(display arena 原始字节,未归一)。
+    fn display_name(&self, idx: u32) -> &[u8] {
+        let e = &self.entries()[idx as usize];
+        &self.display_arena()[e.display_start as usize..(e.display_start + e.display_len) as usize]
+    }
+
+    /// 目录条目的完整路径(match 形态,path_pool 段);非目录条目返回空切片。
+    fn dir_path(&self, idx: u32) -> &[u8] {
+        let (s, l) = self.path_seg(idx);
+        &self.path_pool()[s as usize..(s + l) as usize]
+    }
+
+    /// 沿 parent 链拼 display 完整路径(Task 18 daemon 结果输出用)。
+    fn full_path_dyn(&self, idx: u32) -> String {
+        let mut parts: Vec<&[u8]> = Vec::new();
+        let mut cur = idx;
+        loop {
+            let e = &self.entries()[cur as usize];
+            parts.push(self.display_name(cur));
+            if e.parent == NO_PARENT {
+                break;
+            }
+            cur = e.parent;
+        }
+        parts.reverse();
+        let joined = parts.join(b"/".as_slice());
+        String::from_utf8_lossy(&joined).into_owned()
+    }
+}
+
+impl IndexView for Index {
+    fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+    fn display_arena(&self) -> &[u8] {
+        &self.display_arena.data
+    }
+    fn match_arena(&self) -> &[u8] {
+        &self.match_arena.data
+    }
+    fn path_pool(&self) -> &[u8] {
+        &self.path_pool.data
+    }
+    fn path_seg(&self, idx: u32) -> (u32, u32) {
+        self.path_offsets[idx as usize]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +599,22 @@ mod tests {
             i.rename_entry(f, &long); // ~2048B × 17k ≈ 34.8MB > 32MB 阈值
         }
         assert!(i.needs_compaction());
+    }
+
+    // —— Task 8:IndexView 统一读取面(ADR-3) ——
+
+    #[test]
+    fn view_exposes_slices() {
+        let mut i = ix();
+        let d = i.insert("docs", NO_PARENT, true);
+        i.insert("a.txt", d, false);
+        let v: &dyn IndexView = &i;
+        assert_eq!(v.entries().len(), 2);
+        assert_eq!(v.match_name(1), b"a.txt");
+        assert_eq!(v.display_name(1), b"a.txt");
+        assert_eq!(v.dir_path(0), b"docs");
+        assert_eq!(v.path_seg(0).1, 4, "目录条目路径段有真值");
+        assert_eq!(v.path_seg(1), (0, 0), "文件条目占位段");
+        assert_eq!(v.full_path_dyn(1), "docs/a.txt");
     }
 }

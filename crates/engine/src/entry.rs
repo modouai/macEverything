@@ -30,6 +30,13 @@ pub fn normalize_for_match(name: &str) -> String {
     name.nfc().collect::<String>().to_lowercase()
 }
 
+/// `case:` 查询的比对形态:NFC 归一,不做小写折叠。
+/// 大小写敏感,但 NFC/NFD 别名仍互搜(索引侧 display 原始字节在查询端做同一归一)。
+pub fn normalize_for_match_case_sensitive(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.nfc().collect::<String>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +54,14 @@ mod tests {
         let c = normalize_for_match("CAFÉZ");
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn case_sensitive_normalize_is_nfc_only() {
+        // case: 形态只做 NFC:别名互搜成立,大小写差异保留
+        let nfd = normalize_for_match_case_sensitive("CAFE\u{301}z");
+        let nfc = normalize_for_match_case_sensitive("CAFÉz");
+        assert_eq!(nfd, nfc);
+        assert_ne!(nfd, nfd.to_lowercase(), "不做小写折叠");
     }
 }

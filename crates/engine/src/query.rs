@@ -1,17 +1,25 @@
-//! 查询计划:解析(product.md §4 契约)→ 匹配(Task 8)。
-use crate::entry::normalize_for_match;
+//! 查询计划:解析(product.md §4 契约)→ 匹配内核与打分。
+use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, NO_PARENT};
+use crate::index::IndexView;
+use memchr::memmem;
+use rayon::prelude::*;
 
-/// `?` 占位字节(匹配端按 UTF-8 字符跳过);合法 UTF-8 输入不可能出现 0x01。
+/// `?` 占位字节(匹配端按 UTF-8 字符跳过)。0x01 作为占位;含 U+0001 的文件名/查询串
+/// 会被当通配符——控制字符输入属误用,行为文档化于此,不做运行时拒绝。
 pub const QMARK: u8 = 0x01;
 
 /// `*` 分段后的子串序列 + 首/尾锚:序列按序 AND,首段可钉开头、末段可钉结尾。
-/// 段默认经 normalize_for_match 折叠;case: 查询原样保留(匹配端对 display 原始形态逐字节复核)。
+/// 锚只属于含通配符(`*`/`?`)的词:串首字面段钉开头、串尾字面段钉结尾;
+/// 纯字面词无通配符,双锚皆 false,按子串匹配(「报告」须命中「季度报告.pdf」)。
+/// 段默认经 normalize_for_match 归一(NFC + 小写折叠);`case:` 查询仅 NFC 归一、
+/// 不做小写折叠(匹配端对 display 名做同一 NFC 归一后逐字节比对)。
 #[derive(Debug, PartialEq)]
 pub struct Pattern {
     pub parts: Vec<Vec<u8>>,
-    /// 串首非 `*`:首段必须命中在名称开头。
+    /// 词含通配符且串首非 `*`:首段必须命中在名称开头(纯字面词恒 false)。
     pub prefix_anchor: bool,
-    /// 串尾非 `*`:末段必须命中到名称结尾(`?` 消耗定长字符,同样产生尾锚)。
+    /// 词含通配符且串尾非 `*`:末段必须命中到名称结尾(`?` 消耗定长字符,同样产生尾锚;
+    /// 纯字面词恒 false)。
     pub suffix_anchor: bool,
 }
 
@@ -86,10 +94,12 @@ fn push_name(words: &mut Vec<Word>, rest: &str) {
 }
 
 /// 通配编译:`*` 任意长(分段),`?` 恰一字符(QMARK 占位,匹配端跳过一个 UTF-8 字符)。
-/// 锚定:串首非 `*` → 前锚,串尾非 `*` → 尾锚;连续 `*` 折叠,不产出空段。
+/// 锚定:词含通配符时,串首非 `*` → 前锚、串尾非 `*` → 尾锚;纯字面词双锚皆 false。
+/// 连续 `*` 折叠,不产出空段。parts 默认 NFC + 小写折叠;
+/// `case:` 时仅 NFC、不折叠(与查询端 display 归一同管线)。
 fn compile_pattern(term: &str, case_sensitive: bool) -> Pattern {
     let source = if case_sensitive {
-        term.to_string()
+        normalize_for_match_case_sensitive(term)
     } else {
         normalize_for_match(term)
     };
@@ -110,10 +120,362 @@ fn compile_pattern(term: &str, case_sensitive: bool) -> Pattern {
     if !cur.is_empty() {
         parts.push(cur);
     }
+    // 锚只属于含通配符的词;纯字面词(无 * 无 ?)按子串,双锚皆 false
+    let has_wildcard = bytes.contains(&b'*') || bytes.contains(&b'?');
     Pattern {
         parts,
-        prefix_anchor: !bytes.starts_with(b"*"),
-        suffix_anchor: !bytes.ends_with(b"*"),
+        prefix_anchor: has_wildcard && !bytes.starts_with(b"*"),
+        suffix_anchor: has_wildcard && !bytes.ends_with(b"*"),
+    }
+}
+
+/// 一次执行的产出:hits 为打分排序截断后的条目号,total 为截断前全部命中数,
+/// elapsed_ms 只计匹配 + 排序(product 契约:不含任何 stat)。
+pub struct QueryOutcome {
+    pub hits: Vec<u32>,
+    pub total: u32,
+    pub elapsed_ms: f64,
+}
+
+/// 执行查询:path 命中目录集 → rayon 分块候选过滤与文件名匹配(块内串行)→
+/// 主线程全量排序(分数降序、名长升序)→ 截断 limit。
+pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOutcome {
+    let t = std::time::Instant::now();
+    let entries = view.entries();
+
+    // path 命中目录集:目录条目的路径池段命中全部 path_terms。池段是折叠形态,
+    // 故路径匹配恒按折叠语义(`case:` 只作用于文件名侧;路径池不存 display 形态)。
+    // 墓碑目录的池段可能是改名前的陈旧值,不参与;其子项必同为墓碑,无行为差。
+    let dir_hits: Vec<bool> = if plan.path_terms.is_empty() {
+        Vec::new()
+    } else {
+        (0..entries.len() as u32)
+            .into_par_iter()
+            .map(|idx| {
+                let e = &entries[idx as usize];
+                e.is_dir()
+                    && e.is_live()
+                    && plan
+                        .path_terms
+                        .iter()
+                        .all(|pt| match_pattern(view.dir_path(idx), pt))
+            })
+            .collect()
+    };
+
+    // 候选行:(分数, 名长, 条目号)。case: 候选名 = NFC(display)(不折叠,逐条归一);
+    // 否则 = match 名(arena 已折叠,零拷贝借用)。
+    let mut rows: Vec<(u8, usize, u32)> = (0..entries.len() as u32)
+        .into_par_iter()
+        .filter_map(|idx| {
+            let e = &entries[idx as usize];
+            if !e.is_live() {
+                return None;
+            }
+            if !plan.path_terms.is_empty() {
+                // 命中目录的直接子项全取(含文件与子目录);文件路径不入池,
+                // 以自身 match 名命中 path 词补「词落在文件名段」的情形。
+                // 目录自身不按名字入选(命中目录本身不是结果,path 语义测已钉死)。
+                let under_hit_dir = e.parent != NO_PARENT && dir_hits[e.parent as usize];
+                let name_hits_path = !e.is_dir()
+                    && plan
+                        .path_terms
+                        .iter()
+                        .all(|pt| match_pattern(view.match_name(idx), pt));
+                if !under_hit_dir && !name_hits_path {
+                    return None;
+                }
+            }
+            let target: std::borrow::Cow<'_, [u8]> = if plan.case_sensitive {
+                let display = String::from_utf8_lossy(view.display_name(idx));
+                std::borrow::Cow::Owned(
+                    crate::entry::normalize_for_match_case_sensitive(&display).into_bytes(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(view.match_name(idx))
+            };
+            if !plan.name_terms.is_empty()
+                && !plan.name_terms.iter().all(|pt| match_pattern(&target, pt))
+            {
+                return None;
+            }
+            if plan.whole_word && !all_parts_word_bounded(&target, &plan.name_terms) {
+                return None;
+            }
+            Some((score_of(&target, plan), target.len(), idx))
+        })
+        .collect();
+
+    let total = rows.len() as u32;
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let hits = rows.into_iter().take(limit).map(|(_, _, i)| i).collect();
+    QueryOutcome {
+        hits,
+        total,
+        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+    }
+}
+
+/// 单 Pattern 命中判定:parts 按序锚定扫描——首段(前锚时)必须命中在名称开头,
+/// 末段(尾锚时)必须命中到名称结尾,中段依次 memmem 且位置递增;
+/// 空段序列(纯 `*`)恒真。含 QMARK 的段逐字节比对,QMARK 跳过一个 UTF-8 字符。
+fn match_pattern(name: &[u8], p: &Pattern) -> bool {
+    if p.parts.is_empty() {
+        return true;
+    }
+    let last = p.parts.len() - 1;
+    let mut cursor = 0usize; // 上一段结束位置:下一段从此起搜,保证位置递增
+    for (pi, part) in p.parts.iter().enumerate() {
+        let head_anchored = pi == 0 && p.prefix_anchor;
+        let tail_anchored = pi == last && p.suffix_anchor;
+        let end = if head_anchored {
+            // 前锚只试位置 0(QMARK 段也走 match_at)
+            match_at(name, 0, part)
+        } else if part.contains(&QMARK) {
+            find_with_qmark(name, cursor, part, tail_anchored)
+        } else if tail_anchored {
+            // 尾锚取最后一次出现:若它延伸不到结尾,更早的出现更不能(memmem rfind)
+            memmem::rfind(&name[cursor..], part).map(|o| cursor + o + part.len())
+        } else {
+            memmem::find(&name[cursor..], part).map(|o| cursor + o + part.len())
+        };
+        match end {
+            Some(e) if !tail_anchored || e == name.len() => cursor = e,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// part 在 name 的 off 处恰好匹配时返回结束字节位;QMARK 跳过一个 UTF-8 字符
+/// (按首字节判 1-4 字节长度)。
+fn match_at(name: &[u8], off: usize, part: &[u8]) -> Option<usize> {
+    let (mut h, mut p) = (off, 0usize);
+    while p < part.len() {
+        if h >= name.len() {
+            return None;
+        }
+        if part[p] == QMARK {
+            h += utf8_char_len(name[h]);
+            p += 1;
+        } else if name[h] == part[p] {
+            h += 1;
+            p += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(h)
+}
+
+/// 从 from 起按字符步进扫描含 QMARK 的段;need_end 时要求匹配延伸到名称结尾(尾锚)。
+/// QMARK 消耗定长不定字节,结束位不可预知,只能逐位试。
+fn find_with_qmark(name: &[u8], from: usize, part: &[u8], need_end: bool) -> Option<usize> {
+    let mut off = from;
+    loop {
+        if let Some(end) = match_at(name, off, part) {
+            if !need_end || end == name.len() {
+                return Some(end);
+            }
+        }
+        if off >= name.len() {
+            return None;
+        }
+        off += utf8_char_len(name[off]);
+    }
+}
+
+/// UTF-8 字符字节长度(按首字节);独立续字节属损坏输入,防御性按 1 步进。
+fn utf8_char_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// 打分:首个 name_term 的首 part 在名上的位置——前缀命中 3 > 词边界命中 2 > 子串命中 1。
+/// 无名词(纯 path)或首 part 缺失(纯 `*`)一律 3,排序退化为按名长升序。
+fn score_of(target: &[u8], plan: &QueryPlan) -> u8 {
+    let Some(part) = plan.name_terms.first().and_then(|p| p.parts.first()) else {
+        return 3;
+    };
+    if match_at(target, 0, part).is_some() {
+        return 3;
+    }
+    if !part.contains(&QMARK) && word_boundary_hit(target, part) {
+        return 2;
+    }
+    1
+}
+
+/// `whole:` 语义:name_terms 每个非空、不含 QMARK 的 part 都须整词出现
+/// (QMARK 段消耗定长不定字节,词边界不可判定,豁免)。
+fn all_parts_word_bounded(target: &[u8], terms: &[Pattern]) -> bool {
+    terms.iter().all(|p| {
+        p.parts
+            .iter()
+            .all(|part| part.is_empty() || part.contains(&QMARK) || word_boundary_hit(target, part))
+    })
+}
+
+/// part 以整词边界出现在名中:命中位置 0 或前字节非词字符,尾部同理。
+fn word_boundary_hit(name: &[u8], part: &[u8]) -> bool {
+    let mut from = 0usize;
+    while let Some(o) = memmem::find(&name[from..], part) {
+        let pos = from + o;
+        let end = pos + part.len();
+        if (pos == 0 || !is_word_byte(name[pos - 1]))
+            && (end == name.len() || !is_word_byte(name[end]))
+        {
+            return true;
+        }
+        from = pos + 1;
+    }
+    false
+}
+
+/// 词字符:ASCII 字母数字 + 下划线;非 ASCII 连续段(UTF-8 多字节)视为一个词。
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+    use crate::entry::NO_PARENT;
+    use crate::index::{Index, IndexView};
+
+    fn sample() -> Index {
+        let mut i = Index::new();
+        let docs = i.insert("Documents", NO_PARENT, true);
+        let proj = i.insert("projects", NO_PARENT, true);
+        let _ = i.insert("季度报告.pdf", docs, false);
+        let _ = i.insert("budget.xlsx", docs, false);
+        let _ = i.insert("README.md", proj, false);
+        i
+    }
+
+    #[test]
+    fn substr_and_ordering() {
+        let i = sample();
+        let out = execute(&i, &parse("报告").unwrap(), 100);
+        assert_eq!(out.total, 1);
+        assert_eq!(i.display_name(out.hits[0]), "季度报告.pdf".as_bytes());
+        assert!(out.elapsed_ms >= 0.0);
+    }
+
+    #[test]
+    fn wildcard_anchors() {
+        let i = sample();
+        assert_eq!(execute(&i, &parse("*.pdf").unwrap(), 100).total, 1);
+        assert_eq!(execute(&i, &parse("*eport*").unwrap(), 100).total, 0); // 测试树无 eport
+        assert_eq!(execute(&i, &parse("季度*").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn path_term_hits_dir_children() {
+        let i = sample();
+        // documents 折叠后匹配 Documents 目录的路径池段;命中目录的直接子项全取,
+        // 目录自身不算命中(path: 的语义是「路径含词的东西」,测试钉死不含命中目录本身)
+        let out = execute(&i, &parse("path:documents").unwrap(), 100);
+        assert_eq!(out.total, 2); // Documents 下两个文件
+    }
+
+    #[test]
+    fn case_and_whole() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("README.md", d, false);
+        assert_eq!(execute(&i, &parse("readme").unwrap(), 100).total, 1); // 默认不敏感
+        assert_eq!(execute(&i, &parse("case:readme").unwrap(), 100).total, 0); // case: 敏感
+        assert_eq!(
+            execute(&i, &parse("whole:readme.md").unwrap(), 100).total,
+            1
+        );
+        assert_eq!(execute(&i, &parse("whole:read").unwrap(), 100).total, 0); // 整词不中
+    }
+
+    #[test]
+    fn score_prefix_beats_substring() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("报告.txt", d, false);
+        i.insert("季度报告.txt", d, false);
+        let out = execute(&i, &parse("报告").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "报告.txt".as_bytes()); // 前缀命中排前
+    }
+
+    #[test]
+    fn limit_caps_and_total_accurate() {
+        let i = sample();
+        let out = execute(&i, &parse("*").unwrap(), 2);
+        assert_eq!(out.hits.len(), 2);
+        assert_eq!(out.total, 5); // 截断前全部命中数
+    }
+
+    #[test]
+    fn pure_path_query_works() {
+        // 纯 path 查询可用:候选量 = 命中目录子项,不做百万全拼路径(Task 7 review 性能防线)
+        let i = sample();
+        let out = execute(&i, &parse("path:projects").unwrap(), 100);
+        assert_eq!(out.total, 1);
+        assert_eq!(i.display_name(out.hits[0]), b"README.md");
+    }
+
+    #[test]
+    fn case_nfc_but_sensitive() {
+        // 索引侧 NFD 形态输入;case: 仅 NFC 归一、不做小写折叠:
+        // 大小写敏感不中,NFD 输入与 NFC pattern 归一后相等 → 命中(别名互搜)
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("CAFE\u{301}.md", d, false); // NFD 形态的 CAFÉ.md
+        assert_eq!(execute(&i, &parse("case:caf\u{e9}").unwrap(), 100).total, 0);
+        assert_eq!(execute(&i, &parse("case:CAF\u{c9}").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn whole_word_boundaries() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("init.txt", d, false);
+        let _ = i.insert("README.md", d, false);
+        assert_eq!(execute(&i, &parse("whole:init").unwrap(), 100).total, 1);
+        assert_eq!(execute(&i, &parse("whole:read").unwrap(), 100).total, 0); // readme 的前缀,非整词
+    }
+
+    #[test]
+    fn qmark_consumes_exactly_one_utf8_char() {
+        // 契约:? 恰一字符,按首字节跳 1-4 字节——é(2 字节)与 A(1 字节)同为一字符;
+        // 报告AB 多一字尾随、报告 缺字符,皆不中
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("报告A", d, false);
+        let _ = i.insert("报告AB", d, false);
+        let _ = i.insert("报告", d, false);
+        let _ = i.insert("报告é", d, false);
+        let out = execute(&i, &parse("报告?").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        let names: Vec<Vec<u8>> = out
+            .hits
+            .iter()
+            .map(|h| i.display_name(*h).to_vec())
+            .collect();
+        assert!(names.contains(&"报告A".as_bytes().to_vec()));
+        assert!(names.contains(&"报告é".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn suffix_anchor_takes_last_occurrence() {
+        // 契约:尾锚看「命中到名称结尾」——首现位置(2)不达结尾,末现(6)达到 → 命中;
+        // 若实现误用首现,此测必红
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("a.pdf.pdf", d, false);
+        assert_eq!(execute(&i, &parse("*.pdf").unwrap(), 100).total, 1);
     }
 }
 
