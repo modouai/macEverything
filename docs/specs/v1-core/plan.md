@@ -590,10 +590,11 @@ mod tests {
         let p = i.insert("projects", NO_PARENT, true);
         let sub = i.insert("alpha", p, true);
         let _f = i.insert("x.rs", sub, false);
-        assert_eq!(i.dir_path(sub), b"projects/alpha");
+        assert_eq!(i.dir_path(sub), b"projects/alpha".to_vec());
         i.rename_entry(p, "workspace");
-        assert_eq!(i.dir_path(sub), b"workspace/alpha"); // 级联重写
-        assert_eq!(i.dir_path(_f), b"workspace/alpha");   // 文件经父链求值
+        assert_eq!(i.dir_path(sub), b"workspace/alpha".to_vec()); // 目录:路径池级联重写
+        // 文件不进路径池(Task 12b 占位设计);其路径经父链求值:
+        assert_eq!(i.full_path(_f).to_string_lossy(), "workspace/alpha/x.rs");
     }
 
     #[test]
