@@ -1,0 +1,11 @@
+pub mod arena;
+pub mod config;
+pub mod entry;
+pub mod error;
+pub mod fsevents;
+pub mod index;
+pub mod persist;
+pub mod query;
+pub mod reconcile;
+pub mod scanner;
+pub mod watcher;

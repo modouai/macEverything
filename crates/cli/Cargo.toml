@@ -1,0 +1,13 @@
+[package]
+name = "macEverything"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "macEverything"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+serde_json.workspace = true
+anyhow = "1"
