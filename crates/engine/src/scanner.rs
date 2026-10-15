@@ -29,12 +29,14 @@ fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
     excludes.iter().any(|x| p.starts_with(x))
 }
 
-/// 调用方契约(debug 期执法):roots 两两不得前缀重叠。
+/// 调用方契约(debug 期执法):roots 两两不得前缀重叠(含相等——相等根同样
+/// 重复收录且并行臂聚合键互相覆盖)。
 fn assert_disjoint_roots(roots: &[PathBuf]) {
     debug_assert!(
-        roots
+        roots.iter().enumerate().all(|(i, a)| roots
             .iter()
-            .all(|a| roots.iter().all(|b| a == b || !b.starts_with(a))),
+            .enumerate()
+            .all(|(j, b)| i == j || !b.starts_with(a))),
         "roots 不得互相重叠:重叠根会重复收录同一物理子树,且并行臂与串行臂行为分歧"
     );
 }
@@ -390,11 +392,22 @@ mod tests {
     }
 
     /// 重叠根为调用方契约违规:debug 构建断言拒绝(模块头「调用方契约」)。
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "roots 不得互相重叠")]
     fn overlapping_roots_rejected_in_debug() {
         let t = fixture();
         scan_roots(&[t.path().to_path_buf(), t.path().join("src")], &[], 8);
+    }
+
+    /// 相等根同样违规(曾因 a == b 短路豁免,突变实证)。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "roots 不得互相重叠")]
+    fn equal_roots_rejected_in_debug() {
+        let t = fixture();
+        let root = t.path().to_path_buf();
+        scan_roots(&[root.clone(), root], &[], 8);
     }
 
     /// 并行臂权限分支钉:threads=8 下只读目录同样单独归类 permission
