@@ -522,4 +522,17 @@ mod tests {
         assert_eq!(i.tombstone_count(), 1);
         assert_eq!(i.entry_count(), 2); // docs + 新 item
     }
+
+    // M-r1 双池记账钉:rename 的 display+match 两段孤儿都计入
+    // orphan_pool_bytes(文件改名不涉路径池,隔离验证;删记账行此测必红)
+    #[test]
+    fn rename_entry_counts_display_and_match_orphans() {
+        let long = "x".repeat(1024);
+        let mut i = ix();
+        let f = i.insert("file", NO_PARENT, false);
+        for _ in 0..17_000 {
+            i.rename_entry(f, &long); // ~2048B × 17k ≈ 34.8MB > 32MB 阈值
+        }
+        assert!(i.needs_compaction());
+    }
 }
