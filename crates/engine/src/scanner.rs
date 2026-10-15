@@ -28,7 +28,8 @@ pub struct ScanGaps {
 /// 排除判定:绝对路径排除按前缀命中(整棵子树剪枝);相对名排除(如
 /// `node_modules`、`.git`)按「路径任一组件等于该名」匹配——语义见
 /// `reconcile::expand_excludes` 契约(product §1 默认排除即名字式)。
-fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
+/// 首扫(scanner)与增量(watcher::apply_dir_diff)共用此判定,两条路径语义一致。
+pub(crate) fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
     excludes.iter().any(|x| {
         if x.is_absolute() {
             p.starts_with(x)
@@ -93,10 +94,9 @@ fn scan_serial(roots: &[PathBuf], excludes: &[PathBuf]) -> (Index, ScanGaps) {
     let mut gaps = ScanGaps::default();
     let mut queue: VecDeque<(PathBuf, u32)> = VecDeque::new();
     for root in roots {
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        // 根条目名 = 完整绝对路径:full_path 沿父链拼接后即为可直接使用的绝对路径
+        // (`/Users/x/Docs/a.txt`);若只存尾段名,结果路径会丢前导目录。
+        let name = root.to_string_lossy().into_owned();
         let idx = index.insert(&name, NO_PARENT, true);
         queue.push_back((root.clone(), idx));
     }
@@ -223,10 +223,8 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
     let mut index = Index::new();
     let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
     for root in roots {
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        // 根条目名 = 完整绝对路径(与串行臂一致,full_path 可直接使用)
+        let name = root.to_string_lossy().into_owned();
         let idx = index.insert(&name, NO_PARENT, true);
         dir_map.insert(root.clone(), idx);
     }

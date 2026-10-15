@@ -163,7 +163,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "engine",
+ "libc",
+ "log",
+ "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

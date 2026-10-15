@@ -1,7 +1,7 @@
 //! 增量:事件 → 目录集合(100ms 静默窗)→ apply_dir_diff(唯一真相)。
 use crate::index::{DiffStats, Index};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 事件批处理器:push 登记受影响目录,静默窗期满后 drain 出批量集合。
@@ -49,10 +49,14 @@ pub fn now_stub() -> fn() -> Instant {
 /// 「完整真相」,部分读取的 listing 会把「读不到」的条目误判为「已删除」打墓碑。
 /// 调用方(增量 worker)记录错误并等待后续事件重试;目录已被删的竞态由父目录
 /// 的 diff 兜底(remove 级联)。
+///
+/// 排除:与首扫共用 `scanner::is_excluded`——排除目录不入 listing,防增量把
+/// 首扫排除掉的子树(如 ~/Library)重新拉回索引(两条路径语义一致)。
 pub fn apply_dir_diff(
     index: &mut Index,
     dir_idx: u32,
     abs_dir: &Path,
+    excludes: &[PathBuf],
 ) -> std::io::Result<DiffStats> {
     let rd = std::fs::read_dir(abs_dir)?;
     let mut listing = std::collections::BTreeMap::new();
@@ -62,7 +66,11 @@ pub fn apply_dir_diff(
         if ft.is_symlink() {
             continue;
         }
-        listing.insert(e.file_name().to_string_lossy().into_owned(), ft.is_dir());
+        let is_dir = ft.is_dir();
+        if is_dir && crate::scanner::is_excluded(&e.path(), excludes) {
+            continue;
+        }
+        listing.insert(e.file_name().to_string_lossy().into_owned(), is_dir);
     }
     Ok(index.diff_dir(dir_idx, &listing))
 }
@@ -94,7 +102,7 @@ mod tests {
         let mut i = Index::new();
         let d = i.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
         let _ = i.insert("ghost.txt", d, false); // 索引有、磁盘无
-        let stats = apply_dir_diff(&mut i, d, dir.path()).unwrap();
+        let stats = apply_dir_diff(&mut i, d, dir.path(), &[]).unwrap();
         assert!(stats.removed >= 1);
         let kids: Vec<Vec<u8>> = i
             .children_of(d)
@@ -103,5 +111,28 @@ mod tests {
             .collect();
         assert!(kids.contains(&b"a.txt".to_vec()));
         assert!(!kids.contains(&b"ghost.txt".to_vec()));
+    }
+
+    /// 增量排除钉:磁盘上出现排除目录(如 ~/Library)时,diff 不得把它拉进索引
+    /// (回归钉——曾在实机重放路径暴露:首扫排除的 Library 被增量重新收录)。
+    #[test]
+    fn diff_respects_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Library")).unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "").unwrap();
+        let mut i = Index::new();
+        let d = i.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        let excludes = vec![dir.path().join("Library")];
+        apply_dir_diff(&mut i, d, dir.path(), &excludes).unwrap();
+        let kids: Vec<Vec<u8>> = i
+            .children_of(d)
+            .iter()
+            .map(|k| i.display_name_of(*k).to_vec())
+            .collect();
+        assert!(
+            !kids.contains(&b"Library".to_vec()),
+            "排除目录不得经增量入索引:{kids:?}"
+        );
+        assert!(kids.contains(&b"keep.txt".to_vec()));
     }
 }
