@@ -120,6 +120,10 @@ fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
 /// 编译期钉:Entry 定长 24B 是 mmap 裸转型 *const Entry 的前提(布局同构契约),
 /// Entry 布局改动时此处先红,防线前移到编译期。
 const _: () = assert!(std::mem::size_of::<Entry>() == 24, "Entry 必须 24 字节");
+const _: () = assert!(
+    std::mem::align_of::<Entry>() == 4,
+    "Entry 对齐必须 4(mmap 裸转型对齐前提)"
+);
 
 #[derive(thiserror::Error, Debug)]
 pub enum LoadError {
@@ -240,6 +244,7 @@ impl SharedView {
 /// 段切界与写侧同规则:entries_off = align_up(path_offsets 段末, 4)。
 pub fn load_mmap(path: &Path) -> Result<Box<SharedView>, LoadError> {
     let file = std::fs::File::open(path)?;
+    // 0 字节文件必须早拒:Mmap::map 对空文件报 Io,而 truncated_prefix 语义期望 Truncated
     if file.metadata()?.len() == 0 {
         return Err(LoadError::Truncated);
     }
@@ -315,7 +320,8 @@ pub fn load_mmap(path: &Path) -> Result<Box<SharedView>, LoadError> {
     }))
 }
 
-/// 边界检查:off..off+len 必须是 buf 内的合法区间(off 越过文件尾同样拒绝,含 0 长度请求)。
+/// 边界检查:off..off+len 必须是 buf 内的合法区间;0 长度请求在界内时接受,
+/// off 越过文件尾(含 off == len 处的 0 长度)拒绝。
 /// 全 u64 域比较长度,无溢出面;len/offset 来自文件,通过后才允许切片。
 fn need(buf: &[u8], off: usize, len: u64) -> Result<(), LoadError> {
     if off > buf.len() || len > (buf.len() - off) as u64 {
@@ -427,7 +433,6 @@ mod tests {
 #[cfg(test)]
 mod load_tests {
     use super::*;
-    use crate::index::{Index, IndexView};
 
     fn build_and_save(dir: &tempfile::TempDir, last_id: u64) -> (Index, std::path::PathBuf) {
         let mut i = Index::new();
@@ -463,6 +468,18 @@ mod load_tests {
         assert_eq!(v.match_name(1), src.match_name_of(1));
         assert_eq!(v.display_name(1), src.display_name_of(1));
         assert_eq!(view.meta.last_event_id, 7);
+        // scan_roots/excluded 段往返钉(build_and_save 传空,此处自建非空)
+        let path2 = dir.path().join("with-roots.bin");
+        let meta2 = IndexMeta {
+            built_at: 2,
+            last_event_id: 9,
+            scan_roots: vec![b"/Users/t".to_vec()],
+            excluded: vec![b"~/Library".to_vec()],
+        };
+        write_atomic(&src, &meta2, &path2).unwrap();
+        let view2 = load_mmap(&path2).unwrap();
+        assert_eq!(view2.meta.scan_roots, vec![b"/Users/t".to_vec()]);
+        assert_eq!(view2.meta.excluded, vec![b"~/Library".to_vec()]);
         // 查询直跑共享视图(Task 8 的 execute 零改动消费)。
         // 词用 résumé:normalize_for_match 只做 NFC+小写折叠不去变音符,"resume" 必不命中
         let out = crate::query::execute(v, &crate::query::parse("résumé").unwrap(), 10);
