@@ -433,8 +433,9 @@ mod load_tests {
         let mut i = Index::new();
         let d = i.insert("docs", crate::entry::NO_PARENT, true);
         i.insert("résumé.txt", d, false);
-        // 1 字节名子目录 + 1 字节名文件:display/match 各 16B、路径池 10B,
-        // 池末偏移 110 ≡ 2 (mod 4) 非 4 对齐——钉住 entries 段 align_up 切界
+        // 1 字节名子目录 + 1 字节名文件(résumé.txt 为 12B UTF-8,é 各占 2B):
+        // display/match 两池各 18B、路径池 10B → 池末偏移 114、offsets_end = 114 + 4×8 = 146,
+        // 146 ≡ 2 (mod 4) 非 4 对齐——钉住 entries 段 align_up 切界
         // (删读侧 next_multiple_of(4) 或写侧补零,此 fixture 下必红)
         i.insert("x", d, true);
         i.insert("y", d, false);
@@ -490,7 +491,7 @@ mod load_tests {
         let dir = tempfile::tempdir().unwrap();
         let (src, path) = build_and_save(&dir, 3);
         let view = load_mmap(&path).unwrap();
-        let m = view.materialize();
+        let mut m = view.materialize();
         assert_eq!(m.entry_count(), src.entry_count());
         let a: std::collections::BTreeSet<String> = (0..m.entries.len() as u32)
             .map(|i| m.full_path(i).to_string_lossy().into_owned())
@@ -501,9 +502,11 @@ mod load_tests {
         assert_eq!(a, b);
         // 路径池重建钉:目录段经条目号可取且与源一致(删此重建代码此行必红)
         assert_eq!(m.dir_path(0), src.dir_path(0));
-        // 物化后可变操作可用
-        let docs = m.children_of(0);
-        let _ = docs;
+        // 物化后可变操作真实可用:remove 走墓碑制,计数联动(children_of 只读,不算实证)
+        let before = m.entry_count();
+        m.remove(m.children_of(0)[0]);
+        assert_eq!(m.entry_count(), before - 1);
+        assert_eq!(m.tombstone_count(), 1);
     }
 
     // live/tombstone 计数拆分钉:物化把计数全记进 live 时此测必红
