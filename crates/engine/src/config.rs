@@ -38,8 +38,8 @@ pub fn load(path: &Path) -> Config {
     }
 }
 
-/// 原子保存:先建父目录,写 `<目标>.tmp` 后 rename 替换,不留半写文件。
-/// 原子保存(临时文件 + rename,复用 persist::tmp_path_for)。
+/// 原子保存:先建父目录,写 `<目标>.tmp` 后 rename 替换,不留半写文件
+/// (tmp 命名复用 persist::tmp_path_for)。
 /// 取舍:不做 fsync——最坏断电配置损坏,load 的降级路径已兜住(回默认三条)。
 pub fn save(cfg: &Config, path: &Path) -> std::io::Result<()> {
     if let Some(p) = path.parent() {
