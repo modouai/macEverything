@@ -3,6 +3,7 @@ use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, NO_P
 use crate::index::IndexView;
 use memchr::memmem;
 use rayon::prelude::*;
+use unicode_normalization::is_nfc;
 
 /// `?` 占位字节(匹配端按 UTF-8 字符跳过)。0x01 作为占位;含 U+0001 的文件名/查询串
 /// 会被当通配符——控制字符输入属误用,行为文档化于此,不做运行时拒绝。
@@ -139,14 +140,15 @@ pub struct QueryOutcome {
 }
 
 /// 执行查询:path 命中目录集 → rayon 分块候选过滤与文件名匹配(块内串行)→
-/// 主线程全量排序(分数降序、名长升序)→ 截断 limit。
+/// 主线程 top-limit 选择(O(n) 划分 + 前 k ≤ limit 排序)。
 pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOutcome {
     let t = std::time::Instant::now();
     let entries = view.entries();
 
     // path 命中目录集:目录条目的路径池段命中全部 path_terms。池段是折叠形态,
-    // 路径词在解析侧恒按折叠编译(case: 只作用于文件名侧),此处比对两侧同形态。
-    // 墓碑目录的池段可能是改名前的陈旧值,不参与;其子项必同为墓碑,无行为差。
+    // 路径词在解析侧恒按折叠编译(case: 只作用于文件名侧),此处比对两侧同形态;
+    // whole: 同样作用于路径侧(见 path_terms_match)。墓碑目录的池段可能是改名前
+    // 的陈旧值,不参与;其子项必同为墓碑,无行为差。
     let dir_hits: Vec<bool> = if plan.path_terms.is_empty() {
         Vec::new()
     } else {
@@ -154,17 +156,12 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
             .into_par_iter()
             .map(|idx| {
                 let e = &entries[idx as usize];
-                e.is_dir()
-                    && e.is_live()
-                    && plan
-                        .path_terms
-                        .iter()
-                        .all(|pt| match_pattern(view.dir_path(idx), pt))
+                e.is_dir() && e.is_live() && path_terms_match(view.dir_path(idx), plan)
             })
             .collect()
     };
 
-    // 候选行:(分数, 名长, 条目号)。case: 候选名 = NFC(display)(不折叠,逐条归一);
+    // 候选行:(分数, 名长, 条目号)。case: 候选名 = NFC(display)(不折叠);
     // 否则 = match 名(arena 已折叠,零拷贝借用)。
     let mut rows: Vec<(u8, usize, u32)> = (0..entries.len() as u32)
         .into_par_iter()
@@ -177,21 +174,31 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                 // 命中目录的直接子项全取(含文件与子目录);文件路径不入池,
                 // 以自身 match 名命中 path 词补「词落在文件名段」的情形。
                 // 目录自身不按名字入选(命中目录本身不是结果,path 语义测已钉死)。
+                // 已知限制:path 词不横跨目录段与文件名——目录池无文件名、
+                // 文件只取自身名;tech.md「父路径+名称短拼」留待需求出现再落
+                // (Task 21 回填 tech.md),现行为即已知限制。
                 let under_hit_dir = e.parent != NO_PARENT && dir_hits[e.parent as usize];
-                let name_hits_path = !e.is_dir()
-                    && plan
-                        .path_terms
-                        .iter()
-                        .all(|pt| match_pattern(view.match_name(idx), pt));
+                let name_hits_path = !e.is_dir() && path_terms_match(view.match_name(idx), plan);
                 if !under_hit_dir && !name_hits_path {
                     return None;
                 }
             }
             let target: std::borrow::Cow<'_, [u8]> = if plan.case_sensitive {
-                let display = String::from_utf8_lossy(view.display_name(idx));
-                std::borrow::Cow::Owned(
-                    crate::entry::normalize_for_match_case_sensitive(&display).into_bytes(),
-                )
+                // NFC 直通零拷贝:display 名绝大多数为 ASCII/NFC,直接借用原始字节;
+                // 仅真非 NFC 形态才归一分配(百万条目逐条 nfc().collect 是百万次小分配)。
+                match std::str::from_utf8(view.display_name(idx)) {
+                    Ok(s) if is_nfc(s) => std::borrow::Cow::Borrowed(view.display_name(idx)),
+                    Ok(s) => {
+                        std::borrow::Cow::Owned(normalize_for_match_case_sensitive(s).into_bytes())
+                    }
+                    // 索引侧名称来自 &str 入库,必为合法 UTF-8;此臂兜损坏数据
+                    Err(_) => std::borrow::Cow::Owned(
+                        normalize_for_match_case_sensitive(&String::from_utf8_lossy(
+                            view.display_name(idx),
+                        ))
+                        .into_bytes(),
+                    ),
+                }
             } else {
                 std::borrow::Cow::Borrowed(view.match_name(idx))
             };
@@ -208,13 +215,34 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
         .collect();
 
     let total = rows.len() as u32;
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let hits = rows.into_iter().take(limit).map(|(_, _, i)| i).collect();
+    // top-limit 选择而非全量排序:select_nth O(n) 划出前 limit 段,再对 k ≤ limit 排序;
+    // 全量 sort O(n log n) 计入 elapsed_ms,百万命中时单独击穿 P99 <10ms。
+    // 比较子含 idx 决胜成全序,截断集与稳定排序一致(确定性不受不稳定划分影响)。
+    if limit == 0 {
+        rows.clear();
+    } else if limit < rows.len() {
+        rows.select_nth_unstable_by(limit - 1, cmp_rows);
+        rows.truncate(limit);
+    }
+    rows.sort_by(cmp_rows);
+    let hits = rows.into_iter().map(|(_, _, i)| i).collect();
     QueryOutcome {
         hits,
         total,
         elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
     }
+}
+
+/// 候选行全序比较:分数降序、名长升序、条目号升序决胜。
+fn cmp_rows(a: &(u8, usize, u32), b: &(u8, usize, u32)) -> std::cmp::Ordering {
+    b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+}
+
+/// path 词对一段路径字节的匹配:全部 Pattern 命中;`whole:` 开启时各段还须整词出现
+/// (case:/whole: 作用于整轮,tech.md——路径侧不得静默退化为子串)。
+fn path_terms_match(bytes: &[u8], plan: &QueryPlan) -> bool {
+    plan.path_terms.iter().all(|pt| match_pattern(bytes, pt))
+        && (!plan.whole_word || all_parts_word_bounded(bytes, &plan.path_terms))
 }
 
 /// 单 Pattern 命中判定:parts 按序锚定扫描——首段(前锚时)必须命中在名称开头,
@@ -298,7 +326,9 @@ fn utf8_char_len(b: u8) -> usize {
 }
 
 /// 打分:首个 name_term 的首 part 在名上的位置——前缀命中 3 > 词边界命中 2 > 子串命中 1。
-/// 无名词(纯 path)或首 part 缺失(纯 `*`)一律 3,排序退化为按名长升序。
+/// 多词查询打分只取首词首段(其余词只参与命中判定;product/tech 未定义多词打分,
+/// 以首词为准是已文档化的决策)。无名词(纯 path)或首 part 缺失(纯 `*`)一律 3,
+/// 排序退化为按名长升序。
 fn score_of(target: &[u8], plan: &QueryPlan) -> u8 {
     let Some(part) = plan.name_terms.first().and_then(|p| p.parts.first()) else {
         return 3;
@@ -489,6 +519,50 @@ mod match_tests {
         let d = i.insert("d", NO_PARENT, true);
         let _ = i.insert("a.pdf.pdf", d, false);
         assert_eq!(execute(&i, &parse("*.pdf").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn whole_flag_covers_path_terms() {
+        // whole: 作用于整轮(tech.md):path 词在路径上同样整词边界,而非静默退化子串
+        let i = sample();
+        assert_eq!(execute(&i, &parse("path:documents").unwrap(), 100).total, 2);
+        assert_eq!(
+            execute(&i, &parse("whole: path:documents").unwrap(), 100).total,
+            2
+        );
+        assert_eq!(
+            execute(&i, &parse("whole: path:ment").unwrap(), 100).total,
+            0
+        ); // ment 处 docu|ment|s 词中,边界生效
+    }
+
+    #[test]
+    fn part_order_follows_pattern_sequence() {
+        // 段序锚定:parts 按序出现(a 先于 b)——突变「段搜索改全名搜索破坏段序」时必红
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("axb.txt", d, false);
+        let _ = i.insert("bxa.txt", d, false);
+        let out = execute(&i, &parse("*a*b*").unwrap(), 100);
+        assert_eq!(out.total, 1);
+        assert_eq!(i.display_name(out.hits[0]), b"axb.txt");
+    }
+
+    #[test]
+    fn whole_word_checks_left_boundary() {
+        // 左边界:reinit 的 init 处词中,非整词——突变「删左边界判断」时必红
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("reinit.txt", d, false);
+        assert_eq!(execute(&i, &parse("whole:init").unwrap(), 100).total, 0);
+    }
+
+    #[test]
+    fn limit_zero_returns_nothing_but_accurate_total() {
+        let i = sample();
+        let out = execute(&i, &parse("*").unwrap(), 0);
+        assert!(out.hits.is_empty());
+        assert_eq!(out.total, 5);
     }
 }
 

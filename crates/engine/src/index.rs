@@ -115,21 +115,9 @@ impl Index {
         &self.match_arena.data[e.match_start as usize..(e.match_start + e.match_len) as usize]
     }
 
-    /// 条目的完整路径(display 原始形态,展示用)。
+    /// 条目的完整路径(display 原始形态,展示用)。委托 trait 默认实现(父链拼接唯此一份)。
     pub fn full_path(&self, idx: u32) -> std::path::PathBuf {
-        let mut parts: Vec<Vec<u8>> = vec![];
-        let mut cur = idx;
-        loop {
-            let e = &self.entries[cur as usize];
-            parts.push(self.display_name_of(cur).to_vec());
-            if e.parent == NO_PARENT {
-                break;
-            }
-            cur = e.parent;
-        }
-        parts.reverse();
-        let joined = parts.join(b"/".as_slice());
-        String::from_utf8_lossy(&joined).into_owned().into()
+        self.full_path_dyn(idx).into()
     }
 
     /// 直接子项(活条目)。O(n) 线性扫是已知设计(百万规模单目录 diff ~2-4ms,预算内)。
@@ -143,9 +131,9 @@ impl Index {
     }
 
     /// 目录在磁盘上的现名(match 形态);供 watcher/diff 反查。
+    /// 委托 trait 默认实现(池段切取唯此一份),按 owned 供既有调用方。
     pub fn dir_path(&self, idx: u32) -> Vec<u8> {
-        let (s, l) = self.path_offsets[idx as usize];
-        self.path_pool.data[s as usize..(s + l) as usize].to_vec()
+        IndexView::dir_path(self, idx).to_vec()
     }
 
     // —— Task 6:变更语义 ——
@@ -346,13 +334,15 @@ pub trait IndexView: Sync {
     /// 匹配形态名(match arena 折叠段;case: 查询在查询端另取 display 归一)。
     fn match_name(&self, idx: u32) -> &[u8] {
         let e = &self.entries()[idx as usize];
-        &self.match_arena()[e.match_start as usize..(e.match_start + e.match_len) as usize]
+        let s = e.match_start as usize;
+        &self.match_arena()[s..s + e.match_len as usize]
     }
 
     /// 展示形态名(display arena 原始字节,未归一)。
     fn display_name(&self, idx: u32) -> &[u8] {
         let e = &self.entries()[idx as usize];
-        &self.display_arena()[e.display_start as usize..(e.display_start + e.display_len) as usize]
+        let s = e.display_start as usize;
+        &self.display_arena()[s..s + e.display_len as usize]
     }
 
     /// 目录条目的完整路径(match 形态,path_pool 段);非目录条目返回空切片。
