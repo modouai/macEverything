@@ -25,8 +25,17 @@ pub struct ScanGaps {
     pub io_errors: u32,
 }
 
+/// 排除判定:绝对路径排除按前缀命中(整棵子树剪枝);相对名排除(如
+/// `node_modules`、`.git`)按「路径任一组件等于该名」匹配——语义见
+/// `reconcile::expand_excludes` 契约(product §1 默认排除即名字式)。
 fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
-    excludes.iter().any(|x| p.starts_with(x))
+    excludes.iter().any(|x| {
+        if x.is_absolute() {
+            p.starts_with(x)
+        } else {
+            p.components().any(|c| c.as_os_str() == x.as_os_str())
+        }
+    })
 }
 
 /// 调用方契约(debug 期执法):roots 两两不得前缀重叠(含相等——相等根同样
@@ -459,5 +468,33 @@ mod tests {
         assert_eq!(gaps.io_errors, 0);
         assert!(index.entry_count() > 0);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// 名字式排除:相对名(如 node_modules)匹配路径任一组件——任意层级的
+    /// node_modules 都整棵剪枝,不限于扫描根直属(与绝对路径前缀式并存)。
+    #[test]
+    fn name_style_excludes_match_any_component() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        fs::create_dir_all(r.join("src/node_modules/x")).unwrap();
+        fs::write(r.join("src/node_modules/x/i.js"), "").unwrap();
+        fs::write(r.join("src/keep.rs"), "").unwrap();
+        let excludes = vec![PathBuf::from("node_modules")];
+        let (index, _) = scan_roots(&[r.to_path_buf()], &excludes, 4);
+        let paths: Vec<String> = (0..index.entries.len() as u32)
+            .map(|i| index.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("node_modules")),
+            "任意层级名字式排除:{paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.ends_with("keep.rs")));
+        // 绝对路径前缀式排除并存(fixture 的 node_modules 在根下,同样被剪)
+        let abs = vec![r.join("src")];
+        let (idx2, _) = scan_roots(&[r.to_path_buf()], &abs, 1);
+        let paths2: Vec<String> = (0..idx2.entries.len() as u32)
+            .map(|i| idx2.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        assert!(!paths2.iter().any(|p| p.contains("/src")));
     }
 }
