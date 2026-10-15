@@ -1,6 +1,6 @@
 # macEverything v1-core 技术规格
 
-**Status:** 写作中
+**Status:** 已确认
 **version:** 1.1.0
 **prev_version:** 1.0.0
 **updated:** 2026-10-15
