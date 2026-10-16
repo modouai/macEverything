@@ -1,7 +1,6 @@
 //! daemon:引擎宿主——冷启动编排(秒开 → 物化 → 重放/重扫)+ 增量循环 + 服务循环。
 //! 单实例:绑定 EADDRINUSE 时 connect 探测——连得上 = 已在运行;连不上 = 崩溃
 //! 残留 stale socket,unlink 重绑。stop 经 socket 消息触发,响应在最终落盘后返回。
-use crate::protocol::{self, Gap, HitEntry, Request, Response};
 use anyhow::{bail, Context, Result};
 use engine::config;
 use engine::entry::NO_PARENT;
@@ -10,6 +9,7 @@ use engine::index::{Index, IndexView};
 use engine::persist::{self, IndexMeta, SharedView};
 use engine::reconcile;
 use engine::watcher::{self, DirBatcher};
+use protocol::{self, Gap, HitEntry, Request, Response};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

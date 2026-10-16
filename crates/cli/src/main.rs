@@ -1,7 +1,6 @@
 //! macEverything CLI:start/stop/query/status/exclude 五子命令(product §5)。
 mod client;
 mod daemon;
-mod protocol;
 
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;

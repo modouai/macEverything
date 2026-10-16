@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 engine = { path = "../engine" }
-serde.workspace = true
+protocol = { path = "../protocol" }
 serde_json.workspace = true
 anyhow = "1"
 log = { workspace = true, features = ["std"] }

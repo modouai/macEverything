@@ -1,10 +1,10 @@
 //! client:query/status/stop/exclude 的连接与离线降级(场景 5:daemon 不在时
 //! query/status 直读落盘索引自答并标注,exclude/stop 报错提示)。
 use crate::daemon::DaemonPaths;
-use crate::protocol::{self, HitEntry, Request, Response};
 use anyhow::{anyhow, bail, Result};
 use engine::index::IndexView;
 use engine::persist;
+use protocol::{self, HitEntry, Request, Response};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
