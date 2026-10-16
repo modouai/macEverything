@@ -60,35 +60,38 @@ crates/
 │       └── autostart.rs        SMAppService 注册/注销/查询(LaunchAgent 兜底)
 ├── engine/                  唯一改动:query 排序支持(见下)
 └── cli/                     迁移至 protocol/client crate;daemon 宿主与子命令保留
-scripts/bundle.sh             ← 新增:.app 组装(二进制 + Info.plist + 可选图标;LSUIElement=true)
+scripts/bundle.sh             ← 新增:.app 组装;CFBundleExecutable=macEverything-app(Contents/MacOS/),
+                                随包 CLI=macEverything(同名覆盖与定位自命中双避免);LSUIElement=true
 ```
 
 ### 引擎扩展:排序查询
 
-engine 保持纯逻辑(不直接碰文件系统)——元数据以**闭包注入**:
+engine 保持纯逻辑(不直接碰文件系统)——元数据以**批量闭包注入**,并行归 daemon:
 
 ```rust
 pub enum SortKey { Relevance, Name, Size, Mtime, Path }
 
-/// meta_of:条目号 → (大小, 修改时间);由调用方注入(daemon 传真实 stat,测试传 mock)。
-/// 计分口径:elapsed_ms 含匹配+键计算+排序;stat_ms 单独累计 meta_of 的调用耗时。
+/// meta_of:批量接口——入参为候选条目号切片,返回**按序对应**的 (大小, 修改时间)。
+/// daemon 侧实现内部并行(rayon 铺开 stat),engine 单次顺序调用,无 Sync 约束。
+/// 计分口径:elapsed_ms 含匹配+键计算+排序;stat_ms 为 engine 包住 meta_of 调用的耗时。
+/// 排序算出的元数据由 daemon 侧闭包自持(缓存 map,供响应组装时免重查);SortOutcome 不含 meta。
 pub fn execute_sorted(
     view: &dyn IndexView, plan: &QueryPlan, limit: usize,
-    sort: SortKey, meta_of: &dyn Fn(u32) -> (Option<u64>, Option<u64>),
-) -> SortOutcome   // SortOutcome = QueryOutcome + { stat_ms: f64, entries_meta: HashMap<u32,(u64,u64)>? }
+    sort: SortKey, meta_of: &dyn Fn(&[u32]) -> Vec<(Option<u64>, Option<u64>)>,
+) -> SortOutcome   // 新结构:{ hits, total, elapsed_ms, stat_ms: f64 }(QueryOutcome 保持 v1 不动)
 ```
 
 - `Relevance` = 现有 `execute`(委托,行为不变,不调 meta_of)。
 - `Name`/`Path`:匹配集全量排序(键来自 arena,零 stat),取前 limit。
-- `Size`/`Mtime`:**两段式**——先匹配得候选,对候选集调 `meta_of`(daemon 侧真实 stat,并行化在 daemon 实现;测试侧 mock),再排序取前 limit。
-- **stat 归属与去重**:排序所用元数据随排序产生、随响应携带;daemon 的 `stat_rows`(补全响应行的 size/mtime)对已有值**跳过不重查**(只补 None 行)——「无重查」为契约。`stat_ms` 语义 = 本响应内为排序与补全所付的 stat 总耗时。
+- `Size`/`Mtime`:**两段式**——先匹配得候选,对候选集调 `meta_of`(daemon 侧批量并行 stat;测试侧 mock),再排序取前 limit。
+- **stat 归属与去重(定案)**:daemon 的 meta_of 实现把批量 stat 结果**存入自持缓存 map**(闭包捕获);响应组装阶段的 `stat_rows` 先查该 map 命中则跳过,只对未命中行补 stat——「无重查」为契约,由 daemon 内部数据流保证。`stat_ms` = engine 包住 meta_of 调用的耗时(排序轮);补全轮沿用既有 v1 计时。
 - 排序稳定性:等值键用条目号决胜(确定性,同 v1 查询内约定)。
 - **排序键形态(定案)**:名称/路径键取 **display 原始形态 + Unicode 码点序**;不做本地化排序(与 Finder 的拼音/区域序不同,已知局限,文档标注)。中文与 ASCII 混排按码点,行为确定可复现。
 - 边界:limit=0 与全命中 0 条走既有路径。候选集全量 stat,不做抽样——完整排序语义要求全量键,耗时随响应如实告知(约 120 万条目全 stat 数百 ms 量级,仅点大小/时间列时触发;UI 出「排序中…」状态)。
 
 ### 协议变更与版本策略
 
-**版本策略(定案)**:纯**新增可选字段不 bump v**(v=1 保持);`sort_echo` 回显使旧 daemon 的降级可被 UI 识别——旧 daemon 忽略 `sort` 字段时,响应回显 `sort_echo:""`(=relevance),完整窗口发现请求键与回显不符即状态栏提示「引擎版本过旧,排序未生效」并提示升级,**不静默展示错排序**。同包同版(App 与随包引擎)为正常交付形态,跨版本混跑仅在用户手工混装时发生。
+**版本策略(定案)**:纯**新增可选字段不 bump v**(v=1 保持);`sort_echo` 回显使旧 daemon 的降级可被 UI 识别——旧 daemon 忽略 `sort` 字段时,响应回显 `sort_echo:""`(=relevance),完整窗口发现请求键与回显不符即状态栏提示「引擎版本过旧,排序未生效」**并给「重启引擎」动作**(经随包 CLI `stop`→`start`,消除旧进程后由新版本接管),不静默展示错排序。同包同版(App 与随包引擎)为正常交付形态,跨版本混跑仅在用户手工混装时发生。
 
 | 消息 | 变更 | 兼容性 |
 |---|---|---|
@@ -109,12 +112,12 @@ pub fn execute_sorted(
 | 置顶 | `with_always_on_top`(官方) |
 | 右键菜单 | **原生 NSMenu**(objc2):egui 收到右键 → 构建 NSMenu(NSMenuItem + target/action 桥回 Rust)→ `popUpContextMenu` 于鼠标位置;菜单项语义见 product §2。非自绘:观感/键盘导航/异屏缩放均随系统 |
 
-### 进程编排
+### 进程编排(与 product §5 对齐)
 
-- **App 单实例**:数据目录文件锁(flock);二次启动 → 唤起已有实例悬浮条(经 socket 或通知,实现取简:检测锁存在即退出并提示)。
-- **daemon 探测/拉起**:`UnixStream::connect(socket)` 探测;失败 → `Command::new("macEverything").arg("start")`(PATH 查找;缺失报可操作错误)→ 轮询连通(≤3s,250ms 间隔)→ 可用。
-- **退出语义**:托盘「退出」只停 App(socket 不 send Stop);引擎常驻。
-- **状态轮询**:App 对引擎状态的获取 = 每次查询响应捎带 + 空闲每 5s 一次 status(轻量;不引入订阅推送,v2.0 从简)。
+- **App 单实例 = app.sock 通道**:App 启动时在数据目录监听 `app.sock`;二次启动连接它发「唤起悬浮条」消息后自行退出。socket 不可连(App 已退出残留)则清理后正常启动。
+- **daemon 探测/拉起**:`UnixStream::connect(daemon.sock)` 探测;失败 → 按**引擎定位三档**找可执行文件(① `current_exe()` 同目录(随包 `Contents/MacOS/macEverything`)② PATH ③ 均失败 → 错误文案**列出实际搜过的全部路径**)→ spawn `start` → 轮询连通(≤3s,250ms 间隔)→ 可用。
+- **退出语义**:托盘「退出」只停 App(不发 Stop);引擎常驻。
+- **状态轮询**:查询响应捎带引擎状态;**轮询仅在至少一个窗口(悬浮条/完整窗口)可见时进行**(5s 间隔);两窗口均隐藏时停止轮询——与「隐藏时 CPU 0%」红线一致,状态在下次窗口可见或查询时刷新。
 
 ### 查询会话(session.rs,可测纯逻辑)
 
@@ -141,7 +144,7 @@ pub fn execute_sorted(
 
 | 维度 | 决策 |
 |---|---|
-| crate 划分 | protocol(契约)+ app(GUI);engine 零业务改动(仅 query 扩展);cli 机械迁移 |
+| crate 划分 | protocol(契约)+ client(客户端承载层:连接/stat/离线/状态常量)+ app(GUI)+ cli(daemon 宿主与子命令);engine 零业务改动(仅 query 排序扩展) |
 | UI 技术栈 | eframe/egui 0.x(workspace 锁版本);egui_extras(表格/虚拟化);中文字体:内置 Noto Sans SC 子集或系统字体加载(避免豆腐块——实现期验证) |
 | 平台补丁 | objc2 + objc2-app-kit(unsafe 集中 platform/mac.rs,SAFETY 逐处) |
 | 托盘/快捷键/自启 | tray-icon / global-hotkey(tauri 系)/ SMAppService(经 objc2 或 launchd plist 兜底) |
