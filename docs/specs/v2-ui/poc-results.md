@@ -645,6 +645,41 @@ POC6_MODE=inwindow POC6_G=1 POC6_AUTO=1 \
 
 ---
 
+## PoC-7：系统毛玻璃（NSVisualEffectView）与 eframe/GL 叠加
+
+**状态：✅ 可行——「面板窗 + 下挂同级毛玻璃窗」路线实机确认：未遮挡区桌面呈「模糊」、面板底 80%（设计稿 `#191C21CC`）观感 OK。**
+
+- **日期**：2026-10-17
+- **实锁版本**：eframe / egui 0.37.0、winit 0.30.13、objc2 0.6.5、objc2-app-kit 0.3.2
+- **代码**：`scripts/poc/poc7_vibrancy/`（独立 crate，根 Cargo.toml `[workspace] exclude` 已追加）
+- **起因**：`floatbar-visual` §6.1 —— 面板底走 ② 系统毛玻璃（辉哥定案）；spec 标注「GL 图层与 vibrancy 的叠加未验证，别假设可行」。
+
+### 结论表
+
+| # | 验证项 | 结论 | 判定依据 |
+| --- | --- | --- | --- |
+| 1 | **层级约束（关键事实）** | winit 视图就是窗口 contentView，**不可换容器 / 加兄弟层** | 运行时实证 `panel.contentView = "WinitView"`；winit 0.30.13 `window_delegate.rs:656` 直接 `setContentView(WinitView)`，且 `WindowDelegate::view()` 恒把 contentView 按 `WinitView` 解释（含 ivars 读取）——换层级会把 ivars 读成垃圾（UB） |
+| 2 | 可行路线 | **面板窗下挂同级毛玻璃窗**：borderless + `ignoresMouseEvents` + `addChildWindow:ordered:Below`，每帧同步 frame | 实机开关两态对比：未遮挡区（探针右半）桌面**模糊** ✓ |
+| 3 | 面板底 alpha | **80%（设计稿 `#191C21CC`）** | 辉哥实机判读：80% 观感 OK |
+| 4 | material 循环（HUDWindow / Popover / Sidebar / UnderWindowBackground） | 80% 面板底下**肉眼不可辨** | 日志 20 次切换均生效（material 读回随动）——差异过小，非切换失效。落实现按「随系统外观自适应」取 `Popover`（备选 `UnderWindowBackground`），一行可换 |
+| 5 | 附：无边框窗键盘可达 | 需覆写 `canBecomeKeyWindow` / `canBecomeMainWindow → true` | 探针首版点走焦点后键盘失灵（无边框窗默认 false）；补覆写 + `activate` + `makeKeyWindow` 后恢复正常 |
+
+### 复现步骤
+
+```bash
+cargo run --release --manifest-path scripts/poc/poc7_vibrancy/Cargo.toml
+# 面板底只画左半（右半为未遮挡区，可直读毛玻璃）
+# V 开关毛玻璃 · M 材质 · 1/2/3 面板 alpha(0/60%/80%) · S 层级 · Q 退出
+```
+
+### 落规格口径
+
+- `floatbar-visual` §6.1 走 ②：面板底 = token alpha（深 `#191C21CC` / 浅 `#FFFFFFD6`），毛玻璃由「下挂同级窗」提供。
+- `tech.md`「悬浮条窗口行为」新增「毛玻璃」行：vibrancy 窗（borderless / ignoresMouseEvents / collectionBehavior 与面板同源）挂面板窗下（ordered: Below），frame 每帧同步、显隐随面板。
+- 遗留（并入实现期实机验收）：多屏 / 切 Space 下毛玻璃窗跟随；深浅色切 material。
+
+---
+
 ## Task 14：平台行为产品化（悬浮条平台落地）
 
 **状态：✅ 八项实机验证全过；L1/L2 选路 A（deferred 视口 + 常驻）；与 PoC 结论两处出入已记录（见文末「与 PoC 结论的出入」）。**
