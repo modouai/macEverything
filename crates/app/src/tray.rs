@@ -24,17 +24,30 @@
 //! 会滞留到下一次出帧(hotkey.rs 模块注释的同一证据链)。消息经 mpsc 汇到 UI 帧。
 //!
 //! 引擎状态刷新走独立线程 + 请求通道(悬停/点击/拉起后触发;**无轮询**,守
-//! 「隐藏态 CPU 0%」红线):右键弹菜单发生在托盘库内部(NSStatusItem 的
-//! `performClick` 嵌套 run loop),不先经本模块——悬停(`Enter`)期刷新让菜单
-//! 弹出时状态项已是最新;快照存 `Arc<Mutex<_>>`,主线程 `sync()` 落到菜单项。
+//! 「隐藏态 CPU 0%」红线):悬停(`Enter`)期刷新让菜单弹出时状态项已是最新;
+//! 快照存 `Arc<Mutex<_>>`,主线程 `sync()` 落到菜单项。
+//!
+//! ## 右键菜单自弹(2026-10-16 修:副屏点击 → 菜单落主屏)
+//!
+//! 托盘库内建弹菜单(右按下 → `NSStatusItem.setMenu` + `button.performClick`)把菜单
+//! 锚定到**状态项所在的菜单栏窗**;多屏实机取证:该窗恒在主屏菜单栏(副屏点击时
+//! 事件 rect = 主屏状态项窗 (823,0,38,33)@2x),菜单随之出现在主屏。故本模块
+//! `with_menu_on_right_click(false)` 关掉内建弹出,右按下事件经**主队列直调**
+//! (与热键同模式,`hotkey.rs` 模块注释「动作直调」;菜单须主线程弹且不等帧)
+//! `platform::popup_tray_menu` —— 按光标所在屏自定位弹出。菜单仍是同一份 muda
+//! `Menu`(勾选态/缺口项增删与原来一致;项选择经 muda 的 MenuEvent 回投)。
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use client::{DaemonPaths, StatusOutcome};
 use eframe::egui;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    CheckMenuItem, ContextMenu, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem,
+};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+use crate::platform;
 
 /// 菜单项 id(分派键;字符串常量集中本处,禁散落)。
 mod ids {
@@ -248,11 +261,14 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
     let tray = TrayIconBuilder::new()
         .with_icon(icon(ICON_SIZE)?)
         .with_tooltip("macEverything")
-        .with_menu(Box::new(menu.clone()))
-        // 左键不弹菜单 = 左键留给「唤起/隐藏切换」(product §3);右键弹菜单(tray-icon 默认)。
+        // 左键留给「唤起/隐藏切换」(product §3);右键菜单**自弹**(见模块注释
+        // 「右键菜单自弹」)——两个内建弹出开关都关,托盘库不再碰菜单。
         .with_menu_on_left_click(false)
+        .with_menu_on_right_click(false)
         .build()
         .map_err(|e| anyhow::anyhow!("托盘图标创建失败: {e}"))?;
+    // 菜单句柄交平台层(自弹按光标所在屏定位;裸指针在主线程注册一次)。
+    platform::register_tray_menu(menu.ns_menu());
 
     // —— 事件泵与状态刷新(见模块注释) ——
     let snapshot = Arc::new(Mutex::new(TrayStatus::default()));
@@ -309,8 +325,19 @@ fn spawn_tray_pump(ctx: egui::Context, tx: Sender<TrayMsg>, refresh: Sender<()>)
                         log::info!("托盘左键:切换悬浮条");
                         send_msg(&tx, TrayMsg::TogglePalette)
                     }
-                    // 悬停 → 顺带刷新引擎状态(右键弹菜单发生在托盘库内部,悬停期刷新
-                    // 可让菜单弹出时状态项已是最新)。
+                    // 右键按下 = 弹菜单(自弹;见模块注释「右键菜单自弹」)。
+                    // 主队列直调(与热键同模式):菜单须主线程弹,且不等帧——
+                    // 不可见窗口的跨线程 repaint 请求被 eframe 节流 ≥100ms。
+                    TrayIconEvent::Click {
+                        button: MouseButton::Right,
+                        button_state: MouseButtonState::Down,
+                        ..
+                    } => {
+                        dispatch2::DispatchQueue::main().exec_async(platform::popup_tray_menu);
+                        false // 不叫帧:菜单是原生窗,egui 无需重绘
+                    }
+                    // 悬停 → 顺带刷新引擎状态(菜单弹出前状态项已是最新;弹出路径见
+                    // 模块注释「右键菜单自弹」,不经托盘库)。
                     TrayIconEvent::Enter { .. } => {
                         if let Err(err) = refresh.send(()) {
                             log::warn!("托盘状态刷新请求失败:{err}");

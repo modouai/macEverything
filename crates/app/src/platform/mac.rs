@@ -427,6 +427,120 @@ pub fn popup_menu(
     choice
 }
 
+// ---------------------------------------------------------------------------
+// 托盘菜单自弹(2026-10-16 实机修复:副屏点击 → 菜单落在主屏)
+
+/// 托盘菜单的 NSMenu 句柄(主队列块跨线程只携带「调用本模块函数」的意图,
+/// 指针经本静态取回——裸指针非 Send,故以 usize 存)。
+static TRAY_MENU: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// 注册托盘菜单(install 期主线程一次;`Menu::ns_menu()` 的裸指针)。
+/// 重复注册保留首个并留痕(进程内只有一份托盘菜单)。
+pub fn register_tray_menu(ns_menu: *mut std::ffi::c_void) {
+    if TRAY_MENU.set(ns_menu as usize).is_err() {
+        log::warn!("托盘菜单重复注册:保留首个,忽略本次");
+    }
+}
+
+/// 在光标所在屏弹出托盘菜单(仅主线程调用;自弹,不经 tray-icon 内建路径)。
+///
+/// ## 为什么自弹(实机根因,2026-10-16)
+///
+/// tray-icon 的 macOS 实现是 `status_item.setMenu(menu)` + `button.performClick(None)`
+/// ——菜单由 AppKit 按**状态项所在的菜单栏窗**锚定;多屏时该窗固定在主屏菜单栏
+/// (实机取证:副屏点右键,tray-icon 事件里的窗 rect = 主屏状态项窗 (823,0,38,33)@2x,
+/// 内建弹出的菜单窗随之落在主屏 x=818)。鼠标位置是对的(事件 position 与
+/// `NSEvent::mouseLocation` 一致),错的是锚定窗。故此处按光标自定位弹出:
+/// 菜单必然出现在用户点击的那块屏上。
+///
+/// 位置 = 光标所在屏、菜单栏底边(`visibleFrame` 顶)、左缘对齐光标 x;
+/// 右缘越界时左移(状态项在菜单栏最右,近右缘必越界;同 muda `fit_anchor` 手法)。
+/// 弹出阻塞(嵌套 run loop 走菜单跟踪模式),返回即菜单关闭——与 `popup_menu` 同款;
+/// 菜单项选择仍经 muda 的 MenuEvent 通道回投(tray.rs 的菜单泵),此处不读返回值。
+pub fn popup_tray_menu() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::warn!("托盘菜单:非主线程调用,忽略");
+        return;
+    };
+    let Some(&addr) = TRAY_MENU.get() else {
+        log::warn!("托盘菜单:未注册(register_tray_menu 未执行),忽略");
+        return;
+    };
+    // SAFETY:addr 是 register_tray_menu(主线程、install 期)写入的 NSMenu 裸指针,
+    // muda 的 Menu 句柄持有该 NSMenu 至进程退出;本函数仅主线程访问,满足 NSMenu
+    // 的主线程约束(nonnull 由注册路径保证:muda 的 ns_menu 恒指向存活对象)。
+    let menu: &NSMenu = unsafe { &*(addr as *const NSMenu) };
+    let mouse = NSEvent::mouseLocation();
+    let screen = screen_with_point(mtm, mouse);
+    let visible = match &screen {
+        Some(screen) => screen.visibleFrame(),
+        None => {
+            // 理论不可达(至少一屏):退化主屏可见区,仍给确定位置。
+            log::warn!("托盘菜单:光标所在屏查不到,退化主屏可见区");
+            match NSScreen::mainScreen(mtm) {
+                Some(main) => main.visibleFrame(),
+                None => NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)),
+            }
+        }
+    };
+    // 可见区已扣菜单栏时栏底即顶边(gap = 0);未扣(理论不可达)时下移兜底栏高,
+    // 菜单不压菜单栏(见 screen_menu_bar_height 一族;实机取证:副屏在栏上时
+    // visibleFrame 顶 = 984,恰为栏底;鼠标不在该屏时该值回到屏顶)。
+    let own_bar = screen.as_deref().map_or(0.0, screen_menu_bar_height);
+    let gap = if own_bar > 0.5 {
+        0.0
+    } else {
+        fallback_menu_bar_height(mtm)
+    };
+    let size = menu.size();
+    let at = tray_menu_anchor(mouse.x, visible, size.width, gap);
+    let (x, y) = (at.x, at.y);
+    let t0 = std::time::Instant::now();
+    // 阻塞调用(同 popup_menu):嵌套 run loop,返回即菜单关闭。
+    let popped = menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(x, y), None);
+    log::info!(
+        "托盘菜单弹出:位置=({x:.0},{y:.0}) 光标=({:.0},{:.0}) 屏栏高={own_bar:.0} 菜单={:.0}x{:.0} 阻塞 {}ms 返回={popped}(仅留痕)",
+        mouse.x,
+        mouse.y,
+        size.width,
+        size.height,
+        t0.elapsed().as_millis()
+    );
+}
+
+/// 托盘菜单锚点(纯函数,单测钉住):菜单左上角落点(AppKit 屏坐标,点)。
+///
+/// - x = 光标 x;右缘越界左移让出(muda `fit_anchor` 同法——状态项在菜单栏最右,
+///   近右缘必越界),再 clamp 回左缘内(两侧各留 `EDGE_MARGIN`);
+/// - y = 可见区顶边 - `unaccounted_bar`:可见区已扣菜单栏时栏底即顶边(传 0),
+///   未扣时下移该值(菜单不压菜单栏)。
+fn tray_menu_anchor(mouse_x: f64, visible: NSRect, menu_w: f64, unaccounted_bar: f64) -> NSPoint {
+    let right = visible.origin.x + visible.size.width;
+    let mut x = mouse_x;
+    if x + menu_w > right {
+        x = right - menu_w - EDGE_MARGIN;
+    }
+    let x = x.max(visible.origin.x + EDGE_MARGIN);
+    let y = visible.origin.y + visible.size.height - unaccounted_bar;
+    NSPoint::new(x, y)
+}
+
+/// 屏菜单栏高度(点)= frame 顶 - visibleFrame 顶;该屏当前无菜单栏(未扣)时为 0。
+fn screen_menu_bar_height(s: &NSScreen) -> f64 {
+    let f = s.frame();
+    let v = s.visibleFrame();
+    (f.origin.y + f.size.height) - (v.origin.y + v.size.height)
+}
+
+/// 菜单栏高度兜底(点):主屏栏高;主屏也未扣(异常态)退 24(常见菜单栏高,
+/// 只用于不压菜单栏,不阻塞弹出)。
+fn fallback_menu_bar_height(mtm: MainThreadMarker) -> f64 {
+    NSScreen::mainScreen(mtm)
+        .map(|main| screen_menu_bar_height(&main))
+        .filter(|h| *h > 0.5)
+        .unwrap_or(24.0)
+}
+
 /// 取 Frame 的 NSView(结果窗口即根视口窗;取窗路径与 PoC-3 同法)。
 fn frame_view(frame: &eframe::Frame) -> Option<Retained<NSView>> {
     let handle = match frame.window_handle() {
@@ -726,4 +840,46 @@ fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> Anchor {
     let y = (top_y - h).max(visible.origin.y + EDGE_MARGIN);
     win.setFrameOrigin(NSPoint::new(x, y));
     Anchor { x, top_y, h }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 副屏可见区(与本机实机同形:Redmi 1920x1080 @ (1470,-65);AppKit 坐标)。
+    fn vis() -> NSRect {
+        NSRect::new(NSPoint::new(1470.0, -65.0), NSSize::new(1920.0, 1080.0))
+    }
+
+    /// 常规:锚点 = 光标 x、可见区顶边(可见区已扣菜单栏 → 栏底,传 0)。
+    #[test]
+    fn tray_anchor_aligns_cursor_x_with_visible_top() {
+        let p = tray_menu_anchor(2662.0, vis(), 110.0, 0.0);
+        assert_eq!(p.x, 2662.0);
+        assert_eq!(p.y, -65.0 + 1080.0);
+    }
+
+    /// 右缘越界左移让出(状态项在菜单栏最右,近右缘必越界):菜单右缘不越屏。
+    #[test]
+    fn tray_anchor_shifts_left_at_right_edge() {
+        let p = tray_menu_anchor(3320.0, vis(), 110.0, 0.0);
+        assert_eq!(p.x, 3390.0 - 110.0 - EDGE_MARGIN);
+        assert!(p.x + 110.0 <= 3390.0, "菜单右缘不得越屏");
+        assert!(p.x < 3320.0, "越界时须相对光标左移");
+    }
+
+    /// 左缘 clamp:光标贴左缘时锚点仍在可见区内(留 EDGE_MARGIN)。
+    #[test]
+    fn tray_anchor_clamps_to_left_edge() {
+        let p = tray_menu_anchor(1472.0, vis(), 110.0, 0.0);
+        assert_eq!(p.x, 1470.0 + EDGE_MARGIN);
+    }
+
+    /// 可见区未扣菜单栏(理论不可达)时按兜底栏高下移:菜单不压菜单栏。
+    #[test]
+    fn tray_anchor_drops_below_unaccounted_bar() {
+        let p = tray_menu_anchor(2662.0, vis(), 110.0, 31.0);
+        assert_eq!(p.x, 2662.0, "x 不受栏高影响");
+        assert_eq!(p.y, -65.0 + 1080.0 - 31.0);
+    }
 }

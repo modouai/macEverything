@@ -368,6 +368,12 @@ impl ResultsState {
                             [ui.available_width(), INPUT_H],
                             egui::TextEdit::singleline(&mut self.input)
                                 .id_salt("results-input")
+                                // 文字垂直居中(2026-10-16 实机反馈「整体偏上」):
+                                // egui 0.37 的 TextEdit 主题默认 align2 = LEFT_TOP
+                                // (theme/default_style.rs 的 TextEditStyle),而 add_sized
+                                // 的 centered_and_justified 会把输入框拉到 INPUT_H 高——
+                                // 文字就贴顶。显式 LEFT_CENTER = 行盒在框内居中,横向仍左对齐。
+                                .align(egui::Align2::LEFT_CENTER)
                                 .hint_text("搜索文件…"),
                         )
                     })

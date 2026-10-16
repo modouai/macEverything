@@ -191,6 +191,22 @@ pub fn popup_menu(
     }
 }
 
+/// 注册托盘菜单(install 期一次;`Menu::ns_menu()` 的裸指针,按屏自弹用)。
+/// 非 macOS:no-op(本仓交付面仅 macOS,stub 只为保持 facade 可编译)。
+pub fn register_tray_menu(ns_menu: *mut std::ffi::c_void) {
+    #[cfg(target_os = "macos")]
+    mac::register_tray_menu(ns_menu);
+    #[cfg(not(target_os = "macos"))]
+    let _ = ns_menu;
+}
+
+/// 在光标所在屏弹出托盘菜单(阻塞;主线程)。自弹,绕过 tray-icon 内建的
+/// StatusItem 锚定(副屏点击会错屏到主屏;根因见 mac.rs)。非 macOS:no-op。
+pub fn popup_tray_menu() {
+    #[cfg(target_os = "macos")]
+    mac::popup_tray_menu();
+}
+
 /// 是否已接上悬浮条窗(诊断;未接上时调用方排下一帧完成接线)。
 pub fn attached() -> bool {
     #[cfg(target_os = "macos")]

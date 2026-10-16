@@ -446,6 +446,10 @@ impl PaletteState {
                                 egui::TextEdit::singleline(input)
                                     .id_salt("palette-input")
                                     .font(font(FONT_INPUT))
+                                    // 文字垂直居中(同结果窗口;egui 0.37 主题的
+                                    // TextEdit align2 默认 LEFT_TOP,add_sized 拉高后贴顶
+                                    // —— 2026-10-16 实测两窗同病,一并显式居中)。
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .hint_text("搜索文件…"),
                             )
                         },
