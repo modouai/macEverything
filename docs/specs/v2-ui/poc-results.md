@@ -171,3 +171,83 @@ bash verify.sh follow                       # 面板先可见 → 他人全屏�
 
 - 取证口径：`screencapture -x -D 1 /tmp/poc1b-*.png` 截图 + `/tmp/winlist.swift onscreen|all`（CGWindowList，`verify.sh` 缺脚本时自动重建）；前台应用用 `lsappinfo front`。
 - 手动项（留给辉哥）：① 真键盘打字（本 spike 的输入验证走进程内合成事件，未覆盖 HID 路径）；② 系统深/浅色切换下主题跟随（见「已知副作用」）。
+
+---
+
+## Task 2：PoC-2 — ⌥Space 族全局热键注册（中文输入法环境）
+
+**状态：自动化部分完成（三候选注册 3/3 成功 + 事件投递链经合成按键验证通过）；中文/英文输入法态下的真键盘按键实效「人工验证待辉哥执行」（步骤见本节文末，结论表 #4/#5 待回填）。**
+
+- **日期**：2026-10-16
+- **实锁版本**：global-hotkey 0.6.4（plan 示意 0.6 系，crates.io 当前最新为 0.8.0，本次锁 0.6.4）、objc2 0.6.5、objc2-app-kit 0.3.2、objc2-foundation 0.3.2；传递依赖 keyboard-types 0.7.0、crossbeam-channel 0.5.17
+- **代码**：`scripts/poc/poc2_hotkey/`（独立 crate，根 Cargo.toml `[workspace] exclude` 已追加）
+
+### 结论表
+
+| # | 验证项 | 结论 | 判定依据 |
+| --- | --- | --- | --- |
+| 1 | 三候选注册（自动化） | ✅ 3/3 成功 | 原始输出见「现象细节」#1；组合↔id：⌥Space=65598、⌥⇧Space=33620030、⌃⌥⇧Space=34144318 |
+| 2 | 系统符号热键占用盘点（原始数据） | ⌃Space / ⌃⌥Space / ⌘Space / ⌘⌥Space 占用；三候选空闲 | `defaults read com.apple.symbolichotkeys AppleSymbolicHotKeys`（53 条中涉 Space 的仅四条，均 enabled=1）：#60 输入法上一源=⌃Space、#61 下一源=⌃⌥Space、#64 Spotlight=⌘Space、#65 Spotlight 窗口=⌘⌥Space；三个候选无对应条目 |
+| 3 | 事件投递链（自动化；合成按键注入） | ✅ 三候选均送达 | 隔离实验三例见「现象细节」#2；注入轮 ⌥⇧Space + ⌥Space×2 全数到达终端（3/3 打印 pressed） |
+| 4 | 中文（拼音）输入法态下真键盘按键 | ⏳ 人工验证待辉哥执行 | 见文末「人工验证步骤」 |
+| 5 | 英文输入法态下真键盘按键 | ⏳ 人工验证待辉哥执行 | 同上 |
+| 6 | 前台应用/输入法吞键（旁证，未定性） | ⚠️ 观察到 1 例未送达 | 注入轮 A：⌥Space 首发送达失败（当时前台 = WPS Office，活动输入源 = 微信输入法拼音）；注入轮 B 同机同法对照 ⌥Space 2/2 送达。原因待 #4/#5 定性 |
+
+### 现象细节
+
+1. **注册输出（原始，逐字）**：
+   ```
+   == PoC-2 全局热键注册（global-hotkey 0.6.4 / Carbon RegisterEventHotKey）==
+   OK   ⌥Space  (id=65598)
+   OK   ⌥⇧Space  (id=33620030)
+   OK   ⌃⌥⇧Space  (id=34144318)
+   == 注册结果：3/3 成功 ==
+   ```
+   macOS 后端即 Carbon `RegisterEventHotKey`（成功返回 `noErr`）；失败时 crate 报「Unable to register hotkey: Space」，**不透出 OSStatus 码**。
+2. **投递链隔离实验（三例；同机、同注入方式 = CGEvent 于 kCGHIDEventTap 合成 ⌃⌥⇧Space）**：
+
+   | 例 | 进程形态 | 是否收到 |
+   | --- | --- | --- |
+   | ① | 裸进程 + `CFRunLoop::run_in_mode` 泵 | ❌ |
+   | ② | `NSApplication` 初始化 + `CFRunLoop` 泵 | ❌ |
+   | ③ | `NSApplication` 初始化 + `nextEventMatchingMask:untilDate:inMode:dequeue:` 拉取 | ✅ |
+   结论：macOS 上 Carbon 热键事件必须经 AppKit 的 nextEvent 事件拉取才到本进程；eframe/winit 的 `NSApplication::run()` 内部即此循环，**Task 15 产品接线天然满足**。plan 示意的「裸 sleep 轮询 `GlobalHotKeyEvent::receiver()`」在 macOS 收不到事件——PoC 已按例③实现。
+3. **合成按键口径与边界**：注入进程需「辅助功能」授权（本机 `AXIsProcessTrusted=true`、`CGPreflightPostEventAccess=true`）；注入事件在 HID 层进入会话流（session 级 CGEvent tap 可见，flags=alt+shift 正确）。合成注入足以验证投递链，**不能替真人切输入法**——输入法态与真键盘的组合行为以人工步骤为准。
+4. **本机输入法事实（与任务描述的偏差）**：活动输入源实测为**微信输入法拼音**（`com.tencent.inputmethod.wetype.pinyin`，TIS 查询）；「已启用」列表另有系统 SCIM 简体（`com.apple.inputmethod.SCIM.ITABC`）、搜狗拼音、清见输入法等，均未选中。
+5. **外证（风险参考）**：FB15168205（2024-09，macOS 15.0，Resolution: Fixed）——沙盒应用用 `RegisterEventHotKey` 注册「仅 Option 或 Option+Shift」修饰的热键在 15.0 曾完全失效；本机 macOS 27 实测注册与投递均正常，且 本应用非沙盒分发，暂不构成风险。
+
+### 与 plan 示意的差异（供 Task 15 接线参考）
+
+1. plan 的裸轮询循环收不到事件（见 #2），须有主线程事件循环；本 PoC 实现 = `NSApplication` 初始化 + nextEvent 拉取（每次最多阻塞 50ms），拉取片之间消费 `GlobalHotKeyEvent::receiver()`。
+2. `HotKey::id()` 由 crate 计算（`mods.bits() << 16 | key`）；事件按 id 反查组合名，勿自行拼 id。
+3. 注册失败信息不含 OSStatus 码；产品弹「被占用」提示时无法区分「被占用」与其它 OS 错误，只能统一按注册失败处理。
+
+### 复现步骤
+
+```bash
+cd scripts/poc/poc2_hotkey
+# 本机 crates.io sparse index 极慢（实测 ~14KB/s），拉依赖走 rsproxy：
+cargo run --release --config 'source.crates-io.replace-with="rsproxy"' \
+                       --config 'source.rsproxy.registry="sparse+https://rsproxy.cn/index/"'
+# 或先构建再直接运行（默认 60 秒自动退出；POC2_SECS=<秒> 覆盖时长，供自动化短跑）：
+./target/release/poc2-hotkey
+```
+
+### 人工验证步骤（辉哥执行；中文/英文两态 × 三候选）
+
+> 自动化部分无法替真人切输入法与按真键盘；以下步骤执行后把结果回填结论表 #4/#5。
+
+1. 终端运行：`cd scripts/poc/poc2_hotkey && cargo run --release --config 'source.crates-io.replace-with="rsproxy"' --config 'source.rsproxy.registry="sparse+https://rsproxy.cn/index/"'`，等出现「3/3 成功」与「现在开始监听」。
+2. 切到任意**可输入文本**处（WPS 正文 / 备忘录 / 浏览器地址栏），光标点进输入框——输入法只在有文本焦点时才拦截按键。
+3. 切到**中文（拼音）**输入法；可先在框里敲 1~2 个拼音字母进入组字（候选窗）态再按——拦截最可能发生在此态。
+4. 依次按 ⌥Space、⌥⇧Space、⌃⌥⇧Space 各 1~2 次，记录终端是否出现 `>>> pressed: id=<n> <组合名>`。
+5. 切**英文（ABC）**输入法，重复第 4 步。
+6. 记录四格结果（中文态/英文态 × 触发与否），并附带记录「按键是否把字符输进了文本框」（⌥Space 在文本视图可能产生不间断空格）。
+7. 60 秒自动退出；中途退出按 Ctrl+C。
+
+### 默认键建议（据现证据；人工步骤执行后定稿）
+
+- **⌥Space 两态均有效** → 按 product §1 用 ⌥Space，保留降级链（⌥⇧Space → ⌃⌥⇧Space）。
+- **⌥Space 仅中文态失效** → 默认改 **⌥⇧Space**（本机实测注册与投递均通、无系统符号热键占用；与输入法自带快捷键的撞车面留待 Task 15 实机回归观察），⌃⌥⇧Space 作兜底。降级触发方式建议：注册成功但观察到「输入法态下按了没反应」时，Task 15 加一次可见提示并允许切备选。
+- **三候选全部注册失败** → 回报辉哥扩池。本机实测三候选注册全 OK，该分支未触发。
+- 旁证 #6（前台应用/输入法偶发吞键）提示：即使注册成功，唤起居也可能偶发无响应；Task 15 建议保留托盘唤起兜底，并在无响应场景给一次可见提示（v2.0 无设置页，提示即可）。
