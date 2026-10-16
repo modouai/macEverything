@@ -67,14 +67,42 @@ fn now_secs() -> u64 {
 
 fn default_roots() -> Result<Vec<PathBuf>> {
     // MCE_ROOTS(冒号分隔)覆盖扫描根:基准与隔离测试用;生产缺省 = 主目录 + /Applications。
+    // 覆盖生效时留痕:该变量在生产路径同样可读,静默生效会让人误判索引范围。
     if let Some(v) = std::env::var_os("MCE_ROOTS") {
         let roots: Vec<PathBuf> = std::env::split_paths(&v).collect();
         if !roots.is_empty() {
+            log::warn!(
+                "MCE_ROOTS 覆盖扫描根(基准/测试用途): {:?}",
+                roots
+                    .iter()
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            );
             return Ok(roots);
         }
     }
     let home = std::env::var_os("HOME").context("HOME 未设置,无法确定扫描根")?;
     Ok(vec![PathBuf::from(home), PathBuf::from("/Applications")])
+}
+
+/// 扫描根校验:不存在的根不静默——记入缺口清单(status 可见)并留错误日志。
+/// product 边界表:「扫描根不存在(如重命名了主目录)」须可操作提示。
+fn invalid_roots_gaps(roots: &[PathBuf]) -> Vec<Gap> {
+    let gaps: Vec<Gap> = roots
+        .iter()
+        .filter(|r| !r.is_dir())
+        .map(|r| Gap {
+            path: r.to_string_lossy().into_owned(),
+            reason: "扫描根不存在或不可读,请检查路径(如主目录是否被重命名)".into(),
+        })
+        .collect();
+    if !gaps.is_empty() {
+        log::error!(
+            "扫描根无效: {:?}",
+            gaps.iter().map(|g| &g.path).collect::<Vec<_>>()
+        );
+    }
+    gaps
 }
 
 enum IndexHolder {
@@ -480,7 +508,7 @@ fn consume_events(
     is_replay: bool,
     replayed_from_disk: bool,
 ) {
-    let mut batcher = DirBatcher::new(BATCH_WINDOW, watcher::now_stub());
+    let mut batcher = DirBatcher::new(BATCH_WINDOW, watcher::system_now());
     let mut replay_events: u64 = 0;
     let mut stream_errored = false;
 
@@ -620,14 +648,12 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
         .unwrap_or(8);
     let (idx, gaps) = reconcile::full_rescan(&roots, &excludes, threads);
     state.built_at.store(now_secs(), Ordering::Relaxed);
-    *state.gaps.lock().unwrap() = gaps
-        .permission
-        .iter()
-        .map(|(p, r)| Gap {
-            path: p.to_string_lossy().into_owned(),
-            reason: r.clone(),
-        })
-        .collect();
+    let mut gap_list = invalid_roots_gaps(&roots);
+    gap_list.extend(gaps.permission.iter().map(|(p, r)| Gap {
+        path: p.to_string_lossy().into_owned(),
+        reason: r.clone(),
+    }));
+    *state.gaps.lock().unwrap() = gap_list;
     state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
     *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
     rebuild_dir_map(state);
@@ -685,14 +711,12 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             *state.holder.write().unwrap() = IndexHolder::Mutable(index);
             let (recs, gaps) = engine::scanner::collect_records(&roots, &excludes, threads);
             state.built_at.store(now_secs(), Ordering::Relaxed);
-            *state.gaps.lock().unwrap() = gaps
-                .permission
-                .iter()
-                .map(|(p, r)| Gap {
-                    path: p.to_string_lossy().into_owned(),
-                    reason: r.clone(),
-                })
-                .collect();
+            let mut gap_list = invalid_roots_gaps(&roots);
+            gap_list.extend(gaps.permission.iter().map(|(p, r)| Gap {
+                path: p.to_string_lossy().into_owned(),
+                reason: r.clone(),
+            }));
+            *state.gaps.lock().unwrap() = gap_list;
             state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
             for chunk in recs.chunks(SCAN_CHUNK) {
                 let mut h = state.holder.write().unwrap();
@@ -754,11 +778,41 @@ fn handle_conn(
     stream.read_exact(&mut buf)?;
     let req: Request = protocol::decode_request(&buf).context("解码请求失败")?;
     let resp = dispatch(req, state, paths);
-    let body = serde_json::to_vec(&resp)?;
+    let body = encode_response(resp)?;
     stream.write_all(&(body.len() as u32).to_le_bytes())?;
     stream.write_all(&body)?;
     stream.flush()?;
     Ok(())
+}
+
+/// 响应写侧体积预算:client 读侧拒绝超过 MAX_MSG 的响应,1000 条深路径结果
+/// (路径均值可达 1KB)会把合法查询整体打成「响应超限」失败。超限时按上限
+/// 二分收缩 entries 后重序列化——total 保持真实,输出语义即「仅展示前 N 条」。
+fn encode_response(resp: Response) -> serde_json::Result<Vec<u8>> {
+    let mut body = serde_json::to_vec(&resp)?;
+    if body.len() <= protocol::MAX_MSG {
+        return Ok(body);
+    }
+    let Response::Query {
+        mut entries,
+        total,
+        elapsed_ms,
+        stat_ms,
+    } = resp
+    else {
+        // 非查询响应不该接近上限(状态/排除列表都是小对象):原样返回交 client 判定
+        return Ok(body);
+    };
+    while !entries.is_empty() && body.len() > protocol::MAX_MSG {
+        entries.truncate(entries.len() / 2);
+        body = serde_json::to_vec(&Response::Query {
+            entries: entries.clone(),
+            total,
+            elapsed_ms,
+            stat_ms,
+        })?;
+    }
+    Ok(body)
 }
 
 fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {

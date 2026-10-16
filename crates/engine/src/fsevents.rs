@@ -1,8 +1,7 @@
-//! FSEvents C API 直调封装雏形(ADR-5)。
-//!
-//! 本文件为 Task 3 spike 产物:只做「stream 创建 + 回调 + 事件收集」最小封装,
-//! 以经典 runloop 接线(`FSEventStreamScheduleWithRunLoop` + 专用线程 `CFRunLoopRun`)。
-//! spike 以行为观测为先,封装形态待 watcher/replay 任务按需演化。
+//! FSEvents C API 直调封装定稿(ADR-5):stream 生命周期(runloop 专用线程)、
+//! 事件收集、`sinceWhen` 历史重放、丢弃标记判定与事件 ID 追踪。
+//! 全部 unsafe FFI 集中于本文件;实机验证见 `tests/fsevents_live.rs`,
+//! spike 实证结论(HistoryDone 触发条件、无可观测滚动信号)见 tech.md ADR-5。
 //!
 //! 回调第 4 参 `eventPaths` 的语义(SDK FSEvents.h,`FSEventStreamCallback` 文档):
 //! 创建流时设 `kFSEventStreamCreateFlagUseCFTypes`,则它是 `CFArrayRef`,
@@ -177,13 +176,16 @@ pub fn start_stream(
     extra_flags: fs::FSEventStreamCreateFlags,
 ) -> Result<(FseStream, Receiver<FseEvent>), StreamStartError> {
     let (tx, rx) = channel();
-    // Box 回调上下文,裸指针交给 FSEventStreamContext.info;stop() 在 join 后回收。
-    let ctx: *mut CallbackCtx = Box::into_raw(Box::new(CallbackCtx { tx }));
-
+    // 路径先转换:错误路径须在 ctx Box 化**之前**返回,否则裸指针无人回收。
     let c_paths: Vec<CString> = paths
         .iter()
-        .map(|p| CString::new(*p).expect("路径含 NUL"))
-        .collect();
+        .map(|p| {
+            CString::new(*p).map_err(|_| StreamStartError(format!("监视路径含 NUL 字节: {p:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Box 回调上下文,裸指针交给 FSEventStreamContext.info;stop() 在 join 后回收。
+    let ctx: *mut CallbackCtx = Box::into_raw(Box::new(CallbackCtx { tx }));
     // SAFETY:全程在属主线程、ctx 已 Box 化且未移交;CFArray/CFString 的 Create 遵循
     // 「Create 归还调用方所有权」惯例——数组与临时字符串按次 Release,数组本身移交
     // FSEventStreamCreate(创建后 CF 持有引用,无需再 Release)。context 为栈上值,
@@ -235,7 +237,6 @@ pub fn start_stream(
     let worker = Builder::new()
         .name("fsevents-runloop".into())
         .spawn(move || {
-            // 先整体绑定再进闭包:避免闭包按精确路径捕获裸指针字段,绕过 SendPtr 的 Send 实现。
             let sp = stream_ptr;
             let stream = sp.0;
             // SAFETY:在本线程(即将成为流所调度的 runloop 线程)内取当前 runloop,
@@ -283,10 +284,19 @@ pub fn start_stream(
     let ready = match ready_rx.recv() {
         Ok(r) => r,
         Err(_) => {
-            // worker 在回报前退出(panic):join 回收线程,再回收 ctx,报错而非连带 panic。
-            let _ = worker.join();
+            // worker 在回报前退出(panic):join 回收线程,再回收 ctx 与 stream,报错而非连带 panic。
+            let joined = worker.join();
+            if joined.is_err() {
+                log::warn!("fsevents-runloop 线程在回报就绪前 panic");
+            }
             // SAFETY:worker 已终结,回调不可能再发生;独占回收 ctx 唯一所有权。
             unsafe { drop(Box::from_raw(ctx)) };
+            // stream 已创建但从未交给任何人:此路径极罕见(worker 仅做 CF 调用,无 panic 源)。
+            // 只做 CFRelease 减引用(引用计数线程安全);不调用 Stop/Invalidate——
+            // 跨线程 Invalidate 实测 SIGTRAP(tech.md spike 要点),宁可留 runloop source
+            // 随线程消亡回收,不与崩溃风险对赌。
+            // SAFETY:stream 由本次调用独占,无其他持有者;Release 只减引用计数。
+            unsafe { fs::FSEventStreamRelease(stream) };
             return Err(StreamStartError(
                 "fsevents-runloop 线程在回报就绪前退出".into(),
             ));
@@ -313,7 +323,9 @@ pub fn start_stream(
 
 impl FseStream {
     /// 流当前已处理到的事件 ID(`FSEventStreamGetLatestEventId`)。
-    /// 落盘时写入 `last_event_id`(ADR-5 停机重放起点);流已拆除后返回 0。
+    /// 供实机测试与诊断查询;daemon 的落盘水位(ADR-5 重放起点)另由消费线程
+    /// 维护的「已应用水位」承担(见 cli/daemon.rs 的 applied_event_id)。
+    /// 流已拆除后返回 0。
     #[must_use]
     pub fn latest_event_id(&self) -> EventId {
         if self.worker.is_none() {

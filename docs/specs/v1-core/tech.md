@@ -1,8 +1,8 @@
 # macEverything v1-core 技术规格
 
-**Status:** 已确认(实现完成,实测回填)
-**version:** 1.2.0
-**prev_version:** 1.1.0
+**Status:** 已确认(实现完成,实测回填;含审查修复轮)
+**version:** 1.3.0
+**prev_version:** 1.2.0
 **updated:** 2026-10-16
 **产品依据:** product.md v1.2.0(产品已确认)
 **changes:**
@@ -12,6 +12,10 @@
 - (1.2.0)实现完成实测回填:性能预算表五项实测数字;新增实现偏差清单(Entry 24B/
   折叠实现/聚合交织序/根名绝对路径/path 跨段限制);查询管线补 Finder 预编译
   (CPattern,主开销消除);增量补链与重放追平语义、落盘串行化入档
+- (1.3.0)代码审查修复轮回填:落盘水位改「已应用水位」语义并配套退出排空;合批窗口
+  自首事件起算;重放不可用判定加抽样对拍(补「部分回放」缺口);首扫流式聚合
+  (场景 2 落地);结果行 stat 并行化 + stat_ms 字段;exclude 补扫描根内校验与
+  失败原因;协议删死字段 offline/built_at;error.rs 空模块移除(错误类型按模块分置)
 
 ---
 
@@ -61,7 +65,7 @@
 ### ADR-5 FSEvents C API 直调,以 sinceWhen 实现停机重放
 
 - **Context**:`notify` 封装固定从「现在」开始监听,不暴露 `sinceWhen`,停机窗口只能全量重扫(成本 O(全盘) 且不随窗口缩小);FSEvents 框架本身支持从持久化日志(`.fseventsd`)的指定事件 ID 重放历史,是 macOS 上对标 USN Journal 的唯一机制。
-- **Decision**:engine 直调 FSEvents C API(经 `fsevent-sys` 绑定),自建 stream 生命周期管理;每次落盘把当前事件 ID 写入索引文件 header 的 `last_event_id`;daemon 重启后以 `last_event_id` 为 `sinceWhen` 创建流,重放停机窗口事件(走与实时事件同一条目录 diff 管线),收到 HistoryDone 标记即追平转纯实时。**spike 结论(2026-10-15)**:过旧 sinceWhen 行为 = 从保留窗口起点全量回放并正常收尾(since = 0、1、当前ID÷2、当前ID−10⁷ 四点行为一致,回放段末尾收到 HistoryDone,其后流正常转实时);可观测信号 = 无(MustScanSubDirs / UserDropped / KernelDropped / EventIdsWrapped 全程未出现);回退设计按纯保守判定器定稿——重放零事件且停机时长超阈值(默认 48h 可配置)触发全量重扫;重放异常直接重扫。
+- **Decision**:engine 直调 FSEvents C API(经 `fsevent-sys` 绑定),自建 stream 生命周期管理;每次落盘把**已应用水位**(一批目录 diff 全部完成后推进的最大事件 ID)写入索引文件 header 的 `last_event_id`;daemon 重启后以 `last_event_id` 为 `sinceWhen` 创建流,重放停机窗口事件(走与实时事件同一条目录 diff 管线),收到 HistoryDone 标记即追平转纯实时。**spike 结论(2026-10-15)**:过旧 sinceWhen 行为 = 从保留窗口起点全量回放并正常收尾(since = 0、1、当前ID÷2、当前ID−10⁷ 四点行为一致,回放段末尾收到 HistoryDone,其后流正常转实时);可观测信号 = 无(MustScanSubDirs / UserDropped / KernelDropped / EventIdsWrapped 全程未出现);回退设计按纯保守判定器定稿——重放零事件且停机时长超阈值(默认 48h 可配置)触发全量重扫;重放异常直接重扫。
 - **Alternatives Considered**:继续用 notify + 全量重扫兜底(Rejected:浪费已知信息,重扫成本恒定不降);kqueue 自建事件源(Rejected:fd 预算撑不住全盘目录数);APFS 磁盘结构直读——即 mac 版 MFT(Rejected:FileVault 加密、SIP、格式无官方承诺随 macOS 版本漂移,风险收益完全失配,且只解决枚举不解决增量事件);「日志已滚动」信号判定器(Rejected:spike 证实信号不存在,无从订阅)。
 - **Consequences**:engine 引入 ~200 行 unsafe FFI,集中于 `fsevents.rs` 单文件;停机补齐从 O(全盘) 降为 O(停机变更);回退判定不依赖未证信号,保守判定器保证「禁止静默遗漏」。
 - **spike 实测要点**(`crates/engine/examples/spike_fsevents.rs`,Apple Silicon + macOS 26,单卷验证):HistoryDone(flag 0x10)仅在 sinceWhen 为真实历史 ID 时出现,恒为回放段最后一条事件、flag 位只有 0x10、id 等于回放段最后事件 ID;SinceNow 建流不产生 HistoryDone——daemon 落盘的 last_event_id 恒为真实 ID,「收 HistoryDone 即追平」的设计成立。SinceNow 非精确切点:建流前发生、仍缓冲在 fseventsd 的变更会以大于当前 ID 的形式送达,故事件处理须幂等(目录 diff 天然幂等)。回放段事件 ID 非严格递增(同路径多事件合并、跨路径乱序),水位线必须取批内最大 ID。回放延迟随深度显著增长:since 取最近历史 ID 时回放段 13ms,since 取 0/1/当前ID÷2 等陈旧区时实测 4-14s(同深度各点波动大,首扫为主)。runloop 拆除(ScheduleWithRunLoop 自 macOS 13 标记 deprecated,仍可用)必须在流所调度的线程上执行,跨线程 Invalidate 实测 SIGTRAP。
@@ -91,10 +95,9 @@ macEverything/
 │   │       ├── query.rs         # 语法解析(词法)→ 计划 → 匹配(memmem)→ 打分排序(path: 走目录路径池)
 │   │       ├── persist.rs       # 落盘快照写、临时文件 + rename、mmap 加载与校验、last_event_id
 │   │       ├── fsevents.rs      # FSEvents C API 直调封装:stream 生命周期、sinceWhen 重放、事件 ID 追踪
-│   │       ├── watcher.rs       # 事件→目录集、100ms 防抖、重放调度、Rescan/日志滚动兜底
-│   │       ├── reconcile.rs     # 兜底全量重扫:并行扫描 diff 应用、差异计数
-│   │       ├── config.rs        # 排除列表读写(toml)
-│   │       └── error.rs         # EngineError(thiserror):含 PermissionGap 分类
+│   │       ├── watcher.rs       # 事件→目录集、100ms 合批(窗口自首事件起算)、重放调度、Rescan/日志滚动兜底
+│   │       ├── reconcile.rs     # 兜底全量重扫入口:should_degrade 判定、full_rescan、排除列表展开
+│   │       └── config.rs        # 排除列表读写(toml)
 │   └── cli/
 │       └── src/
 │           ├── main.rs          # 子命令分派:start/stop/query/status/exclude
@@ -118,13 +121,13 @@ macEverything/
 3. `path:` 匹配走**目录路径池**:每个目录条目维护完整路径(归一化形态,含扫描根前缀)于独立 arena(`path_pool`,~20-40 万目录 ≈ 10-20MB),`path:` 词对池 memmem 直扫 <2ms;命中目录的直接子项即候选,文件项自身路径 = 父目录路径 + 名称(短串拼接判定)。目录改名/增删时增量管线同步维护受影响子树的池条目(重放与实时同一管线,风暴场景成本 O(子树))。此池消除 `path:` 单独成查询时「百万条目逐条拼路径」的性能破产路径。
 4. 打分排序:前缀命中(3)> 词边界命中(2)> 子串命中(1),同级按 `name_len` 升序;堆选前 N。
 
-**增量管线**:FSEvents 回调线程收事件 → 目录路径去重入集 → 100ms 静默窗后交给增量 worker → 每目录 `read_dir` 与索引 diff(该目录 `parent` 的直接子项)→ 增/删(墓碑)/改名(diff 天然表现为删 + 增,子树级联 = 目录条目下 `parent` 重挂 + 路径懒惰求值)→ 变更计数进落盘节流。收到 RESCAN 标记、监听器错误或重放不可用判定 → 触发 `reconcile`(全量重扫,复用并行扫描器,后台线程)。
+**增量管线**:FSEvents 回调线程收事件 → 目录路径去重入集 → 100ms 合批(**窗口自首个 pending 事件起算**,到期即 drain,持续风暴不无限推迟)→ 每目录 `read_dir` 与索引 diff(该目录 `parent` 的直接子项)→ 增/删(墓碑)/改名(diff 天然表现为删 + 增,子树级联 = 目录条目下 `parent` 重挂 + 路径池级联重写)→ 变更计数进落盘节流。收到 RESCAN 标记、监听器错误或重放不可用判定 → 触发 `reconcile`(全量重扫,复用并行扫描器,后台线程)。
 
-**停机重放**:daemon 启动 → mmap 加载读出 `last_event_id` → 以其为 `sinceWhen` 创建 FSEvents 流(ADR-5)→ 重放事件走与实时事件同一条目录 diff 管线 → 收到 HistoryDone 标记即追平,转纯实时。**不可用判定(spike 定稿,ADR-5)**:过旧 sinceWhen 无可观测信号,重放不可用只认保守判定器——重放零事件且停机时长 > 阈值(默认 48h,配置项)→ 判不可用,转全量重扫。重放全程旧索引可查,状态「补齐中」;转重扫后状态「重扫中」。
+**停机重放**:daemon 启动 → mmap 加载读出 `last_event_id` → 以其为 `sinceWhen` 创建 FSEvents 流(ADR-5)→ 重放事件走与实时事件同一条目录 diff 管线 → 收到 HistoryDone 标记即追平,转纯实时。**不可用判定(spike 定稿,ADR-5)**:过旧 sinceWhen 无可观测信号,重放不可用认两路判定——①零事件且停机时长 > 阈值(默认 48h,配置项);②**抽样对拍**:追平后随机抽 100 个已索引目录做 diff,差异目录占比超 5% 判重放不可信(spike 证实过旧 sinceWhen 会「从保留窗口起点部分回放」,有事件但丢前段,零事件判定覆盖不到)。重放全程旧索引可查,状态「补齐中」;转重扫后状态「重扫中」。
 
-**落盘节流**:变更计数器;worker 每轮检查「距上次落盘 ≥ 30s 或累计 ≥ 10000 条」→ 触发快照线程;快照 = 短读锁取一致句柄(见并发模型协议细节)→ 写 `<file>.tmp` → fsync → rename。`stop` 经 socket 消息触发同一快照路径,响应在落盘完成后返回;SIGTERM 走同路径兜底。
+**落盘节流**:变更计数器;worker 每轮检查「距上次落盘 ≥ 30s 或累计 ≥ 10000 条」→ 触发快照线程;**落盘水位取「已应用水位」**(消费线程应用完一批目录 diff 后的最大事件 ID,与「接收水位」分离)——保证落盘水位 ≤ 索引内容对应的事件,「已收未应用」的变更重启后必被重放覆盖;退出/停止前强制排空 pending。快照走 `<file>.tmp` → fsync → rename。`stop` 经 socket 消息触发同一快照路径,响应在落盘完成后返回;SIGTERM 走同路径兜底。
 
-**冷启动**:`start` → persist 校验 magic/version → mmap → `IndexView::Shared` 立即可查 → 后台线程物化 `IndexView::Mutable`(从 mmap 拷贝)→ 物化完成即启动停机重放(sinceWhen = last_event_id,ADR-5)→ 重放毕重落盘并保持 `Mutable`;重放不可用才走全量重扫。查询代码只面对 `&[Entry] + &[u8]`,两视图同构,无分支扩散。
+**冷启动**:`start` → persist 校验 magic/version → mmap → `IndexView::Shared` 立即可查 → 后台线程物化 `IndexView::Mutable`(从 mmap 拷贝)→ 物化完成即启动停机重放(sinceWhen = last_event_id,ADR-5)→ 重放毕重落盘并保持 `Mutable`;重放不可用才走全量重扫。查询代码只面对 `&[Entry] + &[u8]`,两视图同构,无分支扩散。**首扫流式**(product 场景 2):无落盘索引时先挂「仅含根」的可变索引,遍历与聚合分离(collect_records → 按 50k/批 apply_records),批间释放写锁——首扫期间 query 返回已扫部分、status 可见进度;首扫水位在扫描**之前**取,建流后重放补齐扫描窗口变更。
 
 ### 性能预算分配(对应 product.md 目标 1~6)
 
@@ -156,7 +159,7 @@ socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0
 | query | client → daemon | `query: string`(原始语法串)、`limit: int ≤ 1000` | `entries: [{name, path, size, mtime}]`、`total: int`、`elapsed_ms: int` | `size`/`mtime` 懒 stat 填充 |
 | stop | client → daemon | `{}` | `ok: bool`、`final_entry_count: int` | daemon 执行最终落盘快照后响应,随后进程退出;收到响应即落盘已保证 |
 | status | client → daemon | `{}` | `state: building/ready/reconciling/degraded`、`entry_count: int`、`gaps: [{path, reason}]`、`io_error_count: int`、`built_at: int`、`index_file: string` | 状态契约唯一出口;daemon 不在时 client 读索引文件头自答并标 `offline: true` |
-| exclude.add / exclude.remove | client → daemon | `path: string` | `ok: bool`、`excluded: [string]` | 变更即生效并触发受影响范围重扫 |
+| exclude.add / exclude.remove | client → daemon | `path: string` | `ok: bool`、`excluded: [string]`、`message?: string` | 变更即生效并触发受影响范围重扫;失败(路径越界/落盘失败)回 ok=false + 可操作原因 |
 | exclude.list | client → daemon | `{}` | `excluded: [string]` | |
 
 离线模式(query 时 daemon 不在):client 直接 mmap 索引文件执行同一查询管线,响应加 `offline: true` 与 `built_at`,CLI 输出标注「离线索引」。
@@ -171,7 +174,7 @@ socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0
 | 存储层 | 内存 = 扁平 Entry 数组 + 双 arena;持久 = 同构布局文件 + mmap;删除 = 墓碑 + 阈值整理 |
 | 并发模型 | watcher 线程 / 增量 worker / 快照线程 / `RwLock<IndexView>`;查询走 rayon 读锁;禁 shared mutable 无锁技巧。协议细节:写锁批量应用(单批 <10ms);快照取短读锁复制句柄后无锁序列化(arena 追加式,快照期间新写入不进本快照,由下次落盘补);墓碑整理走双缓冲重建,期间增量入暂存队列,重建完成原子 swap 后 100ms 内应用,暂存窗口不计入增量 ≤500ms 红线 |
 | 进程通信 | Unix socket + 长度前缀 JSON;同步线程每连接一线程;单实例 = 绑定失败 |
-| 错误处理 | EngineError 分类(PermissionGap 独立);缺口计数不中断;daemon 日志落文件(数据目录 daemon.log);禁 catch 静默 |
+| 错误处理 | 错误类型按模块分置(LoadError/StreamStartError/ScanGaps;统一 EngineError 无消费方,不建空抽象);缺口计数不中断;daemon 日志落文件(数据目录 daemon.log);禁 catch 静默 |
 | 测试策略 | engine 全模块单测(TDD)+ 集成(落盘回环/对拍/daemon 生命周期)+ 基准脚本;CLI 实机验证 |
 
 ## 风险与应对

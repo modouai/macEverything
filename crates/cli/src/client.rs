@@ -168,6 +168,8 @@ fn offline_status(paths: &DaemonPaths) -> Result<()> {
                 &paths.index_file().to_string_lossy(),
                 true,
             );
+            // 缺口清单只在 daemon 内存中:离线时显式说明,不静默留白
+            println!("权限缺口与 IO 错误计数:需 daemon 在线查看(执行 macEverything start)");
             Ok(())
         }
         Err(_) => {

@@ -57,7 +57,8 @@ impl DirBatcher {
     }
 }
 
-pub fn now_stub() -> fn() -> Instant {
+/// 生产时钟入口(命名不用 stub:它是生产路径的默认值,测试自注入替身)。
+pub fn system_now() -> fn() -> Instant {
     Instant::now
 }
 
@@ -101,7 +102,7 @@ mod tests {
 
     #[test]
     fn batcher_dedups_within_window() {
-        let mut b = DirBatcher::new(std::time::Duration::from_millis(100), now_stub());
+        let mut b = DirBatcher::new(std::time::Duration::from_millis(100), system_now());
         b.push("/a/b");
         b.push("/a/b");
         b.push("/a/c");
@@ -118,7 +119,7 @@ mod tests {
     /// 突变「push 内改写 first_push / drain 判 last_push」时此测必红。
     #[test]
     fn window_counts_from_first_push_not_last() {
-        let mut b = DirBatcher::new(std::time::Duration::from_millis(100), now_stub());
+        let mut b = DirBatcher::new(std::time::Duration::from_millis(100), system_now());
         b.push("/a");
         b.first_push = Some((b.now)() - std::time::Duration::from_millis(110)); // 窗口已到期
         b.push("/b"); // 持续到达的新事件
@@ -129,7 +130,7 @@ mod tests {
     /// drain_ready 后窗口重置:下一批重新从首事件起算,不被上一批残留影响。
     #[test]
     fn window_resets_after_drain() {
-        let mut b = DirBatcher::new(std::time::Duration::from_millis(100), now_stub());
+        let mut b = DirBatcher::new(std::time::Duration::from_millis(100), system_now());
         b.first_push = Some((b.now)() - std::time::Duration::from_millis(150));
         b.push("/a");
         assert_eq!(b.drain_ready().len(), 1);
@@ -140,7 +141,7 @@ mod tests {
     /// drain_all 无视窗口(重放追平与停止落盘前强制排空)。
     #[test]
     fn drain_all_ignores_window_and_clears() {
-        let mut b = DirBatcher::new(std::time::Duration::from_secs(5000), now_stub());
+        let mut b = DirBatcher::new(std::time::Duration::from_secs(5000), system_now());
         b.push("/x");
         assert!(b.drain_ready().is_empty());
         assert_eq!(b.drain_all(), vec!["/x".to_string()]);

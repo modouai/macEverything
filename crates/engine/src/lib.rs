@@ -1,7 +1,6 @@
 pub mod arena;
 pub mod config;
 pub mod entry;
-pub mod error;
 pub mod fsevents;
 pub mod index;
 pub mod persist;

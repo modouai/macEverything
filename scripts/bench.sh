@@ -10,9 +10,27 @@ BIN=${BIN:-target/release/macEverything}
 BENCH_HOME=$(mktemp -d /tmp/mce-bench-home.XXXXXX)
 export MCE_ROOTS="$ROOT"
 
+# 小目录走废纸篓(trash 不在时装提示保留,不静默);合成树体积大,不走废纸篓。
+trash_dir() {
+  local d=$1
+  [ -e "$d" ] || return 0
+  if command -v trash >/dev/null 2>&1; then
+    trash "$d" 2>/dev/null || echo "警告: trash 失败,留下 $d 待手动清理" >&2
+  else
+    echo "提示: 未找到 trash 命令,留下 $d 待手动清理" >&2
+  fi
+}
+
 cleanup() {
   HOME="$BENCH_HOME" "$BIN" stop >/dev/null 2>&1 || true
-  /usr/bin/trash "$BENCH_HOME" >/dev/null 2>&1 || true
+  trash_dir "$BENCH_HOME"
+  # 合成树默认保留(复查/复跑省去重建的分钟级开销);BENCH_PURGE_TREE=1 彻底删除
+  if [ "${BENCH_PURGE_TREE:-0}" = "1" ]; then
+    rm -rf "$ROOT"
+    echo "已删除合成树 $ROOT"
+  else
+    echo "合成树保留于 $ROOT(BENCH_PURGE_TREE=1 重跑可删,或手动清理)"
+  fi
 }
 trap cleanup EXIT
 
@@ -83,6 +101,7 @@ sleep 0.3
 printf "  冷启动到就绪(含重放): %ss\n" "$(wait_ready)"
 HITS=$(HOME="$BENCH_HOME" "$BIN" query "r9999" 2>/dev/null | head -1)
 printf "  重放补齐抽验: %s\n" "$HITS"
-rm -rf "$ROOT/__replay_window__"
+# 先停 daemon 再删窗口目录:运行中删除会与监听/事件处理竞态
 HOME="$BENCH_HOME" "$BIN" stop >/dev/null
+rm -rf "$ROOT/__replay_window__"
 echo "== 基准完成 =="
