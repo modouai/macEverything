@@ -1,0 +1,10 @@
+[package]
+name = "poc1-window"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "system_fonts"] }
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSApplication", "NSRunningApplication", "NSView", "NSScreen"] }
+raw-window-handle = "0.6.2"
