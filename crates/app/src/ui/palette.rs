@@ -21,6 +21,12 @@ use protocol::HitEntry;
 
 /// 防抖窗口(tech「查询会话」:60ms)。
 pub const DEBOUNCE: Duration = Duration::from_millis(60);
+/// 打字「突发窗口」:最后一次输入变更后此窗口内视为仍在打字,面板高度只长不缩
+/// (高度策略 A「冻结伸缩」,2026-10-16 实机抖动修复)。取值须大于连打间隔
+/// (实测 ~125ms/键)并覆盖防抖 60ms + 查询往返(~10ms),否则键间收拢会复发抖动。
+pub const BURST_IDLE: Duration = Duration::from_millis(320);
+/// 在途查询计入突发的最长时长(查询挂起时冻结不得永久卡死;超时即按停稳收拢)。
+const QUERY_INFLIGHT_MAX: Duration = Duration::from_secs(2);
 /// 「切 Space 失焦豁免」窗口期(product §1 键位表 2026-10-16 定;实机调参值):
 /// Space 变更落在**失焦时刻**之前不超过此值 → 本次失焦视为切 Space 所致。
 pub const SPACE_EXEMPT_WINDOW: Duration = Duration::from_millis(500);
@@ -181,11 +187,22 @@ pub struct PaletteState {
     show_at: Option<Instant>,
     /// 在途查询(代际号, 发起时刻):响应落地时记往返。
     query_sent: Option<(u64, Instant)>,
+    /// 面板内容冻结高度(策略 A:打字突发内的最大内容高,输入行 + 结果区整段;
+    /// None = 未冻结)。突发内只长不缩,输入停稳(BURST_IDLE)后收拢——消除逐键
+    /// 高度跳动(窗口高 = 该值 + 内外边距,冻住它即冻住窗口)。
+    frozen_panel_h: Option<f32>,
+    /// 最近一次输入变更时刻(突发窗口起算;仅输入帧更新,不随帧推进)。
+    last_input_at: Option<Instant>,
+    /// 空串清空待决:IME 过渡帧(Preedit("") 清组合)的空串不是用户清空,
+    /// 推迟到非过渡帧复判——预编辑帧不得清结果区(2026-10-16 抖动根因)。
+    pending_empty_clear: bool,
 }
 
 impl PaletteState {
+    /// `egui_ctx` 直传(不取 `eframe::CreationContext`):本类型只用其 Context,
+    /// 且 headless 测试要能直接构造(打字高度探针,见 tests::probe)。
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        egui_ctx: egui::Context,
         paths: DaemonPaths,
         viewport: egui::ViewportId,
         hotkey_note: Option<String>,
@@ -204,7 +221,7 @@ impl PaletteState {
             visible_rows: ROWS_INITIAL,
             full_window_request: None,
             paths,
-            ctx: cc.egui_ctx.clone(),
+            ctx: egui_ctx,
             viewport,
             tx,
             rx,
@@ -221,6 +238,9 @@ impl PaletteState {
             last_pass_start: None,
             show_at: None,
             query_sent: None,
+            frozen_panel_h: None,
+            last_input_at: None,
+            pending_empty_clear: false,
         }
     }
 
@@ -249,6 +269,9 @@ impl PaletteState {
         self.focus_pending_since = None;
         self.last_focused = None;
         self.last_h = None;
+        self.frozen_panel_h = None;
+        self.last_input_at = None;
+        self.pending_empty_clear = false;
     }
 
     /// 每帧驱动(悬浮条视口回调 `ui::draw_palette` 调用):防抖到期发查询;
@@ -415,6 +438,19 @@ impl PaletteState {
             }
         }
 
+        // 打字突发判定(高度策略 A 的冻结窗口):
+        // 末次输入在 BURST_IDLE 内 / 防抖在途 / 查询在途(超 QUERY_INFLIGHT_MAX 不计,
+        // 免得查询挂起把冻结卡死)。
+        let now = Instant::now();
+        let bursting = self.pending_empty_clear
+            || self
+                .last_input_at
+                .is_some_and(|t| now.saturating_duration_since(t) < BURST_IDLE)
+            || self.session.pending_delay(now).is_some()
+            || self
+                .query_sent
+                .is_some_and(|(_, t0)| now.saturating_duration_since(t0) < QUERY_INFLIGHT_MAX);
+
         let note = self.status_note.clone();
         let hotkey_note = self.hotkey_note.clone();
         let input = &mut self.input;
@@ -425,6 +461,10 @@ impl PaletteState {
             .corner_radius(egui::CornerRadius::same(PANEL_RADIUS))
             .inner_margin(egui::Margin::symmetric(PANEL_PAD_X, PANEL_PAD_Y))
             .show(ui, |ui| {
+                // 面板内容起点(冻结高度按「输入行 + 结果区」整段量,与窗口高一致:
+                // 只量结果区会在空态/列表两种排版间漏掉几 px 间距差,白白触发一次
+                // 窗口 resize——冻结要冻到窗口上才没有过渡帧)。
+                let panel_top = ui.min_rect().bottom();
                 // 内容宽 = 窗宽 - 左右边距 - 描边
                 ui.set_width(PANEL_W - 2.0 * PANEL_PAD_X as f32 - 2.0);
                 // —— 输入行:输入框占满余宽,角标贴右 ——
@@ -467,6 +507,10 @@ impl PaletteState {
                 }
 
                 // —— 结果列表 / 空态 / 计数行 ——
+                // 面板高度策略 A「冻结伸缩」(2026-10-16 实机抖动修复):打字突发内
+                // 只长不缩——结果随响应整体替换(0 命中/行数变少都不缩窗),突发结束
+                // (输入停稳 + 响应落地)后一次性收拢。逐键伸缩会连带窗口 resize 的过渡帧
+                // (旧帧内容未及重绘 → 拉伸/重影伪影)。
                 if self.results.is_empty() {
                     if matches!(self.session.state, State::Empty) {
                         ui.add_space(8.0);
@@ -538,6 +582,25 @@ impl PaletteState {
                         .weak(),
                     );
                 }
+                // 面板内容自然高(输入行 + 结果区)→ 冻结步进(只长不缩;停稳收拢兼留痕)。
+                let natural_h = (ui.min_rect().bottom() - panel_top).max(0.0);
+                let prev_frozen = self.frozen_panel_h;
+                let (frozen, pad) = freeze_step(prev_frozen, natural_h, bursting);
+                self.frozen_panel_h = frozen;
+                if !bursting {
+                    if let Some(prev) = prev_frozen {
+                        if (prev - natural_h).abs() > 4.0 {
+                            log::info!("面板冻结收拢:{prev:.0}px → {natural_h:.0}px(输入停稳)");
+                        }
+                    }
+                }
+                if pad > 0.0 {
+                    // `add_space` 顺带推进一个布局 item_spacing(垂直布局实测 +3pt);
+                    // 扣掉它,内容高才精确落到冻结值(窗口高 = 内容 + 内外边距),
+                    // 不然多出的几 pt 每次都会白触发一次窗口 resize。
+                    let gap = ui.spacing().item_spacing.y;
+                    ui.add_space((pad - gap).max(0.0));
+                }
                 input_resp
             });
 
@@ -561,18 +624,39 @@ impl PaletteState {
                     DEBOUNCE.as_millis()
                 );
             }
-            let now = Instant::now();
+            self.last_input_at = Some(now); // 突发窗口起算(面板冻结,见 BURST_IDLE)
             self.session.on_input(&self.input, now);
-            if self.input.is_empty() {
-                // 输入清空 = Idle 清空态:立即清结果,不等响应(product §1)
-                self.results.clear();
-                self.total = 0;
-                self.selected = 0;
-                self.status_note = None;
-            } else {
+            if !self.input.is_empty() {
                 // 防抖到期帧(空闲不排帧:隐藏/无输入时 CPU 仍 0%)
                 ctx.request_repaint_after(DEBOUNCE);
             }
+        }
+        // 输入清空 = Idle 清空态:立即清结果,不等响应(product §1)。
+        // 例外(2026-10-16 实机抖动根因):IME 过渡帧(Preedit("") 清组合)的空串不是
+        // 「用户清空」——macOS 选字事件序为 Preedit("") → Commit("字")(egui-winit
+        // 实测事件表),清组合那帧预编辑文本已移出输入框,此刻照清会把上一轮结果清掉、
+        // 面板缩回输入行,提交帧结果回来又弹开 → 逐字抖动。故过渡帧只置待决,
+        // 非过渡帧复判:提交随即到达(输入非空)→ 取消;组合真被取消(仍空且无 IME
+        // 事件)→ 照清。
+        let (do_clear, pending) = empty_clear_step(
+            input_resp.changed(),
+            self.ime_busy,
+            self.input.is_empty(),
+            self.pending_empty_clear,
+        );
+        if pending && !self.pending_empty_clear {
+            log::info!(
+                "空串清空待决:IME 过渡帧不清结果(现有 {} 项;提交到达即取消)",
+                self.results.len()
+            );
+        }
+        self.pending_empty_clear = pending;
+        if do_clear {
+            self.results.clear();
+            self.total = 0;
+            self.selected = 0;
+            self.status_note = None;
+            self.frozen_panel_h = None; // 清空即回输入行高(product §1)
         }
         if self.needs_focus {
             input_resp.request_focus();
@@ -584,6 +668,10 @@ impl PaletteState {
         if self.last_h.is_none_or(|last| (last - h).abs() > 1.0) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(PANEL_W, h)));
             self.last_h = Some(h);
+            // 尺寸命令异步落到窗口(下一帧才可能生效);立即补排一帧,让「窗口已变、
+            // 新区域未重绘」的过渡窗口尽量短——该窗口里合成器会把旧 framebuffer
+            // 拉伸展示,是实机「路径文字重影/行距拉大」瞬态伪影的来源之一。
+            ctx.request_repaint_of(self.viewport);
         }
 
         // —— 键位动作(在 TextEdit 处理完本帧事件之后:⌥↵ 取到最新输入词)——
@@ -606,7 +694,6 @@ impl PaletteState {
         // 宽限期内鼠标键按下同样立即隐藏(用户已点走)。ghost 态(豁免后的可见未聚焦)
         // 点击面板外也隐藏:该态下点其他应用不产生聚焦事件,只能靠鼠标键状态识别。
         // 边沿检测保证豁免后的常驻未聚焦不被反复起待决。
-        let now = Instant::now();
         let focused = ctx.input(|i| i.viewport().focused);
         let lost_edge = self.last_focused == Some(true) && focused == Some(false);
         if focused != self.last_focused {
@@ -782,6 +869,34 @@ impl Keys {
             }
         })
     }
+}
+
+/// 空串清空判定(纯逻辑;`draw` 输入处理节调用)。入参:`changed` = 本帧输入有变更;
+/// `ime_busy` = 本帧有 IME 事件(预编辑/提交);`empty` = 输入当前为空串;
+/// `pending` = 上帧留下的待决态。返回 (本帧是否执行清空, 新的待决态)。
+///
+/// IME 过渡帧(`ime_busy`)的空串只置待决、不清:macOS 选字事件序
+/// `Preedit("") → Commit("字")`(egui-winit 实测表)里清组合那帧输入会短暂为空,
+/// 照清会闪空面板(2026-10-16 实机抖动根因);下一帧提交到达(输入非空)即取消待决,
+/// 组合真被取消(仍空且无 IME 事件)则照清。
+fn empty_clear_step(changed: bool, ime_busy: bool, empty: bool, pending: bool) -> (bool, bool) {
+    let pending = if changed { empty } else { pending };
+    if pending && empty && !ime_busy {
+        (true, false)
+    } else {
+        (false, pending)
+    }
+}
+
+/// 面板冻结步进(纯逻辑;高度策略 A「冻结伸缩」):`bursting`(打字突发)内只长不缩,
+/// 冻结高取 `max(prev, natural)`,不足部分以补白(pad)补齐;停稳后收拢(冻结复位)。
+/// 返回 (新冻结高, 本帧补白高度)。
+fn freeze_step(prev: Option<f32>, natural_h: f32, bursting: bool) -> (Option<f32>, f32) {
+    if !bursting {
+        return (None, 0.0);
+    }
+    let frozen = prev.map_or(natural_h, |f| f.max(natural_h));
+    (Some(frozen), (frozen - natural_h).max(0.0))
 }
 
 /// 发起一次查询的工作线程(`client::query` + 顺带 `client::status`),结果经 mpsc
@@ -983,6 +1098,186 @@ mod tests {
         assert_eq!(sort_str(SortKey::Size), Some("size"));
         assert_eq!(sort_str(SortKey::Mtime), Some("mtime"));
         assert_eq!(sort_str(SortKey::Path), Some("path"));
+    }
+
+    // ------------------------------------------------------------------
+    // 打字高度探针(headless;「屏幕录屏 + 抽帧量面板底边」的应用层同构版):
+    // 逐帧注入输入法事件序(egui-winit 实测表形态:预编辑链 → Preedit("")+Commit
+    // 选字),查询响应手工注入(不起工作线程),记录每帧请求的窗口高度 `last_h`
+    // (= 屏上像素高 /2)与结果数。`--nocapture` 看序列表。
+    // 用途:打字段出现「结果→空态→结果」的逐键伸缩时此探针变红(突变验证用)。
+
+    /// 造 N 条命中(只用于行数/高度,内容不参与布局高度)。
+    fn hits(n: usize) -> Vec<HitEntry> {
+        (0..n)
+            .map(|i| HitEntry {
+                name: format!("命中{i}.md"),
+                path: format!("/tmp/mce-probe/Documents/子目录/命中{i}.md"),
+                size: None,
+                mtime: None,
+            })
+            .collect()
+    }
+
+    /// 跑一帧(注入事件 → draw),返回本帧请求的窗口高度。
+    fn probe_frame(ctx: &egui::Context, st: &mut PaletteState, events: Vec<egui::Event>) -> f32 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(PANEL_W, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        // 根 Ui 直驱(与 `ui::draw_palette` 的 deferred 视口回调同形态)。
+        let mut out = ctx.run_ui(raw, |ui| {
+            let _ = st.draw(ui);
+        });
+        out.textures_delta.clear(); // headless:不做纹理上传,清掉免得 Drop 告警
+        st.last_h.unwrap_or_default()
+    }
+
+    /// 防抖点火 + 注入合成响应(当代代际号取真正 fire 的),不起工作线程。
+    fn probe_respond(st: &mut PaletteState, rows: usize) {
+        let fire = st
+            .session
+            .pending_at(Instant::now() + DEBOUNCE)
+            .expect("有待发查询才注入响应");
+        let entries = hits(rows);
+        st.apply(QueryResult {
+            generation: fire.generation,
+            payload: Payload::Hits {
+                entries,
+                total: rows as u32,
+                elapsed_ms: 0.1,
+                stat_ms: 0.1,
+                offline: false,
+                sort_echo: String::new(),
+                requested_sort: None,
+            },
+            engine: None,
+        });
+    }
+
+    fn probe_preedit(t: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: t.into(),
+            active_range_chars: None,
+        })
+    }
+
+    fn probe_commit(t: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Commit(t.into()))
+    }
+
+    /// 打字突发(中文输入法)全链:预编辑链保留结果 → 选字 0 命中不缩窗 → 停稳收拢。
+    /// 断言即回归门:突发内高度只长不缩(突变验证:关掉冻结补白/空串待决即红)。
+    #[test]
+    fn typing_burst_height_sequence_never_shrinks() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        let mut seq: Vec<(String, String, usize, f32)> = Vec::new();
+        // 预热两帧:首帧 request_focus,次帧起输入框持焦(IME 事件才归它)。
+        for _ in 0..2 {
+            let h = probe_frame(&ctx, &mut st, vec![]);
+            seq.push(("warm".into(), st.input.clone(), st.results.len(), h));
+        }
+        let step = |st: &mut PaletteState,
+                    seq: &mut Vec<(String, String, usize, f32)>,
+                    tag: &str,
+                    events: Vec<egui::Event>| {
+            let h = probe_frame(&ctx, st, events);
+            seq.push((tag.into(), st.input.clone(), st.results.len(), h));
+            // 把「刚打过字」钉在当下:探针验的是冻结逻辑,不该受机器快慢影响
+            // (慢机上帧间隔一旦超过 BURST_IDLE,键间就会提前收拢,断言假红)。
+            st.last_input_at = Some(Instant::now());
+        };
+
+        // 第 1 字:提交「湖」→ 防抖 → 8 行结果。
+        step(&mut st, &mut seq, "commit 湖", vec![probe_commit("湖")]);
+        probe_respond(&mut st, 8);
+        step(&mut st, &mut seq, "resp 8行", vec![]);
+        let h_8 = seq.last().unwrap().3;
+
+        // 第 2 字组合链(预编辑帧:不动结果区、不触发查询)——结果与高度都保留。
+        for p in ["h", "hu", "hua", "huan"] {
+            step(&mut st, &mut seq, "preedit", vec![probe_preedit(p)]);
+            assert_eq!(
+                st.results.len(),
+                8,
+                "预编辑帧不得清结果(输入={:?})",
+                st.input
+            );
+            assert!(
+                (seq.last().unwrap().3 - h_8).abs() < 1.0,
+                "预编辑帧不得缩窗:{} → {}",
+                h_8,
+                seq.last().unwrap().3
+            );
+        }
+
+        // 选字(macOS 实测序:Preedit("") 清组合 → Commit("换")):0 命中响应到达,
+        // 结果整体替换为空态,但突发内高度只长不缩。
+        step(
+            &mut st,
+            &mut seq,
+            "select 换(0命中)",
+            vec![probe_preedit(""), probe_commit("换")],
+        );
+        probe_respond(&mut st, 0);
+        step(&mut st, &mut seq, "resp 0行", vec![]);
+        let h_0 = seq.last().unwrap().3;
+        assert!(st.results.is_empty(), "0 命中响应整体替换结果");
+        assert!(
+            h_0 >= h_8 - 1.0,
+            "0 命中响应不得缩窗(冻结只长不缩):{h_8} → {h_0}"
+        );
+
+        // 停稳(BURST_IDLE 过后):一次性收拢到自然高(无匹配项)。
+        std::thread::sleep(BURST_IDLE + Duration::from_millis(80));
+        step(&mut st, &mut seq, "settle", vec![]);
+        let h_settle = seq.last().unwrap().3;
+        assert!(h_settle < h_0 - 4.0, "输入停稳后应收拢:{h_0} → {h_settle}");
+
+        for (tag, input, rows, h) in &seq {
+            println!("{tag:<16} 输入={input:<12} 结果={rows:<3} 窗高={h:.0}px");
+        }
+    }
+
+    /// 空串清空判定:IME 过渡帧不清(预编辑帧不动结果区),非过渡帧照清(product §1)。
+    #[test]
+    fn empty_clear_defers_on_ime_transition_frame() {
+        // macOS 选字事件序(egui-winit 实测表):Preedit("") 清组合 → Commit("字")。
+        // 帧1:清组合(输入被清空 + 本帧有 IME 事件)→ 不清,置待决。
+        assert_eq!(empty_clear_step(true, true, true, false), (false, true));
+        // 帧2:提交到达(输入非空)→ 待决取消,不清。
+        assert_eq!(empty_clear_step(true, true, false, true), (false, false));
+        // 组合真被取消(仍空且无 IME 事件)→ 复判执行清空。
+        assert_eq!(empty_clear_step(false, false, true, true), (true, false));
+        // 用户退格清空(无 IME 事件)→ 立即清(product §1:清空即清结果)。
+        assert_eq!(empty_clear_step(true, false, true, false), (true, false));
+        // 无变更且非空 → 不误清、不误置待决。
+        assert_eq!(empty_clear_step(false, false, false, false), (false, false));
+    }
+
+    /// 结果区冻结步进:打字突发内只长不缩(补白补齐),停稳一次性收拢。
+    #[test]
+    fn freeze_step_grows_only_until_settled() {
+        // 突发首帧:以当帧高度为基线,无补白。
+        assert_eq!(freeze_step(None, 200.0, true), (Some(200.0), 0.0));
+        // 结果变少(0 命中 / 行数下降):保持冻结高,补白补齐——不缩窗。
+        assert_eq!(freeze_step(Some(200.0), 120.0, true), (Some(200.0), 80.0));
+        // 结果变多:跟随升高,无补白。
+        assert_eq!(freeze_step(Some(200.0), 260.0, true), (Some(260.0), 0.0));
+        // 输入停稳:冻结复位,高度回到自然高(单次过渡)。
+        assert_eq!(freeze_step(Some(200.0), 120.0, false), (None, 0.0));
     }
 
     #[test]

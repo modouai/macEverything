@@ -296,7 +296,7 @@ impl App {
         let hotkey_note = hotkey.note().map(str::to_string);
         let shared = Arc::new(Mutex::new(Shared {
             palette: palette::PaletteState::new(
-                cc,
+                cc.egui_ctx.clone(),
                 paths.clone(),
                 palette_viewport_id(),
                 hotkey_note,
