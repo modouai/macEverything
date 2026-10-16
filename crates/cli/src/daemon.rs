@@ -64,6 +64,13 @@ fn now_secs() -> u64 {
 }
 
 fn default_roots() -> Result<Vec<PathBuf>> {
+    // MCE_ROOTS(冒号分隔)覆盖扫描根:基准与隔离测试用;生产缺省 = 主目录 + /Applications。
+    if let Some(v) = std::env::var_os("MCE_ROOTS") {
+        let roots: Vec<PathBuf> = std::env::split_paths(&v).collect();
+        if !roots.is_empty() {
+            return Ok(roots);
+        }
+    }
     let home = std::env::var_os("HOME").context("HOME 未设置,无法确定扫描根")?;
     Ok(vec![PathBuf::from(home), PathBuf::from("/Applications")])
 }
@@ -85,6 +92,9 @@ pub struct EngineState {
     stopping: AtomicBool,
     dirty: AtomicU64,
     last_flush: Mutex<Instant>,
+    /// 落盘串行锁:stop 落盘与消费线程退出落盘/节流落盘互斥(曾实测并发
+    /// write_atomic 交错损坏索引;tmp 名唯一化之外的语义级双保险)。
+    flush_lock: Mutex<()>,
     dir_map: Mutex<HashMap<PathBuf, u32>>,
     roots: Mutex<Vec<PathBuf>>,
     cfg: Mutex<config::Config>,
@@ -102,6 +112,7 @@ impl EngineState {
             stopping: AtomicBool::new(false),
             dirty: AtomicU64::new(0),
             last_flush: Mutex::new(Instant::now()),
+            flush_lock: Mutex::new(()),
             dir_map: Mutex::new(HashMap::new()),
             roots: Mutex::new(vec![]),
             cfg: Mutex::new(config::Config { excluded: vec![] }),
@@ -243,35 +254,29 @@ fn rebuild_dir_map(state: &EngineState) {
 }
 
 /// 对单个绝对目录执行 diff 并维护 dir_map。锁序:holder(write) → dir_map。
-fn diff_one(state: &EngineState, abs_dir: &Path) {
-    // canonical 基址统一形态:map 键全 canonical;diff 的读取目录与子键拼接同基址。
-    let base = abs_dir
-        .canonicalize()
-        .unwrap_or_else(|_| abs_dir.to_path_buf());
-    let mut h = state.holder.write().unwrap();
-    let IndexHolder::Mutable(idx) = &mut *h else {
+/// 对单个已索引目录执行 diff:应用目录变化 + 记账 + 局部 dir_map 更新。
+fn apply_and_track(
+    state: &EngineState,
+    idx: &mut Index,
+    map: &mut HashMap<PathBuf, u32>,
+    abs_dir: &Path,
+    excludes: &[std::path::PathBuf],
+) {
+    let Some(&dir_idx) = map.get(abs_dir) else {
         return;
-    };
-    let mut map = state.dir_map.lock().unwrap();
-    // 直查(canonical 基址)覆盖 map 键形态;再退回字面键(历史插入/特殊场景)。
-    let dir_idx = match map.get(&base).or_else(|| map.get(abs_dir)) {
-        Some(&i) => i,
-        None => return, // 未索引目录(排除内/根外/已删):忽略
     };
     if !idx.entries[dir_idx as usize].is_live() {
-        map.remove(&base); // 目录已删(子树墓碑):清映射,不做 diff
-        map.remove(abs_dir);
+        map.remove(abs_dir); // 目录已删(子树墓碑):清映射,不做 diff
         return;
     }
-    let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
-    match watcher::apply_dir_diff(idx, dir_idx, &base, &excludes) {
+    match watcher::apply_dir_diff(idx, dir_idx, abs_dir, excludes) {
         Ok(stats) => {
             state
                 .dirty
                 .fetch_add((stats.added + stats.removed) as u64, Ordering::Relaxed);
             for k in idx.children_of(dir_idx) {
                 if idx.entries[k as usize].is_dir() {
-                    let mut p = base.clone();
+                    let mut p = abs_dir.to_path_buf();
                     p.push(String::from_utf8_lossy(idx.display_name_of(k)).into_owned());
                     map.insert(p, k);
                 }
@@ -279,9 +284,53 @@ fn diff_one(state: &EngineState, abs_dir: &Path) {
         }
         Err(e) => {
             state.io_errors.fetch_add(1, Ordering::Relaxed);
-            log::warn!("目录 diff 失败 {}: {e}", base.display());
+            log::warn!("目录 diff 失败 {}: {e}", abs_dir.display());
         }
     }
+}
+
+fn diff_one(state: &EngineState, abs_dir: &Path) {
+    // canonical 基址统一形态:map 键全 canonical;diff 的读取目录与子键拼接同基址。
+    let base = abs_dir
+        .canonicalize()
+        .unwrap_or_else(|_| abs_dir.to_path_buf());
+    let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
+    let mut h = state.holder.write().unwrap();
+    let IndexHolder::Mutable(idx) = &mut *h else {
+        return;
+    };
+    let mut map = state.dir_map.lock().unwrap();
+
+    // 目标未索引:事件风暴下子目录事件可能先于其父目录的 diff 到达(新建目录树),
+    // 直查必然 miss。从最近已索引祖先逐级向下补 diff(每级纳入其直接子项),
+    // 再应用目标自身——否则新目录内容要等下次重放/重扫才可见。
+    if !map.contains_key(&base) {
+        let mut chain: Vec<PathBuf> = Vec::new(); // [目标, …, 未索引的第一级]
+        let mut cur = base.clone();
+        loop {
+            let Some(parent) = cur.parent().map(Path::to_path_buf) else {
+                return; // 根之外:忽略
+            };
+            chain.push(cur.clone());
+            cur = parent;
+            if map.contains_key(&cur) {
+                break;
+            }
+        }
+        for next in chain.iter().rev() {
+            if engine::scanner::is_excluded(next, &excludes) {
+                return; // 链上出现排除目录:不拉回索引
+            }
+            apply_and_track(state, idx, &mut map, &cur, &excludes);
+            if !map.contains_key(next) {
+                return; // 祖先 diff 未纳入该级(根外/竞态删):放弃
+            }
+            cur = next.clone();
+        }
+        // 走完 chain 后 cur == base(目标自身尚未 diff)
+    }
+
+    apply_and_track(state, idx, &mut map, &base, &excludes);
 }
 
 fn build_meta(state: &EngineState) -> IndexMeta {
@@ -304,8 +353,9 @@ fn build_meta(state: &EngineState) -> IndexMeta {
     }
 }
 
-/// 快照落盘(原子替换);失败留痕不中断。
+/// 快照落盘(原子替换,flush_lock 串行化);失败留痕不中断。
 fn flush(state: &EngineState, paths: &DaemonPaths) {
+    let _guard = state.flush_lock.lock().unwrap();
     let h = state.holder.read().unwrap();
     if let IndexHolder::Mutable(idx) = &*h {
         let meta = build_meta(state);
@@ -315,6 +365,25 @@ fn flush(state: &EngineState, paths: &DaemonPaths) {
             state.dirty.store(0, Ordering::Relaxed);
             *state.last_flush.lock().unwrap() = Instant::now();
         }
+    }
+}
+
+/// 最终落盘(stop 路径):持 flush_lock 串行化;返回 (落盘成功, 条目数)。
+fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
+    let _guard = state.flush_lock.lock().unwrap();
+    let h = state.holder.read().unwrap();
+    match &*h {
+        IndexHolder::Mutable(idx) => {
+            let meta = build_meta(state);
+            match persist::write_atomic(idx, &meta, &paths.index_file()) {
+                Ok(()) => (true, idx.entry_count()),
+                Err(e) => {
+                    log::error!("最终落盘失败: {e}");
+                    (false, idx.entry_count())
+                }
+            }
+        }
+        _ => (true, 0),
     }
 }
 
@@ -347,8 +416,12 @@ fn consume_events(
             Ok(ev) => {
                 state.last_event_id.store(ev.id, Ordering::Relaxed);
                 if fsevents::is_history_done(ev.flags) {
-                    // 重放追平:转就绪并落盘一次(更新 last_event_id)
                     if is_replay {
+                        // 追平前强制应用窗口内 pending 事件:否则「就绪」早于索引追上,
+                        // 紧随的查询会漏停机窗口内的变更(实机重放抽验曾因此为空)。
+                        for dir in batcher.drain_all() {
+                            diff_one(&state, Path::new(&dir));
+                        }
                         state.set_state(state::READY);
                         flush(&state, &paths);
                     }
@@ -575,21 +648,11 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         }
         Request::Stop { .. } => {
             state.stopping.store(true, Ordering::SeqCst);
-            // 最终落盘完成后才响应(契约:响应即落盘已保证)
-            let n = {
-                let h = state.holder.read().unwrap();
-                match &*h {
-                    IndexHolder::Mutable(idx) => {
-                        let meta = build_meta(state);
-                        let _ = persist::write_atomic(idx, &meta, &paths.index_file());
-                        idx.entry_count()
-                    }
-                    _ => 0,
-                }
-            };
+            // 最终落盘完成后才响应(契约:响应即落盘已保证);落盘失败如实 ok=false
+            let (ok, n) = persist_final(state, paths);
             let _ = std::fs::remove_file(paths.socket());
             Response::Stop {
-                ok: true,
+                ok,
                 final_entry_count: n,
             }
         }

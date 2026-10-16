@@ -28,8 +28,9 @@ pub struct ScanGaps {
 /// 排除判定:绝对路径排除按前缀命中(整棵子树剪枝);相对名排除(如
 /// `node_modules`、`.git`)按「路径任一组件等于该名」匹配——语义见
 /// `reconcile::expand_excludes` 契约(product §1 默认排除即名字式)。
-/// 首扫(scanner)与增量(watcher::apply_dir_diff)共用此判定,两条路径语义一致。
-pub(crate) fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
+/// 首扫(scanner)、增量(watcher::apply_dir_diff)与 daemon 补链共用此判定,
+/// 三条路径语义一致。
+pub fn is_excluded(p: &Path, excludes: &[PathBuf]) -> bool {
     excludes.iter().any(|x| {
         if x.is_absolute() {
             p.starts_with(x)

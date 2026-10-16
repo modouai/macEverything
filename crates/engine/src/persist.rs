@@ -112,7 +112,16 @@ pub(crate) fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
             "路径无文件名,无法构造临时文件",
         )
     })?;
-    Ok(path.with_file_name(format!("{}.tmp", name.to_string_lossy())))
+    // pid + 进程内序号:防并发写同一目标时两方共用 tmp 名互相踩踏
+    // (daemon 的 stop 落盘与消费线程退出落盘曾实测交错损坏索引文件)。
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        seq
+    )))
 }
 
 // —— 读侧:mmap 零反序列化加载(ADR-3) ——

@@ -37,6 +37,13 @@ impl DirBatcher {
         self.last_push = (self.now)();
         self.pending.drain().collect()
     }
+
+    /// 无视窗口强制取出全部待处理目录:重放追平(HistoryDone)前必须先把窗口内
+    /// pending 事件应用完,否则「就绪」会早于索引追上(实机重放抽验曾因此为空)。
+    pub fn drain_all(&mut self) -> Vec<String> {
+        self.last_push = (self.now)();
+        self.pending.drain().collect()
+    }
 }
 
 pub fn now_stub() -> fn() -> Instant {

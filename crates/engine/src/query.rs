@@ -1,7 +1,7 @@
 //! 查询计划:解析(product.md §4 契约)→ 匹配内核与打分。
 use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, NO_PARENT};
 use crate::index::IndexView;
-use memchr::memmem;
+use memchr::memmem::Finder;
 use rayon::prelude::*;
 use unicode_normalization::is_nfc;
 
@@ -144,6 +144,9 @@ pub struct QueryOutcome {
 pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOutcome {
     let t = std::time::Instant::now();
     let entries = view.entries();
+    // 预编译:Finder 构建一次,百万条目匹配零重建(主开销消除)。
+    let c_name: Vec<CPattern> = plan.name_terms.iter().map(CPattern::compile).collect();
+    let c_path: Vec<CPattern> = plan.path_terms.iter().map(CPattern::compile).collect();
 
     // path 命中目录集:目录条目的路径池段命中全部 path_terms。池段是折叠形态,
     // 路径词在解析侧恒按折叠编译(case: 只作用于文件名侧),此处比对两侧同形态;
@@ -156,7 +159,9 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
             .into_par_iter()
             .map(|idx| {
                 let e = &entries[idx as usize];
-                e.is_dir() && e.is_live() && path_terms_match(view.dir_path(idx), plan)
+                e.is_dir()
+                    && e.is_live()
+                    && path_terms_match(view.dir_path(idx), &c_path, plan.whole_word)
             })
             .collect()
     };
@@ -178,7 +183,8 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                 // 文件只取自身名;tech.md「父路径+名称短拼」留待需求出现再落
                 // (Task 21 回填 tech.md),现行为即已知限制。
                 let under_hit_dir = e.parent != NO_PARENT && dir_hits[e.parent as usize];
-                let name_hits_path = !e.is_dir() && path_terms_match(view.match_name(idx), plan);
+                let name_hits_path =
+                    !e.is_dir() && path_terms_match(view.match_name(idx), &c_path, plan.whole_word);
                 if !under_hit_dir && !name_hits_path {
                     return None;
                 }
@@ -202,15 +208,13 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
             } else {
                 std::borrow::Cow::Borrowed(view.match_name(idx))
             };
-            if !plan.name_terms.is_empty()
-                && !plan.name_terms.iter().all(|pt| match_pattern(&target, pt))
-            {
+            if !c_name.is_empty() && !c_name.iter().all(|pt| match_pattern(&target, pt)) {
                 return None;
             }
-            if plan.whole_word && !all_parts_word_bounded(&target, &plan.name_terms) {
+            if plan.whole_word && !all_parts_word_bounded(&target, &c_name) {
                 return None;
             }
-            Some((score_of(&target, plan), target.len(), idx))
+            Some((score_of(&target, &c_name), target.len(), idx))
         })
         .collect();
 
@@ -240,15 +244,51 @@ fn cmp_rows(a: &(u8, usize, u32), b: &(u8, usize, u32)) -> std::cmp::Ordering {
 
 /// path 词对一段路径字节的匹配:全部 Pattern 命中;`whole:` 开启时各段还须整词出现
 /// (case:/whole: 作用于整轮,tech.md——路径侧不得静默退化为子串)。
-fn path_terms_match(bytes: &[u8], plan: &QueryPlan) -> bool {
-    plan.path_terms.iter().all(|pt| match_pattern(bytes, pt))
-        && (!plan.whole_word || all_parts_word_bounded(bytes, &plan.path_terms))
+/// 预编译段:普通段携带 memchr Finder——`memmem::find` 每次调用都重建 Finder
+/// (needle 预处理),百万条目逐条调用是查询主开销;预编译后搜索只做 SIMD 扫描。
+/// QMARK 段与空段无 Finder(走逐字节/恒真)。
+struct CPart {
+    bytes: Vec<u8>,
+    finder: Option<Finder<'static>>,
+}
+
+/// 预编译 Pattern(execute 入口一次;不改变公开 Pattern 契约)。
+struct CPattern {
+    parts: Vec<CPart>,
+    prefix_anchor: bool,
+    suffix_anchor: bool,
+}
+
+impl CPattern {
+    fn compile(p: &Pattern) -> Self {
+        Self {
+            parts: p
+                .parts
+                .iter()
+                .map(|b| CPart {
+                    finder: if b.is_empty() || b.contains(&QMARK) {
+                        None
+                    } else {
+                        Some(Finder::new(b).into_owned())
+                    },
+                    bytes: b.clone(),
+                })
+                .collect(),
+            prefix_anchor: p.prefix_anchor,
+            suffix_anchor: p.suffix_anchor,
+        }
+    }
+}
+
+fn path_terms_match(bytes: &[u8], path_terms: &[CPattern], whole: bool) -> bool {
+    path_terms.iter().all(|pt| match_pattern(bytes, pt))
+        && (!whole || all_parts_word_bounded(bytes, path_terms))
 }
 
 /// 单 Pattern 命中判定:parts 按序锚定扫描——首段(前锚时)必须命中在名称开头,
 /// 末段(尾锚时)必须命中到名称结尾,中段依次 memmem 且位置递增;
 /// 空段序列(纯 `*`)恒真。含 QMARK 的段逐字节比对,QMARK 跳过一个 UTF-8 字符。
-fn match_pattern(name: &[u8], p: &Pattern) -> bool {
+fn match_pattern(name: &[u8], p: &CPattern) -> bool {
     if p.parts.is_empty() {
         return true;
     }
@@ -259,14 +299,20 @@ fn match_pattern(name: &[u8], p: &Pattern) -> bool {
         let tail_anchored = pi == last && p.suffix_anchor;
         let end = if head_anchored {
             // 前锚只试位置 0(QMARK 段也走 match_at)
-            match_at(name, 0, part)
-        } else if part.contains(&QMARK) {
-            find_with_qmark(name, cursor, part, tail_anchored)
-        } else if tail_anchored {
-            // 尾锚取最后一次出现:若它延伸不到结尾,更早的出现更不能(memmem rfind)
-            memmem::rfind(&name[cursor..], part).map(|o| cursor + o + part.len())
+            match_at(name, 0, &part.bytes)
+        } else if let Some(f) = &part.finder {
+            let hay = &name[cursor..];
+            if tail_anchored {
+                // 尾锚取最后一次出现:若它延伸不到结尾,更早的出现更不能
+                f.find_iter(hay)
+                    .last()
+                    .map(|o| cursor + o + part.bytes.len())
+            } else {
+                f.find(hay).map(|o| cursor + o + part.bytes.len())
+            }
         } else {
-            memmem::find(&name[cursor..], part).map(|o| cursor + o + part.len())
+            // QMARK 段(compile 后 finder 为 None;空段不会出现在这里)
+            find_with_qmark(name, cursor, &part.bytes, tail_anchored)
         };
         match end {
             Some(e) if !tail_anchored || e == name.len() => cursor = e,
@@ -329,14 +375,14 @@ fn utf8_char_len(b: u8) -> usize {
 /// 多词查询打分只取首词首段(其余词只参与命中判定;product/tech 未定义多词打分,
 /// 以首词为准是已文档化的决策)。无名词(纯 path)或首 part 缺失(纯 `*`)一律 3,
 /// 排序退化为按名长升序。
-fn score_of(target: &[u8], plan: &QueryPlan) -> u8 {
-    let Some(part) = plan.name_terms.first().and_then(|p| p.parts.first()) else {
+fn score_of(target: &[u8], name_terms: &[CPattern]) -> u8 {
+    let Some(part) = name_terms.first().and_then(|p| p.parts.first()) else {
         return 3;
     };
-    if match_at(target, 0, part).is_some() {
+    if match_at(target, 0, &part.bytes).is_some() {
         return 3;
     }
-    if !part.contains(&QMARK) && word_boundary_hit(target, part) {
+    if part.finder.is_some() && word_boundary_hit(target, part) {
         return 2;
     }
     1
@@ -344,20 +390,25 @@ fn score_of(target: &[u8], plan: &QueryPlan) -> u8 {
 
 /// `whole:` 语义:name_terms 每个非空、不含 QMARK 的 part 都须整词出现
 /// (QMARK 段消耗定长不定字节,词边界不可判定,豁免)。
-fn all_parts_word_bounded(target: &[u8], terms: &[Pattern]) -> bool {
+fn all_parts_word_bounded(target: &[u8], terms: &[CPattern]) -> bool {
     terms.iter().all(|p| {
-        p.parts
-            .iter()
-            .all(|part| part.is_empty() || part.contains(&QMARK) || word_boundary_hit(target, part))
+        p.parts.iter().all(|part| {
+            part.bytes.is_empty() || part.finder.is_none() || word_boundary_hit(target, part)
+        })
     })
 }
 
 /// part 以整词边界出现在名中:命中位置 0 或前字节非词字符,尾部同理。
-fn word_boundary_hit(name: &[u8], part: &[u8]) -> bool {
+fn word_boundary_hit(name: &[u8], part: &CPart) -> bool {
+    // 调用方(all_parts_word_bounded/score_of)已豁免空段与 QMARK 段;
+    // finder 缺失即豁免场景,视为命中(与原实现的短路语义一致)。
+    let Some(f) = &part.finder else {
+        return true;
+    };
     let mut from = 0usize;
-    while let Some(o) = memmem::find(&name[from..], part) {
+    while let Some(o) = f.find(&name[from..]) {
         let pos = from + o;
-        let end = pos + part.len();
+        let end = pos + part.bytes.len();
         if (pos == 0 || !is_word_byte(name[pos - 1]))
             && (end == name.len() || !is_word_byte(name[end]))
         {

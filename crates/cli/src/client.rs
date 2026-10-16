@@ -58,6 +58,9 @@ pub fn stop(paths: &DaemonPaths) -> Result<()> {
             println!("已停止,最终条目数 {final_entry_count}");
             Ok(())
         }
+        Response::Stop { ok: false, .. } => {
+            bail!("daemon 已停止,但最终落盘失败(详情见数据目录 daemon.log)")
+        }
         other => bail!("意外响应: {other:?}"),
     }
 }
