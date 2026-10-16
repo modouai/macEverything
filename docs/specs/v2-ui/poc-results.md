@@ -585,3 +585,72 @@ tail -f /tmp/poc5.log                 # 输出日志（open 方式唯一取证�
 1. **注册后的 BTM 原始 dump 未取得**（sfltool 授权门禁）；如需补证，辉哥在终端跑 `sudo sfltool dumpbtm | grep -i poc5`（会要求输入密码）或看「系统设置 → 登录项与扩展」。
 2. **`requiresApproval(2)` 状态未在本机观察到**（首登审批路径）；重启验证时留意是否出现提示。
 3. **DR 不匹配时的登录拉起行为未验证**（改二进制后再重启的场景，即「App 更新后登录项是否仍能拉起」）——本 PoC 终态已用与源码一致的 cdhash 注册，该场景待后续版本实测。
+
+---
+
+## Task 14：平台行为产品化（悬浮条平台落地）
+
+**状态：✅ 八项实机验证全过；L1/L2 选路 A（deferred 视口 + 常驻）；与 PoC 结论两处出入已记录（见文末「与 PoC 结论的出入」）。**
+
+- **日期**：2026-10-16
+- **实锁版本**：eframe / egui 0.37.0、objc2 0.6.5、objc2-app-kit 0.3.2、objc2-foundation 0.3.2、raw-window-handle 0.6.2（新增直接依赖：`objc2-foundation`；objc2-app-kit 增 `NSScreen` / `NSEvent` / `NSView` features）
+- **代码**：`crates/app/src/platform/{mod,mac}.rs`（补丁 + 原生路径；unsafe 集中）、`crates/app/src/ui/mod.rs`（视口形态与唤起/隐藏流）、`crates/app/src/ui/theme.rs`（`ThemeFollow`）、`crates/app/src/ui/palette.rs`（回投定向唤醒）
+- **验证环境**：macOS 27.0、双屏（主屏 x∈[0,1920)、副屏 x∈[1920,3840)，各 1920x1080 逻辑点）、运行中引擎（条目 ~120 万）
+
+### 实现形态（相对 Task 12 的改动）
+
+| 维度 | Task 12（旧） | Task 14（现） | 依据 |
+| --- | --- | --- | --- |
+| 视口类型 | immediate（隐藏即销毁） | **deferred + 常驻**（每 pass 注册；窗口直到进程退出才销毁） | L1/L2 选路 A |
+| 隐藏路径 | 视口销毁 | `ViewportCommand::Visible(false)`（winit → `orderOut`，窗口保留） | L2 |
+| 显示路径 | winit 视口重建 | 平台层原生 `orderFrontRegardless` + `makeKeyWindow`（主线程） | tech 表「显示路径（定案）」 |
+| 补丁时机 | 每次创建 | 视口窗创建后首见即施（`NSApp.windows()` 按标题定位 → 换类 + 五要素 + 补丁 a）；可见期每帧漂移核对 | 本文件「必须的属性组合」 |
+| 还原类时机 | 关窗前 | 进程退出（`App::on_exit` → `revert_class`；常驻形态下唯一销毁点） | 补丁 b |
+| 位置 | ViewportBuilder position | 平台层原生 `setFrameOrigin`（鼠标屏可见区，顶边在上 1/4）；高度变化「顶边钉住」重锚 | tech 表「多屏定位」 |
+| 排帧 | 根视口 logic 每 2s 常排 | 仅悬浮条可见期（悬浮条 pass 自排；根视口隐藏即停） | L4 |
+| 根窗关闭 | 退出 App | 取消关闭 + 隐藏窗口（product §2「关闭窗口不退出」；悬浮条 ⌥↵ 原生唤回） | 本次顺带（托盘退出 Task 16） |
+
+补丁施加实测回读（启动日志）：`换类 NSKVONotifying_WinitWindow → MacePalettePanel（实例大小 528==528）；level=3；CanJoinAllSpaces=true；FullScreenAuxiliary=true；styleMask=0x8c；first_responder=true`。
+
+### 八项实机验证（逐项取证）
+
+| # | 验证项 | 结论 | 取证 |
+| --- | --- | --- | --- |
+| 1 | 跨他人全屏 Space | ✅ 通过 | `poc1b-fs-actor`（独立进程全屏，新建 Space）激活期触发唤起 → `CGWindowList(.optionOnScreenOnly)` 同屏并列 `layer=3 palette bounds=(660,294 600x44)` 与对方 `layer=0 (0,30 1920x1050)`；截图面板压在全屏窗内容上；`lsappinfo front` 仍是对方进程（未夺前台）；面板内合成键入「报告」→ 结果出现（共 1145 项） |
+| 2 | 多桌面 Space 切换跟随 | ✅ 通过（带焦点条件） | 显示中 ⌃→ 切 Space（窗口清单指纹变化佐证已切换）→ 面板仍在屏同位置；**若目标 Space 的应用接管焦点则按「失焦隐藏」隐藏**（actor 退出触发 Space 回切那轮实测到）——见「与 PoC 结论的出入」#2 |
+| 3 | 失焦隐藏 | ✅ 通过 | 显示中激活他应用（Finder/Chrome）→ 日志「悬浮条隐藏（Esc/打开成功/失焦）」+ 清单转空；多次往返稳定 |
+| 4 | 多屏定位 | ✅ 通过 | 鼠标移至副屏 (2700,500) 触发唤起 → 日志 `origin=(2580, 743)`、清单 `bounds=(2580,294 600x44)`（副屏水平居中、顶边同主屏相对位）；`screencapture -D 2` 截图副屏见面板；鼠标回主屏再唤起 → 回主屏居中 |
+| 5 | 键盘（唤起即打字，不点） | ✅ 通过 | 面板成 key（`isKeyWindow=true`）后，合成 HID 键（CGEvent unicode 注入/键码 Esc/⌥↵）直达面板：键入即出结果、Esc 隐藏、⌥↵ 打开完整窗口；**中文**：辉哥实机用输入法检索并打开文件（应用日志「默认应用打开：/Users/alex/TeamDrive/…pdf」+ 输入法 IMK 与进程交互记录） |
+| 6 | CPU 红线复核（悬浮条隐藏 + 主窗隐藏 60s） | ✅ 通过 | `top -l 2 -s 1 -pid <pid> -stats cpu` 12/12 = 0.0%；`ps -o time=` 累计 CPU 0:01.55 → 0:01.55（60s 零增量） |
+| 7 | L1 复现（主窗被完全遮挡 → 唤起可用） | ✅ 通过 | 主窗被全屏应用 Space 覆盖/不在当前 Space 时触发唤起 → 面板出现并可搜（同 #1 取证，主窗全程不在屏） |
+| 8 | 关窗不崩（往返压测） | ✅ 通过 | 20 轮「唤起 → Esc 隐藏」循环（另加多轮显隐）：进程存活、日志零 `abort/panic`；退出路径日志「悬浮条窗口类还原：MacePalettePanel → NSKVONotifying_WinitWindow」+ 进程干净退出（补丁 b 生效） |
+
+补充观察（非本任务引入）：多视口下第二个窗（悬浮条）的 GL config 不支持透明，eframe 首帧报 `Cannot create transparent window: the GL config does not support it`——Task 12/13 会话日志同报（`/tmp/mce12-app.log`、`/tmp/mce13-*.log` 均含该行），属 eframe/glutin 多视口能力面；视觉影响仅圆角外区域（面板 Frame 自身底色正常）。
+
+### 四个遗留的处置
+
+- **L1（immediate 视口只随根视口 pass 渲染）→ 选 A：改 `show_viewport_deferred`**。依据（实锁 eframe 0.37 源码）：immediate 视口的自身窗事件被重定向给父窗（`glow_integration.rs` `is_immediate && viewport_id != ROOT` 分支），deferred 视口有独立 pass（`viewport_ui_cb.is_some()` 走完整渲染路径）。实测：主窗被他人全屏覆盖/不在当前 Space 时，唤起 + 键入 + 结果渲染全通（#7/#1）。
+- **L2（隐藏即销毁视口窗）→ deferred 视口可「orderOut 隐藏不销毁」，选常驻**。隐藏 = `ViewportCommand::Visible(false)`（winit `set_visible(false)` → `orderOut`）；窗口仅创建一次（builder 逐 pass 常量，`ViewportBuilder::patch` 无差异 → 无重建）。收益：状态不丢、无 NSWindow 新建/销毁往返，且**销毁面只剩进程退出一处**（还原类补丁收敛到 `on_exit`）。
+- **L3（唤起抢焦点）→ NSPanel nonactivating + `orderFrontRegardless` + `makeKeyWindow`**，实测成 key 不夺前台（#1：`front` 仍是他人应用）+ 真键盘可用（#5）。
+- **L4（`request_repaint_after(2s)` 常驻破坏隐藏 0%）→ 改为仅悬浮条可见期排帧**：悬浮条回调自排 `CHECK_INTERVAL` 上限（含主题跟随检查）；根视口 logic 隐藏期不排帧；唤起时 `ThemeFollow::check_now` 立即补查外观。实测隐藏 60s 零增量（#6）。
+
+### 与 PoC 结论的出入
+
+1. **失焦语义（PoC-1b 遗留的实测问题）→ `focused` 仍可靠**。non-activating panel 下 winit `WindowEvent::Focused` 取自 `windowDidBecomeKey/DidResignKey`（winit 0.30.13 `window_delegate.rs:207-227`），面板成 key 即 focused=true、被他窗夺 key 即 false；#3 多次往返稳定，无需改「点击外部检测」。
+2. **「显示中切 Space → 跟随可见」带条件（与 PoC-1b #10 口径的差异）**。PoC-1b #10 的「跟随」只验窗口可见性（其面板无失焦门槛）；本产品有「失焦 → 隐藏」（product §1），而 macOS 切 Space 时目标 Space 的窗口接管 key ⇒ 面板 resignKey ⇒ 按失焦隐藏。实测两种分支都出现过（同一 Space 家族内切换保持可见；目标 Space 他应用接管焦点则隐藏）。**tech.md 平台行为表「失焦隐藏」行已补注此边界**；是否要为「切 Space」开特例（如 Space 切换通知 + 短窗豁免）待辉哥定：当前实现按产品原文「失焦 → 隐藏」，不擅自加特例。
+3. **根窗 `Visible(true)` 不切 Space（PoC 未覆盖路径）**：非激活 app 下 winit `makeKeyAndOrderFront` 不把窗口带回当前 Space —— 悬浮条 ⌥↵ 打开完整窗口时「命令生效但窗口在别的 Space 不可见」。解法：平台层 `NSApp.activate()` + `orderFrontRegardless` + `makeKeyWindow`（常规 App 窗口语义，与悬浮条「不夺前台」相反）。实测 #8 退出轮次中「完整窗口(根窗)唤起」日志 + 窗口回屏。
+4. **视口常驻对「补丁漂移」的影响**：窗口不再每轮重建，漂移核对只需「可见期每帧」做（隐藏期零开销）；实测全程 0 次漂移（与 spike 同）。
+
+### 复现步骤
+
+```bash
+cd /Users/alex/project/macEverything
+cargo build -p macEverything-app && ./target/debug/macEverything-app   # 主窗(dev 入口)启动;悬浮条隐藏
+./target/debug/macEverything-app                                       # 二次启动 = app.sock 唤起悬浮条
+# 独立「他人全屏应用」:
+cd scripts/poc/poc1b_nspanel && cargo build --bin poc1b-fs-actor && ./target/debug/poc1b-fs-actor
+touch /tmp/poc1b-actor-quit                                            # 收尾
+```
+
+- 取证工具(前序会话留下,可复用):`/tmp/winlist.swift onscreen|all`(CGWindowList)、`/tmp/mce12_drive.swift {click x y|key kc [mod]|type 文本|sleep ms}`(CGEvent HID 注入)、`/tmp/front_app.swift`(前台应用)、`/tmp/mce14_move.swift x y`(鼠标移动)、`/tmp/mce14_util.swift`(屏与鼠标)。
+- 截图存本机 `/tmp/mce14-*.png`(重启后可能被系统清理)。

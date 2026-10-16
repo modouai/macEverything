@@ -27,7 +27,15 @@ objc2-app-kit = { version = "0.3", features = [
     "NSPanel",
     "NSResponder",
     "NSAppearance",
+    # Task 14 平台层:NSScreen(多屏定位)、NSEvent(mouseLocation)、NSView(contentView
+    # 取 first responder 目标)。
+    "NSScreen",
+    "NSEvent",
+    "NSView",
 ] }
+# objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
+# 依赖非传递可见,Rust 侧须显式声明。
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo"] }
 raw-window-handle = "0.6"
 anyhow = "1"
 log = { workspace = true, features = ["std"] }

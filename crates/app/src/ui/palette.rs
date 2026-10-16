@@ -5,8 +5,8 @@
 //! UI;UI 每帧 try_recv,按代际号 `accept_response` 丢弃旧代(Task 11 语义)。
 //! 角标状态取自工作线程顺带执行的 `client::status`(product §7 映射)。
 //!
-//! 平台行为(去边框/置顶/跨 Space 的 NSPanel 改类)Task 14 接;本文件只管
-//! 「可见可搜可开」。
+//! 本文件只管「可见可搜可开」;平台行为(跨 Space/浮动级别/失焦隐藏/多屏定位、
+//! 唤起隐藏路径)在 `ui/mod.rs` 接线 + `platform/`(Task 14,见模块注释「视口形态」)。
 
 use eframe::egui;
 use std::sync::mpsc;
@@ -88,6 +88,8 @@ pub struct PaletteState {
 
     paths: DaemonPaths,
     ctx: egui::Context,
+    /// 本面板所属视口(查询线程回投时定向唤醒该视口——隐藏期不误唤醒根视口)。
+    viewport: egui::ViewportId,
     tx: mpsc::Sender<QueryResult>,
     rx: mpsc::Receiver<QueryResult>,
     /// 输入法组合中(候选窗开着):Enter/Esc 属输入法,应用不处理。
@@ -106,7 +108,11 @@ pub struct PaletteState {
 }
 
 impl PaletteState {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: DaemonPaths) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        paths: DaemonPaths,
+        viewport: egui::ViewportId,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             session: Session::new(DEBOUNCE),
@@ -121,6 +127,7 @@ impl PaletteState {
             full_window_request: None,
             paths,
             ctx: cc.egui_ctx.clone(),
+            viewport,
             tx,
             rx,
             ime_composing: false,
@@ -145,13 +152,14 @@ impl PaletteState {
         self.ime_busy = false;
         self.needs_focus = true;
         self.scroll_to_selected = false;
-        // 窗口是新建的(隐藏即销毁视口):重观察一次聚焦再允许失焦隐藏,
-        // 否则新建窗口首帧报 unfocused 会立刻自我隐藏。
+        // 每次唤起重新「武装」失焦门:窗口常驻(隐藏走 orderOut 不销毁),
+        // 但唤起瞬间尚未成 key(报 unfocused)时不隐藏,待观察到聚焦后失焦才隐藏。
         self.seen_focus = false;
         self.last_h = None;
     }
 
-    /// 每帧驱动(根视口 `App::logic` 调用):防抖到期发查询;收工作线程结果。
+    /// 每帧驱动(悬浮条视口回调 `ui::draw_palette` 调用):防抖到期发查询;
+    /// 收工作线程结果(根视口被完全遮挡、`logic` 不跑时仍由此驱动,Task 14)。
     pub fn tick(&mut self, now: Instant) {
         if let Some(fire) = self.session.pending_at(now) {
             self.spawn_query(fire);
@@ -165,6 +173,7 @@ impl PaletteState {
     fn spawn_query(&mut self, fire: Fire) {
         let paths = self.paths.clone();
         let ctx = self.ctx.clone();
+        let viewport = self.viewport;
         let tx = self.tx.clone();
         let sort = sort_str(fire.sort);
         std::thread::spawn(move || {
@@ -199,7 +208,9 @@ impl PaletteState {
                 payload,
                 engine,
             });
-            ctx.request_repaint(); // 跨线程唤醒(结果到达帧)
+            // 跨线程唤醒:定向悬浮条视口(根视口隐藏/遮挡时不被根窗节流拖住;
+            // 面板已隐藏则该帧被 eframe 按不可见视口跳过,不破隐藏零帧)。
+            ctx.request_repaint_of(viewport);
         });
     }
 

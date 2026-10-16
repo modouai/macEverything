@@ -102,13 +102,21 @@ pub fn execute_sorted(
 
 ### 悬浮条窗口行为(platform/mac.rs)
 
+> **Task 14 已落地**(实现与逐项实机取证见 poc-results.md「Task 14」):下表各行实现即现状;
+> 新增一行「视口形态」——悬浮条改 **deferred 视口 + 常驻**(隐藏走 orderOut 不销毁;
+> 独立渲染 pass,不随根视口是否被遮挡),解决 Task 12 遗留 L1/L2。
+
 | 行为 | 实现 |
 |---|---|
-| 跨 Space(含他人全屏) | **NSPanel 改类五要素**(见 ADR-8;poc1b spike 定稿:`scripts/poc/poc1b_nspanel` 为可直接移植的实现参考) |
+| 跨 Space(含他人全屏) | **NSPanel 改类五要素**(见 ADR-8;poc1b spike 定稿:`scripts/poc/poc1b_nspanel` 为可直接移植的实现参考);补丁施加时机 = 视口窗创建后首见(`NSApp.windows()` 按标题定位),可见期每帧漂移核对 |
+| 视口形态 | **deferred 视口 + 常驻**(`show_viewport_deferred`,每根视口 pass 注册;builder 逐 pass 常量防重建);隐藏 = `Visible(false)`(winit `orderOut`,不销毁);窗口唯一销毁点 = 进程退出(改类还原补丁落 `App::on_exit`) |
 | 浮动级别 | `setLevel(NSFloatingWindowLevel)`(PoC 实测;winit always_on_top 已自带 level 3,补丁增量在 collectionBehavior) |
-| 失焦隐藏 | eframe `WindowEvent::Focused(false)` → `ViewportCommand::Visible(false)`(官方) |
-| **显示路径(定案)** | 显示必须走 **native `orderFrontRegardless()`**(主线程经 DispatchQueue 投递)+ `ctx.request_repaint()`;**禁用 winit `Visible(true)` 唤起**——PoC-4 实测 eframe 0.37 对不可见窗口的跨线程唤起有 100ms 硬节流(`run.rs` 源码),唤起 132ms 超线;native 路径对外中位 **16.7ms**,且与 NSPanel 五要素(ADR-8)同路 |
-| 多屏定位 | 唤起时取鼠标所在屏(NSEvent.mouseLocation 或 winit monitor)→ 计算居中偏上坐标 → `set_outer_position`(官方) |
+| 失焦隐藏 | eframe 视口 `focused` → egui 命令 `Visible(false)`(winit orderOut)。实测(non-activating panel):`focused` 语义有效(winit 取 `windowDidBecomeKey/DidResignKey`)。**边界**:切 Space 时目标 Space 的他应用接管 key ⇒ 视为失焦 ⇒ 隐藏(product §1 原文口径;是否给「切 Space」开豁免特例待定,见 poc-results Task 14「与 PoC 结论的出入」#2) |
+| **显示路径(定案)** | 显示必须走 **native `orderFrontRegardless()` + `makeKeyWindow()`**(主线程直接调用;唤起入口本就在主线程,无跨线程,故无需 DispatchQueue 投递)+ `ctx.request_repaint_of(悬浮条视口)`;**禁用 winit `Visible(true)` 唤起**——PoC-4 实测 eframe 0.37 对不可见窗口的跨线程唤起有 100ms 硬节流(`run.rs` 源码),唤起 132ms 超线;native 路径对外中位 **16.7ms**,且与 NSPanel 五要素(ADR-8)同路 |
+| 多屏定位 | 唤起时取鼠标所在屏(`NSEvent.mouseLocation` + `NSScreen.visibleFrame`)→ 可见区水平居中、顶边在上 1/4 → 平台层原生 `setFrameOrigin`(不经 winit `set_outer_position`);高度随内容变化时「顶边钉住」重锚 |
+| 排帧纪律(L4) | 只在悬浮条可见期排帧(悬浮条 pass 自排 `CHECK_INTERVAL` 上限,含主题跟随检查);全隐藏期不排帧 → 事件循环回 Wait(隐藏态 CPU 0% 红线;Task 14 实测 60s 累计 CPU 零增量);唤起时 `ThemeFollow::check_now` 立即补查外观 |
+| 根窗(完整窗口)唤起 | `NSApp.activate()` + `orderFrontRegardless`(常规 App 窗口语义,与悬浮条「不夺前台」相反);实测非激活 app 下 winit `makeKeyAndOrderFront` 不切 Space |
+| 根窗关闭 | 取消关闭(`CancelClose`)+ 隐藏窗口(关闭窗口不退出 App,product §2);真退出走托盘「退出」(Task 16) |
 | 无边框/透明/圆角 | `ViewportBuilder { decorations:false, transparent:true, ... }`(官方)+ egui 自绘圆角阴影 |
 | 置顶 | `with_always_on_top`(官方) |
 | 右键菜单 | **原生 NSMenu**(objc2):egui 收到右键 → 构建 NSMenu(NSMenuItem + target/action 桥回 Rust)→ `popUpContextMenu` 于鼠标位置;菜单项语义见 product §2。非自绘:观感/键盘导航/异屏缩放均随系统 |

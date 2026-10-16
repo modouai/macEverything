@@ -39,7 +39,10 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
             .with_inner_size([900.0, 600.0])
-            .with_visible(true), // 开发期可见;Task 14 接平台行为后收
+            .with_visible(true),
+        // ↑ 完整窗口启动即显示:开发期入口(窗口内 dev 按钮唤起悬浮条/退出)。
+        // 产品形态(两窗皆隐、LSUIElement、托盘/热键入口)待 Task 15/16/17/20;
+        // 悬浮条视口自身启动隐藏(ui::palette_builder 的 visible(false))。
         ..Default::default()
     };
     eframe::run_native(

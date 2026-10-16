@@ -53,6 +53,58 @@ impl ThemeThrottle {
             }
         }
     }
+
+    /// 复位计时:下一次 `should_check` 立即放行(唤起时「亮起即补查一次」用)。
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+/// 主题跟随状态(节流 + 已应用值;两视口共享,Task 14 起挂在共享状态里)。
+///
+/// 排帧纪律(L4,tech 平台行为表):探帧只在「有窗可见」期进行——悬浮条 callback
+/// 与根视口 `logic` 各自检查本状态并给自己的视口排下一帧(`CHECK_INTERVAL` 上限);
+/// 全隐藏期不排帧,隐藏态 CPU 0% 红线不被破坏。唤起时 `check_now` 立即补查,
+/// 免「隐藏期切了外观、亮起首帧仍是旧主题」。
+pub struct ThemeFollow {
+    throttle: ThemeThrottle,
+    theme: Option<Theme>,
+}
+
+impl ThemeFollow {
+    pub fn new(initial: Theme, interval: Duration) -> Self {
+        Self {
+            throttle: ThemeThrottle::new(interval),
+            theme: Some(initial),
+        }
+    }
+
+    /// 到期才探测;变化才应用(返回是否发生了应用)。
+    pub fn maybe_apply(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+        if !self.throttle.should_check(now) {
+            return false;
+        }
+        let detected = current_theme();
+        if self.theme != Some(detected) {
+            self.theme = Some(detected);
+            apply(ctx, detected);
+            log::info!("系统外观:{detected:?} → 应用对应主题");
+            return true;
+        }
+        false
+    }
+
+    /// 立即补查一次(节流复位 + 当帧探测;每次唤起调用)。
+    pub fn check_now(&mut self, ctx: &egui::Context) {
+        self.throttle.reset();
+        self.maybe_apply(ctx, Instant::now());
+    }
+
+    /// 当前已应用主题(测试断言用;产品侧无消费者,不做公开面)。
+    #[cfg(test)]
+    pub fn current(&self) -> Option<Theme> {
+        self.theme
+    }
 }
 
 /// 当前系统外观(同进程 objc2 查询;非 macOS → Light)。
@@ -157,5 +209,34 @@ mod tests {
         assert_eq!(ctx.theme(), egui::Theme::Dark);
         apply(&ctx, Theme::Light);
         assert_eq!(ctx.theme(), egui::Theme::Light);
+    }
+
+    /// 跟随状态三态:节流内不探测;到期探测;`check_now` 复位后当帧放行。
+    #[test]
+    fn follow_throttle_and_check_now() {
+        let ctx = egui::Context::default();
+        let mut f = ThemeFollow::new(Theme::Light, Duration::from_secs(2));
+        let t0 = Instant::now();
+        // 首查在构造时已置:距构造 < interval 不探测(无论系统当前外观)。
+        assert!(!f.maybe_apply(&ctx, t0), "interval 内不探测");
+        // 到期:探测一次(系统外观在测试宿主不可控,断言只钉「不静态跳过」)。
+        let _ = f.maybe_apply(&ctx, t0 + Duration::from_secs(2));
+        // check_now 复位节流:紧接着再调即重新探测。
+        f.check_now(&ctx);
+        assert!(f.current().is_some(), "已应用主题恒有值");
+    }
+
+    /// 节流 reset 语义(钉:reset 后首次必放行)。
+    #[test]
+    fn throttle_reset_releases_next_check() {
+        let mut t = ThemeThrottle::new(Duration::from_secs(2));
+        let t0 = Instant::now();
+        assert!(t.should_check(t0));
+        assert!(!t.should_check(t0 + Duration::from_millis(1)));
+        t.reset();
+        assert!(
+            t.should_check(t0 + Duration::from_millis(2)),
+            "复位后立即放行"
+        );
     }
 }
