@@ -160,7 +160,7 @@ pub fn execute_sorted(
 | 风险 | 应对 |
 |---|---|
 | PoC-1:跨 Space/浮动级别不生效 | 降级「当前 Space 可见」,产品文档标注;不阻塞其余功能 |
-| PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space/⌃Space);以实机结果定默认 |
+| PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space / ⌃⌥⇧Space;⌃Space 族为系统输入法占用,不在候选池);以实机结果定默认 |
 | PoC-3:NSMenu 阻塞式弹出与 egui 事件循环 | NSMenu 弹出走嵌套 run loop(阻塞当前线程)——在 eframe 主线程弹出需验证无卡死/输入错乱;不通过则菜单弹出移至独立线程或改用 popUpMenuPositioningItem 非模态 |
 | PoC-4:eframe 隐藏 CPU 0% vs 唤起 <100ms 的两线拉扯 | 隐藏视口 `ControlFlow::Wait` 实测 CPU;唤起路径(热键事件 → 显示 → 首帧)实测延迟;若 >100ms 排查 `with_visible(false)` ↔ 显示的首帧成本(预渲染/keep-warm 折中) |
 | PoC-5:SMAppService + ad-hoc 签名的自启 | 先做注册/注销小验证再全量接;不通改用 LaunchAgent plist 兜底(功能等价,登录时启动) |
