@@ -346,3 +346,103 @@ POC3_AUTO=1 POC3_DARK=1 POC3_POS=200,200 ./target/release/poc3-nsmenu
 - 「独立线程弹出」路线不成立：`NSMenu` 在 objc2 绑定里即 `MainThreadOnly`，AppKit 要求菜单在主线程跟踪。
 - 「非模态 API」不存在等价物：`NSMenu` 没有非阻塞弹出接口。若产品形态要求菜单开启期间继续渲染（如动画），只能自绘菜单或把菜单放进独立进程，两者都放弃系统观感——不建议。
 - 残留风险（低）：嵌套 run loop 期间 eframe 帧循环与 winit 事件派发暂停（窗口冻结即其表现）。本 PoC 未观察到其它副作用；长时开启菜单（>10s）与多层子菜单留待 Task 18 实机回归。
+
+---
+
+## Task 4：PoC-4 — eframe 两红线（隐藏 CPU 0% × 唤起 <100ms）
+
+**状态：⚠️ 需折中——两条红线无法用「egui 原生显示命令」同时满足（隐藏 ✅ 0%，唤起 ❌ 对外可见中位 117ms）；显示改走 native 路径（主线程 `orderFrontRegardless`）后两线兼得（隐藏 0%、唤起对外可见中位 16.7ms）。产品接线建议见文末。**
+
+- **日期**：2026-10-16
+- **实锁版本**：eframe / egui 0.37.0、winit 0.30.13、objc2 0.6.5、objc2-app-kit 0.3.2、dispatch2 0.3.1、raw-window-handle 0.6.2
+- **代码**：`scripts/poc/poc4_idle/`（独立 crate，根 Cargo.toml `[workspace] exclude` 已追加；测量脚本 `measure.sh`）
+- **窗口形态**：600x400 置顶（`always_on_top`，悬浮条形态）、位置 (200,200)
+- **两条口径（勿混）**：
+  - **进程内**：`SHOW_LATENCY_MS` = 发出显示请求 t0 → 首帧 `ui()` 进入；`SHOW_LOGIC_MS` = t0 → 首个 `logic()`。不含热键系统投递（Task 2 覆盖）、不含帧内绘制（swap_buffers）、不含上屏。
+  - **对外**：`VISIBLE_DELTA_MS` = t0（落盘锚点）→ CGWindowList 首次报本窗口 onscreen（外部轮询，1ms 间隔；含 WindowServer 标志更新延迟）。
+
+### 结论表
+
+| # | 验证项 | 结论 | 判定依据 |
+| --- | --- | --- | --- |
+| 1 | 隐藏态 CPU（60s） | ✅ 恒 0.0% | 12/12 采样 = 0.0%（`top -l 2 -s 1 -pid <pid> -stats cpu` 区间值）；累计 CPU 时间 0:00.17 → 0:00.17（60s 增量低于 ps 分辨率 10ms） |
+| 2 | 隐藏期无唤醒源 | ✅ 零帧 | 打点：启动 0.35s 内 8 帧（首帧展出 + 隐藏命令 + macOS 遮挡事件），此后 **119.9s 零 PASS**，直到退出命令；事件循环空闲即 `ControlFlow::Wait` |
+| 3 | 常显静止对照 | ✅ 0.0% | 常显 60s：12/12 = 0.0%，累计 0:00.19 → 0:00.19；启动后零帧（egui 按需重绘，无轮询） |
+| 4 | 唤起延迟：egui 路径（30 轮） | ❌ 超线 | 进程内首帧中位 **132.74ms**（min 119.93 / P99=max 157.53）；对外可见中位 **117.48ms**（n=12，min 115.58 / max 131.62）——两条口径均 >100ms |
+| 5 | 唤起延迟：native 路径（30 轮） | ✅ 达标 | 进程内首帧中位 **32.83ms**（min 21.04 / P99=max 56.19）；对外可见中位 **16.74ms**（n=12，min 13.97 / max 22.72） |
+| 6 | 唤起「通道」成本 | egui 101ms vs native 1ms | SHOW_LOGIC：egui 路径中位 **101.12ms**（30 轮极差 1.0ms，钉在 100ms 节流上）；native 路径中位 **1.01ms**（0.64~5.47）⇒ 唤醒机制本身 ~1ms，100ms 全部来自节流 |
+| 7 | keep-warm（隐藏下持续重绘）代价 | ⚠️ ~0.8% CPU 且不改善唤起 | 隐藏 + 每 100ms 申请重绘：采样 0.4~0.7%，累计 0:00.21 → 0:00.75（≈66s 内 0.54s ≈ **0.8%**）；实际帧率 4~9 帧/s（eframe 把隐藏视口重绘节流到 ≥100ms）；唤起仍走同一节流（节流按窗口可见性生效，与是否热身无关） |
+| 8 | 首帧 ui 时窗口状态 | 两条路径皆「已可见」 | 30+30 轮 `win_visible_at_first_ui=1`：egui 路径的命令在节流帧末即应用（orderFront 先于首帧 ui）；native 路径主队列先行 |
+
+### 现象细节
+
+1. **隐藏态 CPU 原始采样**（`POC4_MODE=hide`，60s，每 ~5s 一点 × 12）：
+
+   ```text
+   sample[1..12] cpu=0.0%          （12/12 全 0.0）
+   累计 CPU 时间：0:00.17 → 0:00.17
+   PASS：t=0.007…0.348 共 8 帧（启动）→ 119.9s 零帧 → t=120.2 起 4 帧（退出命令）
+   ```
+
+2. **egui 路径单轮逐帧结构**（`ViewportCommand::Visible(true)`）：
+
+   ```text
+   SHOW_LOGIC_MS=100.759                      ← t0+100.8ms：节流到点后第一个 logic
+   PASS seq=10 kind=logic win_visible=0 occluded=1 t=4.109   ← 仍隐藏；该帧末才应用 Visible(true) → orderFront
+   PASS seq=11 kind=logic win_visible=1 occluded=1 t=4.126   ← 已在屏，但 egui 侧仍判遮挡 → 只跑 logic
+   PASS seq=12 kind=logic win_visible=1 occluded=0 t=4.166
+   SHOW_LATENCY_MS=157.529                    ← 遮挡态清除后的首帧 ui
+   ```
+
+   构成：100ms（eframe 节流）+ ~1.5ms（唤醒/命令应用）+ 15~55ms（等 macOS 遮挡状态变更通知，期间只跑 logic）。
+
+3. **native 路径单轮逐帧结构**（主队列 `orderFrontRegardless` + `request_repaint`）：
+
+   ```text
+   NATIVE_MAIN_MS=0.346 round=2               ← 主队列 block 执行 orderFrontRegardless（含排队 0.3ms）
+   SHOW_LOGIC_MS=0.693                        ← 0.7ms 即跑 logic（无节流）
+   PASS seq=15/16 kind=logic win_visible=1 occluded=1       ← 窗口已在屏，等遮挡态清除
+   SHOW_LATENCY_MS=32.702                     ← 遮挡态清除后的首帧 ui
+   ```
+
+4. **对外「窗口在屏」**（CGWindowList 轮询）：egui 路径 115.6~131.6ms；native 路径 14.0~22.7ms。native 路径下窗口 ~1ms 即在屏（内容为上一帧），新帧中位 ~33ms 到——悬浮条内容静态时用户无感。
+5. **遮挡干扰（方法学坑，已处理）**：窗口被他人窗口盖住时 macOS 置 occluded，eframe 对遮挡视口只跑 `logic` 不跑 `ui` → 该轮首帧打点会失真（曾出现 30 轮里 4 轮 ui 未跑、被兜底记成 15s 假延迟）。本 PoC 已改为：① 窗口置顶（`always_on_top`，与悬浮条形态一致）；② 打点带 `occluded=` 字段；③ 上一轮未跑到首帧时显式打 `SHOW_MISSED`，不混入分布。
+
+### 根因（源码级，实锁版本）
+
+| 事实 | 出处 |
+| --- | --- |
+| 隐藏窗口的跨线程唤起被硬性节流 100ms（本 PoC 的核心发现） | eframe `native/run.rs:27`：`INVISIBLE_WINDOW_REPAINT_INTERVAL = 100ms`；`native/run.rs:373-380`：`UserEvent::RequestRepaint` 时若窗口不可见 → `when.max(now + 100ms)`（注释指明为 Windows 隐藏窗口高 CPU 之修，egui#7776） |
+| 「不可见」判定 = winit `is_visible()`；`Visible(false)` 即 `orderOut` | winit `platform_impl/macos/window_delegate.rs:904-914`（`set_visible(false)=orderOut`、`set_visible(true)=makeKeyAndOrderFront`、`is_visible()=NSWindow.isVisible()`） |
+| 隐藏/遮挡视口不跑 `ui`，只补跑 `App::logic` | eframe `glow_integration.rs:680`（`is_visible = info.visible().unwrap_or(true) || …`）+ egui `data/input/viewport_info.rs:98`（`visible()` 仅由 minimized/occluded 推导）；首帧 ui 额外等遮挡状态变更通知即由此而来 |
+| 空闲即 `ControlFlow::Wait`（隐藏零 CPU 的机制） | eframe `native/run.rs:297-300` |
+| 跨线程唤醒通道（eframe 内置 `EventLoopProxy`，后台线程可用） | eframe `glow_integration.rs:364-378`（`set_request_repaint_callback`） |
+
+### 两线兼容性结论与折中建议
+
+1. **结论**：egui 原生显示路径下两线互斥——「隐藏 0% CPU」与「唤起 <100ms」不可兼得；瓶颈是 eframe 给隐藏窗口的 100ms 唤醒节流（对「隐藏时不重绘」的代价补偿，见 `run.rs:373-380` 注释）。这是 ADR-8 单栈押注的实证风险点。
+2. **建议（native 显示路径，已实测达标）**：隐藏仍用 `ViewportCommand::Visible(false)`；显示由热键线程 `DispatchQueue::main().exec_async` 投递主线程执行 `orderFrontRegardless()` 后 `ctx.request_repaint()`。隐藏态 CPU 仍 0%（未新增 repaint 源），唤起对外可见中位 16.7ms、进程内首帧中位 32.8ms。
+   - 与 PoC-1b 结论一致：跨全屏 Space 与「不抢焦点」都要求 `orderFrontRegardless`（winit 的 `Visible(true)` 走 `makeKeyAndOrderFront`，会激活 app）。即**产品本来就必须走这条路径**，两红线的冲突随之消解。
+   - 代价：`dispatch2 = "0.3"` 依赖 + 本 PoC 的 ~15 行接线（可整体搬运）。
+3. **不建议 keep-warm**：量化代价 ~0.8% CPU（帧率被节流封顶在 4~9 帧/s），但唤起仍受同一节流支配 → 纯成本无收益。
+4. **残留项（低）**：native 路径首帧 `ui` 仍等 macOS 遮挡状态变更（中位 ~33ms、P99 56ms）。悬浮条内容静态时用户无感；若将来要求「唤醒即新数据」，在 100ms 红线内仍有余量，但需按 P99≈56ms 留裕量，或向 eframe 提「隐藏窗口即时唤醒」需求。
+
+### 复现步骤
+
+```bash
+cd scripts/poc/poc4_idle
+bash measure.sh build            # 拉依赖走 rsproxy 镜像
+bash measure.sh cpu-hide 60      # 隐藏态 CPU：12 点采样 + 累计 CPU + 帧打点
+bash measure.sh show 15          # 常显对照 CPU
+bash measure.sh warm 60          # keep-warm 代价
+bash measure.sh cycle            # 30 轮 egui 路径延迟分布（约 92s；窗口会闪现 30 次并抢焦点）
+bash measure.sh native           # 30 轮 native 路径延迟分布（不抢焦点）
+bash measure.sh visible cycle    # 对外「窗口在屏」口径（外部轮询）
+bash measure.sh visible native
+```
+
+### 与 plan 示意的差异
+
+1. plan 示意 `eframe::App::update`；实锁 0.37 为 `logic()` + `ui()` 拆分（隐藏/遮挡视口只补跑 `logic`），本 PoC 的「首帧」打点正建立在该拆分上。
+2. plan 示意 `top -pid <pid> -l 60`；实测取 `top -l 2 -s 1 -pid <pid> -stats cpu` 的**第二个样本**（区间值；第一样本是进程生命周期均值，会被启动期摊薄），并用 `ps -o time=` 累计 CPU 时间交叉校验。
+3. plan 的「后台线程每 2~3 秒 toggle + 记录首帧」保留（3s/轮 = 隐藏 2.5s + 显示 0.5s，30 轮）；额外加了 t0 落盘锚点（`POC4_T0_FILE`）以支持外部「窗口在屏」口径，并按 plan Step 1 第 5 条实现 `POC4_MODE=show|hide|cycle`（另加 `native`/`warm` 差分）。
