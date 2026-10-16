@@ -131,7 +131,7 @@ pub fn execute_sorted(
 
 | 状态 | 进入条件 | 界面 |
 |---|---|---|
-| Idle | 空词(含 ⌃⌥Space 空词打开) | 清空结果,不发起请求 |
+| Idle | 空词(含 ⌥⇧F 空词打开完整窗口) | 清空结果,不发起请求 |
 | Searching | 防抖命中后发起 | 上一轮结果保留至新结果到达(整体替换,不闪) |
 | EngineStarting | socket 不可连且拉起中 | 角标「启动引擎中」,请求排队重试 ≤3s |
 | Offline | 拉起失败/daemon 退出且离线索引可用 | 结果来自离线索引,角标标注 |
@@ -148,7 +148,7 @@ pub fn execute_sorted(
 | UI 技术栈 | eframe/egui 0.x(workspace 锁版本);egui_extras(表格/虚拟化);中文字体:内置 Noto Sans SC 子集或系统字体加载(避免豆腐块——实现期验证) |
 | 平台补丁 | objc2 + objc2-app-kit(unsafe 集中 platform/mac.rs,SAFETY 逐处) |
 | 托盘/快捷键/自启 | tray-icon / global-hotkey(tauri 系)/ SMAppService(经 objc2 或 launchd plist 兜底) |
-| 进程编排 | 单实例 flock;daemon 探测=socket connect;拉起=spawn CLI;退出只退 App |
+| 进程编排 | 单实例 = app.sock 通道(二次启动唤起悬浮条);daemon 探测=socket connect;拉起=引擎定位三档(随包→PATH→列搜过路径);退出只退 App |
 | 查询会话 | 防抖 60ms + 代际号 + 六态状态机(Idle/Searching/EngineStarting/Offline/Empty/Warming,纯逻辑单测覆盖) |
 | 交付形态 | .app bundle(LSUIElement=1)+ 随包 CLI;bundle.sh 手工组装;引擎定位随包优先、PATH 兜底、全失败列路径 |
 | 引擎扩展 | execute_sorted 两段式(stat 仅候选集);协议 sort 字段向后兼容 |
