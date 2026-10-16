@@ -87,8 +87,12 @@ pub struct EngineState {
     gaps: Mutex<Vec<Gap>>,
     io_errors: AtomicU32,
     built_at: AtomicU64,
-    /// 事件流消费线程持续更新的水位,落盘时写入 meta.last_event_id。
-    last_event_id: AtomicU64,
+    /// 接收水位:事件到达即 fetch_max 推进,只作批次水位快照用,不落盘。
+    seen_event_id: AtomicU64,
+    /// 已应用水位:一批目录 diff **全部完成后**才推进;落盘写 meta.last_event_id。
+    /// 语义保证「落盘水位 ≤ 索引内容对应的事件」——重启重放必覆盖「已收未应用」
+    /// 的变更(否则 stop/崩溃前 100ms 窗口内的变更永久丢失)。
+    applied_event_id: AtomicU64,
     stopping: AtomicBool,
     dirty: AtomicU64,
     last_flush: Mutex<Instant>,
@@ -108,7 +112,8 @@ impl EngineState {
             gaps: Mutex::new(vec![]),
             io_errors: AtomicU32::new(0),
             built_at: AtomicU64::new(0),
-            last_event_id: AtomicU64::new(0),
+            seen_event_id: AtomicU64::new(0),
+            applied_event_id: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             dirty: AtomicU64::new(0),
             last_flush: Mutex::new(Instant::now()),
@@ -254,20 +259,20 @@ fn rebuild_dir_map(state: &EngineState) {
 }
 
 /// 对单个绝对目录执行 diff 并维护 dir_map。锁序:holder(write) → dir_map。
-/// 对单个已索引目录执行 diff:应用目录变化 + 记账 + 局部 dir_map 更新。
+/// 返回该目录本次的变更条数(added + removed),供抽样对拍判定用。
 fn apply_and_track(
     state: &EngineState,
     idx: &mut Index,
     map: &mut HashMap<PathBuf, u32>,
     abs_dir: &Path,
     excludes: &[std::path::PathBuf],
-) {
+) -> u32 {
     let Some(&dir_idx) = map.get(abs_dir) else {
-        return;
+        return 0;
     };
     if !idx.entries[dir_idx as usize].is_live() {
         map.remove(abs_dir); // 目录已删(子树墓碑):清映射,不做 diff
-        return;
+        return 0;
     }
     match watcher::apply_dir_diff(idx, dir_idx, abs_dir, excludes) {
         Ok(stats) => {
@@ -281,15 +286,18 @@ fn apply_and_track(
                     map.insert(p, k);
                 }
             }
+            stats.added + stats.removed
         }
         Err(e) => {
             state.io_errors.fetch_add(1, Ordering::Relaxed);
             log::warn!("目录 diff 失败 {}: {e}", abs_dir.display());
+            0
         }
     }
 }
 
-fn diff_one(state: &EngineState, abs_dir: &Path) {
+/// 对单个目录应用 diff(未索引时先补链);返回该目录的变更条数。
+fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
     // canonical 基址统一形态:map 键全 canonical;diff 的读取目录与子键拼接同基址。
     let base = abs_dir
         .canonicalize()
@@ -297,9 +305,10 @@ fn diff_one(state: &EngineState, abs_dir: &Path) {
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
     let mut h = state.holder.write().unwrap();
     let IndexHolder::Mutable(idx) = &mut *h else {
-        return;
+        return 0;
     };
     let mut map = state.dir_map.lock().unwrap();
+    let mut changed = 0u32;
 
     // 目标未索引:事件风暴下子目录事件可能先于其父目录的 diff 到达(新建目录树),
     // 直查必然 miss。从最近已索引祖先逐级向下补 diff(每级纳入其直接子项),
@@ -309,7 +318,7 @@ fn diff_one(state: &EngineState, abs_dir: &Path) {
         let mut cur = base.clone();
         loop {
             let Some(parent) = cur.parent().map(Path::to_path_buf) else {
-                return; // 根之外:忽略
+                return changed; // 根之外:忽略
             };
             chain.push(cur.clone());
             cur = parent;
@@ -319,25 +328,25 @@ fn diff_one(state: &EngineState, abs_dir: &Path) {
         }
         for next in chain.iter().rev() {
             if engine::scanner::is_excluded(next, &excludes) {
-                return; // 链上出现排除目录:不拉回索引
+                return changed; // 链上出现排除目录:不拉回索引
             }
-            apply_and_track(state, idx, &mut map, &cur, &excludes);
+            changed += apply_and_track(state, idx, &mut map, &cur, &excludes);
             if !map.contains_key(next) {
-                return; // 祖先 diff 未纳入该级(根外/竞态删):放弃
+                return changed; // 祖先 diff 未纳入该级(根外/竞态删):放弃
             }
             cur = next.clone();
         }
         // 走完 chain 后 cur == base(目标自身尚未 diff)
     }
 
-    apply_and_track(state, idx, &mut map, &base, &excludes);
+    changed + apply_and_track(state, idx, &mut map, &base, &excludes)
 }
 
 fn build_meta(state: &EngineState) -> IndexMeta {
     let cfg = state.cfg.lock().unwrap().clone();
     IndexMeta {
         built_at: state.built_at.load(Ordering::Relaxed),
-        last_event_id: state.last_event_id.load(Ordering::Relaxed),
+        last_event_id: state.applied_event_id.load(Ordering::Relaxed),
         scan_roots: state
             .roots
             .lock()
@@ -395,14 +404,32 @@ fn should_flush(state: &EngineState) -> bool {
     dirty >= FLUSH_DIRTY_LIMIT || state.last_flush.lock().unwrap().elapsed() >= FLUSH_INTERVAL
 }
 
+/// 应用一批目录 diff,全部完成后推进已应用水位。
+/// 水位快照在 diff **之前**取:本批目录对应的全部事件此刻必已入 batcher,
+/// 快照覆盖它们且不含后续未入批事件(水位只落后、绝不超前于索引内容)。
+fn apply_batch(state: &EngineState, dirs: Vec<String>) {
+    if dirs.is_empty() {
+        return;
+    }
+    let batch_water = state.seen_event_id.load(Ordering::Relaxed);
+    for dir in &dirs {
+        diff_one(state, Path::new(dir));
+    }
+    state
+        .applied_event_id
+        .fetch_max(batch_water, Ordering::Relaxed);
+}
+
 /// 事件消费循环(重放与增量共用):批量 diff + 落盘节流 + 降级判定。
-/// `last_event_id` 水位持续更新,stop/落盘从这里取。
+/// 水位语义:接收(`seen_event_id`)与已应用(`applied_event_id`)分离,
+/// 落盘只取已应用水位(见 EngineState 字段注释)。
 fn consume_events(
     state: Arc<EngineState>,
     paths: DaemonPaths,
     stream: FseStream,
     rx: std::sync::mpsc::Receiver<fsevents::FseEvent>,
     is_replay: bool,
+    replayed_from_disk: bool,
 ) {
     let mut batcher = DirBatcher::new(BATCH_WINDOW, watcher::now_stub());
     let mut replay_events: u64 = 0;
@@ -414,13 +441,32 @@ fn consume_events(
         }
         match rx.recv_timeout(Duration::from_millis(150)) {
             Ok(ev) => {
-                state.last_event_id.store(ev.id, Ordering::Relaxed);
+                state.seen_event_id.fetch_max(ev.id, Ordering::Relaxed);
                 if fsevents::is_history_done(ev.flags) {
                     if is_replay {
                         // 追平前强制应用窗口内 pending 事件:否则「就绪」早于索引追上,
                         // 紧随的查询会漏停机窗口内的变更(实机重放抽验曾因此为空)。
-                        for dir in batcher.drain_all() {
-                            diff_one(&state, Path::new(&dir));
+                        apply_batch(&state, batcher.drain_all());
+                        // 判定一:零事件 + 停机超阈 → 重放不可信(spike 证实无可观测
+                        // 信号,此为唯一确定性防线;原先该判定只在循环退出后执行,
+                        // 常驻 daemon 下永不触发)。
+                        let downtime =
+                            now_secs().saturating_sub(state.built_at.load(Ordering::Relaxed));
+                        if reconcile::needs_full_rescan(
+                            replay_events,
+                            downtime,
+                            REPLAY_DOWNTIME_THRESHOLD_SECS,
+                        ) {
+                            log::warn!("重放零事件且停机超阈值,转全量重扫");
+                            degrade_and_rescan(&state, &paths);
+                            continue;
+                        }
+                        // 判定二:抽样对拍——日志滚动会「部分回放」(从保留窗口起点
+                        // 开始、有事件但丢前段),零事件判定覆盖不到,抽样 diff 暴露差异。
+                        // 仅对「来自落盘索引的停机重放」有意义;首扫后索引是全新全量的,
+                        // 抽样只白付开销(且首扫窗口变更本就由本轮重放覆盖)。
+                        if replayed_from_disk && sampling_finds_gap(&state, &paths) {
+                            continue; // 已转 degraded,重扫完成后自行置 READY
                         }
                         state.set_state(state::READY);
                         flush(&state, &paths);
@@ -443,35 +489,76 @@ fn consume_events(
                 break;
             }
         }
-        for dir in batcher.drain_ready() {
-            diff_one(&state, Path::new(&dir));
-        }
+        apply_batch(&state, batcher.drain_ready());
         if should_flush(&state) {
             flush(&state, &paths);
         }
     }
 
-    // 重放零事件且停机超阈值 → 保守判定转重扫(唯一兜底,ADR-5)。
-    if is_replay
-        && !stream_errored
-        && replay_events == 0
-        && reconcile::needs_full_rescan(
-            0,
-            now_secs().saturating_sub(state.built_at.load(Ordering::Relaxed)),
+    // 退出前强制排空 pending:停止路径(或流断开)若跳过这一步,窗口内已收未应用的
+    // 变更会因水位停在 diff 完成点而被正确重放,但此处仍排空以让落盘内容尽量新。
+    apply_batch(&state, batcher.drain_all());
+
+    // 降级判定(统一走 reconcile::should_degrade,契约见其 doc):
+    // 流断开 / 保守判定(零事件且停机超阈)——信号路径已由 spike 排除(ADR-5)。
+    // 非重放阶段(增量期)零事件是常态,传 1 使保守判定天然不触发。
+    let replay_probe = if is_replay { replay_events } else { 1 };
+    let stopping = state.stopping.load(Ordering::Relaxed);
+    let downtime = now_secs().saturating_sub(state.built_at.load(Ordering::Relaxed));
+    if !stopping
+        && reconcile::should_degrade(
+            false,
+            stream_errored,
+            replay_probe,
+            downtime,
             REPLAY_DOWNTIME_THRESHOLD_SECS,
         )
     {
-        log::warn!("重放零事件且停机超阈值,转全量重扫");
+        log::warn!("重放不可信(流断开或零事件长停机),转全量重扫");
         degrade_and_rescan(&state, &paths);
     }
-    if stream_errored {
-        log::warn!("事件流断开,转全量重扫兜底");
-        degrade_and_rescan(&state, &paths);
-    }
-    if state.stopping.load(Ordering::Relaxed) {
+    if stopping {
         flush(&state, &paths);
     }
     drop(stream); // 停流(幂等)
+}
+
+/// 重放追平后的抽样对拍兜底:spike 证实日志滚动的丢段无可观测信号,
+/// 且过旧 sinceWhen 会「从保留窗口起点部分回放」(有事件,零事件判定覆盖不到)。
+/// 抽样 N 个已索引目录做 diff:差异目录占比超阈值判重放不可信 → 全量重扫;
+/// 少量差异(正常竞态)由抽样 diff 自身直接补上。
+/// 返回 true 表示已转降级重扫。
+fn sampling_finds_gap(state: &EngineState, paths: &DaemonPaths) -> bool {
+    const SAMPLE_DIRS: usize = 100;
+    const MISMATCH_PCT_LIMIT: usize = 5;
+    let bases: Vec<PathBuf> = {
+        let map = state.dir_map.lock().unwrap();
+        if map.is_empty() {
+            return false;
+        }
+        let keys: Vec<PathBuf> = map.keys().cloned().collect();
+        if keys.len() <= SAMPLE_DIRS {
+            keys
+        } else {
+            let step = keys.len() / SAMPLE_DIRS;
+            (0..SAMPLE_DIRS).map(|i| keys[i * step].clone()).collect()
+        }
+    };
+    let mut mismatched = 0usize;
+    for b in &bases {
+        if diff_one(state, b) > 0 {
+            mismatched += 1;
+        }
+    }
+    if mismatched * 100 / bases.len() > MISMATCH_PCT_LIMIT {
+        log::warn!(
+            "抽样对拍 {mismatched}/{} 个目录与磁盘不符,判重放不可信,转全量重扫",
+            bases.len()
+        );
+        degrade_and_rescan(state, paths);
+        return true;
+    }
+    false
 }
 
 /// 降级:全量重扫重建索引,替换 holder 并重落盘,回就绪。
@@ -510,12 +597,14 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
         .map(|n| n.get())
         .unwrap_or(8);
 
-    let last_event_id = match persist::load_mmap(&paths.index_file()) {
+    // (建流起点水位, 是否来自落盘索引的停机重放——首扫无需抽样对拍)
+    let (last_event_id, replayed_from_disk) = match persist::load_mmap(&paths.index_file()) {
         Ok(view) => {
             let last_id = view.meta.last_event_id;
             let built = view.meta.built_at;
             state.built_at.store(built, Ordering::Relaxed);
-            state.last_event_id.store(last_id, Ordering::Relaxed);
+            state.applied_event_id.store(last_id, Ordering::Relaxed);
+            state.seen_event_id.store(last_id, Ordering::Relaxed);
             // 两段式:Shared 立即可查
             *state.holder.write().unwrap() = IndexHolder::Shared(view);
             state.set_state(state::RECONCILING);
@@ -529,11 +618,15 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             };
             *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
             rebuild_dir_map(&state);
-            last_id
+            (last_id, true)
         }
         Err(e) => {
             log::info!("无可用落盘索引({e}),首扫建索引");
             state.set_state(state::BUILDING);
+            // 水位在扫描**之前**取:扫描窗口内发生的变更,其事件 ID 均大于它,
+            // 随后从该水位建流重放必覆盖(diff 幂等)。若取在扫描完成后,
+            // 扫描读过该目录之后才出现的变更将永久缺失(无任何后续机制补回)。
+            let water = fsevents::current_event_id();
             let (idx, gaps) = engine::scanner::scan_roots(&roots, &excludes, threads);
             state.built_at.store(now_secs(), Ordering::Relaxed);
             *state.gaps.lock().unwrap() = gaps
@@ -545,15 +638,14 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
                 })
                 .collect();
             state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
-            // 扫描完成时刻的水位:覆盖「扫描点 → 关机」的变更
-            let water = fsevents::current_event_id();
-            state.last_event_id.store(water, Ordering::Relaxed);
+            state.applied_event_id.store(water, Ordering::Relaxed);
+            state.seen_event_id.store(water, Ordering::Relaxed);
             *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
             rebuild_dir_map(&state);
             flush(&state, &paths);
             state.set_state(state::READY);
-            // 首扫后无需重放,从 now 起监听
-            fsevents::SINCE_NOW
+            // 从扫描前水位重放:补齐扫描窗口变更,追平后转纯实时
+            (water, false)
         }
     };
 
@@ -581,7 +673,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     }
     let st = state.clone();
     let p = paths.clone();
-    std::thread::spawn(move || consume_events(st, p, stream, rx, is_replay));
+    std::thread::spawn(move || consume_events(st, p, stream, rx, is_replay, replayed_from_disk));
     Ok(())
 }
 
@@ -773,5 +865,75 @@ fn init_logger(paths: &DaemonPaths) {
     .is_ok()
     {
         log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造:空索引 + 一条指向 tempdir 的根目录条目,dir_map 键为 canonical 形态。
+    fn mounted_state(dir: &Path) -> Arc<EngineState> {
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.to_string_lossy().as_ref(), NO_PARENT, true);
+        {
+            let mut map = state.dir_map.lock().unwrap();
+            map.insert(dir.canonicalize().unwrap(), root);
+        }
+        *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+        state
+    }
+
+    /// 水位的核心不变量钉:applied 只在 diff 完成后推进,「已收未应用」不得计入。
+    /// 突变「事件到达即推进落盘水位」——即 stop 前 100ms 变更永久丢失的根因链——
+    /// 时第一段断言必红。
+    #[test]
+    fn applied_watermark_lags_until_batch_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        let state = mounted_state(dir.path());
+
+        // 事件到达:seen 推进,applied 不动
+        state.seen_event_id.store(100, Ordering::Relaxed);
+        assert_eq!(
+            state.applied_event_id.load(Ordering::Relaxed),
+            0,
+            "未应用的接收水位不得进入落盘水位"
+        );
+
+        // 应用一批 → 水位追上,且 diff 真实生效(新文件入索引)
+        apply_batch(&state, vec![dir.path().to_string_lossy().into_owned()]);
+        assert_eq!(
+            state.applied_event_id.load(Ordering::Relaxed),
+            100,
+            "批次应用后水位推进"
+        );
+        let h = state.holder.read().unwrap();
+        let IndexHolder::Mutable(idx) = &*h else {
+            panic!("应为可变索引")
+        };
+        assert_eq!(idx.entry_count(), 2, "根 + a.txt");
+    }
+
+    /// 空批次不推进水位:否则停止路径会把「窗口内未应用的 seen」写进落盘 meta,
+    /// 重启重放即跳过这些变更。
+    #[test]
+    fn empty_batch_does_not_advance_watermark() {
+        let state = EngineState::new();
+        state.seen_event_id.store(7, Ordering::Relaxed);
+        apply_batch(&state, vec![]);
+        assert_eq!(state.applied_event_id.load(Ordering::Relaxed), 0);
+    }
+
+    /// 水位取批次内最大 ID(tech.md:回放段事件 ID 非严格递增,水位必须取 max)。
+    /// 乱序到达后 seen 恒为该批最大 ID,应用后 applied 直接落到最大值。
+    #[test]
+    fn seen_watermark_takes_batch_max() {
+        let state = EngineState::new();
+        for id in [100u64, 50, 200, 150] {
+            state.seen_event_id.fetch_max(id, Ordering::Relaxed);
+        }
+        assert_eq!(state.seen_event_id.load(Ordering::Relaxed), 200);
     }
 }
