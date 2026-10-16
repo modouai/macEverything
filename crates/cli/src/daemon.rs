@@ -446,6 +446,27 @@ fn apply_batch(state: &EngineState, dirs: Vec<String>) {
     state
         .applied_event_id
         .fetch_max(batch_water, Ordering::Relaxed);
+    maybe_compact(state);
+}
+
+/// 墓碑/孤儿字节达阈值时整理(tech.md 风险表承诺:墓碑占比超 20% 或孤儿字节
+/// 超 32MB 触发整理;原实现 0 调用方,长期常驻下内存无界增长)。
+/// 整理重建条目号与 arena,dir_map 随之失效——必须同步重建,否则增量找不到目录。
+fn maybe_compact(state: &EngineState) {
+    let (before, after) = {
+        let mut h = state.holder.write().unwrap();
+        let IndexHolder::Mutable(idx) = &mut *h else {
+            return;
+        };
+        if !idx.needs_compaction() {
+            return;
+        }
+        let before = idx.entries.len();
+        idx.compact();
+        (before, idx.entries.len())
+    };
+    log::info!("索引整理:条目 {before} → {after},回收墓碑与 arena 孤儿字节");
+    rebuild_dir_map(state);
 }
 
 /// 事件消费循环(重放与增量共用):批量 diff + 落盘节流 + 降级判定。
@@ -597,7 +618,7 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let (idx, gaps) = engine::scanner::scan_roots(&roots, &excludes, threads);
+    let (idx, gaps) = reconcile::full_rescan(&roots, &excludes, threads);
     state.built_at.store(now_secs(), Ordering::Relaxed);
     *state.gaps.lock().unwrap() = gaps
         .permission

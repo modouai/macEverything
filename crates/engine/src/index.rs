@@ -213,25 +213,48 @@ impl Index {
 
     /// 删除(墓碑制,不 swap-remove:保条目号与父指针稳定)。
     /// 子树级联:活子项一并打墓碑,保证「活条目的父必活」不变量。
+    /// 无活子项(最常见的文件删除)走廉价探测,免 O(n) 邻接表构建。
     pub fn remove(&mut self, idx: u32) {
         if !self.entries[idx as usize].is_live() {
             return;
         }
-        let mut table = self.children_table();
-        fn walk(ix: &mut Index, table: &mut Vec<Vec<u32>>, cur: u32) {
-            let e = &mut ix.entries[cur as usize];
-            if !e.is_live() {
-                return;
-            }
-            e.flags |= FLAG_TOMBSTONE;
-            ix.live_count -= 1;
-            ix.tombstones += 1;
-            let kids = std::mem::take(&mut table[cur as usize]);
-            for k in kids {
-                walk(ix, table, k);
-            }
+        let has_children = self.entries.iter().any(|e| e.parent == idx && e.is_live());
+        if !has_children {
+            self.tombstone_one(idx);
+            return;
         }
-        walk(self, &mut table, idx);
+        self.remove_many(&[idx]);
+    }
+
+    /// 批量删除:整批共用一次构建的邻接表。单条 remove 各自建表是 O(n),
+    /// 目录 diff 删除风暴下 N 条 = N×O(n);批量后总代价 O(n + ΣS)。
+    /// 同一子树内重复 idx 由 walk 的墓碑短路自然去重。
+    fn remove_many(&mut self, idxs: &[u32]) {
+        let mut table = self.children_table();
+        for &idx in idxs {
+            self.walk_remove(&mut table, idx);
+        }
+    }
+
+    fn tombstone_one(&mut self, idx: u32) {
+        let e = &mut self.entries[idx as usize];
+        if !e.is_live() {
+            return;
+        }
+        e.flags |= FLAG_TOMBSTONE;
+        self.live_count -= 1;
+        self.tombstones += 1;
+    }
+
+    fn walk_remove(&mut self, table: &mut [Vec<u32>], cur: u32) {
+        if !self.entries[cur as usize].is_live() {
+            return;
+        }
+        self.tombstone_one(cur);
+        let kids = std::mem::take(&mut table[cur as usize]);
+        for k in kids {
+            self.walk_remove(table, k);
+        }
     }
 
     /// 墓碑占比(整理触发条件之一,阈值 20%,ADR-2 风险表)。
@@ -261,28 +284,34 @@ impl Index {
         let mut added = 0u32;
         let mut removed = 0u32;
         let mut on_disk = on_disk.clone();
+        let mut to_remove: Vec<u32> = Vec::new();
+        let mut to_reinsert: Vec<(String, bool)> = Vec::new();
         let kids: Vec<u32> = self.children_of(dir_idx);
         for k in kids {
             let name = String::from_utf8_lossy(self.display_name_of(k)).into_owned();
             match on_disk.remove(&name) {
                 Some(is_dir) => {
-                    let e = self.entries[k as usize];
-                    if e.is_dir() != is_dir {
+                    if self.entries[k as usize].is_dir() != is_dir {
                         // 类型变化视为删+增
-                        self.remove(k);
-                        self.insert(&name, dir_idx, is_dir);
+                        to_remove.push(k);
+                        to_reinsert.push((name, is_dir));
                         added += 1;
                         removed += 1;
                     }
                 }
                 None => {
-                    self.remove(k);
+                    to_remove.push(k);
                     removed += 1;
                 }
             }
         }
+        // 批量墓碑:删除风暴(解压后清理、批量删除)共用一次邻接表构建
+        self.remove_many(&to_remove);
+        for (name, is_dir) in to_reinsert {
+            let _ = self.insert(&name, dir_idx, is_dir);
+        }
         for (name, is_dir) in on_disk {
-            self.insert(&name, dir_idx, is_dir);
+            let _ = self.insert(&name, dir_idx, is_dir);
             added += 1;
         }
         DiffStats { added, removed }
@@ -614,6 +643,45 @@ mod tests {
             i.rename_entry(f, &long); // ~2048B × 17k ≈ 34.8MB > 32MB 阈值
         }
         assert!(i.needs_compaction());
+    }
+
+    // 批量删除钉:diff_dir 一次删 99/101 条(删除风暴形态)结果与逐条一致,
+    // 计数联动且触发整理判定(daemon 接线 needs_compaction 的前提)。
+    #[test]
+    fn diff_dir_bulk_removal_and_compaction_trigger() {
+        let mut i = ix();
+        let d = i.insert("docs", NO_PARENT, true);
+        for k in 0..100 {
+            i.insert(&format!("f{k:03}.txt"), d, false);
+        }
+        let stats = i.diff_dir(d, &listing(&[("f000.txt", false)]));
+        assert_eq!((stats.added, stats.removed), (0, 99));
+        assert_eq!(i.entry_count(), 2); // d + f000
+        assert_eq!(i.tombstone_count(), 99);
+        assert!(i.needs_compaction(), "墓碑占比 99/101 > 20%");
+        i.compact();
+        assert_eq!(i.entry_count(), 2);
+        assert_eq!(i.tombstone_count(), 0);
+        assert_eq!(
+            i.dir_path(d),
+            b"docs".to_vec(),
+            "整理后路径池按新条目号重建"
+        );
+    }
+
+    // 批量删除中的类型翻转钉:同一批里既有删除又有 file↔dir 翻转,顺序语义不变。
+    #[test]
+    fn diff_dir_bulk_mixed_removal_and_type_flip() {
+        let mut i = ix();
+        let d = i.insert("docs", NO_PARENT, true);
+        i.insert("gone.txt", d, false);
+        let flip = i.insert("item", d, false); // 磁盘上是目录
+        let stats = i.diff_dir(d, &listing(&[("item", true)]));
+        assert_eq!((stats.added, stats.removed), (1, 2));
+        assert!(!i.entries[flip as usize].is_live(), "旧条目墓碑");
+        let kids = i.children_of(d);
+        assert_eq!(kids.len(), 1);
+        assert!(i.entries[kids[0] as usize].is_dir(), "翻转后为目录");
     }
 
     // —— Task 8:IndexView 统一读取面(ADR-3) ——
