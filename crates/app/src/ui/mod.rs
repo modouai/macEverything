@@ -4,27 +4,49 @@
 //! 第二视口 = 悬浮条占位(Task 12 填 session 搜索,Task 14 套平台行为)。
 
 use eframe::egui;
+use std::sync::mpsc::Receiver;
 
 use crate::platform;
+use crate::single_instance::Incoming;
 
 pub struct App {
     /// 悬浮条是否显示(Task 12 接 session 后接管)。
     palette_visible: bool,
     /// 悬浮条输入框内容(Task 12 接管)。
     palette_input: String,
+    /// 二次启动唤起通道(app.sock 监听线程 → 主线程;main 接线)。
+    incoming: Receiver<Incoming>,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, incoming: Receiver<Incoming>) -> Self {
         Self {
             palette_visible: true,
             palette_input: String::new(),
+            incoming,
+        }
+    }
+
+    /// 二次启动唤起:置显示开关 + 请求重绘(Task 14 换 native
+    /// orderFrontRegardless 显示路径)。
+    fn drain_incoming(&mut self, ctx: &egui::Context) {
+        while let Ok(ev) = self.incoming.try_recv() {
+            match ev {
+                Incoming::ShowPalette => {
+                    log::info!("二次启动唤起:显示悬浮条");
+                    self.palette_visible = true;
+                    ctx.request_repaint();
+                }
+            }
         }
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
+        self.drain_incoming(ctx);
+
         // 平台补丁每次 logic 核对(与 PoC-1 续「每帧核对、漂移即重施」同形态;
         // 本任务为空壳,Task 14 填实现)。
         if let Err(err) = platform::patch_palette_window(frame) {
