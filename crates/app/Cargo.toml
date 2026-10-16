@@ -15,7 +15,11 @@ protocol = { path = "../protocol" }
 engine = { path = "../engine" }
 # 0.37 一律带 system_fonts:仅 default_fonts 时中文渲染为方框(PoC-1 实测,
 # 见 docs/specs/v2-ui/poc-results.md「与 plan 示意的接线差异」#3)。
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts"] }
+# clipboard(2026-10-16 修「输入框无法粘贴」):default-features=false 会一并关掉
+# egui-winit/clipboard,剪贴板集成(arboard)随之缺席——egui-winit 的 handle_key_event
+# 只在 clipboard_shortcuts 下把 ⌘V 译成 Event::Paste,而 Clipboard::get 无 arboard 时
+# 只读进程内兜底串(恒空,空串不再 push 事件),⌘V/⌘C/⌘X 三键全哑。
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts", "clipboard"] }
 egui_extras = "0.37"
 objc2 = "0.6"
 # NSResponder/NSAppearance:ui/theme.rs 经 NSApplication.effectiveAppearance 读系统外观
