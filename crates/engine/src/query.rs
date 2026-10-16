@@ -242,6 +242,110 @@ fn cmp_rows(a: &(u8, usize, u32), b: &(u8, usize, u32)) -> std::cmp::Ordering {
     b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
 }
 
+/// 列排序键(完整窗口列头):Relevance = v1 质量序(委托 execute),
+/// Name/Size/Mtime/Path = 四个可排序列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Relevance,
+    Name,
+    Size,
+    Mtime,
+    Path,
+}
+
+/// execute_sorted 的产出:elapsed_ms 计函数全程(匹配 + 键计算 + 排序,含 meta_of 调用),
+/// stat_ms 为包住 meta_of 的耗时(排序轮)。排序算出的元数据由 daemon 侧闭包自持
+/// (缓存 map,响应组装时免重查)——本结构不含 meta。
+pub struct SortOutcome {
+    pub hits: Vec<u32>,
+    pub total: u32,
+    pub elapsed_ms: f64,
+    pub stat_ms: f64,
+}
+
+/// 一条元数据行:(大小, 修改时间);None = 该字段读取失败。
+pub type MetaRow = (Option<u64>, Option<u64>);
+
+/// 批量元数据闭包引用:入参为候选条目号切片,按序返回对应 MetaRow。
+/// 签名成别名供 engine 入口与 daemon 侧实现共用(clippy type_complexity 门禁);
+/// 显式带生命周期参数,容许捕获局部变量的闭包(daemon 侧缓存 map)。
+pub type MetaOf<'a> = &'a dyn Fn(&[u32]) -> Vec<MetaRow>;
+
+/// 按列排序查询。meta_of 为批量元数据注入:入参为候选条目号切片,按序返回
+/// (大小, 修改时间);daemon 侧内部并行 stat(rayon),engine 单次顺序调用,无 Sync 约束。
+/// 排序键形态(定案):Name/Path 取 display 原始形态 Unicode 码点序,不做本地化排序
+/// (与 Finder 的拼音/区域序不同,已知局限)。等值键以条目号决胜(确定性,同 v1 约定)。
+/// 方向:Size 升序(小在前)、Mtime 降序(最新在前,文件管理器惯例);方向切换在 UI 侧。
+/// Relevance 原样委托 execute(不调 meta_of,回归钉)。
+pub fn execute_sorted(
+    view: &dyn IndexView,
+    plan: &QueryPlan,
+    limit: usize,
+    sort: SortKey,
+    meta_of: MetaOf<'_>,
+) -> SortOutcome {
+    if sort == SortKey::Relevance {
+        let out = execute(view, plan, limit);
+        return SortOutcome {
+            hits: out.hits,
+            total: out.total,
+            elapsed_ms: out.elapsed_ms,
+            stat_ms: 0.0,
+        };
+    }
+    let t = std::time::Instant::now();
+    // 全量匹配(不截断):execute 的 limit 截断在排序后,传 usize::MAX 时
+    // limit < rows.len() 不成立、select_nth 跳过,得全量重排;截断由本函数统一做。
+    let full = execute(view, plan, usize::MAX);
+    let mut hits = full.hits;
+    let total = full.total;
+    // 键计算:仅 Size/Mtime 需要元数据(批量闭包注入);Name/Path 键来自 arena,零 stat。
+    let stat_t = std::time::Instant::now();
+    let meta: Vec<(Option<u64>, Option<u64>)> = match sort {
+        SortKey::Size | SortKey::Mtime => meta_of(&hits),
+        _ => vec![],
+    };
+    let stat_ms = stat_t.elapsed().as_secs_f64() * 1000.0;
+    match sort {
+        SortKey::Size => {
+            let idx: std::collections::HashMap<u32, (Option<u64>, Option<u64>)> =
+                hits.iter().copied().zip(meta).collect();
+            hits.sort_by(|a, b| {
+                let ka = idx[a].0.unwrap_or(u64::MAX); // 读取失败排最后(升序下最大)
+                let kb = idx[b].0.unwrap_or(u64::MAX);
+                ka.cmp(&kb).then(a.cmp(b))
+            });
+        }
+        SortKey::Mtime => {
+            let idx: std::collections::HashMap<u32, (Option<u64>, Option<u64>)> =
+                hits.iter().copied().zip(meta).collect();
+            hits.sort_by(|a, b| {
+                let ka = idx[a].1.unwrap_or(0); // 读取失败排最后(降序下 0 最小)
+                let kb = idx[b].1.unwrap_or(0);
+                kb.cmp(&ka).then(a.cmp(b))
+            });
+        }
+        SortKey::Name => hits.sort_by(|a, b| {
+            view.display_name(*a)
+                .cmp(view.display_name(*b))
+                .then(a.cmp(b))
+        }),
+        SortKey::Path => hits.sort_by(|a, b| {
+            view.full_path_dyn(*a)
+                .cmp(&view.full_path_dyn(*b))
+                .then(a.cmp(b))
+        }),
+        SortKey::Relevance => unreachable!("Relevance 已在入口委托 execute"),
+    }
+    hits.truncate(limit);
+    SortOutcome {
+        hits,
+        total,
+        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+        stat_ms,
+    }
+}
+
 /// path 词对一段路径字节的匹配:全部 Pattern 命中;`whole:` 开启时各段还须整词出现
 /// (case:/whole: 作用于整轮,tech.md——路径侧不得静默退化为子串)。
 /// 预编译段:普通段携带 memchr Finder——`memmem::find` 每次调用都重建 Finder
@@ -715,5 +819,102 @@ mod tests {
         assert_eq!(p.path_terms.len(), 1);
         assert_eq!(p.path_terms[0].parts, vec!["合同".as_bytes().to_vec()]);
         assert_eq!(p.name_terms.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use crate::entry::NO_PARENT;
+    use crate::index::Index;
+
+    fn tree() -> Index {
+        let mut i = Index::new();
+        let d = i.insert("docs", NO_PARENT, true);
+        i.insert("b.txt", d, false); // 条目 1
+        i.insert("a.txt", d, false); // 条目 2
+        i.insert("c.txt", d, false); // 条目 3
+        i
+    }
+    /// 假 meta:条目 1/2/3 → size 30/20/10;mtime 1001/1002/1003。
+    fn meta(ids: &[u32]) -> Vec<(Option<u64>, Option<u64>)> {
+        let sizes = [30u64, 20, 10];
+        ids.iter()
+            .map(|&i| (Some(sizes[(i - 1) as usize]), Some(1000 + i as u64)))
+            .collect()
+    }
+
+    #[test]
+    fn sort_by_size_ascending() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let out = execute_sorted(&i, &plan, 10, SortKey::Size, &meta);
+        let names: Vec<String> = out
+            .hits
+            .iter()
+            .map(|h| String::from_utf8_lossy(i.display_name_of(*h)).into_owned())
+            .collect();
+        assert_eq!(names, vec!["c.txt", "a.txt", "b.txt"]); // size 10 < 20 < 30(升序)
+    }
+
+    #[test]
+    fn sort_by_mtime_is_descending() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let out = execute_sorted(&i, &plan, 2, SortKey::Mtime, &meta);
+        assert_eq!(out.hits.len(), 2, "limit 截断");
+        assert_eq!(out.total, 3, "total 为截断前全量");
+        // 定案:mtime 降序(最新在前)——c.txt(1003) > a.txt(1002) > b.txt(1001)
+        assert_eq!(i.display_name_of(out.hits[0]), b"c.txt");
+        assert_eq!(i.display_name_of(out.hits[1]), b"a.txt");
+    }
+
+    #[test]
+    fn sort_by_name_never_calls_meta() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let no_meta =
+            |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Name 排序不得调 meta") };
+        let out = execute_sorted(&i, &plan, 10, SortKey::Name, &no_meta);
+        let names: Vec<Vec<u8>> = out
+            .hits
+            .iter()
+            .map(|h| i.display_name_of(*h).to_vec())
+            .collect();
+        assert_eq!(
+            names,
+            vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()]
+        );
+    }
+
+    #[test]
+    fn sort_by_path_works() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let no_meta =
+            |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Path 排序不得调 meta") };
+        let out = execute_sorted(&i, &plan, 10, SortKey::Path, &no_meta);
+        // 同一目录下,路径序 == 名称序(前缀相同)
+        let names: Vec<Vec<u8>> = out
+            .hits
+            .iter()
+            .map(|h| i.display_name_of(*h).to_vec())
+            .collect();
+        assert_eq!(
+            names,
+            vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()]
+        );
+    }
+
+    #[test]
+    fn relevance_delegates_to_execute() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let base = execute(&i, &plan, 10);
+        let no_meta =
+            |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Relevance 不得调 meta") };
+        let sorted = execute_sorted(&i, &plan, 10, SortKey::Relevance, &no_meta);
+        assert_eq!(base.hits, sorted.hits);
+        assert_eq!(base.total, sorted.total);
     }
 }
