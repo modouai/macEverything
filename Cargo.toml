@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/engine", "crates/protocol", "crates/client", "crates/cli", "crates/app"]
-exclude = ["scripts/spike-readdir", "scripts/poc/poc1_window", "scripts/poc/poc1b_nspanel", "scripts/poc/poc2_hotkey", "scripts/poc/poc3_nsmenu", "scripts/poc/poc4_idle"]
+exclude = ["scripts/spike-readdir", "scripts/poc/poc1_window", "scripts/poc/poc1b_nspanel", "scripts/poc/poc2_hotkey", "scripts/poc/poc3_nsmenu", "scripts/poc/poc4_idle", "scripts/poc/poc6_height_resize"]
 
 [workspace.package]
 version = "0.1.0"
