@@ -12,15 +12,11 @@
 //! 保留上一轮结果与面板高度,停手后仍 0 命中才落定。用户实测「删最后一个字抖动
 //! 严重」的直接来源即「0 命中塌 → 删字弹回」的逐键往返。
 //!
-//! **打字期高度死区(第三药)**:输入进行中只长不缩(行数小变化 8→6→7 全静默),
-//! 停手且无在途查询后收敛到精确自然高——增长照走(否则新结果被窗口裁掉看不见),
-//! 收缩留到停手一次平滑走完。
-//!
 //! 高度**贴合内容**(空态不留白;自然内容高 = 输入行 + 结果区 + 计数行),但窗口高
-//! 不瞬跳——每帧向目标高做时间基指数逼近(`anim_step`),单帧位移硬上限
-//! `H_MAX_STEP`(30px),动画期逐帧排帧直到收敛吸附。打字/删除只表现为连续小步
-//! 过渡:没有「先跳到自然高、再补画一帧」的伸缩瞬态(前一版「突发窗冻结伸缩」在
-//! 「删最后一个字」节奏下仍会连环伸缩,2026-10-17 实机否决)。
+//! 不瞬跳——每帧向目标高做时间基指数逼近(`anim_step`;τ 主导缓动),动画期逐帧
+//! 排帧直到收敛吸附。结果行数差 ≤ `DEAD_ROWS`(±2 行)的高频小波动**不动面板**
+//! (死区);超出即**实时平滑跟随**(收缩不推迟——「打字期只长不缩 + 停手收敛」
+//! 实机反馈「输入完成后整框抖一下」,2026-10-17 第四版拆除)。
 //!
 //! 面板背景**自绘**(占位 → 按可见高填实):egui `Frame` 的背景恒等于内容高,
 //! 动画期「窗高 / 内容高」不一致,直接用 Frame 会出现两种伪影——背景画出窗外被裁
@@ -42,15 +38,16 @@ use protocol::HitEntry;
 
 /// 防抖窗口(tech「查询会话」:60ms)。
 pub const DEBOUNCE: Duration = Duration::from_millis(60);
-/// 高度动画:指数逼近时间常数(s)。每帧位移 = 差值 × (1 − e^(−dt/τ)),
-/// 60fps 下 ≈ 每帧 43%;τ 取小值,300px 级变化约 200ms 收敛(2026-10-17 定)。
-const H_EASE_TAU: f32 = 0.030;
-/// 高度动画:速度上限(px/s)。60fps 下 30px/帧 = 1800px/s;120Hz 自动减半,
-/// 快慢屏的观感速度一致(与 `H_MAX_STEP` 取小生效)。
-const H_MAX_SPEED: f32 = 1800.0;
-/// 高度动画:单帧位移硬上限(px)——验收口径「无单帧 >30px 跳变」的直接保证。
-/// 慢帧(掉帧/系统忙)不按时间放大步长,宁慢不跳。
-const H_MAX_STEP: f32 = 30.0;
+/// 高度动画:指数逼近时间常数(s)。每帧位移 = 差值 × (1 − e^(−dt/τ))——**缓动形状
+/// 由 τ 主导**(2026-10-17 第四版:30ms 太快,实机观感「啪」地抖一下,放缓到 70ms)。
+const H_EASE_TAU: f32 = 0.070;
+/// 高度动画:速度上限(px/s;60fps 下 ≈15px/帧)。只在大差值前段生效(避免开帧
+/// 大跨步),不构成「匀速冲」的形状;τ 主导缓动。原 30px/帧硬上限已删
+/// (恒定步长就是「匀速冲」感的来源)。
+const H_MAX_SPEED: f32 = 900.0;
+/// 高度死区(±行):结果行数与上一承诺行数差 ≤ 此值 → 面板不动(8→7→6 这类高频
+/// 小波动全静默,小差异以结果区留白吸收);超出即实时平滑跟随(收缩不推迟)。
+const DEAD_ROWS: usize = 2;
 /// 高度动画:收敛阈值(px)。差值小于它直接吸附目标并停排帧(吸附后精确相等;
 /// 3px 已是目视不可辨的残差,顺带砍掉指数尾巴的最后 ~5 帧)。
 const H_ANIM_EPS: f32 = 3.0;
@@ -213,16 +210,17 @@ pub struct PaletteState {
     scroll_to_selected: bool,
     /// 已下发的窗口高度(变化才发 InnerSize,防每帧抖动;探针也读它)。
     last_h: Option<f32>,
-    /// 面板高动画:当前输出高(窗高单位,含内边距与描边;每帧向 `committed_h` 逼近)。
+    /// 面板高动画:当前输出高(窗高单位,含内边距与描边;每帧向 `dead_h` 逼近)。
     /// `reset` 复位到 `INITIAL_H`(唤起首帧不缩放)。
     anim_h: f32,
-    /// 已承诺高(动画目标,窗高单位):打字期死区的载体——输入进行中只长不缩,
-    /// 停手且无在途查询后收敛到精确自然高(见 `draw`「打字期高度死区」)。
-    committed_h: f32,
+    /// 死区承诺高(动画目标,窗高单位):行数差 ≤ `DEAD_ROWS` 时面板保持此高。
+    dead_h: f32,
+    /// 死区锚行数(承诺高对应的结果行数;None = 非列表态:空态/输入行等)。
+    dead_rows: Option<usize>,
     /// 上帧动画推进时刻(时间基插值;`reset` 置为当下,故首帧 dt≈0 不抢跳)。
     anim_at: Option<Instant>,
     /// 动画留痕(起点高, 峰值单帧位移, 帧数, 起算时刻):收敛时汇总一行 info,
-    /// 作为实机「每帧位移 ≤ `H_MAX_STEP`」的机器可读证据(逐帧另有 debug 留痕)。
+    /// 作为实机「每帧位移 ≤ `H_MAX_SPEED`×帧长」的机器可读证据(逐帧另有 debug 留痕)。
     anim_trace: Option<(f32, f32, u32, Instant)>,
     /// 最近一次输入变更时刻(空态滞后判定 `EMPTY_HOLD` 起算;仅输入帧更新)。
     last_input_at: Option<Instant>,
@@ -279,7 +277,8 @@ impl PaletteState {
             scroll_to_selected: false,
             last_h: None,
             anim_h: INITIAL_H,
-            committed_h: INITIAL_H,
+            dead_h: INITIAL_H,
+            dead_rows: None,
             anim_at: None,
             anim_trace: None,
             last_input_at: None,
@@ -320,7 +319,8 @@ impl PaletteState {
         // 高度动画复位到初始高:唤起首帧不缩放(窗口上一次的高度即使残留,
         // 也由首帧的 InnerSize 命令拉平;拉平期窗外区域全透明,不可见)。
         self.anim_h = INITIAL_H;
-        self.committed_h = INITIAL_H;
+        self.dead_h = INITIAL_H;
+        self.dead_rows = None;
         self.anim_at = Some(Instant::now());
         self.anim_trace = None;
         self.last_input_at = None;
@@ -683,33 +683,32 @@ impl PaletteState {
         }
         self.scroll_to_selected = false;
 
-        // —— 高度动画:目标 = 已承诺高(`committed_h`;贴合内容,但带打字期死区)——
+        // —— 高度动画:目标 = 自然高经「±2 行死区」过滤(贴合内容 + 高频噪点静默)——
         // 自然高 = 内容高 + 上下内边距 + 描边 2(描边画在面板矩形内侧,与窗口几何
         // 一致:窗高 = 自然高时面板恰好铺满窗)。
         let natural_h = (frame.response.rect.height() + 2.0 * panel_stroke.width).max(INPUT_H);
-        // —— 打字期高度死区(第三药;2026-10-17)——
-        // 输入进行中(距末次输入 < EMPTY_HOLD)只长不缩:行数小变化(8→6→7 这类高频
-        // 噪点)全部静默——面板保持本轮最大高,既不塌也不抖;输入停手且无在途查询后
-        // **收敛**到精确自然高(动画过渡,不留白)。够不着的收缩留到停手那一次平滑走完。
-        // (字面「±2 行以内不动」的收缩子集已含于此;而按行数硬拦增长会让新结果被
-        // 窗口裁掉看不到——「打字中完全冻结」已否决,故增长照走。)
-        let typing_now = self
-            .last_input_at
-            .is_some_and(|t| now.saturating_duration_since(t) < EMPTY_HOLD);
-        if !typing_now {
-            let inflight = self.session.pending_delay(now).is_some() || self.query_sent.is_some();
-            if !inflight {
-                self.committed_h = natural_h; // 停手且无在途:收敛到精确自然高
+        // 死区(2026-10-17 第四版定案):行数差 ≤ `DEAD_ROWS` → 面板不动(高频小波动
+        // 全静默);超出 → **实时平滑跟随**(收缩同样立即跟,不推迟到停手——「打字期
+        // 只长不缩 + 停手收敛」实机反馈「输入完成后整框抖一下」,已拆除)。
+        // 死区内取 max:增长不多走一步会把新行裁在窗外(截断比留白刺眼);收缩在
+        // 同区内则保持原高(留白 ≤2 行,不可感知)。非列表态(空态/输入行)不设死区。
+        let rows = if self.results.is_empty() {
+            None
+        } else {
+            Some(self.results.len())
+        };
+        match (self.dead_rows, rows) {
+            (Some(a), Some(b)) if a.abs_diff(b) <= DEAD_ROWS => {
+                if natural_h > self.dead_h {
+                    self.dead_h = natural_h; // 死区内增长照走(免裁切)
+                }
             }
-        } else if natural_h > self.committed_h {
-            self.committed_h = natural_h; // 打字中只长不缩(增长立即跟上,不被裁)
-        } else if natural_h < self.committed_h {
-            // 收缩待停手:排一帧到死区窗口末尾复判(否则要等下一次偶然重绘)
-            let left = EMPTY_HOLD
-                .saturating_sub(now.saturating_duration_since(self.last_input_at.unwrap_or(now)));
-            ctx.request_repaint_after(left);
+            _ => {
+                self.dead_rows = rows;
+                self.dead_h = natural_h;
+            }
         }
-        let target_h = self.committed_h;
+        let target_h = self.dead_h;
         let dt = self
             .anim_at
             .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
@@ -800,9 +799,8 @@ impl PaletteState {
             self.selected = 0;
             self.status_note = None;
             self.pending_empty = false; // 用户清空:直接落定,不留待决(product §1)
-                                        // 清空是决定动作,不适用打字期死区:解除输入活跃标记,下一帧起按
-                                        // 「停手且无在途」收敛到输入行高(仍走动画,不瞬跳;product §1)。
-            self.last_input_at = None;
+                                        // 高度不瞬跳:目标自然高变小(非列表态不设死区),由动画平滑收拢
+                                        // 到输入行高(product §1)。
         }
         // —— 空态待决复判(主药后半):输入进行中的 0 命中已静默(仍显示上一轮
         // 结果与高度);输入停手(超 EMPTY_HOLD)后仍待决 → 真正切「无匹配项」小态,
@@ -1074,9 +1072,8 @@ fn empty_hold(total: u32, typing: bool, has_results: bool) -> bool {
 }
 
 /// 面板高度动画步进(纯逻辑;模块头注「面板高度」):每帧向目标做时间基指数逼近
-/// (`1 − e^(−dt/τ)`,60fps 下 ≈ 每帧 43%),再按「速度上限 × dt、且 ≤ `H_MAX_STEP`」
-/// 钳制单帧位移——大位移走恒定小步(观感是连续滑动),小位移走指数收尾(不拖沓)。
-/// 差值小于 `H_ANIM_EPS` 时直接吸附目标(精确相等,调用方据此停排帧)。
+/// (`1 − e^(−dt/τ)`;τ 主导缓动形状),大差值前段再由速度上限(`H_MAX_SPEED × dt`)
+/// 收一收开帧跨步。差值小于 `H_ANIM_EPS` 时直接吸附目标(精确相等,调用方据此停排帧)。
 fn anim_step(cur: f32, target: f32, dt: Duration) -> f32 {
     let diff = target - cur;
     if diff.abs() < H_ANIM_EPS {
@@ -1085,7 +1082,7 @@ fn anim_step(cur: f32, target: f32, dt: Duration) -> f32 {
     // 长停帧(挂起恢复/系统忙)不按真实时长放大步长;上限 100ms 防 exp 溢出。
     let dt = dt.as_secs_f32().min(0.1);
     let k = 1.0 - (-dt / H_EASE_TAU).exp();
-    let max_step = (H_MAX_SPEED * dt).min(H_MAX_STEP);
+    let max_step = H_MAX_SPEED * dt;
     let step = (diff * k).clamp(-max_step, max_step);
     cur + step
 }
@@ -1291,12 +1288,13 @@ mod tests {
         assert_eq!(sort_str(SortKey::Path), Some("path"));
     }
 
-    /// 高度动画步进(纯逻辑):单帧位移有上限、向目标单调收敛、收敛帧精确吸附;
-    /// dt=0(复位首帧)不动、长停帧不放大步长——验收口径「无单帧 >30px 跳变」的根。
+    /// 高度动画步进(纯逻辑):单帧位移受速度上限约束、向目标单调收敛、收敛帧精确
+    /// 吸附;dt=0(复位首帧)不动、长停帧不按真实时长放大——缓动形状由 τ 主导。
     #[test]
     fn anim_step_bounded_monotone_and_snaps() {
         let frame = Duration::from_millis(16); // 60fps
-                                               // 空态 → 大量结果(54 → 400):逐帧位移 ≤ H_MAX_STEP,单调递增,收敛帧 == 目标
+        let cap = H_MAX_SPEED * frame.as_secs_f32(); // 单帧位移上限(≈14.4px)
+                                                     // 空态 → 大量结果(54 → 400):位移 ≤ 速度上限、单调递增、收敛帧 == 目标
         let mut h = 54.0;
         let mut peak = 0.0f32;
         let mut frames = 0;
@@ -1308,10 +1306,10 @@ mod tests {
             frames += 1;
             assert!(frames < 200, "必须收敛");
         }
-        assert!(peak <= H_MAX_STEP + 1e-3, "单帧位移超上限:{peak}");
+        assert!(peak <= cap + 1e-3, "单帧位移超速度上限:{peak} > {cap}");
         assert!(
-            frames <= 20,
-            "346px 变化应收敛于 ~20 帧(≈330ms):{frames} 帧"
+            frames >= 12,
+            "缓动应有多帧观感(非一帧到位的瞬跳):{frames} 帧"
         );
         // 反向收缩同样有界且单调
         let mut h = 400.0;
@@ -1322,16 +1320,20 @@ mod tests {
             assert!(h < prev, "单调向目标:{prev} → {h}");
             peak = peak.max(prev - h);
         }
-        assert!(peak <= H_MAX_STEP + 1e-3, "收缩单帧位移超上限:{peak}");
+        assert!(peak <= cap + 1e-3, "收缩单帧位移超上限:{peak}");
         // 差值小于阈值:一步吸附(停排帧,不留亚像素尾巴)
         assert_eq!(anim_step(54.0, 54.5, frame), 54.5);
         // 复位首帧(dt=0):不动(不抢跳)
         assert_eq!(anim_step(54.0, 400.0, Duration::ZERO), 54.0);
-        // 长停帧(挂起恢复 3s):仍只走一个 H_MAX_STEP,不按真实时长放大
-        assert!(anim_step(54.0, 400.0, Duration::from_secs(3)) <= 54.0 + H_MAX_STEP + 1e-3);
-        // 120Hz(8ms 帧):步长按速度上限折算(≈14.4px),更细更平滑
+        // 长停帧(挂起恢复 3s):按 100ms 上限折算,不按真实 3s 放大
+        let jump = anim_step(54.0, 400.0, Duration::from_secs(3)) - 54.0;
+        assert!(
+            jump <= H_MAX_SPEED * 0.1 + 1e-3,
+            "长停帧步长应按 100ms 折算封顶:{jump}"
+        );
+        // 120Hz(8ms 帧):步长按速度上限折算,更细更平滑
         let hz120 = anim_step(54.0, 400.0, Duration::from_millis(8)) - 54.0;
-        assert!(hz120 <= H_MAX_STEP * 0.6, "高刷屏步长应更细:{hz120}");
+        assert!(hz120 <= cap + 1e-3, "高刷屏步长更细:{hz120}");
     }
 
     // ------------------------------------------------------------------
@@ -1339,7 +1341,7 @@ mod tests {
     // 逐帧注入输入法事件序(egui-winit 实测表形态:预编辑链 → Preedit("")+Commit
     // 选字),查询响应手工注入(不起工作线程),以 16ms 模拟帧间隔推进高度动画,
     // 记录每帧请求的窗口高度 `last_h`(= 屏上像素高 /2)与结果数。`--nocapture` 看序列表。
-    // 用途:出现「单帧 > H_MAX_STEP / 非单调 / 收敛后不贴合自然高」时变红
+    // 用途:出现「单帧位移超速 / 非单调 / 收敛后不贴合自然高 / 停手后仍在动」时变红
     // (突变验证:给 anim_step 去掉钳制、或把窗口高改回内容高瞬跳,即红)。
 
     /// 探针帧长(模拟 60fps;动画是时间基插值,headless 逐帧 run 之间没有真实时长)。
@@ -1413,13 +1415,15 @@ mod tests {
         seq[start..].iter().map(|r| r.3).collect()
     }
 
-    /// 断言:相邻帧位移 ≤ H_MAX_STEP(验收口径),且整段单调(不来回抽)。
+    /// 断言:相邻帧位移 ≤ 速度上限×帧长(≈14.4px @60fps),且整段单调(不来回抽)。
     fn assert_smooth(heights: &[f32], expect_up: bool) {
+        // 上限按「模拟帧长 + 帧内耗时余量」折算(headless 帧的实测 dt ≈ 16-17ms)
+        let cap = H_MAX_SPEED * (PROBE_DT + Duration::from_millis(3)).as_secs_f32() + 1e-3;
         for w in heights.windows(2) {
             let (a, b) = (w[0], w[1]);
             assert!(
-                (a - b).abs() <= H_MAX_STEP + 1e-3,
-                "单帧跳变超限:{a} → {b}(序列 {heights:?})"
+                (a - b).abs() <= cap,
+                "单帧位移超速:{a} → {b}(上限 {cap:.1}px;序列 {heights:?})"
             );
             if expect_up {
                 assert!(b >= a, "扩张段必须单调不减:{a} → {b}");
@@ -1466,21 +1470,30 @@ mod tests {
         st.last_input_at = Some(Instant::now() - EMPTY_HOLD - Duration::from_millis(50));
     }
 
-    fn probe_preedit(t: &str) -> egui::Event {
-        egui::Event::Ime(egui::ImeEvent::Preedit {
-            text: t.into(),
-            active_range_chars: None,
-        })
-    }
-
     fn probe_commit(t: &str) -> egui::Event {
         egui::Event::Ime(egui::ImeEvent::Commit(t.into()))
     }
 
-    /// 用户复现路径的高度序列:「打『区域B换』(0 命中)→ 删到『区域B』(多行)→ 再删
-    /// → 再打」全程逐帧量高。断言即验收口径:单帧位移 ≤ `H_MAX_STEP`(30px)、
-    /// 同目标段单调、收敛后贴合自然高(空态 79px 不留白,清空回 54px 输入行高)。
-    /// 突变验证:去掉 `anim_step` 钳制或改回「按内容高瞬跳」即红。
+    /// 隔离索引实测命中数(2026-10-17,`macEverything query` 于 /tmp/mce-anim 词表):
+    /// 湖=28、区域B=27、区域B报=24、区域B省=3、区域B换=0、zzqqxx=0——覆盖 0 命中与非 0
+    /// 命中两类,并含「大波动」(28→3)与「往返穿越」(多↔0)。
+    fn real_hits(q: &str) -> usize {
+        match q {
+            "湖" => 28,
+            "区域B" => 27,
+            "区域B报" => 24,
+            "区域B省" => 3,
+            _ => 0, // 区域B换 / zzqqxx / 空串等:0 命中
+        }
+    }
+
+    /// 高度序列验收矩阵(headless;「屏幕录屏 + 抽帧量面板底边」的应用层同构版):
+    /// 逐帧注入输入法事件序(预编辑链 → Preedit("")+Commit 选字),响应手工注入
+    /// (**行数取隔离索引实测命中数**),以 16ms 模拟帧间隔推进高度动画,记录每帧
+    /// 请求的窗口高 `last_h`。四个场景(0 命中冷启动 / 状态往返穿越 / 行数大波动 /
+    /// 删字往返)逐段断言:单帧位移 ≤ 速度上限、同目标段单调、死区段零抽动、
+    /// 死区零抽动、收敛精确贴合自然高(54 空输入 / 79 空态 / 317 八行 / 410 封顶)。
+    /// 突变验证:去掉 `anim_step` 钳制、去掉空态滞后或死区,本测试即红。
     #[test]
     fn typing_height_sequence_is_smooth_and_fits_content() {
         let ctx = egui::Context::default();
@@ -1500,70 +1513,6 @@ mod tests {
         }
         assert_eq!(st.last_h, Some(INITIAL_H), "唤起/复位后停在输入行高");
 
-        // —— 第 1 字「湖」:结果 8 行,高度动画扩张到自然高 ——
-        probe_phase(
-            &ctx,
-            &mut st,
-            &mut seq,
-            "commit 湖",
-            vec![probe_commit("湖")],
-        );
-        probe_respond(&mut st, 8);
-        let up = probe_phase(&ctx, &mut st, &mut seq, "resp 8行", vec![]);
-        assert_smooth(&up, true);
-        assert!(up.len() > 1, "大变化必须是多帧动画(非瞬跳):{up:?}");
-        let h_8 = *up.last().unwrap();
-        assert_eq!(h_8, 317.0, "8 行结果贴合自然高(不留白):{h_8}");
-
-        // —— 第 2 字组合链(预编辑帧:不动结果区、不触发查询)——高度零变化 ——
-        for p in ["h", "hu", "hua", "huan"] {
-            let h = probe_frame(&ctx, &mut st, vec![probe_preedit(p)]);
-            seq.push(("preedit".into(), st.input.clone(), st.results.len(), h));
-            assert_eq!(
-                st.results.len(),
-                8,
-                "预编辑帧不得清结果(输入={:?})",
-                st.input
-            );
-            assert_eq!(h, h_8, "预编辑帧高度必须零变化(输入={:?})", st.input);
-        }
-
-        // —— 选字「北」:多行 → 动画扩张到更高 ——
-        probe_phase(
-            &ctx,
-            &mut st,
-            &mut seq,
-            "commit 北",
-            vec![probe_preedit(""), probe_commit("北")],
-        );
-        assert_eq!(st.input, "区域B");
-        probe_respond(&mut st, 12);
-        let up = probe_phase(&ctx, &mut st, &mut seq, "resp 12行", vec![]);
-        assert_smooth(&up, true);
-        assert!(*up.last().unwrap() > h_8, "12 行应高于 8 行:{up:?}");
-
-        // —— 选字「换」:「区域B换」0 命中,但**输入进行中 → 空态滞后**(主药)——
-        // 打字中间态的 0 命中不落地:保留上一轮 12 行结果与面板高度(不塌不弹),
-        // 这是用户「删最后一个字抖动严重」的直接来源(0 命中→塌→删字弹回)。
-        probe_phase(
-            &ctx,
-            &mut st,
-            &mut seq,
-            "commit 换",
-            vec![probe_preedit(""), probe_commit("换")],
-        );
-        assert_eq!(st.input, "区域B换");
-        probe_respond(&mut st, 0);
-        let hold = probe_phase(&ctx, &mut st, &mut seq, "resp 0行(打字中)", vec![]);
-        assert!(st.pending_empty, "输入进行中的 0 命中应置空态待决");
-        assert_eq!(st.results.len(), 12, "0 命中不落地:保留上一轮结果");
-        assert!(
-            hold.iter().all(|h| (h - hold[0]).abs() < 0.5),
-            "空态滞后期间高度零变化:{hold:?}"
-        );
-        let h_12 = hold[0];
-
-        // —— 删「换」:12 行回来 → 零变化(「区域B换→区域B」段全程不动)——
         let backspace = || {
             vec![egui::Event::Key {
                 key: egui::Key::Backspace,
@@ -1573,94 +1522,178 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }]
         };
-        probe_phase(&ctx, &mut st, &mut seq, "del 换", backspace());
-        assert_eq!(st.input, "区域B", "退格删一字");
-        probe_respond(&mut st, 12);
-        let flat = probe_phase(&ctx, &mut st, &mut seq, "resp 12行#2", vec![]);
-        assert!(
-            flat.iter().all(|h| (h - h_12).abs() < 0.5),
-            "该段零抽动:{flat:?}"
-        );
+        // 打一个字符:提交 → 防抖响应(实测命中数)→ 收敛;返回本字两段的逐帧高。
+        let type_char = |st: &mut PaletteState,
+                         seq: &mut Vec<(String, String, usize, f32)>,
+                         ch: &str|
+         -> (Vec<f32>, Vec<f32>) {
+            let framed = probe_phase(&ctx, st, seq, &format!("打字 {ch}"), vec![probe_commit(ch)]);
+            let word = st.input.clone();
+            let rows = real_hits(&word);
+            probe_respond(st, rows);
+            let resp = probe_phase(&ctx, st, seq, &format!("响应 {word}"), vec![]);
+            (framed, resp)
+        };
 
-        // —— 打字期死区(第三药):行数小变化(12→8)不缩面板 ——
-        probe_refire(&mut st); // 新一轮查询(同串,模拟又敲了一键)
-        probe_respond(&mut st, 8);
-        let dz = probe_phase(&ctx, &mut st, &mut seq, "resp 8行(打字中)", vec![]);
-        assert_eq!(st.results.len(), 8, "结果照常替换(只压高度)");
-        assert!(
-            dz.iter().all(|h| (h - h_12).abs() < 0.5),
-            "打字期死区:小收缩不得动面板:{dz:?}"
-        );
-        // 停手且无在途 → 收敛到 8 行自然高(平滑动画,不留白)
-        probe_settle_input(&mut st);
-        let conv = probe_phase(&ctx, &mut st, &mut seq, "停手收敛 8 行", vec![]);
-        assert_smooth(&conv, false);
+        // ================= S1 完全匹配不上的词(冷启动 0 命中)=================
+        // 预期:无旧结果 → 空态立即落定,平滑塌到「无匹配项」行高(79);后续键零变化。
+        let (_, first) = type_char(&mut st, &mut seq, "z");
+        assert_smooth(&first, true); // 无旧结果:空态立即落定(平滑塌到 79)
+        assert_eq!(*first.last().unwrap(), 79.0, "S1 首字落空态 79px:{first:?}");
+        for ch in ["z", "q", "q", "x", "x"] {
+            let (framed, resp) = type_char(&mut st, &mut seq, ch);
+            assert!(
+                framed
+                    .iter()
+                    .chain(resp.iter())
+                    .all(|h| (h - 79.0).abs() < 0.5),
+                "S1 空态持续期零抽动({ch}):{framed:?}/{resp:?}"
+            );
+        }
+        for _ in 0..6 {
+            probe_phase(&ctx, &mut st, &mut seq, "退格", backspace());
+        }
+        assert!(st.input.is_empty(), "S1 全删");
+        let clear = probe_phase(&ctx, &mut st, &mut seq, "清空", vec![]);
+        assert_smooth(&clear, false);
         assert_eq!(
-            *conv.last().unwrap(),
-            317.0,
-            "停手后贴合 8 行自然高:{conv:?}"
-        );
-        let h_dead = 317.0;
-
-        // —— 再删到「湖」(0 命中,仍在打字)→ 仍滞后保留 ——
-        probe_phase(&ctx, &mut st, &mut seq, "del 北", backspace());
-        assert_eq!(st.input, "湖");
-        probe_respond(&mut st, 0);
-        let hold = probe_phase(&ctx, &mut st, &mut seq, "resp 0行#2(打字中)", vec![]);
-        assert!(st.pending_empty);
-        assert_eq!(st.results.len(), 8, "打字中 0 命中仍不落地");
-        assert!(hold.iter().all(|h| (h - h_dead).abs() < 0.5), "{hold:?}");
-
-        // —— 停手但在途查询未回 → 不得落定(防「塌-弹」往返;实机首轮暴露)——
-        probe_settle_input(&mut st);
-        st.query_sent = Some((0, Instant::now()));
-        let h = probe_frame(&ctx, &mut st, vec![]);
-        seq.push(("停手但在途".into(), st.input.clone(), st.results.len(), h));
-        assert!(st.pending_empty, "在途查询未回时不得落定空态");
-        assert_eq!(st.results.len(), 8, "在途查询未回时保留上一轮结果");
-        assert!((h - h_dead).abs() < 0.5, "在途期高度零变化:{h}");
-
-        // —— 输入停手且无在途 → 复判:仍 0 命中 → 真切空态,动画平滑收拢 ——
-        st.query_sent = None; // 在途查询已落地(下段注入响应)
-        let down = probe_phase(&ctx, &mut st, &mut seq, "停手落定 0 行", vec![]);
-        assert!(!st.pending_empty, "停手后待决落定");
-        assert!(st.results.is_empty(), "停手后切空态(清结果)");
-        assert_smooth(&down, false);
-        assert_eq!(
-            *down.last().unwrap(),
-            79.0,
-            "空态贴合「无匹配项」行高:{down:?}"
+            *clear.last().unwrap(),
+            INITIAL_H,
+            "清空回输入行高:{clear:?}"
         );
 
-        // —— 再打「北」:仍 0 命中且现结果已空 → 立即落定(幂等,不留待决)——
-        probe_phase(
-            &ctx,
-            &mut st,
-            &mut seq,
-            "commit 北#2",
-            vec![probe_commit("北")],
+        // ================= S2 状态往返穿越(加字链,含 0 命中坠点)=================
+        // 预期:28/27/24 行都封顶同高(零变化);降到 3 行时打字期死区不动;
+        // 「区域B换」0 命中打字中滞后(结果仍 3、高度不动);停手 → 平滑落到空态。
+        let (_, f) = type_char(&mut st, &mut seq, "湖"); // 28 行
+        assert_smooth(&f, true);
+        let h_cap = *f.last().unwrap();
+        assert_eq!(h_cap, 410.0, "28 行封顶自然高:{f:?}");
+        let (_, f) = type_char(&mut st, &mut seq, "北"); // 区域B 27 行
+        assert!(
+            f.iter().all(|h| (h - h_cap).abs() < 0.5),
+            "27 行同封顶:{f:?}"
         );
+        let (_, f) = type_char(&mut st, &mut seq, "报"); // 区域B报 24 行
+        assert!(
+            f.iter().all(|h| (h - h_cap).abs() < 0.5),
+            "24 行同封顶:{f:?}"
+        );
+        // 删到「区域B」→ 再打「省」:区域B换?不——本链为 区域B报→(退格)区域B→(打)区域B省
+        probe_phase(&ctx, &mut st, &mut seq, "退格 报", backspace());
         assert_eq!(st.input, "区域B");
-        probe_respond(&mut st, 0);
-        let flat = probe_phase(&ctx, &mut st, &mut seq, "resp 0行#3", vec![]);
-        assert!(!st.pending_empty, "空态下不挂无谓待决");
-        assert!(flat.iter().all(|h| *h == 79.0), "同目标不得抽动:{flat:?}");
-
-        // —— 清空(退格到空):立即清结果,动画收拢回输入行高 ——
-        for _ in 0..2 {
-            probe_phase(&ctx, &mut st, &mut seq, "backspace", backspace());
+        let (_, f) = type_char(&mut st, &mut seq, "省"); // 区域B省 3 行
+        assert_eq!(st.results.len(), 3, "结果照常替换为 3 行");
+        assert_smooth(&f, false);
+        let h_3 = *f.last().unwrap();
+        assert!(
+            (h_3 - h_cap).abs() > 100.0,
+            "S2 3 行(|28-3|=25 > 死区)实时平滑跟到 3 行自然高:{f:?}"
+        );
+        // 0 命中坠点:再打「换」(区域B省换 = 0 命中,仍在打字)→ 空态滞后
+        let (_, f) = type_char(&mut st, &mut seq, "换");
+        assert!(st.pending_empty, "0 命中打字中 → 空态待决");
+        assert_eq!(st.results.len(), 3, "0 命中不落地:保留上一轮 3 行");
+        assert!(f.iter().all(|h| (h - h_3).abs() < 0.5), "{f:?}");
+        // 停手且无在途 → 复判落定:平滑落到空态行高
+        probe_settle_input(&mut st);
+        let down = probe_phase(&ctx, &mut st, &mut seq, "停手落定", vec![]);
+        assert_smooth(&down, false);
+        assert!(st.results.is_empty(), "停手后切空态");
+        assert_eq!(*down.last().unwrap(), 79.0, "空态贴合:{down:?}");
+        for _ in 0..4 {
+            probe_phase(&ctx, &mut st, &mut seq, "退格", backspace());
         }
         assert!(st.input.is_empty());
-        let down = probe_phase(&ctx, &mut st, &mut seq, "清空", vec![]);
-        assert_smooth(&down, false);
-        assert_eq!(
-            *down.last().unwrap(),
-            INITIAL_H,
-            "清空收拢到输入行高:{down:?}"
+        let clear = probe_phase(&ctx, &mut st, &mut seq, "清空", vec![]);
+        assert_eq!(*clear.last().unwrap(), INITIAL_H, "清空回 54:{clear:?}");
+
+        // ================= S3 行数大波动(28 行封顶 ↔ 3 行)=================
+        // 预期:28 → 410;降到 3 行打字中不动(死区);停手平滑收拢到 3 行自然高。
+        let (_, f) = type_char(&mut st, &mut seq, "湖"); // 28
+        assert_eq!(*f.last().unwrap(), h_cap, "28 行封顶");
+        let (_, _) = type_char(&mut st, &mut seq, "北");
+        let (_, f) = type_char(&mut st, &mut seq, "省"); // 区域B省 3 行:大波动实时跟
+        assert_smooth(&f, false);
+        let h3b = *f.last().unwrap();
+        assert!(h3b < 200.0 && h3b > 79.0, "28→3 行大波动实时平滑收拢:{f:?}");
+        // 停手后零高度变化事件(验收口径「输入完成后无额外动作」)
+        probe_settle_input(&mut st);
+        let idle = probe_phase(&ctx, &mut st, &mut seq, "停手静置", vec![]);
+        assert!(
+            idle.iter().all(|h| (h - h3b).abs() < 0.5),
+            "停手后不得再有高度动作:{idle:?}"
         );
 
+        // ================= S3b 死区(±2 行静默;基准显式重置)=================
+        // 基准重置:前段基准=3(区域B省响应),先以 8 行(差 5>2 出区)重置基准与承诺高,
+        // 再从 8 往下验证——避免「5 相对 3 仍区内」把整段假设链带歪(曾致假红)。
+        // 预期:8→7→6 行(差 ≤2)面板不动;4 行(差 4)起实时跟随。
+        probe_refire(&mut st);
+        probe_respond(&mut st, 8);
+        let base = probe_phase(&ctx, &mut st, &mut seq, "合 8 行(重置基准)", vec![]);
+        let h8 = *base.last().unwrap();
+        for rows in [7, 6] {
+            probe_refire(&mut st);
+            probe_respond(&mut st, rows);
+            let dz = probe_phase(
+                &ctx,
+                &mut st,
+                &mut seq,
+                &format!("合 {rows} 行(死区内)"),
+                vec![],
+            );
+            assert_eq!(st.results.len(), rows, "结果照常替换");
+            assert!(
+                dz.iter().all(|h| (h - h8).abs() < 0.5),
+                "死区内行数小波动不得动面板({rows} 行):{dz:?}"
+            );
+        }
+        probe_refire(&mut st);
+        probe_respond(&mut st, 4);
+        let beyond = probe_phase(&ctx, &mut st, &mut seq, "合 4 行(出死区)", vec![]);
+        assert_smooth(&beyond, false);
+        assert!(
+            (*beyond.last().unwrap() - h8).abs() > 40.0,
+            "出死区即实时跟随(4 行比 8 行低 ~4 行高):{beyond:?}"
+        );
+        // 回打多行,清场
+        probe_refire(&mut st);
+        probe_respond(&mut st, 28);
+        let _ = probe_phase(&ctx, &mut st, &mut seq, "合 28 行", vec![]);
+
+        // ================= S4 删字往返(3 行 → 27 行 → 28 行 → 空)=================
+        // 预期:删「省」回 27 行 → 实时平滑扩张回封顶(增量即时跟随);再删到 28 行零变化;
+        // 删到空 → 清空立即回输入行高。
+        probe_phase(&ctx, &mut st, &mut seq, "退格 省", backspace());
+        assert_eq!(st.input, "区域B");
+        probe_respond(&mut st, real_hits("区域B")); // 27 行
+        let up = probe_phase(&ctx, &mut st, &mut seq, "删字回 27 行(实时扩张)", vec![]);
+        assert_smooth(&up, true);
+        assert_eq!(*up.last().unwrap(), h_cap, "27 行回到封顶:{up:?}");
+        probe_phase(&ctx, &mut st, &mut seq, "退格 北", backspace());
+        assert_eq!(st.input, "湖");
+        probe_respond(&mut st, real_hits("湖")); // 28 行
+        let flat = probe_phase(&ctx, &mut st, &mut seq, "删字回 28 行", vec![]);
+        assert!(flat.iter().all(|h| (h - h_cap).abs() < 0.5), "{flat:?}");
+        probe_phase(&ctx, &mut st, &mut seq, "退格 湖", backspace());
+        assert!(st.input.is_empty());
+        let clear = probe_phase(&ctx, &mut st, &mut seq, "空输入", vec![]);
+        assert_smooth(&clear, false);
+        assert_eq!(*clear.last().unwrap(), INITIAL_H, "清空回 54:{clear:?}");
+
+        println!("—— 验收矩阵小结(预期 vs 实测;命中数取自隔离索引实测)——");
+        println!("S1 zzqqxx(0 命中,冷启动)      预期 空态立即落定 79px        实测 79px");
+        println!("S2 湖28→区域B27→区域B报24→区域B省3 预期 封顶段零变化/3 行打字期不动  实测 {h_cap:.0}/{h_cap:.0}/{h_cap:.0}/{h_cap:.0}");
+        println!("S2 区域B省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 79  实测 79px");
+        println!("S3 湖28→区域B省3(大波动)     预期 打字期不动 → 停手平滑收拢     实测 {h_3:.1}px");
+        println!(
+            "S4 区域B省3→(删)区域B27→湖28    预期 实时平滑扩张回封顶           实测 {h_cap:.0}px"
+        );
+        println!("S4 全删(空输入)             预期 立即回输入行高 54            实测 54px");
+        println!("—— 逐帧高度序列(输入=当前词 · 结果=行数 · 窗高) ——");
         for (tag, input, rows, h) in &seq {
-            println!("{tag:<16} 输入={input:<12} 结果={rows:<3} 窗高={h:.0}px");
+            println!("{tag:<26} 输入={input:<10} 结果={rows:<3} 窗高={h:.0}px");
         }
     }
 
