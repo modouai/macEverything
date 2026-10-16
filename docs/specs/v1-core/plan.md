@@ -17,10 +17,17 @@
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-**与 tech.md 的实现偏差**(实现期发现,Task 21 回填 tech.md):
+**与 tech.md 的实现偏差**(实现期发现;**已回填 tech.md v1.2.0 偏差清单**,此处保留指向):
 1. `Entry` 为 24 字节/条——display 与 match arena 因折叠变长不平行,需各自偏移;非 spec 的 16 字节。百万条目内存 90-100MB,仍远低于 500MB 红线。
 2. 「全 Unicode 大小写折叠」用 std `str::to_lowercase()` 实现(覆盖 é/É;ß 类特殊折叠除外),不引入 unicode-case 依赖。
-3. 并行聚合 = 线程本地分片按交织序上收,保证「父条目号先于子 + 路径集合确定」,不保证 arena 布局字节级稳定(ADR-6「按队列顺序聚合」的弱化);persist 字节级稳定以同线程序重建为准(Task 13 验证)。另登记调用方契约:**roots 不得互相重叠**(debug_assert 拒绝,daemon 固定两项自然满足)。
+3. 并行聚合 = 线程本地分片按交织序上收 + 深度拓扑排序,保证「父条目号先于子 + 路径集合确定」,不保证 arena 布局字节级稳定。另登记调用方契约:**roots 不得互相重叠**(debug_assert 拒绝,daemon 固定两项自然满足)。
+4. 根条目名 = 扫描根完整绝对路径(full_path 输出即可直接使用的绝对路径;Task 20 实机发现尾段名致结果路径丢前缀后修正)。
+5. `path:` 词不横跨目录段与文件名(已知限制,tech.md 已记)。
+
+**实现期新增的关键优化与修复**(超出 plan 初始设计,已回填 tech.md):
+- 查询 Finder 预编译(P99 51ms→3.6ms,主开销消除);
+- 增量补链(新目录事件先于父 diff 到达)+ HistoryDone 追平前强制 drain;
+- 落盘串行化(flush_lock + tmp 名 pid+seq 唯一化,修并发写损坏);
 
 ---
 
