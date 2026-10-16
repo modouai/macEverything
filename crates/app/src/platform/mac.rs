@@ -21,25 +21,33 @@
 //!   Task 14 视口常驻(隐藏走 orderOut 不销毁),还原点收敛到进程退出(`revert_class`,
 //!   由 `ui::App::on_exit` 调用)。
 //!
+//! 切 Space 失焦豁免(Task 14b):`SpaceObserver` 注册
+//! `NSWorkspaceActiveSpaceDidChangeNotification`(经 `NSWorkspace.notificationCenter()`,
+//! 非默认通知中心),回调记录变更时刻入全局 `SPACE_CHANGE`;ui 侧经 facade
+//! `last_space_change` 读,按窗口期判定失焦是否豁免(判定逻辑纯函数在 facade)。
+//!
 //! 状态是**主线程单例**(thread_local):悬浮条窗口进程内只有一个,视图层(根视口
 //! logic / 悬浮条回调)经 facade 自由函数访问。非主线程调用由 `MainThreadMarker`
-//! 凭证拦下(返回 Err/直接 no-op),不静默越线。
+//! 凭证拦下(返回 Err/直接 no-op),不静默越线。Space 变更记录例外:走全局
+//! `Mutex`(通知投递线程文档未承诺为主线程,不预设前提)。
 
 use std::cell::RefCell;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
-use objc2::{define_class, ClassType, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSEvent, NSFloatingWindowLevel, NSPanel, NSResponder, NSScreen, NSView,
-    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceActiveSpaceDidChangeNotification,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
-use super::PALETTE_TITLE;
+use super::{monotonic_ms, SpaceChange, PALETTE_TITLE};
 
 /// 顶边位置:可见区顶部向下 1/4(Spotlight 式「居中偏上」,product §1)。
 const TOP_INSET_FRACTION: f64 = 0.25;
@@ -75,6 +83,81 @@ define_class!(
     unsafe impl NSObjectProtocol for MacePalettePanel {}
 );
 
+// Space 变更通知观察者(注册于 NSWorkspace 的通知中心;回调仅记录时刻,不碰窗口)。
+define_class!(
+    // SAFETY(define_class 的 unsafe 契约):超类 NSObject 无子类化约束;
+    // 无新增实例变量(ivars 缺省 `()`);方法签名与 AppKit 一致(单参 NSNotification);无 Drop。
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MaceSpaceObserver"]
+    struct SpaceObserver;
+
+    impl SpaceObserver {
+        #[unsafe(method(activeSpaceDidChange:))]
+        fn active_space_did_change(&self, _notification: &NSNotification) {
+            note_space_change();
+        }
+    }
+
+    unsafe impl NSObjectProtocol for SpaceObserver {}
+);
+
+impl SpaceObserver {
+    /// 创建观察者实例(主线程;实例由调用方持有——通知中心持弱引用,不保活)。
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY:this 为主线程刚分配、ivars 已置的实例;本类未覆写 init,走 NSObject。
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// 最近一次 Space 变更(全局:通知投递线程不预设为主线程,故不走 thread_local)。
+static SPACE_CHANGE: Mutex<Option<SpaceChange>> = Mutex::new(None);
+
+/// 记录一次 Space 变更(通知回调):序号递增 + 记时刻 + 留痕(实机调参取证)。
+fn note_space_change() {
+    let mut guard = match SPACE_CHANGE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let seq = guard.map(|c| c.seq).unwrap_or(0) + 1;
+    *guard = Some(SpaceChange {
+        seq,
+        at: std::time::Instant::now(),
+    });
+    drop(guard);
+    log::info!("Space 变更通知(第 {seq} 次;t+{}ms)", monotonic_ms());
+}
+
+/// 最近一次 Space 变更(facade 转发;None = 进程内从未收到)。
+pub fn last_space_change() -> Option<SpaceChange> {
+    match SPACE_CHANGE.lock() {
+        Ok(g) => *g,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+/// 注册 Space 变更观察者(进程内一次;主线程)。失败仅留痕:豁免退化为不生效。
+fn ensure_space_observer(mtm: MainThreadMarker, st: &mut PaletteState) {
+    if st.space_observer.is_some() {
+        return;
+    }
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let observer = SpaceObserver::new(mtm);
+    // SAFETY:observer 为本进程存活对象(Retained 存于 PaletteState 保活,通知中心持弱引用);
+    // selector 为本类实装方法,签名匹配;通知名为 AppKit 常量。
+    unsafe {
+        center.addObserver_selector_name_object(
+            &observer,
+            objc2::sel!(activeSpaceDidChange:),
+            Some(NSWorkspaceActiveSpaceDidChangeNotification),
+            None,
+        );
+    }
+    log::info!("Space 变更通知观察者已注册(NSWorkspaceActiveSpaceDidChangeNotification)");
+    st.space_observer = Some(observer);
+}
+
 /// 漂移计数(与 PoC-1 续同口径:每帧核对,漂移即重施并留痕)。
 #[derive(Default)]
 struct Drift {
@@ -106,11 +189,41 @@ struct PaletteState {
     class_before: String,
     /// 定位锚(显示时置;高度变化时重锚)。
     anchor: Option<Anchor>,
+    /// Space 变更观察者(持引用保活;通知中心持弱引用,不保活)。
+    space_observer: Option<Retained<SpaceObserver>>,
     drift: Drift,
 }
 
 thread_local! {
     static PALETTE: RefCell<PaletteState> = RefCell::new(PaletteState::default());
+}
+
+/// 鼠标任意键当前是否按下(全局状态快照;NSEvent.pressedMouseButtons)。
+///
+/// 免权限:与全局事件监听(addGlobalMonitorForEvents)不同,这是状态查询,
+/// 实机探针实证(2026-10-16)注入点击亦更新该状态。用途:失焦/待决期的
+/// 「点击导致」快判(窗口期豁免之外的那半——product §1「点击其他应用照常隐藏」)。
+pub fn mouse_button_down() -> bool {
+    NSEvent::pressedMouseButtons() != 0
+}
+
+/// 指针是否落在悬浮条窗 frame 内(ghost 态点击豁免判定用;未接上窗 → false)。
+pub fn palette_contains_mouse() -> bool {
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return false; // 非主线程:调用方在主线程
+    };
+    PALETTE.with(|cell| {
+        let st = cell.borrow();
+        let Some(win) = st.palette.as_ref() else {
+            return false; // 视口窗未创建
+        };
+        let f = win.frame();
+        let p = NSEvent::mouseLocation();
+        p.x >= f.origin.x
+            && p.x < f.origin.x + f.size.width
+            && p.y >= f.origin.y
+            && p.y < f.origin.y + f.size.height
+    })
 }
 
 /// 记录根窗句柄(创建期一次;仅用于排除同名窗口)。
@@ -143,6 +256,7 @@ pub fn ensure_patched() -> Result<()> {
     };
     PALETTE.with(|cell| {
         let mut st = cell.borrow_mut();
+        ensure_space_observer(mtm, &mut st); // 进程内一次;与窗口接线解耦
         if st.palette.is_none() {
             let Some(win) = find_palette_window(mtm, st.root.as_deref()) else {
                 return Ok(()); // 视口窗未创建;下帧再试

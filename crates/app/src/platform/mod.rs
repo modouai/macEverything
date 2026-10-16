@@ -6,12 +6,115 @@
 //!
 //! 非 macOS:同名空实现(本仓当前交付面仅 macOS;stub 只为保持 facade 可编译)。
 //! 调用点:根视口 `logic`(每帧核对/唤起)、悬浮条视口回调(重锚)、`App::on_exit`(还原类)。
+//!
+//! 「切 Space 失焦豁免」(2026-10-16 定,product §1 键位表):mac.rs 注册
+//! `NSWorkspaceActiveSpaceDidChangeNotification` 观察者,记录最近一次变更;
+//! `SpaceExemptDecider`(纯逻辑,本文件)按「同一次过渡 + 豁免一次」判定失焦是否豁免。
+//! 实机实测通知晚于失焦约 +270~380ms(全屏 Space 进出两例),故判据以失焦时刻为锚。
+
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 pub mod mac;
 
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
+
+/// 进程内单调时钟基准(懒初始化;日志打点与 Space 变更判定共用,跨进程不可比)。
+static MONO_EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// 进程内单调毫秒(实机取证打点:通知/失焦日志按此对齐先后)。
+pub fn monotonic_ms() -> u64 {
+    MONO_EPOCH.elapsed().as_millis() as u64
+}
+
+/// 最近一次「活动 Space 变更」事件(mac.rs 通知回调写入)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceChange {
+    /// 事件序号(进程内单调递增;「已消费」比对用)。
+    pub seq: u64,
+    /// 事件本地时刻(单调钟)。
+    pub at: Instant,
+}
+
+/// 失焦豁免判定器(纯逻辑,可测):与 Space 变更同一次过渡的失焦豁免一次。
+///
+/// 语义(product §1「(失焦)」行,2026-10-16 定):
+/// - 切桌面 Space 导致的活动应用变更不隐藏(心流不打断);
+/// - 「同一次过渡」= 变更早于失焦不超过 `window`(通知也可能晚于失焦到达,见 `decide`);
+/// - 消费语义:一次 Space 变更至多豁免一次失焦——豁免后再次失焦(如点击其他应用)
+///   不复用同一变更。
+#[derive(Debug)]
+pub struct SpaceExemptDecider {
+    window: Duration,
+    consumed_seq: Option<u64>,
+}
+
+impl SpaceExemptDecider {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            consumed_seq: None,
+        }
+    }
+
+    /// 判定:change = 最近一次 Space 变更(None = 从未收到);focus_loss_at = 本次失焦时刻。
+    /// true = 豁免(并消费该变更)。
+    ///
+    /// 判据以**失焦时刻**为锚:变更早于失焦不超过 `window` 即算同一次过渡。
+    /// 不与「判定时刻」比较——实机实测(2026-10-16)通知晚于失焦到达(约 +270~380ms),
+    /// 判定又在通知之后,锚判定时刻会把应豁免的晚到通知误算成过期。
+    pub fn decide(&mut self, change: Option<SpaceChange>, focus_loss_at: Instant) -> bool {
+        let Some(c) = change else {
+            return false; // 从未收到通知(含非 macOS 恒 None)
+        };
+        if self.consumed_seq == Some(c.seq) {
+            return false; // 该次变更已豁免过一次
+        }
+        // duration_since 对「变更晚于失焦」(同一次过渡的晚到通知)饱和为 0:不判过期。
+        if focus_loss_at.duration_since(c.at) >= self.window {
+            return false; // 失焦前太久:非同一次过渡
+        }
+        self.consumed_seq = Some(c.seq);
+        true
+    }
+}
+
+/// 鼠标任意键当前是否按下(「点击导致失焦」的快判信号;非 macOS 恒 false)。
+pub fn mouse_button_down() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::mouse_button_down()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 指针是否在悬浮条窗内(ghost 态「点面板外才隐藏」判定;非 macOS/未接窗恒 false)。
+pub fn palette_contains_mouse() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::palette_contains_mouse()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 最近一次 Space 变更(非 macOS 恒 None)。
+pub fn last_space_change() -> Option<SpaceChange> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::last_space_change()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
 
 /// 记录根窗句柄(创建期一次)。
 pub fn attach_root(cc: &eframe::CreationContext<'_>) {
@@ -78,5 +181,63 @@ pub fn attached() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(seq: u64, at: Instant) -> Option<SpaceChange> {
+        Some(SpaceChange { seq, at })
+    }
+
+    /// 无变更通知 → 永不豁免(含非 macOS 恒 None 路径)。钉:None 短路。
+    #[test]
+    fn without_change_never_exempts() {
+        let mut d = SpaceExemptDecider::new(Duration::from_millis(500));
+        assert!(!d.decide(None, Instant::now()));
+    }
+
+    /// 变更先于失焦(窗口期内)豁免一次;第二次同一变更不再豁免(消费语义)。
+    #[test]
+    fn change_before_loss_exempts_once() {
+        let t0 = Instant::now();
+        let mut d = SpaceExemptDecider::new(Duration::from_millis(500));
+        assert!(d.decide(change(1, t0), t0 + Duration::from_millis(100)));
+        assert!(
+            !d.decide(change(1, t0), t0 + Duration::from_millis(200)),
+            "同一变更只豁免一次"
+        );
+    }
+
+    /// 变更晚于失焦(通知晚到,实机实测约 +270~380ms)同样豁免——失焦锚定语义。
+    #[test]
+    fn late_notification_exempts() {
+        let loss = Instant::now();
+        let mut d = SpaceExemptDecider::new(Duration::from_millis(500));
+        assert!(d.decide(change(1, loss + Duration::from_millis(380)), loss));
+    }
+
+    /// 失焦前太久(≥ window)的变更不豁免(边界:恰好等于 window 即不豁免)。
+    #[test]
+    fn stale_change_not_exempt() {
+        let loss = Instant::now();
+        let mut d = SpaceExemptDecider::new(Duration::from_millis(500));
+        assert!(!d.decide(change(1, loss - Duration::from_millis(500)), loss));
+        assert!(!d.decide(change(2, loss - Duration::from_millis(900)), loss));
+    }
+
+    /// 新一次 Space 变更重新获得豁免资格(消费只作废同一变更)。
+    #[test]
+    fn new_change_re_exempts() {
+        let loss1 = Instant::now();
+        let mut d = SpaceExemptDecider::new(Duration::from_millis(500));
+        assert!(d.decide(change(1, loss1), loss1));
+        let loss2 = loss1 + Duration::from_secs(2);
+        assert!(
+            d.decide(change(2, loss2 + Duration::from_millis(300)), loss2),
+            "第 2 次变更(晚到通知)豁免第 2 次失焦"
+        );
     }
 }

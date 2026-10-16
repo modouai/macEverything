@@ -19,7 +19,9 @@
 //!
 //! - 显示:平台层原生 `orderFrontRegardless` + `makeKeyWindow`(主线程;不激活 app、
 //!   不切 Space;避开 eframe 对不可见窗口的 100ms 唤醒节流——PoC-4 实测对外 16.7ms);
-//! - 隐藏:egui 命令 `Visible(false)`(零 CPU 实测达标)。
+//! - 隐藏:egui 命令 `Visible(false)`(零 CPU 实测达标);
+//! - 失焦隐藏含「切 Space 豁免」判定(Task 14b,product §1 键位表 2026-10-16 定):
+//!   判定面在 `ui/palette.rs::PaletteState::draw`(本文件只转发 `Action::Hide`)。
 //!
 //! ## 排帧纪律(L4)
 //!

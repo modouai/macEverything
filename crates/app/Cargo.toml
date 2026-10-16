@@ -32,10 +32,14 @@ objc2-app-kit = { version = "0.3", features = [
     "NSScreen",
     "NSEvent",
     "NSView",
+    # Task 14b 切 Space 豁免:NSWorkspace + NSWorkspaceActiveSpaceDidChangeNotification
+    # (通知经 NSWorkspace.notificationCenter() 注册;该 feature 连带 foundation/NSNotification)。
+    "NSWorkspace",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
-# 依赖非传递可见,Rust 侧须显式声明。
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo"] }
+# 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification
+# 为回调参数类型(Task 14b 直接引用,不依赖 feature 统一带来的可用性)。
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification"] }
 raw-window-handle = "0.6"
 anyhow = "1"
 log = { workspace = true, features = ["std"] }

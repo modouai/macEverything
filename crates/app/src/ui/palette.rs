@@ -7,17 +7,30 @@
 //!
 //! 本文件只管「可见可搜可开」;平台行为(跨 Space/浮动级别/失焦隐藏/多屏定位、
 //! 唤起隐藏路径)在 `ui/mod.rs` 接线 + `platform/`(Task 14,见模块注释「视口形态」)。
+//! 失焦隐藏的判定面(含切 Space 豁免,Task 14b)在本文件 `draw` 内
+//! (「失焦隐藏 + 切 Space 豁免」节):失焦边沿 → 宽限期待决 → Space 变更窗口期内豁免。
 
 use eframe::egui;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::platform;
 use crate::session::{Fire, Session, SortKey, State};
 use client::{DaemonPaths, StatusOutcome};
 use protocol::HitEntry;
 
 /// 防抖窗口(tech「查询会话」:60ms)。
 pub const DEBOUNCE: Duration = Duration::from_millis(60);
+/// 「切 Space 失焦豁免」窗口期(product §1 键位表 2026-10-16 定;实机调参值):
+/// Space 变更落在**失焦时刻**之前不超过此值 → 本次失焦视为切 Space 所致。
+pub const SPACE_EXEMPT_WINDOW: Duration = Duration::from_millis(500);
+/// 失焦待决宽限(实机调参值):失焦首帧不立即定夺,等 Space 变更通知到达后复判。
+/// 依据:实机实测(2026-10-16)通知晚于失焦 -76ms ~ +550ms(12 轮样本,6 次带时戳),
+/// 按最坏 +550ms 留余量。点击导致的失焦走鼠标键快判、不等满宽限(见 draw)。
+pub const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(800);
+/// ghost 态(可见但未聚焦)探帧间隔:该态下点击面板外不产生聚焦事件,
+/// 靠全局鼠标键状态识别,须低延迟轮询;该态通常只在豁免后的常驻期短暂存在。
+pub const GHOST_POLL: Duration = Duration::from_millis(150);
 /// 悬浮条窗口宽度(与中央视口创建处的 ViewportBuilder 一致)。
 pub const PANEL_W: f32 = 600.0;
 /// 初始窗口高度(仅输入行;结果出现后自适应增高)。
@@ -101,6 +114,13 @@ pub struct PaletteState {
     needs_focus: bool,
     /// 曾观测到聚焦(之后失焦才隐藏,免启动瞬态误隐藏)。
     seen_focus: bool,
+    /// 失焦豁免判定器(Space 变更窗口期 + 消费语义;纯逻辑见 platform::SpaceExemptDecider)。
+    space_exempt: platform::SpaceExemptDecider,
+    /// 失焦待决起点(Some = 已失焦、等宽限期到期复判;宽限期内的失焦不立即隐藏)。
+    focus_pending_since: Option<Instant>,
+    /// 上帧聚焦观测(失焦边沿检测:`true→false` 跃迁才进入待决;
+    /// 豁免后的常驻未聚焦不再触发,免「切 Space 后数百 ms 又被误隐藏」)。
+    last_focused: Option<bool>,
     /// selected 变更后把该行滚入可见区。
     scroll_to_selected: bool,
     /// 已下发的窗口高度(变化才发 InnerSize,防每帧抖动)。
@@ -134,6 +154,9 @@ impl PaletteState {
             ime_busy: false,
             needs_focus: true,
             seen_focus: false,
+            space_exempt: platform::SpaceExemptDecider::new(SPACE_EXEMPT_WINDOW),
+            focus_pending_since: None,
+            last_focused: None,
             scroll_to_selected: false,
             last_h: None,
         }
@@ -155,6 +178,9 @@ impl PaletteState {
         // 每次唤起重新「武装」失焦门:窗口常驻(隐藏走 orderOut 不销毁),
         // 但唤起瞬间尚未成 key(报 unfocused)时不隐藏,待观察到聚焦后失焦才隐藏。
         self.seen_focus = false;
+        // 待决态与边沿基线一并复位(上一轮的失焦已经由隐藏动作了结)。
+        self.focus_pending_since = None;
+        self.last_focused = None;
         self.last_h = None;
     }
 
@@ -435,10 +461,94 @@ impl PaletteState {
             action = Some(Action::Hide);
         }
 
-        // —— 失焦隐藏(平台行为 Task 14 接原生;此处按视口 focused 先接)——
-        match ctx.input(|i| i.viewport().focused) {
-            Some(true) => self.seen_focus = true,
-            Some(false) if self.seen_focus => action = Some(Action::Hide),
+        // —— 失焦隐藏 + 切 Space 豁免(product §1 键位表 2026-10-16 定)——
+        // 判定链:失焦(边沿)→ 若「鼠标键按下」即判点击导致、立即隐藏(点击是主动作,
+        // 照常隐藏,不等宽限);否则进入待决,宽限后锚失焦时刻复判 Space 变更 → 豁免。
+        // 宽限期内鼠标键按下同样立即隐藏(用户已点走)。ghost 态(豁免后的可见未聚焦)
+        // 点击面板外也隐藏:该态下点其他应用不产生聚焦事件,只能靠鼠标键状态识别。
+        // 边沿检测保证豁免后的常驻未聚焦不被反复起待决。
+        let now = Instant::now();
+        let focused = ctx.input(|i| i.viewport().focused);
+        let lost_edge = self.last_focused == Some(true) && focused == Some(false);
+        if focused != self.last_focused {
+            log::info!(
+                "悬浮条聚焦:{:?} → {focused:?}(t+{}ms)",
+                self.last_focused,
+                platform::monotonic_ms()
+            );
+            self.last_focused = focused;
+        }
+        match focused {
+            Some(true) => {
+                self.seen_focus = true;
+                if self.focus_pending_since.take().is_some() {
+                    log::info!("失焦待决解除:已重新聚焦(保持可见)");
+                }
+            }
+            Some(false) if self.seen_focus => match self.focus_pending_since {
+                // 仅「true→false」边沿进入待决:豁免后的常驻未聚焦不再触发
+                // (否则常态排帧会反复起待决,豁免过一轮后又被隐藏——实机第二轮实证)。
+                None if lost_edge => {
+                    if platform::mouse_button_down() {
+                        log::info!(
+                            "失焦隐藏:点击导致(鼠标键按下,t+{}ms)",
+                            platform::monotonic_ms()
+                        );
+                        action = Some(Action::Hide);
+                    } else {
+                        self.focus_pending_since = Some(now);
+                        log::info!(
+                            "失焦待决:{}ms 后复判(t+{}ms)",
+                            FOCUS_HIDE_GRACE.as_millis(),
+                            platform::monotonic_ms()
+                        );
+                        ctx.request_repaint_after(FOCUS_HIDE_GRACE);
+                    }
+                }
+                None => {
+                    // ghost 态:可见未聚焦(豁免后的常驻)。点面板外 = 用户走开 → 隐藏。
+                    if platform::mouse_button_down() && !platform::palette_contains_mouse() {
+                        log::info!("隐藏:ghost 态点击面板外(t+{}ms)", platform::monotonic_ms());
+                        action = Some(Action::Hide);
+                    }
+                    // 低延迟轮询(mouse down 无事件送达本 app,只能主动查)。
+                    if action.is_none() {
+                        ctx.request_repaint_after(GHOST_POLL);
+                    }
+                }
+                Some(t0) => {
+                    // 待决期内鼠标键按下 = 用户已点走(含点目标 Space 的应用) → 立即隐藏。
+                    if platform::mouse_button_down() {
+                        log::info!(
+                            "失焦隐藏:点击导致(待决期内,t+{}ms)",
+                            platform::monotonic_ms()
+                        );
+                        action = Some(Action::Hide);
+                    } else {
+                        let elapsed = now.duration_since(t0);
+                        if elapsed >= FOCUS_HIDE_GRACE {
+                            // 锚在失焦时刻(t0)判:通知通常晚于失焦到达,判定又在通知之后。
+                            if self.space_exempt.decide(platform::last_space_change(), t0) {
+                                self.focus_pending_since = None;
+                                log::info!(
+                                    "失焦豁免:切 Space 变更同过渡(t+{}ms)",
+                                    platform::monotonic_ms()
+                                );
+                            } else {
+                                log::info!(
+                                    "失焦隐藏:非 Space 变更(t+{}ms)",
+                                    platform::monotonic_ms()
+                                );
+                                action = Some(Action::Hide);
+                            }
+                        } else {
+                            // 宽限期内:保持,并把复判帧排到点(早到的帧不丢后续排帧,
+                            // 否则复判要等下一轮常态排帧——实机首轮实证:迟 2s)。
+                            ctx.request_repaint_after(FOCUS_HIDE_GRACE - elapsed);
+                        }
+                    }
+                }
+            },
             _ => {}
         }
 
