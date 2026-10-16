@@ -654,3 +654,19 @@ touch /tmp/poc1b-actor-quit                                            # 收尾
 
 - 取证工具(前序会话留下,可复用):`/tmp/winlist.swift onscreen|all`(CGWindowList)、`/tmp/mce12_drive.swift {click x y|key kc [mod]|type 文本|sleep ms}`(CGEvent HID 注入)、`/tmp/front_app.swift`(前台应用)、`/tmp/mce14_move.swift x y`(鼠标移动)、`/tmp/mce14_util.swift`(屏与鼠标)。
 - 截图存本机 `/tmp/mce14-*.png`(重启后可能被系统清理)。
+
+## Task 14b:切 Space 失焦豁免(辉哥定案落地)
+
+**结论**:✅ 五验证全过(切 Space 保持可见 ≥8 轮 / 点击他应用当帧隐藏 / 3 轮往返一致 / 主流程回归 / 126 测试全绿)。
+
+**信号调参实测(12 轮样本)**:Space 变更通知相对失焦的时差 = -76ms / +265 / +268 / +337 / +365 / +550ms——**多数晚到**。定案:
+- 判据**锚在失焦时刻**(锚判定时刻会把晚到通知误算过期);宽限 800ms(首版 500ms 当场漏 +550ms 案例)
+- `NSEvent.pressedMouseButtons`(免权限状态查询)使点击导致的失焦**当帧**判出立即隐藏,宽限只兜非点击失焦(切 Space/⌘Tab)
+- 全局事件监听 `addGlobalMonitorForEvents` 实测收不到事件(权限),弃用
+- 常量:`FOCUS_HIDE_GRACE=800ms` / `SPACE_EXEMPT_WINDOW=500ms` / `GHOST_POLL=150ms`
+
+**TDD**:`SpaceExemptDecider` 5 用例 + 两突变实证(删过期检查/删消费检查各自红)。
+
+**遗留**:ghost 态(豁免后可见未聚焦,点他应用无聚焦事件)靠 150ms 轮询兜底,最终两轮未复现属罕见路径;一次启动 315ms 后无对应切换的 spurious 通知(±500ms 内可能误豁免,低风险)。
+
+**取证**:`/tmp/mce14b-final-1.png`;commit `6e8500b`。
