@@ -8,11 +8,13 @@
 //!
 //! ## 方向语义(引擎-UI 分工,见 engine::query::execute_sorted 注释)
 //!
-//! 引擎对每个排序键只有固定方向(Name/Size/Path 升序、Mtime 降序,文件管理器惯例),
-//! **方向切换在 UI 侧**:响应到达后按 `sort_asc` 与自然方向比对,不符即整体反转
-//! (`display_order`)。列头每次点击(同列翻转/异列换键)都走 `on_sort_change`
-//! 同串重查(状态栏「排序中…」),不依赖旧结果的就地反转——响应总是按当前
-//! `sort`/`sort_asc` 重新落序,状态单一来源。
+//! 方向进协议(Task 19b):引擎按顺序做「全量命中排序 → 按方向反转 → 取前 K」,
+//! 因此 total > K 时取得的是全库真最大/最小 K 条。UI 只持界面意图 `sort_asc`
+//! (列头箭头 ▲▼ 所示),发查询时经 `request_desc` 换算为协议 `desc`
+//! (desc = 反转自然方向,mtime 自然方向为降序)。**不做本地反转**:截断集反转
+//! 在 total > K 时语义崩坏(修复的误差本体)。列头每次点击(同列翻转/异列换键)
+//! 都走 `on_sort_change` 同串重查(状态栏「排序中…」)——方向变了必须重查,
+//! 响应总是按当前 `sort`/`sort_asc` 落序,状态单一来源。
 //!
 //! ## 复用(勿复制第二份)
 //!
@@ -63,7 +65,8 @@ pub struct ResultsState {
     pub stat_ms: f64,
     /// 当前排序键(初始 = Relevance:默认排序 = 匹配质量,product §2)。
     pub sort: SortKey,
-    /// 展示方向(true = 该列升序);自然方向见 `natural_asc`,不符即反转。
+    /// 界面展示方向(true = 该列升序;列头箭头 ▲▼ 依据)。落序由引擎按 `desc`
+    /// 完成(见 `request_desc`),本字段不参与结果加工——只作显示与请求换算。
     pub sort_asc: bool,
     /// 选中行号集合(protocol 条目无 id,行号即选择;结果整体替换时清空)。
     pub selection: BTreeSet<usize>,
@@ -212,7 +215,8 @@ impl ResultsState {
         });
     }
 
-    /// 结果应用:代际校验(旧代丢弃)→ 按当前方向落序/失败分支 → 引擎状态并入。
+    /// 结果应用:代际校验(旧代丢弃)→ 落结果/失败分支 → 引擎状态并入。
+    /// 结果已由引擎按请求方向落序(desc),此处原样接收、不做任何本地反转。
     fn apply(&mut self, res: QueryResult) {
         if !self.session.accept_response(res.generation) {
             return; // 慢响应后到不得覆盖新结果(Task 11 语义)
@@ -226,7 +230,7 @@ impl ResultsState {
                 stat_ms,
                 offline,
             } => {
-                self.results = display_order(entries, self.sort, self.sort_asc);
+                self.results = entries;
                 self.total = total;
                 self.elapsed_ms = elapsed_ms;
                 self.stat_ms = stat_ms;
@@ -484,7 +488,7 @@ impl ResultsState {
     }
 
     /// 列头点击:同列翻转方向;异列切键并按该键默认方向;两者都触发同串重查
-    /// (on_sort_change 在防抖窗内合并;响应到达按新方向落序)。
+    /// (on_sort_change 在防抖窗内合并;响应按新方向由引擎落序)。
     fn on_header_click(&mut self, key: SortKey) {
         if self.sort == key {
             self.sort_asc = !self.sort_asc;
@@ -493,7 +497,8 @@ impl ResultsState {
             self.sort_asc = natural_asc(key);
         }
         log::info!("列头点击:{key:?}(asc={})", self.sort_asc);
-        self.session.on_sort_change(key, Instant::now());
+        self.session
+            .on_sort_change(key, request_desc(key, self.sort_asc), Instant::now());
         self.ctx
             .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
     }
@@ -623,18 +628,20 @@ fn converge_selection(selection: &mut BTreeSet<usize>, anchor: &mut Option<usize
     }
 }
 
-/// 引擎各键的自然方向(true = 升序;方向切换在 UI 侧,见模块注释「方向语义」)。
+/// 界面方向(asc = 期望升序显示)→ 协议 desc(反转自然方向,见 protocol::Request::Query
+/// 与 engine::query::execute_sorted 注释)。简洁规则:asc 与自然方向相同 → false。
+/// Relevance 无方向概念:恒 false(引擎忽略,不发该字段)。
+fn request_desc(key: SortKey, asc: bool) -> bool {
+    match key {
+        SortKey::Relevance => false,
+        _ => natural_asc(key) != asc,
+    }
+}
+
+/// 引擎各键的自然方向(true = 升序;desc 反转它,见模块注释「方向语义」)。
 /// Relevance = 匹配质量序,无方向概念(不参与反转)。
 fn natural_asc(key: SortKey) -> bool {
     !matches!(key, SortKey::Mtime | SortKey::Relevance)
-}
-
-/// 响应(引擎自然方向)→ 展示顺序:与 `sort_asc` 不符即整体反转。
-fn display_order(mut entries: Vec<HitEntry>, key: SortKey, asc: bool) -> Vec<HitEntry> {
-    if key != SortKey::Relevance && asc != natural_asc(key) {
-        entries.reverse();
-    }
-    entries
 }
 
 /// 状态栏计数段:N 项 = 命中总数(total);返回条数 < total 时注「展示前 K 条」。
@@ -737,15 +744,6 @@ fn format_ymd_hm(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> Str
 mod tests {
     use super::*;
 
-    fn entry(name: &str) -> HitEntry {
-        HitEntry {
-            name: name.into(),
-            path: format!("/tmp/{name}"),
-            size: None,
-            mtime: None,
-        }
-    }
-
     #[test]
     fn human_size_bounds() {
         assert_eq!(human_size(512), "512 B");
@@ -782,37 +780,26 @@ mod tests {
         assert!(natural_asc(SortKey::Path));
     }
 
+    /// 8 态表(四键 × 升/降)逐行钉:desc = asc 与自然方向不同
+    /// (Name/Size/Path 自然升、Mtime 自然降;Task 19b 定案)。
     #[test]
-    fn display_order_reverses_when_direction_differs() {
-        let v = || vec![entry("a"), entry("b"), entry("c")];
-        // 与自然方向一致:原样
-        let names =
-            |v: Vec<HitEntry>| -> Vec<String> { v.into_iter().map(|e| e.name).collect::<Vec<_>>() };
-        assert_eq!(
-            names(display_order(v(), SortKey::Size, true)),
-            ["a", "b", "c"],
-            "Size 升 = 自然方向"
+    fn request_desc_encodes_ui_direction() {
+        // 自然方向为升:asc 即自然,desc=false;降需反转,desc=true
+        assert!(!request_desc(SortKey::Name, true), "Name 升 = 自然");
+        assert!(request_desc(SortKey::Name, false), "Name 降 = 反转");
+        assert!(!request_desc(SortKey::Size, true), "Size 升 = 自然");
+        assert!(request_desc(SortKey::Size, false), "Size 降 = 反转");
+        assert!(!request_desc(SortKey::Path, true), "Path 升 = 自然");
+        assert!(request_desc(SortKey::Path, false), "Path 降 = 反转");
+        // 自然方向为降(mtime):asc 与自然相反,desc=true;降即自然,desc=false
+        assert!(
+            request_desc(SortKey::Mtime, true),
+            "Mtime 升 = 反转(自然为降)"
         );
-        assert_eq!(
-            names(display_order(v(), SortKey::Size, false)),
-            ["c", "b", "a"],
-            "Size 降 = 反转"
-        );
-        assert_eq!(
-            names(display_order(v(), SortKey::Mtime, false)),
-            ["a", "b", "c"],
-            "Mtime 降 = 自然方向"
-        );
-        assert_eq!(
-            names(display_order(v(), SortKey::Mtime, true)),
-            ["c", "b", "a"],
-            "Mtime 升 = 反转"
-        );
-        assert_eq!(
-            names(display_order(v(), SortKey::Relevance, false)),
-            ["a", "b", "c"],
-            "Relevance 无方向,不反转"
-        );
+        assert!(!request_desc(SortKey::Mtime, false), "Mtime 降 = 自然");
+        // Relevance 无方向:恒 false(引擎忽略;不依赖 asc 取值)
+        assert!(!request_desc(SortKey::Relevance, true));
+        assert!(!request_desc(SortKey::Relevance, false));
     }
 
     #[test]
@@ -938,9 +925,14 @@ mod tests {
     //
     // 跑法(daemon 在线或离线有落盘索引皆可;仓库约定同 engine/tests/fsevents_live.rs):
     //   cargo test -p macEverything-app -- --ignored live_results_window_walkthrough --nocapture
-    // ⚠ 排序断言要求 daemon 含 Task 8b 的 sort 支持:旧版 daemon 会**静默忽略** sort、
-    //    按 relevance 返回(排序断言失败即此因;换当前构建起的 daemon 再跑,
-    //    Task 19 的 sort_echo 校验接上后此坑在界面上可见)。
+    // 隔离跑法(不碰真实索引;daemon 须以同一 HOME 启动,根经 MCE_ROOTS 指向合成目录):
+    //   HOME=$TMP/home MCE_ROOTS=$TMP/root macEverything start
+    //   HOME=$TMP/home ./target/debug/deps/macEverything_app-<hash> --ignored \
+    //       live_results_window_walkthrough --nocapture
+    // ⚠ 排序断言要求 daemon 含 Task 8b 的 sort + Task 19b 的 desc 支持:旧版 daemon
+    //    静默忽略 sort(退 relevance)或忽略 desc(降序请求回升序,排序断言失败即
+    //    此因);换当前构建起的 daemon 再跑(Task 19 的 sort_echo 校验接上后
+    //    「排序未生效」在界面上可见)。
 
     /// 真机全链路:真实引擎查高频词 → 表格落数(draw 全渲染无 panic)→
     /// 列头排序(升/降/换列)→ 多选(单选/shift/⌘A)。

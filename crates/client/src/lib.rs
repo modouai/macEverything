@@ -130,7 +130,15 @@ pub struct QueryOutcome {
 
 /// 查询:daemon 在线走 socket;不在则直读落盘索引离线降级。
 /// sort = 列排序键(name/size/mtime/path);None = relevance(CLI 与 v1 调用方语义)。
-pub fn query(paths: &DaemonPaths, q: &str, limit: u32, sort: Option<&str>) -> Result<QueryOutcome> {
+/// desc = 反转该键的自然方向(false = 自然方向,不发该字段——与 19b 前客户端同形);
+/// 引擎在全量命中排序后按方向取前 K,total > K 时为真最大/最小 K 条。
+pub fn query(
+    paths: &DaemonPaths,
+    q: &str,
+    limit: u32,
+    sort: Option<&str>,
+    desc: bool,
+) -> Result<QueryOutcome> {
     let limit = limit.min(RESULT_CAP);
     if let Some(mut s) = connect(paths) {
         let resp = expect_ok(call(
@@ -140,6 +148,9 @@ pub fn query(paths: &DaemonPaths, q: &str, limit: u32, sort: Option<&str>) -> Re
                 query: q.into(),
                 limit,
                 sort: sort.map(String::from),
+                // false 不发送:None 与 false 引擎语义相同(自然方向),
+                // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
+                desc: desc.then_some(true),
             },
         )?)?;
         match resp {

@@ -20,6 +20,14 @@ pub enum Request {
         /// 不 bump v:旧 daemon 忽略未知字段,旧客户端缺省不发送此键。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sort: Option<String>,
+        /// 方向:desc = **反转该排序键的自然方向**,不是绝对升/降(Task 19b 定案)。
+        /// 自然方向:name/size/path 升序、mtime 降序(engine::query::execute_sorted);
+        /// None/false = 自然方向,true = 反转(如 mtime + desc=true 即最旧在前)。
+        /// 引擎在全量命中排序后按方向取前 K——截断在方向之后,total > K 时取的是
+        /// 真最大/最小 K 条(修复「升序前 K 条反转」误差)。同 sort:纯新增可选
+        /// 字段不 bump v,缺省不发送。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desc: Option<bool>,
     },
     Status {
         v: u32,
@@ -148,6 +156,7 @@ mod tests {
             query: "a b".into(),
             limit: 100,
             sort: None,
+            desc: None,
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(
@@ -187,6 +196,41 @@ mod tests {
         assert!(matches!(p, Response::Query { sort_echo, .. } if sort_echo.is_empty()));
     }
 
+    /// desc 向后兼容钉:旧 JSON(无 desc;v1 形态与 8b 的 sort-only 形态)必须可
+    /// 解码且 desc=None,缺省语义 = 引擎自然方向(等值 false)。
+    #[test]
+    fn desc_field_backward_compatible() {
+        let old = br#"{"msg":"query","v":1,"query":"a","limit":10}"#;
+        let r: Request = serde_json::from_slice(old).unwrap();
+        assert!(matches!(r, Request::Query { desc: None, .. }));
+        // 8b 客户端形态:带 sort、无 desc——19b daemon 收到的消息与 8b 完全同形
+        let old_8b = br#"{"msg":"query","v":1,"query":"a","limit":10,"sort":"size"}"#;
+        let r8b: Request = serde_json::from_slice(old_8b).unwrap();
+        assert!(matches!(
+            r8b,
+            Request::Query { sort: Some(ref s), desc: None, .. } if s == "size"
+        ));
+    }
+
+    /// desc 编码→解码往返:线上形态为 JSON bool(不是字符串),经长度头协议无损保留。
+    #[test]
+    fn desc_field_roundtrip() {
+        let r = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: Some("size".into()),
+            desc: Some(true),
+        };
+        let b = encode(&r).unwrap();
+        assert_eq!(decode_request(&b[4..]).unwrap(), r);
+        let body = serde_json::to_string(&r).unwrap();
+        assert!(
+            body.contains(r#""desc":true"#),
+            "desc 线上为 JSON bool:{body}"
+        );
+    }
+
     /// sort 编码→解码往返:请求与响应两侧的排序字段经长度头协议无损保留。
     #[test]
     fn sort_field_roundtrip() {
@@ -195,6 +239,7 @@ mod tests {
             query: "a".into(),
             limit: 10,
             sort: Some("size".into()),
+            desc: None,
         };
         let b = encode(&r).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r);
@@ -209,7 +254,7 @@ mod tests {
         assert_eq!(decode_response(&b[4..]).unwrap(), p);
     }
 
-    /// sort=None(CLI/App 不传)编码不含 sort 键:v1 线上形态逐字节保持,
+    /// sort/desc=None(CLI/App 不传)编码不含两键:v1 线上形态逐字节保持,
     /// 混跑期旧 daemon 收到的消息与旧客户端完全同形。
     #[test]
     fn none_sort_omits_field_on_wire() {
@@ -218,9 +263,11 @@ mod tests {
             query: "a".into(),
             limit: 10,
             sort: None,
+            desc: None,
         };
         let body = serde_json::to_string(&r).unwrap();
         assert!(!body.contains("sort"), "None 不应序列化 sort 键:{body}");
+        assert!(!body.contains("desc"), "None 不应序列化 desc 键:{body}");
     }
 
     #[test]

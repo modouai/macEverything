@@ -23,6 +23,9 @@ pub use engine::query::SortKey;
 pub struct Fire {
     pub query: String,
     pub sort: SortKey,
+    /// 方向:反转 `sort` 的自然方向(Task 19b;协议 desc 字段的客户端语义)。
+    /// 由调用方经 `request_desc`(ui/results.rs)从界面方向换算后交给会话。
+    pub desc: bool,
     pub generation: u64,
 }
 
@@ -33,6 +36,8 @@ pub struct Session {
     /// 最近一次已发起的查询(串, 排序);排序变更时按此串重发
     last_fired: Option<(String, SortKey)>,
     sort: SortKey,
+    /// 当前方向(反转自然方向);随排序变更原子更新(键与方向同属一次请求)
+    desc: bool,
     generation: u64,
     pub state: State,
 }
@@ -44,6 +49,7 @@ impl Session {
             pending: None,
             last_fired: None,
             sort: SortKey::Relevance,
+            desc: false,
             generation: 0,
             state: State::Idle,
         }
@@ -66,9 +72,12 @@ impl Session {
     /// 排序变更:同串重发 —— 窗内有 pending 保持原串、刷新时刻;无 pending 按
     /// last_fired 的串构造 pending(代际号在下一次 pending_at 自然 +1);
     /// 两者皆无(空词/从未发起)→ 不动。
+    /// `desc` = 协议方向(反转自然方向),与键原子更新:方向变了必须重查——
+    /// 引擎按方向排序后截断,截断集不能靠旧响应本地反转(Task 19b)。
     /// 消费方:完整窗口点列头排序(ui/results.rs);悬浮条不用此能力(product §8)。
-    pub fn on_sort_change(&mut self, key: SortKey, now: Instant) {
+    pub fn on_sort_change(&mut self, key: SortKey, desc: bool, now: Instant) {
         self.sort = key;
+        self.desc = desc;
         let query = self
             .pending
             .as_ref()
@@ -94,6 +103,7 @@ impl Session {
         Some(Fire {
             query,
             sort: self.sort,
+            desc: self.desc,
             generation: self.generation,
         })
     }
@@ -216,11 +226,13 @@ mod tests {
         let base = Instant::now();
         s.on_input("a", base);
         let f1 = s.pending_at(base + Duration::from_millis(20)).unwrap();
-        s.on_sort_change(SortKey::Size, base + Duration::from_millis(30));
+        assert!(!f1.desc, "缺省方向 = 自然方向");
+        s.on_sort_change(SortKey::Size, true, base + Duration::from_millis(30));
         let f2 = s.pending_at(base + Duration::from_millis(50)).unwrap();
         assert_eq!(f2.query, f1.query);
         assert_ne!(f2.generation, f1.generation);
         assert_eq!(f2.sort, SortKey::Size);
+        assert!(f2.desc, "方向与键原子随 Fire 下发(Task 19b)");
     }
 
     #[test]

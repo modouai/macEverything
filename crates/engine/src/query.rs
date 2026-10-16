@@ -275,13 +275,18 @@ pub type MetaOf<'a> = &'a dyn Fn(&[u32]) -> Vec<MetaRow>;
 /// (大小, 修改时间);daemon 侧内部并行 stat(rayon),engine 单次顺序调用,无 Sync 约束。
 /// 排序键形态(定案):Name/Path 取 display 原始形态 Unicode 码点序,不做本地化排序
 /// (与 Finder 的拼音/区域序不同,已知局限)。等值键以条目号决胜(确定性,同 v1 约定)。
-/// 方向:Size 升序(小在前)、Mtime 降序(最新在前,文件管理器惯例);方向切换在 UI 侧。
-/// Relevance 原样委托 execute(不调 meta_of,回归钉)。
+/// 方向(定案,Task 19b):desc = **反转该键的自然方向**,不是绝对升/降。自然方向
+/// Size/Name/Path 升序(小/首字面/短路径在前)、Mtime 降序(最新在前,文件管理器惯例)。
+/// desc 反转发生在**全量命中排序之后、截断之前**——total > K 时取真最大/最小 K 条
+/// (修复「自然方向前 K 条反转」把截断集反转的误差);等值键组内条目号随反转逆序,
+/// 同键组内顺序无用户可感知语义,接受(定案)。
+/// Relevance 原样委托 execute(不调 meta_of、忽略 desc,回归钉)。
 pub fn execute_sorted(
     view: &dyn IndexView,
     plan: &QueryPlan,
     limit: usize,
     sort: SortKey,
+    desc: bool,
     meta_of: MetaOf<'_>,
 ) -> SortOutcome {
     if sort == SortKey::Relevance {
@@ -336,6 +341,11 @@ pub fn execute_sorted(
                 .then(a.cmp(b))
         }),
         SortKey::Relevance => unreachable!("Relevance 已在入口委托 execute"),
+    }
+    // desc = 反转自然方向;先反转后截断,取的是全量命中里真最大/最小的 K 条
+    // (先前 K 再反转 = 截断集反转,语义崩坏,Task 19b 修复的核心)。
+    if desc {
+        hits.reverse();
     }
     hits.truncate(limit);
     // 口径(裁决):elapsed_ms = 全程 − stat 轮耗时,即「匹配 + 键计算 + 排序」
@@ -851,7 +861,7 @@ mod sort_tests {
     fn sort_by_size_ascending() {
         let i = tree();
         let plan = parse("*.txt").unwrap();
-        let out = execute_sorted(&i, &plan, 10, SortKey::Size, &meta);
+        let out = execute_sorted(&i, &plan, 10, SortKey::Size, false, &meta);
         let names: Vec<String> = out
             .hits
             .iter()
@@ -872,7 +882,7 @@ mod sort_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             ids.iter().map(|_| (Some(1), Some(1))).collect()
         };
-        let out = execute_sorted(&i, &plan, 10, SortKey::Size, &slow);
+        let out = execute_sorted(&i, &plan, 10, SortKey::Size, false, &slow);
         assert!(
             out.stat_ms >= 40.0,
             "stat_ms 独计 meta_of 耗时(≥ 睡的 50ms):{}",
@@ -905,9 +915,9 @@ mod sort_tests {
         let same = |ids: &[u32]| -> Vec<(Option<u64>, Option<u64>)> {
             ids.iter().map(|_| (Some(100), Some(5))).collect()
         };
-        let out = execute_sorted(&i, &plan, 10, SortKey::Size, &same);
+        let out = execute_sorted(&i, &plan, 10, SortKey::Size, false, &same);
         assert_eq!(out.hits, vec![x, y], "等值键按条目号决胜(确定性)");
-        let out_m = execute_sorted(&i, &plan, 10, SortKey::Mtime, &same);
+        let out_m = execute_sorted(&i, &plan, 10, SortKey::Mtime, false, &same);
         assert_eq!(out_m.hits, vec![x, y], "mtime 等值同样按条目号决胜");
     }
 
@@ -915,7 +925,7 @@ mod sort_tests {
     fn sort_by_mtime_is_descending() {
         let i = tree();
         let plan = parse("*.txt").unwrap();
-        let out = execute_sorted(&i, &plan, 2, SortKey::Mtime, &meta);
+        let out = execute_sorted(&i, &plan, 2, SortKey::Mtime, false, &meta);
         assert_eq!(out.hits.len(), 2, "limit 截断");
         assert_eq!(out.total, 3, "total 为截断前全量");
         // 定案:mtime 降序(最新在前)——c.txt(1003) > a.txt(1002) > b.txt(1001)
@@ -929,7 +939,7 @@ mod sort_tests {
         let plan = parse("*.txt").unwrap();
         let no_meta =
             |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Name 排序不得调 meta") };
-        let out = execute_sorted(&i, &plan, 10, SortKey::Name, &no_meta);
+        let out = execute_sorted(&i, &plan, 10, SortKey::Name, false, &no_meta);
         let names: Vec<Vec<u8>> = out
             .hits
             .iter()
@@ -947,7 +957,7 @@ mod sort_tests {
         let plan = parse("*.txt").unwrap();
         let no_meta =
             |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Path 排序不得调 meta") };
-        let out = execute_sorted(&i, &plan, 10, SortKey::Path, &no_meta);
+        let out = execute_sorted(&i, &plan, 10, SortKey::Path, false, &no_meta);
         // 同一目录下,路径序 == 名称序(前缀相同)
         let names: Vec<Vec<u8>> = out
             .hits
@@ -967,8 +977,117 @@ mod sort_tests {
         let base = execute(&i, &plan, 10);
         let no_meta =
             |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Relevance 不得调 meta") };
-        let sorted = execute_sorted(&i, &plan, 10, SortKey::Relevance, &no_meta);
+        let sorted = execute_sorted(&i, &plan, 10, SortKey::Relevance, false, &no_meta);
         assert_eq!(base.hits, sorted.hits);
+        assert_eq!(base.total, sorted.total);
+    }
+
+    /// 方向语义核心钉(修复误差本体):desc=true 取的是**全量命中里真最大的 K 条**,
+    /// 不是「升序前 K 条反转」。5 条命中 limit=2:desc=false 取最小 2、desc=true 取
+    /// 最大 2;若实现回退为「先前 K 再反转」,desc=true 会得最小两条的逆序(d.txt→a.txt),
+    /// 断言必红。
+    #[test]
+    fn desc_true_takes_top_k_before_truncation() {
+        let mut i = Index::new();
+        let d = i.insert("docs", NO_PARENT, true);
+        i.insert("a.txt", d, false); // 条目 1 → 10
+        i.insert("b.txt", d, false); // 条目 2 → 50
+        i.insert("c.txt", d, false); // 条目 3 → 30
+        i.insert("d.txt", d, false); // 条目 4 → 20
+        i.insert("e.txt", d, false); // 条目 5 → 40
+        let sizes = [10u64, 50, 30, 20, 40];
+        let meta = |ids: &[u32]| -> Vec<(Option<u64>, Option<u64>)> {
+            ids.iter()
+                .map(|&i| (Some(sizes[(i - 1) as usize]), Some(1000 + i as u64)))
+                .collect()
+        };
+        let plan = parse("*.txt").unwrap();
+        let names = |out: &SortOutcome| -> Vec<String> {
+            out.hits
+                .iter()
+                .map(|h| String::from_utf8_lossy(i.display_name_of(*h)).into_owned())
+                .collect()
+        };
+        let asc = execute_sorted(&i, &plan, 2, SortKey::Size, false, &meta);
+        assert_eq!(asc.hits.len(), 2, "K=2 截断");
+        assert_eq!(asc.total, 5, "total 为截断前全量");
+        assert_eq!(names(&asc), vec!["a.txt", "d.txt"], "自然方向 = 最小的两条");
+        let desc = execute_sorted(&i, &plan, 2, SortKey::Size, true, &meta);
+        assert_eq!(desc.hits.len(), 2, "K=2 截断");
+        assert_eq!(desc.total, 5, "total 为截断前全量");
+        assert_eq!(
+            names(&desc),
+            vec!["b.txt", "e.txt"],
+            "desc=true = 全库最大的两条(截断前排序;先前 K 再反转会得 d/a)"
+        );
+    }
+
+    /// desc = 反转自然方向(非绝对升/降):mtime 自然方向为降序,desc=true 即升序
+    /// (最旧在前);desc=false 与 19b 前行为逐位一致。
+    #[test]
+    fn desc_true_reverses_mtime_natural_direction() {
+        let i = tree(); // 条目 1/2/3 = b/a/c → mtime 1001/1002/1003
+        let plan = parse("*.txt").unwrap();
+        let natural = execute_sorted(&i, &plan, 10, SortKey::Mtime, false, &meta);
+        assert_eq!(
+            natural
+                .hits
+                .iter()
+                .map(|h| i.display_name_of(*h))
+                .collect::<Vec<_>>(),
+            vec![b"c.txt", b"a.txt", b"b.txt"],
+            "自然方向 = 最新在前(降)"
+        );
+        let reversed = execute_sorted(&i, &plan, 10, SortKey::Mtime, true, &meta);
+        assert_eq!(
+            reversed
+                .hits
+                .iter()
+                .map(|h| i.display_name_of(*h))
+                .collect::<Vec<_>>(),
+            vec![b"b.txt", b"a.txt", b"c.txt"],
+            "desc=true = 升序(最旧在前)"
+        );
+    }
+
+    /// Name/Path 的 desc=true 反转字面序(Path 同目录下与 Name 同序)。
+    #[test]
+    fn desc_true_reverses_name_and_path() {
+        let i = tree(); // 自然 a < b < c
+        let plan = parse("*.txt").unwrap();
+        let no_meta = |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> {
+            panic!("Name/Path 排序不得调 meta")
+        };
+        let name_desc = execute_sorted(&i, &plan, 10, SortKey::Name, true, &no_meta);
+        assert_eq!(
+            name_desc
+                .hits
+                .iter()
+                .map(|h| i.display_name_of(*h))
+                .collect::<Vec<_>>(),
+            vec![b"c.txt", b"b.txt", b"a.txt"]
+        );
+        let path_desc = execute_sorted(&i, &plan, 10, SortKey::Path, true, &no_meta);
+        assert_eq!(
+            path_desc
+                .hits
+                .iter()
+                .map(|h| i.display_name_of(*h))
+                .collect::<Vec<_>>(),
+            vec![b"c.txt", b"b.txt", b"a.txt"]
+        );
+    }
+
+    /// Relevance 无方向概念:desc 被忽略,结果与 execute 逐位一致(委托回归钉)。
+    #[test]
+    fn relevance_ignores_desc() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let base = execute(&i, &plan, 10);
+        let no_meta =
+            |_: &[u32]| -> Vec<(Option<u64>, Option<u64>)> { panic!("Relevance 不得调 meta") };
+        let sorted = execute_sorted(&i, &plan, 10, SortKey::Relevance, true, &no_meta);
+        assert_eq!(base.hits, sorted.hits, "desc=true 不得改变 relevance 序");
         assert_eq!(base.total, sorted.total);
     }
 }

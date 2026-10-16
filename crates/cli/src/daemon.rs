@@ -187,7 +187,8 @@ fn parse_sort_key(sort: Option<&str>) -> (SortKey, &'static str) {
 /// Size/Mtime 列排序是上述锁外纪律的显式例外:完整排序语义要求候选集全量键,
 /// 排序轮 meta_of 批量并行 stat 在读锁内(耗时随响应如实告知,tech.md 已标注);
 /// 结果行落入缓存 map,组装轮零重查、不触碰锁外 stat 路径。
-fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>) -> Response {
+/// desc(定案,Task 19b)= 反转自然方向,透传引擎;缺省(旧客户端)等价 false。
+fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc: bool) -> Response {
     let (key, key_str) = parse_sort_key(sort);
     let Ok(plan) = engine::query::parse(q) else {
         return Response::Error {
@@ -212,7 +213,8 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>) -> Re
             }
             metas
         };
-        let out = engine::query::execute_sorted(v, &plan, limit.min(1000) as usize, key, &meta_fn);
+        let out =
+            engine::query::execute_sorted(v, &plan, limit.min(1000) as usize, key, desc, &meta_fn);
         let rows: Vec<(u32, String, String)> = out
             .hits
             .iter()
@@ -890,8 +892,12 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
     }
     match req {
         Request::Query {
-            query, limit, sort, ..
-        } => run_query(state, &query, limit, sort.as_deref()),
+            query,
+            limit,
+            sort,
+            desc,
+            ..
+        } => run_query(state, &query, limit, sort.as_deref(), desc.unwrap_or(false)),
         Request::Status { .. } => {
             let name = *state.state_name.lock().unwrap();
             let entry_count = with_view(state, |v| {
