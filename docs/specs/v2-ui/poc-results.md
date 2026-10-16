@@ -251,3 +251,98 @@ cargo run --release --config 'source.crates-io.replace-with="rsproxy"' \
 - **⌥Space 仅中文态失效** → 默认改 **⌥⇧Space**（本机实测注册与投递均通、无系统符号热键占用；与输入法自带快捷键的撞车面留待 Task 15 实机回归观察），⌃⌥⇧Space 作兜底。降级触发方式建议：注册成功但观察到「输入法态下按了没反应」时，Task 15 加一次可见提示并允许切备选。
 - **三候选全部注册失败** → 回报辉哥扩池。本机实测三候选注册全 OK，该分支未触发。
 - 旁证 #6（前台应用/输入法偶发吞键）提示：即使注册成功，唤起居也可能偶发无响应；Task 15 建议保留托盘唤起兜底，并在无响应场景给一次可见提示（v2.0 无设置页，提示即可）。
+
+---
+
+## Task 3：PoC-3 — 原生 NSMenu 在 egui 主线程弹出
+
+**状态：通过（自动化 5 轮全过 + 浅色 / 深色 / 键盘导航截图留证）。plan 预置的降级路径（独立线程弹出、非模态 API）未触发、不需要。**
+
+- **日期**：2026-10-16
+- **实锁版本**：eframe / egui 0.37.0、objc2 0.6.5、objc2-app-kit 0.3.2、objc2-foundation 0.3.2、objc2-core-foundation 0.3.2、objc2-core-graphics 0.3.2、raw-window-handle 0.6.2
+- **代码**：`scripts/poc/poc3_nsmenu/`（独立 crate，根 Cargo.toml `[workspace] exclude` 已追加）
+
+### 结论表
+
+| # | 验证项 | 结论 | 判定依据 |
+| --- | --- | --- | --- |
+| 1 | 右键 → 原生 NSMenu 弹出（系统观感） | ✅ 通过 | 5/5 轮弹出；浅色截图 `/tmp/poc3-r1-menu.png`；深色截图 `/tmp/poc3-dark-r1-menu.png`——`POC3_DARK=1` 把 app 有效外观置 darkAqua 后，菜单整体渲染为系统深色样式而周围其它 app 窗口仍为浅色，证明观感由 AppKit 按有效外观渲染（产品中该外观即系统外观），非自绘 |
+| 2 | 键盘导航 ↑↓ | ✅ 通过 | 注入 ↓×4 后截图 `/tmp/poc3-r3-menu.png`：`拷贝路径` 带系统蓝色选中高亮；四轮 ↓×N + Return 的 `highlightedItem().tag()` = 1 / 2 / 4 / 3，与注入脚本全对上（前置：指针须先移出菜单，见「现象细节」#5） |
+| 3 | Esc 取消 | ✅ 通过 | 轮 4 注入 Esc → `highlightedItem()` 为 None、状态栏显示「取消（未选择）」、菜单关闭 |
+| 4 | 关闭后 egui 恢复（无卡死） | ✅ 通过 | 第 2~5 轮的右键均被 egui `secondary_clicked` 重新识别（输入管线若死则后续轮不会弹出）；收尾注入 a / b 键，egui 收到 `A, Text(a), B, Text(b)` |
+| 5 | 连续弹 5 次无崩溃 / 无泄漏 | ✅ 通过 | 5 轮（含 1 轮取消）跑完、进程退出码 0；RSS 采样无增长（125088→124976KB 跨 24s；134912→135296KB 跨 16s 全流程） |
+| 6 | 弹出期间 egui 渲染冻结 | ✅ 观测（符合预期，可接受） | 弹出调用期间主线程在嵌套 run loop 内，`ui()` 不返回、帧不更新；菜单开启期间抓的截图显示窗口内容仍是弹出前最后一帧。阻塞时长 = 菜单开启时长（每次弹出约 1.1~2.2s，含注入脚本的固定等待），非固定开销；关闭当帧即恢复 |
+| 7 | `popUpMenuPositioningItem:atLocation:inView:` 返回值语义 | ⚠️ 不可依赖 | 24 次成功选择里 23 次 true、1 次 false（首轮）；6 次取消均 false。同场景结果不一致，**选择结果一律以 `highlightedItem()` 为准** |
+
+### 现象细节
+
+1. **弹出与定位（通过）**：`item=None` 时菜单左上角落在传入的 `location`（即鼠标点击点）。位置日志：点击点窗口底坐标 (320.0, 246.0) → 视图坐标 (320.0, 214.0)；窗口内容高 460，460−246=214，flipped 换算正确。
+2. **冻结时长（观测）**：最终验证轮 5 次弹出阻塞 1592 / 1746 / 2168 / 1244 / 1957 ms。注入脚本在菜单开启后固定等 700ms 再发提交键，抓屏又占约 0.3~1.2s——阻塞时长基本等于菜单开启到关闭的全过程，即由用户决定。
+3. **恢复（通过）**：菜单关闭后同一帧继续执行，状态栏（弹出次数 / 上次选择 / 累计阻塞）立即刷新；随后注入的 a / b 键到达 egui，界面计数同步更新（`/tmp/poc3-after-keys.png`）。
+4. **返回值不稳定（观测）**：24 次成功选择里出现过 1 次 `popped=false`（自动化的首轮），取消轮 6/6 为 false——bool 与「是否选中」不对应，也无法与任何已知语义对齐；沿用 `highlightedItem()` 读取结果即可，勿用 bool 判定。
+5. **指针悬停会预高亮菜单项（观测，接线必读）**：菜单左上角正好落在点击点，指针若停在菜单上，所在项会被预高亮——此时 ↓ 从第 2 项开始（实测踩到：↓×1 选中 tag=2）。产品里该行为与系统菜单一致、无需干预；自动化脚本须先把指针移出菜单再按 ↓（本 PoC 已加 `mouseMoved` 到菜单外 200ms 后再发 ↓，此后 5 轮结果稳定）。
+6. **共享会话干扰（环境注记）**：本机与并行会话共用。收尾统计的 10 个按键里有 5 个非本脚本注入（`IO / Text(o) / S / Text(s) / Space / Text( )`，在注入脚本起跑前到达），判读时以日志中注入轮次对应的条目为准。
+
+### API 实际用法与签名（与 plan 示意的差异）
+
+objc2-app-kit 0.3.2 实际绑定（`src/generated/NSMenu.rs:166-175`）：
+
+```rust
+pub fn popUpMenuPositioningItem_atLocation_inView(
+    &self,
+    item: Option<&NSMenuItem>,
+    location: NSPoint,
+    view: Option<&NSView>,
+) -> bool;
+```
+
+- plan 示意的 `menu.popUpContextMenu(None, &NSEvent::…, &view)` 实际是关联函数且需要真实 NSEvent：`NSMenu::popUpContextMenu_withEvent_forView(menu: &NSMenu, event: &NSEvent, view: &NSView)`（同文件 :146-148）。本 PoC 不需要合成 NSEvent，直接用 positioning 变体。
+- `NSMenu` / `NSMenuItem` 均 `#[thread_kind = MainThreadOnly]`：`alloc` 需 `MainThreadMarker`，另需 `use objc2::MainThreadOnly;` 把 trait 引入作用域（否则 `NSMenu::alloc(mtm)` 编译不过）。这也意味着**菜单只能在主线程弹出**，「独立线程弹出」降级路线不成立。
+- `NSMenuItem::initWithTitle_action_keyEquivalent` 是 `unsafe fn`（安全约定：selector 必须有效）；传 `None` 即无 action，PoC 阶段无需 target/action 桥接（回调桥接在 Task 18）。
+- **无 action 的项默认被自动验证判为禁用**：必须 `menu.setAutoenablesItems(false)` + `item.setEnabled(true)`，否则项灰掉、`highlightedItem()` 无值。
+- 读取选择：弹出返回后 `menu.highlightedItem()` → `Option<Retained<NSMenuItem>>`，取 `.tag()` / `.title()`；取消为 None。
+
+位置计算（本次采用，免手工换算坐标）：
+
+```rust
+let window_point = window.mouseLocationOutsideOfEventStream();   // 窗口底坐标（原点 = 内容区左下）
+let location = view.convertPoint_fromView(window_point, None);   // → 视图坐标（flipped，原点左上）
+menu.popUpMenuPositioningItem_atLocation_inView(None, location, Some(&view));
+```
+
+实测视图坐标与 egui 坐标同值（同为逻辑点、原点左上；winit 的 view 为 flipped，winit-0.30.13 `view.rs:159-163`）。**Task 18 可直接用 egui 坐标定位菜单**（如 `i.pointer.interact_pos()`）；保留 AppKit 换算路径更稳（不依赖「view 恰好覆盖整个内容区」的假设，将来窗口加工具栏/内边距时仍正确）。
+
+### 自动化方法与坑（供 Task 18 与后续 GUI PoC 复用）
+
+- 注入方式：CGEvent HID 层合成事件（右键 / 左键 / ↑↓ / Return / Esc / 字母），需「辅助功能」授权（本机已具备；与 PoC-2 注入同源）。
+- **后台启动的进程抢前台不可靠**：仅靠 `NSApplication::activate()` 反复重试，实测一次要等约 60 秒才成功（重试 602 次）。可靠做法：`window.orderFrontRegardless()` 把窗口压到最前，再合成一次左键点击——合成点击视为用户输入，首次尝试即激活成功。产品由用户点击唤起，不存在该问题。
+- 抓屏用子进程 `screencapture -x`（约 0.3~1.2s，耗时计入菜单开启时长）。
+- 键盘导航断言前先把指针移出菜单（`mouseMoved` 注入），否则指针悬停项被预高亮、↓×N 的落点整体偏移一项（见「现象细节」#5）。
+- 关键判定信号用「egui 是否收到二次点击」而非注入端日志：注入成功不代表窗口收到，两者分开记录更易定位。
+
+### 复现命令
+
+```bash
+cd scripts/poc/poc3_nsmenu
+# 本机 crates.io sparse index 极慢（实测 ~14KB/s），拉新依赖走 rsproxy：
+cargo build --release --config 'source.crates-io.replace-with="rsproxy"' \
+            --config 'source.rsproxy.registry="sparse+https://rsproxy.cn/index/"'
+
+# 手动：右键弹菜单（↑↓ 导航、Return 选择、Esc 取消；观感与导航以手动为准）
+POC3_POS=200,200 ./target/release/poc3-nsmenu
+
+# 自动化：5 轮注入（右键 → ↓×N → Return/Esc）+ 每轮菜单期抓屏 + 收尾输入 a/b
+POC3_AUTO=1 POC3_POS=200,200 ./target/release/poc3-nsmenu
+
+# 深色外观对照（验证菜单观感由 app 有效外观驱动；系统为浅色时亦可复现深色菜单）
+POC3_AUTO=1 POC3_DARK=1 POC3_POS=200,200 ./target/release/poc3-nsmenu
+```
+
+证据截图在本机 `/tmp/`（与 PoC-1/2 同，重启后可能被系统清理）：`poc3-r1-menu.png`（浅色菜单）、`poc3-r3-menu.png`（↓×4 高亮「拷贝路径」）、`poc3-dark-r1-menu.png`（深色菜单）、`poc3-after-keys.png`（5 轮后状态 + 收尾按键计数）。
+
+### 降级路径评估（本次未触发；留档供 Task 18 备用）
+
+- plan 预置的两条降级本次都不需要：阻塞式主线程弹出与 eframe 主循环兼容良好——冻结时长 = 菜单开启时长，关闭即恢复。
+- 「独立线程弹出」路线不成立：`NSMenu` 在 objc2 绑定里即 `MainThreadOnly`，AppKit 要求菜单在主线程跟踪。
+- 「非模态 API」不存在等价物：`NSMenu` 没有非阻塞弹出接口。若产品形态要求菜单开启期间继续渲染（如动画），只能自绘菜单或把菜单放进独立进程，两者都放弃系统观感——不建议。
+- 残留风险（低）：嵌套 run loop 期间 eframe 帧循环与 winit 事件派发暂停（窗口冻结即其表现）。本 PoC 未观察到其它副作用；长时开启菜单（>10s）与多层子菜单留待 Task 18 实机回归。
