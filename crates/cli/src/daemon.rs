@@ -166,38 +166,64 @@ fn stat_of(path: &str) -> (Option<u64>, Option<u64>) {
     }
 }
 
-fn run_query(view: &dyn IndexView, q: &str, limit: u32) -> Response {
-    match engine::query::parse(q) {
-        Ok(plan) => {
-            let out = engine::query::execute(view, &plan, limit.min(1000) as usize);
-            let entries: Vec<HitEntry> = out
-                .hits
-                .iter()
-                .map(|h| {
-                    let path = view.full_path_dyn(*h);
-                    let name = String::from_utf8_lossy(view.display_name(*h)).into_owned();
-                    let (size, mtime) = stat_of(&path);
-                    HitEntry {
-                        name,
-                        path,
-                        size,
-                        mtime,
-                    }
-                })
-                .collect();
-            Response::Query {
-                entries,
-                total: out.total,
-                elapsed_ms: out.elapsed_ms,
-                offline: false,
-                built_at: 0,
-            }
-        }
-        Err(_) => Response::Error {
+/// 查询执行:匹配与排序在 holder 读锁内完成;结果行的 size/mtime 在**锁外**
+/// 并行读取——product 契约要求按需读取「并行执行、单独计时随输出给出」,
+/// 且 stat 不应持读锁阻塞增量 diff 的写锁获取。
+fn run_query(state: &EngineState, q: &str, limit: u32) -> Response {
+    let Ok(plan) = engine::query::parse(q) else {
+        return Response::Error {
             code: "parse".into(),
             message: "空查询".into(),
-        },
+        };
+    };
+    // 锁内:匹配 + 排序 + 结果行的名称/路径(纯内存拼接,微秒级)
+    let Some((rows, total, elapsed_ms)) = with_view(state, |v| {
+        let out = engine::query::execute(v, &plan, limit.min(1000) as usize);
+        let rows: Vec<(String, String)> = out
+            .hits
+            .iter()
+            .map(|h| {
+                (
+                    String::from_utf8_lossy(v.display_name(*h)).into_owned(),
+                    v.full_path_dyn(*h),
+                )
+            })
+            .collect();
+        (rows, out.total, out.elapsed_ms)
+    }) else {
+        return Response::Error {
+            code: "warming".into(),
+            message: "索引构建中,暂不可查".into(),
+        };
+    };
+    // 锁外:并行按需读取(慢速 syscall 不阻塞写锁)
+    let (entries, stat_ms) = stat_rows(rows);
+    Response::Query {
+        entries,
+        total,
+        elapsed_ms,
+        stat_ms,
     }
+}
+
+/// 结果行的 size/mtime 并行读取;返回 (条目, 读取耗时毫秒)。
+/// daemon 在线查询与 CLI 离线查询共用(product 契约口径一致)。
+pub fn stat_rows(rows: Vec<(String, String)>) -> (Vec<HitEntry>, f64) {
+    use rayon::prelude::*;
+    let t = Instant::now();
+    let entries: Vec<HitEntry> = rows
+        .into_par_iter()
+        .map(|(name, path)| {
+            let (size, mtime) = stat_of(&path);
+            HitEntry {
+                name,
+                path,
+                size,
+                mtime,
+            }
+        })
+        .collect();
+    (entries, t.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Option<R> {
@@ -725,15 +751,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         };
     }
     match req {
-        Request::Query { query, limit, .. } => {
-            match with_view(state, |v| run_query(v, &query, limit)) {
-                Some(r) => r,
-                None => Response::Error {
-                    code: "warming".into(),
-                    message: "索引构建中,暂不可查".into(),
-                },
-            }
-        }
+        Request::Query { query, limit, .. } => run_query(state, &query, limit),
         Request::Status { .. } => {
             let name = *state.state_name.lock().unwrap();
             let entry_count = with_view(state, |v| {
@@ -749,7 +767,6 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
                 io_error_count: state.io_errors.load(Ordering::Relaxed),
                 built_at: state.built_at.load(Ordering::Relaxed),
                 index_file: paths.index_file().to_string_lossy().into_owned(),
-                offline: false,
             }
         }
         Request::Stop { .. } => {

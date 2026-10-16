@@ -40,11 +40,10 @@ pub enum Response {
         entries: Vec<HitEntry>,
         total: u32,
         elapsed_ms: f64,
-        /// 离线应答(daemon 不在,client 直读落盘索引)时置位。
+        /// 结果行 size/mtime 的按需读取耗时(product 契约:不计入 elapsed_ms,
+        /// 单独计时随输出给出)。缺省 0:容忍跨版本响应。
         #[serde(default)]
-        offline: bool,
-        #[serde(default)]
-        built_at: u64,
+        stat_ms: f64,
     },
     Status {
         state: String,
@@ -53,8 +52,6 @@ pub enum Response {
         io_error_count: u32,
         built_at: u64,
         index_file: String,
-        #[serde(default)]
-        offline: bool,
     },
     Stop {
         ok: bool,
@@ -142,8 +139,7 @@ mod tests {
             }],
             total: 1,
             elapsed_ms: 0.8,
-            offline: false,
-            built_at: 0,
+            stat_ms: 1.2,
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(decode_response(&bytes[4..]).unwrap(), r);

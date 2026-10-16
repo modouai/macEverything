@@ -81,9 +81,9 @@ pub fn query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<()> {
                 entries,
                 total,
                 elapsed_ms,
-                ..
+                stat_ms,
             } => {
-                print_hits(&entries, total, elapsed_ms);
+                print_hits(&entries, total, elapsed_ms, stat_ms);
                 Ok(())
             }
             other => bail!("意外响应: {other:?}"),
@@ -98,21 +98,24 @@ fn offline_query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<()> {
         .map_err(|e| anyhow!("daemon 未运行,且落盘索引不可用({e});先执行 macEverything start"))?;
     let plan = engine::query::parse(q).map_err(|_| anyhow!("空查询"))?;
     let out = engine::query::execute(view.as_ref(), &plan, limit as usize);
-    let entries: Vec<HitEntry> = out
+    let rows: Vec<(String, String)> = out
         .hits
         .iter()
-        .map(|h| HitEntry {
-            name: String::from_utf8_lossy(view.display_name(*h)).into_owned(),
-            path: view.full_path_dyn(*h),
-            size: None,
-            mtime: None,
+        .map(|h| {
+            (
+                String::from_utf8_lossy(view.display_name(*h)).into_owned(),
+                view.full_path_dyn(*h),
+            )
         })
         .collect();
+    // 与 daemon 在线路径共用同一并行按需读取:离线结果同样含 size/mtime
+    // (product 查询契约不含「离线除外」豁免),口径与耗时字段一致。
+    let (entries, stat_ms) = crate::daemon::stat_rows(rows);
     println!(
         "[离线索引 · 生成于 {}] 执行 macEverything start 可获得实时结果",
         fmt_time(view.meta.built_at)
     );
-    print_hits(&entries, out.total, out.elapsed_ms);
+    print_hits(&entries, out.total, out.elapsed_ms, stat_ms);
     Ok(())
 }
 
@@ -213,11 +216,13 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<(
     }
 }
 
-fn print_hits(entries: &[HitEntry], total: u32, elapsed_ms: f64) {
-    println!("共 {total} 项 · 匹配 {elapsed_ms:.1} ms");
+fn print_hits(entries: &[HitEntry], total: u32, elapsed_ms: f64, stat_ms: f64) {
+    println!("共 {total} 项 · 匹配 {elapsed_ms:.1} ms · 读取信息 {stat_ms:.1} ms");
     for e in entries {
+        // 契约:结果列表含名称、路径、大小、修改时间
         let size = e.size.map(human_size).unwrap_or_else(|| "-".into());
-        println!("  {:>8}  {}  {}", size, e.name, e.path);
+        let mtime = e.mtime.map(fmt_time).unwrap_or_else(|| "-".into());
+        println!("  {mtime}  {size:>8}  {}  {}", e.name, e.path);
     }
     if total as usize > entries.len() {
         println!("(仅展示前 {} 条)", entries.len());
