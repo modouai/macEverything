@@ -446,3 +446,142 @@ bash measure.sh visible native
 1. plan 示意 `eframe::App::update`；实锁 0.37 为 `logic()` + `ui()` 拆分（隐藏/遮挡视口只补跑 `logic`），本 PoC 的「首帧」打点正建立在该拆分上。
 2. plan 示意 `top -pid <pid> -l 60`；实测取 `top -l 2 -s 1 -pid <pid> -stats cpu` 的**第二个样本**（区间值；第一样本是进程生命周期均值，会被启动期摊薄），并用 `ps -o time=` 累计 CPU 时间交叉校验。
 3. plan 的「后台线程每 2~3 秒 toggle + 记录首帧」保留（3s/轮 = 隐藏 2.5s + 显示 0.5s，30 轮）；额外加了 t0 落盘锚点（`POC4_T0_FILE`）以支持外部「窗口在屏」口径，并按 plan Step 1 第 5 条实现 `POC4_MODE=show|hide|cycle`（另加 `native`/`warm` 差分）。
+
+---
+
+## Task 5：PoC-5 — SMAppService 自启（ad-hoc 签名）
+
+**状态：✅ 通过——ad-hoc 签名的 .app 可成功 register，status 转 enabled(1)；open 与直接执行两种启动方式均有效；无需 sudo。SMAppService 可用，无需启用 LaunchAgent 兜底。重启实测留辉哥（终态已注册，见文末人工步骤）。**
+
+- **日期**：2026-10-16
+- **环境**：macOS 27.0（26A428）、Apple Silicon（arm64）、Swift 6.4（swiftc 1.168.6）
+- **代码**：`scripts/poc/poc5_autostart/`（`poc5.swift` + `make-mini-app.sh` 组最小 .app + `verify.sh` 三态验证；非 cargo crate，根 Cargo.toml 无需改）
+- **被测对象**：最小 .app（`CFBundleIdentifier=com.example.maceverything.poc5`、`CFBundleExecutable=poc5-binary`、`LSUIElement=true`，Swift 单文件），ad-hoc 签名：`codesign --force --deep -s -` → `Signature=adhoc`、`TeamIdentifier=not set`、`CDHash=fbc77b29…`
+
+### 结论表
+
+| # | 验证项 | 结论 | 判定依据 |
+| --- | --- | --- | --- |
+| 1 | ad-hoc 签名下 register | ✅ 可用 | `register: OK（无抛错）→ status=enabled(1)`；本机未出现任何审批弹窗、未用 sudo |
+| 2 | 三态流转 | ✅ | `notFound(3)`（首次，LS 未认识）→ register → `enabled(1)` → unregister → `notRegistered(0)`；重复流转稳定复现（direct/open 两轮全绿） |
+| 3 | 启动方式差异（open vs 直接执行） | 两者皆有效，无功能差异 | open：`ppid=1`（launchd 拉起）、`bundlePath=/private/tmp/poc5.app`（LS 解析 /tmp 符号链接）；直接执行：`ppid=<shell>`、`bundlePath=/tmp/poc5.app`。register/status/unregister 结果两模式逐项一致 |
+| 4 | launchctl 观察注册态 | ❌ 看不到（机制使然） | 注册态下 `launchctl list` 与 `launchctl print gui/501` 均无 poc5 条目；运行的 App 才以 `application.<bundleid>.<n>` 出现（对照：本机 WeChat/Edge/Ghostty 等运行中 app 均有该形式条目） |
+| 5 | sfltool dumpbtm（BTM 数据库） | ⚠️ 授权门禁，不可靠 | 首两次全量成功（2074 行，含 UID 501 段）；随后稳定挂起于 `SFAuthorization → AuthorizationCopyRights`（sample 栈：`mach_msg2_trap` 等 authd 回复）。sfltool 非交互不可用，留作人工检查手段 |
+| 6 | kickstart 近似验证（plan Step 2） | ❌ 不适用 | `launchctl kickstart gui/501/application.com.example.maceverything.poc5` 与 `…/com.example.maceverything.poc5` 均报 `Could not find service ... in domain for user gui: 501`；注册态实测无 launchd 服务名可 kick |
+| 7 | 未签名二进制 | 无法执行（arm64 内核门槛） | `codesign --remove-signature` 后 exec 直接 SIGKILL（exit=137）；最小 clang 二进制对照同样 137。ad-hoc 是硬性下限，「无签名 + SMAppService」场景不存在 |
+| 8 | 无 bundle 直接跑（plan 假设"会报错"） | ⚠️ 不报错，且注册出独立条目 | bundle 外裸二进制（`bundleID=<nil>`）`register: OK → enabled(1)`；与 bundle 条目互相独立（一边 unregister 另一边仍 enabled）。产品侧须在 bundle 内调用并核对 bundle id |
+| 9 | 二进制内容变化（模拟更新） | status 不失效 | 用构建戳改二进制（cdhash `fbc77b29`→`f5e528a2`），`status` 仍 `enabled(1)`；随后 unregister/register 均正常。「登录时 BTM 是否因 DR 不匹配拒启」需重启实测（未验证） |
+| 10 | 条目身份键 | bundle id（非路径/cdhash） | 注册从 `/tmp/poc5.app` 迁到 `~/Applications/poc5.app`（unregister 旧 + register 新）后，两个路径副本 status 均报 `enabled(1)`；cdhash 变化不影响见 #9 |
+| 11 | 同 bundle 第二可执行（他名） | 同一身份 | 把二进制复制为 `Contents/MacOS/maceverything-cli` 后运行，`bundleID` 仍解析为 `com.example.maceverything.poc5`——身份由 bundle 决定，与可执行名无关（product 的 App 主可执行 + CLI 同 bundle 场景成立） |
+
+### 现象细节（原始输出）
+
+**三态原始流转**（direct 模式；open 模式逐行一致，仅 ppid/bundlePath 不同）：
+
+```text
+[1] status   → status=notFound(3) raw=3            ← 本 PoC 首次运行的初始态：app 在 /tmp、LS 尚未认识
+[2] register → register: OK（无抛错）→ status=enabled(1)
+    status   → status=enabled(1) raw=1
+[3] unregister → unregister: OK（无抛错）→ status=notRegistered(0)
+    status   → status=notRegistered(0) raw=0
+[4] register（复原）→ register: OK → status=enabled(1)     ← 终态=已启用
+```
+
+> 口径说明：`notFound(3)` 只出现在「LS 从未认识该 app」的首次；其后的完整轮次（direct/open 各一整轮）初始态均为 `notRegistered(0)`，上表其余各行即取自该两轮的逐行一致输出。
+
+open 模式同构（`open /tmp/poc5.app --args status|register|unregister`）：
+
+```text
+[2026-10-16T07:07:15Z] pid=66457 ppid=1 起: cmd=status ... bundlePath=/private/tmp/poc5.app
+[2026-10-16T07:07:17Z] pid=66477 ppid=1 register: OK（无抛错）→ status=enabled(1)
+[2026-10-16T07:07:21Z] pid=66497 ppid=1 unregister: OK（无抛错）→ status=notRegistered(0)
+```
+
+- `notFound(3)` 只出现在「LS 从未认识该 app」时；经历一次 register 后不再出现（再 unregister 即 `notRegistered(0)`）。**产品侧读状态时 `notFound` 与 `notRegistered` 都应视作「未启用」**。
+- open 模式有 2 秒等待：`open` 异步返回，进程输出只落日志文件（`/tmp/poc5.log`），stdout 不可见——这是 `open` 方式取证的唯一渠道。
+- daemon 常驻可被 `ps aux | grep poc5-binary` 观察（`/tmp/poc5.app/Contents/MacOS/poc5-binary daemon 6`）；直接执行的进程不产生 launchctl `application.*` 条目。
+
+**BTM 挂起取证**（`sample` 卡住的 sfltool）：
+
+```text
+-[SFAuthorization obtainWithRights:flags:environment:authorizedRights:error:]  (SecurityFoundation)
+ AuthorizationCopyRights  (Security)
+ _AuthorizationCopyRights_send_message  (Security)
+ xpc_connection_send_message_with_reply_sync  (libxpc.dylib)
+ ... mach_msg2_trap  (libsystem_kernel.dylib)      ← 等 authd 授权回复，无交互渠道即挂起
+```
+
+**注册前 BTM 基线**（`sfltool dumpbtm` 全量 2074 行，成功那次）：UID 501 段含 EdgeUpdater、fpprotect、ollama 等既有条目，**无 poc5/maceverything**。注册后的 BTM 原始 dump 因挂起未取得（见「遗留」）。
+
+**边界实验原始行**：
+
+```text
+# 未签名（codesign --remove-signature 后）
+$ /tmp/poc5-unsigned-*.app/Contents/MacOS/poc5-binary status
+（无任何输出）exit=137            ← arm64 内核拒绝执行未签名二进制
+$ codesign --verify --deep /tmp/poc5-unsigned-*.app
+/tmp/poc5-unsigned-*.app: code object is not signed at all
+
+# 无 bundle（build/ 裸二进制，bundleID=<nil>）
+$ ./build/poc5-binary register
+register: OK（无抛错）→ status=enabled(1)      ← 不报错！
+$ /tmp/poc5.app/Contents/MacOS/poc5-binary unregister   # 只注销 bundle 条目
+bundle 内 status: notRegistered(0)
+bundle 外 status: enabled(1)                    ← 两条目独立
+
+# cdhash 变化后（换二进制不改 bundle id）
+CDHash=f5e528a2fbaa0ef7c4b59d350e894574e69cb32f（新）
+status=enabled(1)                               ← 仍报启用
+
+# kickstart 近似
+$ launchctl kickstart -k gui/501/application.com.example.maceverything.poc5
+Could not find service "application.com.example.maceverything.poc5" in domain for user gui: 501
+```
+
+### 机制与产品推论
+
+1. **注册条件 = 在 .app bundle 内 + 有签名**：进程经 `NSBundle.main` 能解析出含 `CFBundleIdentifier` 的 bundle 即可，与「谁拉起」（LaunchServices / 终端 / shell）无关；Apple Silicon 上内核强制 ad-hoc 签名下限，签名形态（ad-hoc vs Developer ID）不影响本次注册。⇒ 产品（个人使用 ad-hoc，对外分发再补 Developer ID）的自启能力成立。
+2. **登录项由 BTM 管理，不落 launchd**：macOS 13+ 的 `SMAppService` 登录项存于 BackgroundTaskManagement，`launchctl` 只在进程运行时可观察；因此**产品自启状态自查走 `SMAppService.mainApp.status`**，`launchctl`/`sfltool` 只作旁证。
+3. **产品须防「注册错目标」**：`register()` 在 bundle 外不报错（结论表 #8），故 App 侧接线时应先校验 `Bundle.main.bundleIdentifier == "com.example.maceverything"` 再调 register。包内身份已实测无歧义：主可执行与 CLI 同 bundle 不同名时 `Bundle.main` 身份一致（#11），两条入口不会注册出两套条目；风险集中在「未打包的 CLI 裸跑」场景。
+4. **更新后行为**：cdhash 改变不影响已注册条目的 status（#9）；重新打包但代码不变时 cdhash 可复现（同内容同哈希），无需重复注册；稳妥做法仍是 App 启动时 `status == .notRegistered/.notFound` 就补 register（幂等）。
+5. **LaunchAgent 兜底（本次未启用，差异留档）**：plist 兜底不要求签名/bundle，任何二进制可跑；代价是需手写 plist、与 App 更新无联动、开关需自行 bootstrap/bootout。既然 ad-hoc 路线可用，**建议不作为主路径**；仅当重启验证发现 BTM 不拉起时再回退。
+
+### 人工重启验证步骤（辉哥执行；脚本侧已完成到「终态已注册」）
+
+终态：登录项已注册（`enabled(1)`），指向 `~/Applications/poc5.app`（cdhash `fbc77b29…`，与仓库源码一致）；该二进制无参数启动即进 daemon 600 秒，便于观察。
+
+1. 重启 Mac，用辉哥账号登录。
+2. 登录后 1 分钟内执行：`ps aux | grep poc5-binary` —— 预期出现 `~/Applications/poc5.app/Contents/MacOS/poc5-binary`（无参数）进程。
+3. 双证据：`tail -5 /tmp/poc5.log` —— 预期新增一行 `cmd=<none>` 且 `ppid=1`（由 launchd 拉起）的启动记录。
+4. 旁证：`launchctl list | grep -i poc5`（进程存活期间可见 `application.com.example.maceverything.poc5.<n>`）；「系统设置 → 通用 → 登录项与扩展」中应有 poc5 条目；首次登录若弹「允许在后台」类提示，点允许后重登再看。
+5. 验证完清理（可选）：`~/Applications/poc5.app/Contents/MacOS/poc5-binary unregister`，然后 `~/Applications/poc5.app` 与 `/tmp/poc5.app` 移入废纸篓。
+6. 若第 2/3 步未见进程：记为「BTM 未拉起」，此时再评估 LaunchAgent 兜底（结论表外的兜底路线见「机制与产品推论」第 5 条）。
+
+> 注：plan 的 `sudo launchctl kickstart -k gui/$(id -u)/com.example.maceverything.poc5` 近似验证**不适用**（结论表 #6：注册态实测无 launchd 服务名可 kick），故本 PoC 只留真实重启一步。
+
+### 复现步骤
+
+```bash
+cd scripts/poc/poc5_autostart
+bash make-mini-app.sh                 # swiftc 编译 + 组 /tmp/poc5.app + ad-hoc 签名 + 验签
+bash verify.sh direct                 # 三态全流程（直接执行 bundle 内二进制）
+bash verify.sh open                   # 三态全流程（open 经 LaunchServices 拉起）
+POC5_BTM=1 bash verify.sh direct      # 附：带看门狗尝试 sfltool dumpbtm（本机会挂起，8s 超时）
+# 单命令：
+/tmp/poc5.app/Contents/MacOS/poc5-binary register|status|unregister
+open /tmp/poc5.app --args register    # 经 open 传参亦可
+tail -f /tmp/poc5.log                 # 输出日志（open 方式唯一取证渠道）
+```
+
+### 与 plan 示意的差异
+
+1. plan 假设「无 bundle 直接跑会报错」——实测**不报错**且注册出独立条目（结论表 #8），已改列为产品侧接线注意项。
+2. plan 的 `sudo launchctl kickstart` 近似验证不可行（结论表 #6），真实重启为唯一验证；`sfltool dumpbtm` 非交互不可用（结论表 #5），本 PoC 的观察主通道改为进程内 `status` API + `launchctl` 旁证。
+3. plan 的默认 `/tmp/poc5.app` 路径保留为脚本默认；为使重启验证不受 /tmp 清理影响，终态注册迁移到 `~/Applications/poc5.app`（product §交付形态的真实安装位置，结论表 #10 顺带取证）。
+4. 额外记录：未签名对照（#7）、重建/改内容对照（#9）、条目身份键（#10）、同 bundle 第二可执行（#11）——四项均为 plan 外补充，服务产品接线。
+
+### 遗留
+
+1. **注册后的 BTM 原始 dump 未取得**（sfltool 授权门禁）；如需补证，辉哥在终端跑 `sudo sfltool dumpbtm | grep -i poc5`（会要求输入密码）或看「系统设置 → 登录项与扩展」。
+2. **`requiresApproval(2)` 状态未在本机观察到**（首登审批路径）；重启验证时留意是否出现提示。
+3. **DR 不匹配时的登录拉起行为未验证**（改二进制后再重启的场景，即「App 更新后登录项是否仍能拉起」）——本 PoC 终态已用与源码一致的 cdhash 注册，该场景待后续版本实测。
