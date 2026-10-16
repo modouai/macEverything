@@ -62,8 +62,9 @@ echo "== 2. 查询 P99(200 次随机关键词,红线 P99 < 10ms) =="
 TIMES=$(mktemp /tmp/mce-q.XXXXXX)
 for i in $(seq 1 200); do
   kw="file_$(printf %07d $(( (RANDOM * 32768 + RANDOM) % TOTAL )))"
+  # 只取「匹配」段:输出含「匹配 X ms · 读取信息 Y ms」两段,泛取会混入 stat 耗时
   HOME="$BENCH_HOME" "$BIN" query "$kw" 2>/dev/null \
-    | head -1 | grep -oE '[0-9]+\.[0-9]+ ms' | grep -oE '[0-9]+\.[0-9]+' >> "$TIMES" || true
+    | head -1 | grep -oE '匹配 [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' >> "$TIMES" || true
 done
 python3 - "$TIMES" <<'PY'
 import sys
