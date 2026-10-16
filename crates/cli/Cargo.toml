@@ -8,13 +8,13 @@ name = "macEverything"
 path = "src/main.rs"
 
 [dependencies]
+client = { path = "../client" }
 engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 serde_json.workspace = true
 anyhow = "1"
 log = { workspace = true, features = ["std"] }
 libc.workspace = true
-rayon.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

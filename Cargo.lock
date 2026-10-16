@@ -21,6 +21,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "engine",
+ "protocol",
+ "rayon",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -162,11 +172,11 @@ name = "macEverything"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "client",
  "engine",
  "libc",
  "log",
  "protocol",
- "rayon",
  "serde_json",
  "tempfile",
 ]

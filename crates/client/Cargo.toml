@@ -1,0 +1,10 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+protocol = { path = "../protocol" }
+anyhow = "1"
+rayon.workspace = true

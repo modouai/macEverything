@@ -2,6 +2,7 @@
 //! 单实例:绑定 EADDRINUSE 时 connect 探测——连得上 = 已在运行;连不上 = 崩溃
 //! 残留 stale socket,unlink 重绑。stop 经 socket 消息触发,响应在最终落盘后返回。
 use anyhow::{bail, Context, Result};
+use client::{stat_rows, state, DaemonPaths};
 use engine::config;
 use engine::entry::NO_PARENT;
 use engine::fsevents::{self, FseStream};
@@ -9,7 +10,7 @@ use engine::index::{Index, IndexView};
 use engine::persist::{self, IndexMeta, SharedView};
 use engine::reconcile;
 use engine::watcher::{self, DirBatcher};
-use protocol::{self, Gap, HitEntry, Request, Response};
+use protocol::{self, Gap, Request, Response};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -36,35 +37,6 @@ const RESCAN_COOLDOWN: Duration = Duration::from_secs(30);
 /// 钉住比较语义:覆盖点是「小于等于」——floor 本身的事件同属历史。
 fn event_covered_by_rescan(ev_id: u64, rescan_floor: u64) -> bool {
     ev_id <= rescan_floor
-}
-
-/// 状态四态(product §1 契约)。
-pub mod state {
-    pub const BUILDING: &str = "building";
-    pub const READY: &str = "ready";
-    pub const RECONCILING: &str = "reconciling";
-    pub const DEGRADED: &str = "degraded";
-    pub const OFFLINE: &str = "offline";
-}
-
-#[derive(Clone)]
-pub struct DaemonPaths {
-    pub data_dir: PathBuf,
-}
-
-impl DaemonPaths {
-    pub fn socket(&self) -> PathBuf {
-        self.data_dir.join("daemon.sock")
-    }
-    pub fn index_file(&self) -> PathBuf {
-        self.data_dir.join("index.bin")
-    }
-    pub fn config_file(&self) -> PathBuf {
-        self.data_dir.join("config.toml")
-    }
-    pub fn log_file(&self) -> PathBuf {
-        self.data_dir.join("daemon.log")
-    }
 }
 
 fn now_secs() -> u64 {
@@ -196,19 +168,6 @@ pub fn bind_single_instance(sock: &Path) -> Result<UnixListener> {
 
 // —— 查询执行(daemon 端,结果行按需 stat) ——
 
-fn stat_of(path: &str) -> (Option<u64>, Option<u64>) {
-    match std::fs::metadata(path) {
-        Ok(m) => (
-            Some(m.len()),
-            m.modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs()),
-        ),
-        Err(_) => (None, None),
-    }
-}
-
 /// 查询执行:匹配与排序在 holder 读锁内完成;结果行的 size/mtime 在**锁外**
 /// 并行读取——product 契约要求按需读取「并行执行、单独计时随输出给出」,
 /// 且 stat 不应持读锁阻塞增量 diff 的写锁获取。
@@ -247,26 +206,6 @@ fn run_query(state: &EngineState, q: &str, limit: u32) -> Response {
         elapsed_ms,
         stat_ms,
     }
-}
-
-/// 结果行的 size/mtime 并行读取;返回 (条目, 读取耗时毫秒)。
-/// daemon 在线查询与 CLI 离线查询共用(product 契约口径一致)。
-pub fn stat_rows(rows: Vec<(String, String)>) -> (Vec<HitEntry>, f64) {
-    use rayon::prelude::*;
-    let t = Instant::now();
-    let entries: Vec<HitEntry> = rows
-        .into_par_iter()
-        .map(|(name, path)| {
-            let (size, mtime) = stat_of(&path);
-            HitEntry {
-                name,
-                path,
-                size,
-                mtime,
-            }
-        })
-        .collect();
-    (entries, t.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Option<R> {

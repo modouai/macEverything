@@ -10,7 +10,7 @@
 ## 现状分析
 
 - v1 引擎已验收:查询 P99 3ms(真实环境约 120 万条目,2026-10-16 实测 1,197,010)、增量 ≤0.3s、mmap 秒开、停机重放;`engine` 为纯逻辑库(ADR-1 已为 v2 预留:「v2 增加 app crate(egui),engine 不动」)。
-- CLI 已有完整 socket 契约实现(`crates/cli/src/protocol.rs`:Request/Response/编解码/版本/校验)与客户端逻辑(`client.rs`:连接/离线降级/输出)——v2 的 App 是**第二个客户端**,协议与客户端逻辑应复用而非复制。
+- CLI 已有完整 socket 契约实现(已提升为共享 crate `crates/protocol`:Request/Response/编解码/版本/校验)与客户端承载层(已提升为共享 crate `crates/client`:连接/离线降级/按需 stat 读取/状态常量)——v2 的 App 是**第二个客户端**,协议与客户端逻辑应复用而非复制。
 - v1 验收暴露的教训对 v2 的约束:热路径避免每次重建结构(Finder 教训 → UI 侧同理:egui 每帧布局要避免大分配);事件/状态语义显式(batcher 窗口起算教训 → UI 的防抖与响应代际要显式建模)。
 - 已知平台事实(本机实测):FSEvents/runloop 交互已封装良好;全局快捷键在 macOS 走 Carbon(`global-hotkey` crate,tauri 系);托盘 `tray-icon`(tauri 系)覆盖菜单栏图标+菜单;winit 的 `WindowExtMacOS` **不含**窗口级别/跨 Space 设置(官方文档查证于 2026-10)——这两项必须走 objc2。
 
