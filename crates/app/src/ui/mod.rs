@@ -3,6 +3,15 @@
 //! 主视口(ROOT)= 完整结果窗口(Task 17 填结果表格);
 //! 第二视口 = 悬浮条(Task 12 UI;Task 14 接平台层:跨 Space/浮动级别/失焦隐藏/多屏定位)。
 //!
+//! ## 菜单栏托盘(Task 16)
+//!
+//! 托盘本体(图标/菜单/事件泵)在 `tray.rs`;本文件只做两件事:
+//! ① `logic()` 每帧消费托盘动作(`drain_tray`:`TogglePalette` 与热键共用
+//!    `toggle_palette`;`OpenResults` = 完整窗口占位,Task 17 接管;`ToggleAutostart`
+//!    Task 20 前占位;`Quit` = 置 `quitting` 后走根窗关闭的干净退出路径,引擎常驻;
+//!    `LaunchEngine` 放工作线程)并把最新引擎快照落到菜单项(`TrayRuntime::sync`)。
+//! ② 两个带查询词 / 无查询词的「打开完整窗口」入口共用 `show_root_window`。
+//!
 //! ## 视口形态(Task 14 定案,L1/L2 处置)
 //!
 //! 悬浮条用 **deferred 视口 + 常驻**(`show_viewport_deferred`,每次根视口 pass 注册):
@@ -49,9 +58,11 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::engine_launcher;
 use crate::hotkey;
 use crate::platform;
 use crate::single_instance::Incoming;
+use crate::tray::{self, TrayMsg};
 
 /// 系统 CJK 字体候选路径(探测用;结论见模块注释「中文字体」)。
 const CJK_FONT_CANDIDATES: [&str; 2] = [
@@ -82,6 +93,16 @@ fn palette_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("palette")
 }
 
+/// 显示完整窗口(根视口):平台层原生唤起(activate + 置前),失败退回 egui 命令。
+/// 悬浮条 ⌥↵ 与托盘「打开完整窗口」/ 缺口项共用(单一实现,勿复制第三份)。
+fn show_root_window(ctx: &egui::Context) {
+    if let Err(err) = platform::show_root_window() {
+        log::warn!("根窗原生唤起失败,退回 egui 命令:{err}");
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+    }
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
 /// 悬浮条视口 builder(常量;每 pass 传同一份——`patch` 无差异则无命令/无重建)。
 /// `visible(false)`:启动隐藏(唤起走平台层原生路径,不用 winit `Visible(true)`)。
 fn palette_builder() -> egui::ViewportBuilder {
@@ -104,11 +125,15 @@ pub struct App {
     fonts_logged: bool,
     /// 首帧接线已尝试次数(见 `PATCH_ATTACH_ATTEMPTS`)。
     attach_attempts: u32,
-    /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 接)。
+    /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 已接)。
     quitting: bool,
     /// 全局热键运行时(Task 15):manager 保活 + 事件泵计数;
     /// 泵线程命中即请求 ROOT 重绘,`logic` 里 `poll_toggle` 消费(见 hotkey.rs)。
     hotkey: hotkey::HotkeyRuntime,
+    /// 菜单栏托盘(Task 16);None = 安装失败(已留痕,其余入口照常)。
+    tray: Option<tray::TrayRuntime>,
+    /// 引擎路径(托盘「拉起引擎」用;PaletteState 内另持一份同源克隆)。
+    paths: client::DaemonPaths,
 }
 
 /// 两视口共享的运行时状态。
@@ -127,6 +152,7 @@ impl App {
         incoming: Receiver<Incoming>,
         paths: client::DaemonPaths,
         hotkey: hotkey::HotkeyRuntime,
+        tray: Option<tray::TrayRuntime>,
     ) -> Self {
         probe_fonts();
         // 首个 pass 之前先应用一次外观:egui 首帧按 System 偏好的 fallback(Dark)
@@ -140,7 +166,12 @@ impl App {
         Self {
             incoming,
             shared: Arc::new(Mutex::new(Shared {
-                palette: palette::PaletteState::new(cc, paths, palette_viewport_id(), hotkey_note),
+                palette: palette::PaletteState::new(
+                    cc,
+                    paths.clone(),
+                    palette_viewport_id(),
+                    hotkey_note,
+                ),
                 theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
                 palette_visible: false, // 启动隐藏(plan 骨架:.with_visible(false))
             })),
@@ -148,6 +179,8 @@ impl App {
             attach_attempts: 0,
             quitting: false,
             hotkey,
+            tray,
+            paths,
         }
     }
 
@@ -195,6 +228,67 @@ impl App {
         }
     }
 
+    /// 切换悬浮条显示态(托盘左键 / 菜单「打开搜索」与热键共用)。
+    fn toggle_palette(&mut self, ctx: &egui::Context) {
+        if self.shared().palette_visible {
+            self.hide_palette(ctx);
+        } else {
+            self.show_palette(ctx);
+        }
+    }
+
+    /// 消费托盘动作(Task 16):泵线程已为本帧请求 ROOT 重绘(与热键同模式,见 tray.rs)。
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        while let Some(msg) = self.tray.as_ref().and_then(tray::TrayRuntime::poll) {
+            match msg {
+                TrayMsg::TogglePalette => {
+                    log::info!("托盘:切换悬浮条");
+                    self.toggle_palette(ctx);
+                }
+                TrayMsg::OpenResults => {
+                    // Task 17 接管完整窗口内容;此处先把根窗唤到前台(缺口项同入口,
+                    // 展开缺口清单 Task 19 接)。
+                    log::info!("托盘:打开完整窗口(Task 17 前的占位)");
+                    show_root_window(ctx);
+                }
+                TrayMsg::ToggleAutostart => {
+                    // Task 20 前占位:勾选态只在内存(勾选动作已由 muda 在菜单侧翻转,
+                    // 真源即菜单项自身;持久化与 SMAppService 注册/注销 Task 20 接)。
+                    let checked = self.tray.as_ref().is_some_and(|t| t.autostart_checked());
+                    log::info!("托盘:开机自启勾选 → {checked}(占位;Task 20 接真实注册)");
+                }
+                TrayMsg::Quit => {
+                    // 退出只退 App,引擎常驻(product §5)。走 dev 退出按钮同一条干净
+                    // 退出路径(置 quitting 放行根窗关闭 → eframe 收尾 → on_exit 还原
+                    // 窗口类;`std::process::exit` 会跳过 on_exit,platform/mac.rs 的
+                    // 改类还原是干净退出的必要步骤,故不用)。
+                    log::info!("托盘:退出 App(引擎常驻)");
+                    self.quitting = true;
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                TrayMsg::LaunchEngine => {
+                    // 状态项仅在未运行时可点(tray.rs engine_launchable);拉起阻塞
+                    // (≤3s 轮询)放工作线程,完成后请求状态刷新校准状态项。
+                    log::info!("托盘:拉起引擎");
+                    let paths = self.paths.clone();
+                    let refresh = self.tray.as_ref().map(tray::TrayRuntime::refresh_handle);
+                    std::thread::spawn(move || {
+                        match engine_launcher::ensure_engine(&paths) {
+                            Ok(()) => log::info!("引擎拉起完成"),
+                            Err(err) => log::warn!("引擎拉起失败:{err:#}"),
+                        }
+                        if let Some(tx) = refresh {
+                            if let Err(err) = tx.send(()) {
+                                log::warn!("托盘状态刷新请求失败:{err}");
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     /// 隐藏悬浮条(egui 命令 → winit `orderOut`;视口与窗口保留,状态复位)。
     fn hide_palette(&mut self, ctx: &egui::Context) {
         {
@@ -203,7 +297,7 @@ impl App {
             s.palette.reset();
         }
         ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
-        log::info!("悬浮条隐藏(热键/dev 按钮)");
+        log::info!("悬浮条隐藏(热键/托盘切换/dev 按钮)");
     }
 }
 
@@ -212,20 +306,21 @@ impl eframe::App for App {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
+        // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/
+        // 文本更新要求主线程——muda 约束;快照由刷新线程写、悬停/点击/拉起后触发)。
+        self.drain_tray(ctx);
+        if let Some(tray) = &mut self.tray {
+            tray.sync();
+        }
+
         // 全局热键(Task 15):事件泵线程已为本帧请求 ROOT 重绘(hotkey.rs 模块注释
         // 「事件泵为什么必须带唤醒」)→ 消费按下计数并按可见态切换唤起/隐藏。
         if hotkey::poll_toggle(&self.hotkey) {
-            let visible = self.shared().palette_visible;
             log::info!(
-                "热键 {} 按下:{}悬浮条",
-                self.hotkey.name().unwrap_or("(未注册)"),
-                if visible { "隐藏" } else { "唤起" }
+                "热键 {} 按下:切换悬浮条",
+                self.hotkey.name().unwrap_or("(未注册)")
             );
-            if visible {
-                self.hide_palette(ctx);
-            } else {
-                self.show_palette(ctx);
-            }
+            self.toggle_palette(ctx);
         }
 
         // 平台补丁:找悬浮条窗(首见即施加)/漂移核对(可见期)。
@@ -283,7 +378,7 @@ impl eframe::App for App {
             .button(if palette_visible {
                 "隐藏悬浮条"
             } else {
-                "显示悬浮条(dev 入口;⌥Space 热键 Task 15 接)"
+                "显示悬浮条(dev 入口;⌥Space 热键 / 托盘左键)"
             })
             .clicked()
         {
@@ -296,7 +391,7 @@ impl eframe::App for App {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("关闭本窗口 = 隐藏(不退出);悬浮条 ⌥↵ 可再打开本窗口").weak());
         if ui
-            .button("退出 App(dev 入口;托盘退出 Task 16 接)")
+            .button("退出 App(dev 入口;托盘菜单「退出」同路径)")
             .clicked()
         {
             self.quitting = true;
@@ -364,14 +459,7 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             s.palette.reset();
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             // 根窗走平台层原生(activate + 置前;单发 egui 命令不切 Space,实测)。
-            if let Err(err) = platform::show_root_window() {
-                log::warn!("根窗原生唤起失败,退回 egui 命令:{err}");
-                ctx.send_viewport_cmd_to(
-                    egui::ViewportId::ROOT,
-                    egui::ViewportCommand::Visible(true),
-                );
-                ctx.request_repaint_of(egui::ViewportId::ROOT);
-            }
+            show_root_window(&ctx);
         }
         None => {}
     }

@@ -47,3 +47,8 @@ raw-window-handle = "0.6"
 global-hotkey = "0.6"
 anyhow = "1"
 log = { workspace = true, features = ["std"] }
+# Task 16 菜单栏托盘(实锁 0.26.1;菜单走其 re-export 的 muda)。
+# 关默认 features:默认的 libappindicator 只服务 Linux 后端,本仓交付面仅 macOS,
+# 开启会把整棵 GTK/system-deps 依赖树拖进 Cargo.lock(Linux 目标依赖也入锁)。
+# 将来若出 Linux 构建,须启用 `libappindicator` 或 `ksni`(crate 内 compile_error 强制)。
+tray-icon = { version = "0.26.1", default-features = false }
