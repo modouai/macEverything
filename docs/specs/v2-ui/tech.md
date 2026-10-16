@@ -26,12 +26,12 @@
 - **Alternatives Considered**:协议留 cli、app 依赖 cli 的 lib(Rejected:cli 无 lib target 需先引入,且 app 会连带拉进 daemon 宿主代码);协议各持一份(Rejected:契约与离线/stat 行为双真相);App 内嵌 engine 当 daemon(Rejected:双引擎实例/锁冲突/与 CLI 互斥)。
 - **Consequences**:cli 做一次机械迁移(protocol 与 client 相关代码搬家);`protocol` 为唯一契约真相、`client` 为唯一客户端行为真相;版本策略见「协议变更」节。
 
-### ADR-8 悬浮条 = egui/eframe 渲染 + objc2 平台补丁
+### ADR-8 悬浮条 = egui/eframe 渲染 + objc2 平台补丁(NSPanel 改类)
 
-- **Context**:悬浮条需要 NSPanel 级行为(跨 Space 可见、浮动级别、失焦隐藏、多屏定位)。egui/eframe 官方覆盖无边框/透明/置顶/失焦事件/窗口定位;跨 Space 与窗口级别 winit 公开 API 不提供(文档查证)。原生 NSPanel 壳 + egui 渲染的集成成本高(自管 glow/wgpu surface)。
-- **Decision**:eframe 单技术栈;窗口行为缺口经 winit raw handle(`ns_window()` → NSWindow 指针)用 objc2-app-kit 补丁:`setCollectionBehavior(CanJoinAllSpaces | FullScreenAuxiliary)`、`setLevel(NSFloatingWindowLevel)`、按需 `setActivationPolicy/Accessory`。unsafe 集中于 `platform/mac.rs` 单模块(与 v1 `fsevents.rs` 同纪律:SAFETY 注释逐处、失败可降级)。
-- **Alternatives Considered**:原生 NSPanel 壳(Rejected:集成成本/双栈维护);SwiftUI 壳 + socket(Rejected:第二语言,双栈;v1 阶段已评过同类);纯 winit 公开 API(Rejected:能力缺口即产品红线)。
-- **Consequences**:新增 objc2 依赖链(unsafe);PoC-1 先于界面实现验证;失败路径有明确降级(当前 Space 可见)。
+- **Context**:悬浮条需要 NSPanel 级行为(跨 Space 可见、浮动级别、失焦隐藏、多屏定位)。egui/eframe 官方覆盖无边框/透明/置顶/失焦事件/窗口定位;跨 Space 与窗口级别 winit 公开 API 不提供(文档查证)。**PoC-1 实测**:普通 NSWindow 即使设 `CanJoinAllSpaces|FullScreenAuxiliary`,`setLevel` 任意档,**进不了他人全屏 Space**(四组合对照 + CoreGraphics 清单取证;外证 tauri#11488)。
+- **Decision**(PoC-1 续 spike 定稿,`scripts/poc/poc1b_nspanel`):eframe 单技术栈 + **运行期 NSPanel 改类**——`object_setClass` 把 winit 窗口换成自定义 NSPanel 子类;生效组合**五要素缺一不可**:①自定义子类覆写 `canBecomeKeyWindow`→true(裸 NSPanel 跨 Space 可但收不到键盘)②`setStyleMask(原 mask | NSWindowStyleMaskNonactivatingPanel)`(跨全屏硬条件)③`setLevel(Floating)` ④`setCollectionBehavior(CanJoinAllSpaces|FullScreenAuxiliary)` ⑤显示走 `orderFrontRegardless`/`makeKeyWindow`(成 key 而不夺前台)。**两必带补丁**:a) 改 styleMask 后补 `makeFirstResponder(contentView)`(否则键盘链路断,winit 源码注释同款修法);b) **关窗前还原窗口类**(否则 `ViewportCommand::Close` → winit Window drop → `panic in a function that cannot unwind` abort;spike 三方对照实证)。unsafe 集中于 `platform/mac.rs` 单模块。
+- **Alternatives Considered**:普通 NSWindow 纯补丁(Rejected:PoC-1 实证不可行);原生 NSPanel 壳(Rejected:集成成本/双栈维护);SwiftUI 壳 + socket(Rejected:第二语言;v1 阶段已评过同类)。
+- **Consequences**:跨全屏 Space 通过(双取证);**KVO 副作用**:winit 的主题监听(NSKVONotifying_WinitWindow)随换类失效——深浅色跟随**自建探测**(渲染帧查询系统外观),Task 13 按此实现;真键盘 HID 路径与 Chrome 全屏复核留人工验证(辉哥执行,poc-results 有步骤)。
 
 ## 变更方案
 
@@ -104,8 +104,8 @@ pub fn execute_sorted(
 
 | 行为 | 实现 |
 |---|---|
-| 跨 Space | `NSWindow.setCollectionBehavior(CanJoinAllSpaces \| FullScreenAuxiliary)` |
-| 浮动级别 | `NSWindow.setLevel(NSFloatingWindowLevel)`(值由 PoC 实测确定:floating / status 档位) |
+| 跨 Space(含他人全屏) | **NSPanel 改类五要素**(见 ADR-8;poc1b spike 定稿:`scripts/poc/poc1b_nspanel` 为可直接移植的实现参考) |
+| 浮动级别 | `setLevel(NSFloatingWindowLevel)`(PoC 实测;winit always_on_top 已自带 level 3,补丁增量在 collectionBehavior) |
 | 失焦隐藏 | eframe `WindowEvent::Focused(false)` → `ViewportCommand::Visible(false)`(官方) |
 | 多屏定位 | 唤起时取鼠标所在屏(NSEvent.mouseLocation 或 winit monitor)→ 计算居中偏上坐标 → `set_outer_position`(官方) |
 | 无边框/透明/圆角 | `ViewportBuilder { decorations:false, transparent:true, ... }`(官方)+ egui 自绘圆角阴影 |
@@ -159,7 +159,7 @@ pub fn execute_sorted(
 
 | 风险 | 应对 |
 |---|---|
-| PoC-1:跨 Space/浮动级别不生效 | 降级「当前 Space 可见」,产品文档标注;不阻塞其余功能 |
+| PoC-1:跨 Space/浮动级别 | **已定稿通过**(NSPanel 改类五要素+两补丁,spike 双取证);NSPanel 改类的复杂度即代价(KVO 主题链路断→自建探测;关窗还原类防 abort) |
 | PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space / ⌃⌥⇧Space;⌃Space 族为系统输入法占用,不在候选池);以实机结果定默认 |
 | PoC-3:NSMenu 阻塞式弹出与 egui 事件循环 | NSMenu 弹出走嵌套 run loop(阻塞当前线程)——在 eframe 主线程弹出需验证无卡死/输入错乱;不通过则菜单弹出移至独立线程或改用 popUpMenuPositioningItem 非模态 |
 | PoC-4:eframe 隐藏 CPU 0% vs 唤起 <100ms 的两线拉扯 | 隐藏视口 `ControlFlow::Wait` 实测 CPU;唤起路径(热键事件 → 显示 → 首帧)实测延迟;若 >100ms 排查 `with_visible(false)` ↔ 显示的首帧成本(预渲染/keep-warm 折中) |

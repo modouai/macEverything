@@ -916,7 +916,7 @@ git commit -m "feat(app): 悬浮条 UI——输入即搜/列表/键位/打开动
 /// 加载:FontDefinitions 注册为 Propo 与 Monospace 的 fallback 家族。
 ```
 
-- [ ] **Step 2: 深浅色**:读系统外观(`NSApp.effectiveAppearance` 经 objc2,或 `defaults read -g AppleInterfaceStyle` 轮询——**用 objc2 事件式更好,但首版可用「渲染帧时查询」**)→ `ctx.set_visuals(Light/Dark)`;切换时重绘即跟随。
+- [ ] **Step 2: 深浅色(自建探测——PoC-1 结论:winit 的 KVO 主题监听随 NSPanel 改类失效)**:每渲染帧(或低频节流)读系统外观经 objc2(`NSApp.effectiveAppearance.name` ← `NSAppearanceNameDarkAqua` 判定,或 `defaults read -g AppleInterfaceStyle` 子进程——**用 objc2 同进程查询,避免子进程**)→ 外观变化时 `ctx.set_visuals(Light/Dark)` 并重绘。
 
 - [ ] **Step 3: 实机验证**:中文文件名列表无豆腐块;系统外观切换(设置或 `osascript` 模拟)→ 两窗口即时变色。
 
@@ -938,7 +938,7 @@ git commit -m "feat(app): 中文字体加载 + 深浅色跟随主题"
 - Create: `crates/app/src/platform/mod.rs`(facade:非 macOS 空实现)
 - Modify: `crates/app/src/ui/mod.rs`(唤起/隐藏流程接平台层)
 
-**Why:** tech 平台行为表——跨 Space/浮动级别(PoC-1 验证过的补丁产品化)、失焦隐藏、多屏定位。
+**Why:** tech 平台行为表——跨 Space/浮动级别(**)PoC-1 续 spike 定稿的 NSPanel 改类五要素+两补丁产品化**,实现参考直接读 `scripts/poc/poc1b_nspanel/src/main.rs`(五要素:自定义子类覆写 canBecomeKeyWindow/NonactivatingPanel styleMask/Floating level/CanJoinAllSpaces|FullScreenAuxiliary/orderFrontRegardless;两必带补丁:makeFirstResponder 修键盘链路、**关窗前还原窗口类防 winit drop abort**))、失焦隐藏、多屏定位。
 
 - [ ] **Step 1: 平台 API(facade)**
 
