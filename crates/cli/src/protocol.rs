@@ -60,6 +60,9 @@ pub enum Response {
     Exclude {
         ok: bool,
         excluded: Vec<String>,
+        /// 失败原因(ok=false 时给出可操作提示);成功时缺省不序列化。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     Error {
         code: String,

@@ -782,21 +782,34 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         Request::ExcludeList { .. } => Response::Exclude {
             ok: true,
             excluded: state.cfg.lock().unwrap().excluded.clone(),
+            message: None,
         },
-        Request::ExcludeAdd { path, .. } => {
-            apply_exclude_change(state, paths, &path, ExcludeOp::Add);
-            Response::Exclude {
-                ok: true,
-                excluded: state.cfg.lock().unwrap().excluded.clone(),
-            }
-        }
+        Request::ExcludeAdd { path, .. } => exclude_response(state, paths, &path, ExcludeOp::Add),
         Request::ExcludeRemove { path, .. } => {
-            apply_exclude_change(state, paths, &path, ExcludeOp::Remove);
-            Response::Exclude {
-                ok: true,
-                excluded: state.cfg.lock().unwrap().excluded.clone(),
-            }
+            exclude_response(state, paths, &path, ExcludeOp::Remove)
         }
+    }
+}
+
+/// 排除变更的统一应答:失败如实回 ok=false + 可操作原因(不再恒 ok=true)。
+fn exclude_response(
+    state: &Arc<EngineState>,
+    paths: &DaemonPaths,
+    path: &str,
+    op: ExcludeOp,
+) -> Response {
+    let excluded = || state.cfg.lock().unwrap().excluded.clone();
+    match apply_exclude_change(state, paths, path, op) {
+        Ok(()) => Response::Exclude {
+            ok: true,
+            excluded: excluded(),
+            message: None,
+        },
+        Err(msg) => Response::Exclude {
+            ok: false,
+            excluded: excluded(),
+            message: Some(msg),
+        },
     }
 }
 
@@ -805,14 +818,36 @@ enum ExcludeOp {
     Remove,
 }
 
+/// 排除路径校验(tech.md 契约):须为绝对路径且位于扫描根内,否则拒绝。
+/// 两侧都做 canonical 兜底比较(/var → /private/var 符号链接形态统一)。
+fn validate_exclude_in_roots(path: &str, roots: &[PathBuf]) -> Result<(), String> {
+    protocol::validate::exclude_path(path)?;
+    let canon = |x: &Path| x.canonicalize().unwrap_or_else(|_| x.to_path_buf());
+    let p = canon(Path::new(path));
+    if roots.iter().any(|r| p.starts_with(canon(r))) {
+        return Ok(());
+    }
+    Err(format!(
+        "路径不在扫描根内: {path}(扫描根: {});排除仅作用于扫描根内的目录",
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、")
+    ))
+}
+
 /// 排除变更:校验 → 更新配置 → 落盘配置 → 重扫使变更生效。
 /// 运行时无定向增量(受影响范围重扫可作后续优化),重扫保证正确性;
-/// 非法路径不改状态(响应仍带当前列表,调用方自行比对)。
-fn apply_exclude_change(state: &Arc<EngineState>, paths: &DaemonPaths, path: &str, op: ExcludeOp) {
-    if let Err(msg) = protocol::validate::exclude_path(path) {
-        log::warn!("排除路径非法({msg}): {path}");
-        return;
-    }
+/// 失败(路径非法/越界/配置落盘失败)返回可操作原因,不改内存状态之外的任何东西。
+fn apply_exclude_change(
+    state: &Arc<EngineState>,
+    paths: &DaemonPaths,
+    path: &str,
+    op: ExcludeOp,
+) -> Result<(), String> {
+    let roots = state.roots.lock().unwrap().clone();
+    validate_exclude_in_roots(path, &roots)?;
     {
         let mut cfg = state.cfg.lock().unwrap();
         match op {
@@ -827,8 +862,10 @@ fn apply_exclude_change(state: &Arc<EngineState>, paths: &DaemonPaths, path: &st
     let cfg = state.cfg.lock().unwrap().clone();
     if let Err(e) = config::save(&cfg, &paths.config_file()) {
         log::error!("配置保存失败: {e}");
+        return Err(format!("配置保存失败({e}),变更未持久化,重启后将丢失"));
     }
     degrade_and_rescan(state, paths);
+    Ok(())
 }
 
 /// 服务循环(主线程):accept → 每连接一线程;stop 处理后退出进程。
@@ -966,5 +1003,24 @@ mod tests {
             state.seen_event_id.fetch_max(id, Ordering::Relaxed);
         }
         assert_eq!(state.seen_event_id.load(Ordering::Relaxed), 200);
+    }
+
+    /// 排除路径校验钉(tech.md 契约:必须为扫描根内绝对路径,否则拒绝)。
+    /// 突变「只查绝对路径不查根内」时根外断言必红。
+    #[test]
+    fn exclude_path_must_be_inside_scan_roots() {
+        let roots = vec![PathBuf::from("/Users/t"), PathBuf::from("/Applications")];
+        assert!(validate_exclude_in_roots("/Users/t/Library", &roots).is_ok());
+        assert!(validate_exclude_in_roots("/Applications/Xcode.app", &roots).is_ok());
+        assert!(
+            validate_exclude_in_roots("/Users/t", &roots).is_ok(),
+            "根本身合法"
+        );
+        // 根外绝对路径
+        assert!(validate_exclude_in_roots("/etc", &roots).is_err());
+        assert!(validate_exclude_in_roots("/System/Library", &roots).is_err());
+        // 相对名(上游只放行绝对路径)
+        assert!(validate_exclude_in_roots("node_modules", &roots).is_err());
+        assert!(validate_exclude_in_roots("~/Library", &roots).is_err());
     }
 }

@@ -202,13 +202,17 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<(
         bail!("daemon 未在运行;排除变更需引擎在线,先执行 macEverything start");
     };
     match expect_ok(call(&mut s, &req)?)? {
-        Response::Exclude { ok, excluded } => {
+        Response::Exclude {
+            ok,
+            excluded,
+            message,
+        } => {
             println!("排除目录({} 条):", excluded.len());
             for e in excluded {
                 println!("  {e}");
             }
             if !ok {
-                bail!("操作未生效");
+                bail!("{}", message.unwrap_or_else(|| "操作未生效".into()));
             }
             Ok(())
         }
