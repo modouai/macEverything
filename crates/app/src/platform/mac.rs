@@ -41,8 +41,8 @@ use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSEvent, NSFloatingWindowLevel, NSMenu, NSMenuItem, NSPanel, NSResponder,
-    NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceActiveSpaceDidChangeNotification,
+    NSScreen, NSView, NSViewLayerContentsPlacement, NSWindow, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace, NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -737,8 +737,10 @@ fn configure(ns: &NSWindow) {
     panel.setBecomesKeyOnlyIfNeeded(false);
     // 补丁 a:改 styleMask 会打断键盘投递链,必须补 first responder。
     let ok = restore_first_responder(ns);
+    // 高度变化呈现(PoC-6 定案):resize 时旧帧钉左上、裁切而非缩放拉伸。
+    let placement = set_top_left_placement(ns);
     log::info!(
-        "悬浮条窗属性:level={} CanJoinAllSpaces={} FullScreenAuxiliary={} styleMask={:#x} first_responder={ok}",
+        "悬浮条窗属性:level={} CanJoinAllSpaces={} FullScreenAuxiliary={} styleMask={:#x} first_responder={ok} layer_placement={placement:?}",
         ns.level(),
         ns.collectionBehavior()
             .contains(NSWindowCollectionBehavior::CanJoinAllSpaces),
@@ -746,6 +748,15 @@ fn configure(ns: &NSWindow) {
             .contains(NSWindowCollectionBehavior::FullScreenAuxiliary),
         ns.styleMask().0
     );
+}
+
+/// resize 时旧帧的放置策略:`layerContentsPlacement = TopLeft`(PoC-6 定案——
+/// 窗口先撑/后收期间旧帧钉左上、裁切而非拉伸;默认值 0 = 轴向缩放拉伸)。
+/// 返回读回值(11 = TopLeft)供留痕;无 contentView 时返回 None。
+fn set_top_left_placement(ns: &NSWindow) -> Option<NSInteger> {
+    let view = ns.contentView()?;
+    view.setLayerContentsPlacement(NSViewLayerContentsPlacement::TopLeft);
+    Some(view.layerContentsPlacement().0)
 }
 
 /// 跨 Space 需要的 collection behavior 组合(PoC-1/1b 沿用值)。
