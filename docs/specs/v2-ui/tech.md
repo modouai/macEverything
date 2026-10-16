@@ -9,19 +9,22 @@
 
 ## 现状分析
 
-- v1 引擎已验收:查询 P99 3ms(140 万条目)、增量 ≤0.3s、mmap 秒开、停机重放;`engine` 为纯逻辑库(ADR-1 已为 v2 预留:「v2 增加 app crate(egui),engine 不动」)。
+- v1 引擎已验收:查询 P99 3ms(真实环境约 120 万条目,2026-10-16 实测 1,197,010)、增量 ≤0.3s、mmap 秒开、停机重放;`engine` 为纯逻辑库(ADR-1 已为 v2 预留:「v2 增加 app crate(egui),engine 不动」)。
 - CLI 已有完整 socket 契约实现(`crates/cli/src/protocol.rs`:Request/Response/编解码/版本/校验)与客户端逻辑(`client.rs`:连接/离线降级/输出)——v2 的 App 是**第二个客户端**,协议与客户端逻辑应复用而非复制。
 - v1 验收暴露的教训对 v2 的约束:热路径避免每次重建结构(Finder 教训 → UI 侧同理:egui 每帧布局要避免大分配);事件/状态语义显式(batcher 窗口起算教训 → UI 的防抖与响应代际要显式建模)。
 - 已知平台事实(本机实测):FSEvents/runloop 交互已封装良好;全局快捷键在 macOS 走 Carbon(`global-hotkey` crate,tauri 系);托盘 `tray-icon`(tauri 系)覆盖菜单栏图标+菜单;winit 的 `WindowExtMacOS` **不含**窗口级别/跨 Space 设置(官方文档查证于 2026-10)——这两项必须走 objc2。
 
 ## 架构变更
 
-### ADR-7 protocol crate 提升 + app crate 新增
+### ADR-7 协议与客户端承载层提升为共享 crate(protocol + client)
 
-- **Context**:协议与客户端逻辑目前在 cli crate 内;App 需要同款契约。复制一份即产生双真相(契约漂移风险);App 内嵌 engine 则破坏「CLI/UI 共用一个 daemon」的进程模型(v1 ADR-1/4)。
-- **Decision**:新建 `crates/protocol`(纯契约:消息类型/编解码/校验/版本,零业务依赖),cli 与 app 共同依赖;新建 `crates/app`(GUI,依赖 protocol + 领域无关的 UI 栈)。engine 零改动(除下述查询扩展)。
-- **Alternatives Considered**:协议留 cli、app 依赖 cli 的 lib(Rejected:app 会连带拉进 daemon 宿主与整个 CLI 依赖);协议各持一份(Rejected:契约漂移);App 内嵌 engine 当 daemon(Rejected:双引擎实例/锁冲突/与 CLI 互斥)。
-- **Consequences**:cli 需做一次机械迁移(协议文件搬家 + 引用改路径);`protocol` crate 成为唯一契约真相,变更走版本字段。
+- **Context**:协议(`protocol.rs`)与客户端逻辑(`client.rs`+`DaemonPaths`/`stat_rows`/状态常量/离线降级)目前在 cli crate 内;App 需要同款能力。cli 无 lib target,照搬即复制——而「复制」的对象不止协议:离线降级依赖 `engine::persist`+`engine::query`,stat 补全、连接管理同理,复制面比协议大得多(契约与行为双漂移)。App 内嵌 engine 当 daemon 则破坏「CLI/UI 共用一个 daemon」进程模型(v1 ADR-1/4)。
+- **Decision**:提升为**两个共享 crate**:
+  - `crates/protocol`(纯契约:消息类型/编解码/校验/版本,零业务依赖);
+  - `crates/client`(客户端承载层:`DaemonPaths`、socket 连接/请求、`stat_rows` 按需读取、状态常量、离线降级查询——依赖 `protocol` + `engine` 纯逻辑 API)。
+  依赖关系:cli = daemon 宿主 + 子命令(依赖 client);app = GUI(依赖 client + UI 栈);**app 依赖 engine 经由 client 承载层发生**(engine 是纯逻辑库,不违反单 daemon 模型)。engine 零业务改动(仅下述查询扩展)。
+- **Alternatives Considered**:协议留 cli、app 依赖 cli 的 lib(Rejected:cli 无 lib target 需先引入,且 app 会连带拉进 daemon 宿主代码);协议各持一份(Rejected:契约与离线/stat 行为双真相);App 内嵌 engine 当 daemon(Rejected:双引擎实例/锁冲突/与 CLI 互斥)。
+- **Consequences**:cli 做一次机械迁移(protocol 与 client 相关代码搬家);`protocol` 为唯一契约真相、`client` 为唯一客户端行为真相;版本策略见「协议变更」节。
 
 ### ADR-8 悬浮条 = egui/eframe 渲染 + objc2 平台补丁
 
@@ -36,47 +39,63 @@
 
 ```
 crates/
-├── protocol/                ← 新建(从 cli 迁移,原样)
+├── protocol/                ← 新建(从 cli 迁移)
 │   └── src/lib.rs             Request/Response/HitEntry/Gap/encode/decode/validate/PROTOCOL_VERSION
-├── app/                     ← 新建
+├── client/                  ← 新建(承载层,从 cli 迁移并归置)
+│   └── src/lib.rs             DaemonPaths / connect+call / stat_rows / state 常量 / 离线降级查询
+│                              (依赖 protocol + engine;cli 与 app 的共同客户端面)
+├── app/                     ← 新建(GUI)
 │   └── src/
-│       ├── main.rs            启动编排:单实例锁 → daemon 探测/拉起 → 快捷注册 → 托盘 → eframe 主循环
-│       ├── client.rs          socket 客户端(查询/状态;离线降级;响应代际)
-│       ├── session.rs         查询会话:防抖(60ms)+ 代际号 + 排序状态(纯逻辑,可测)
+│       ├── main.rs            启动编排:app.sock 单实例 → 引擎定位(随包→PATH)/拉起 → 快捷注册 → 托盘 → eframe 主循环
+│       ├── session.rs         查询会话:防抖(60ms)+ 代际号 + 排序状态 + 空词/warming/离线分支(纯逻辑,可测)
 │       ├── ui/
-│       │   ├── mod.rs          App 壳:双视口(悬浮条/完整窗口)生命周期
-│       │   ├── palette.rs      悬浮条视图:输入+列表+角标
-│       │   └── results.rs      完整窗口:表格(虚拟化/列排序/多选)+右键菜单+状态栏
+│       │   ├── mod.rs          App 壳:双视口(悬浮条/完整窗口)生命周期 + 深浅色主题
+│       │   ├── palette.rs      悬浮条视图:输入+列表+状态角标
+│       │   └── results.rs      完整窗口:表格(虚拟化/列排序/多选)+原生菜单桥接+状态栏+缺口面板
 │       ├── platform/
 │       │   ├── mod.rs          平台能力 facade(非 macOS 编译为空实现,便于测试)
-│       │   └── mac.rs          objc2:跨 Space/浮动级别/激活策略/鼠标所在屏
+│       │   └── mac.rs          objc2:跨 Space/浮动级别/激活策略/鼠标所在屏/NSMenu 构建与弹出
 │       ├── hotkey.rs           global-hotkey 注册与事件泵(失败可换备选位)
 │       ├── tray.rs             tray-icon 图标/菜单/左键切换
-│       └── autostart.rs        SMAppService 注册/注销/查询(或 LaunchAgent 兜底)
-├── engine/                  唯一改动:query::execute_sorted(见下)
-└── cli/                     删除本地 protocol 实现,改 `use protocol::*`
+│       └── autostart.rs        SMAppService 注册/注销/查询(LaunchAgent 兜底)
+├── engine/                  唯一改动:query 排序支持(见下)
+└── cli/                     迁移至 protocol/client crate;daemon 宿主与子命令保留
+scripts/bundle.sh             ← 新增:.app 组装(二进制 + Info.plist + 可选图标;LSUIElement=true)
 ```
 
-### 引擎扩展:execute_sorted
+### 引擎扩展:排序查询
+
+engine 保持纯逻辑(不直接碰文件系统)——元数据以**闭包注入**:
 
 ```rust
 pub enum SortKey { Relevance, Name, Size, Mtime, Path }
 
-pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort: SortKey) -> QueryOutcome
+/// meta_of:条目号 → (大小, 修改时间);由调用方注入(daemon 传真实 stat,测试传 mock)。
+/// 计分口径:elapsed_ms 含匹配+键计算+排序;stat_ms 单独累计 meta_of 的调用耗时。
+pub fn execute_sorted(
+    view: &dyn IndexView, plan: &QueryPlan, limit: usize,
+    sort: SortKey, meta_of: &dyn Fn(u32) -> (Option<u64>, Option<u64>),
+) -> SortOutcome   // SortOutcome = QueryOutcome + { stat_ms: f64, entries_meta: HashMap<u32,(u64,u64)>? }
 ```
 
-- `Relevance` = 现有 `execute`(委托,行为不变)。
+- `Relevance` = 现有 `execute`(委托,行为不变,不调 meta_of)。
 - `Name`/`Path`:匹配集全量排序(键来自 arena,零 stat),取前 limit。
-- `Size`/`Mtime`:**两段式**——先匹配得候选(≤ 全命中),对候选集 stat(按路径并行),再排序取前 limit。耗时口径与 v1 一致:「引擎耗时」只含匹配+排序;stat 单独计时随响应返回(`stat_ms` 字段),UI 状态栏展示两者。
-- 排序稳定性:等值列用条目号决胜(确定性,同 v1 查询内约定)。
-- 边界:limit=0 与全命中 0 条走既有路径。候选集全量 stat,不做抽样——完整排序语义要求全量键,耗时随响应如实告知(140 万条目全 stat 数百 ms 量级,仅点大小/时间列时触发)。
+- `Size`/`Mtime`:**两段式**——先匹配得候选,对候选集调 `meta_of`(daemon 侧真实 stat,并行化在 daemon 实现;测试侧 mock),再排序取前 limit。
+- **stat 归属与去重**:排序所用元数据随排序产生、随响应携带;daemon 的 `stat_rows`(补全响应行的 size/mtime)对已有值**跳过不重查**(只补 None 行)——「无重查」为契约。`stat_ms` 语义 = 本响应内为排序与补全所付的 stat 总耗时。
+- 排序稳定性:等值键用条目号决胜(确定性,同 v1 查询内约定)。
+- **排序键形态(定案)**:名称/路径键取 **display 原始形态 + Unicode 码点序**;不做本地化排序(与 Finder 的拼音/区域序不同,已知局限,文档标注)。中文与 ASCII 混排按码点,行为确定可复现。
+- 边界:limit=0 与全命中 0 条走既有路径。候选集全量 stat,不做抽样——完整排序语义要求全量键,耗时随响应如实告知(约 120 万条目全 stat 数百 ms 量级,仅点大小/时间列时触发;UI 出「排序中…」状态)。
 
-### 协议变更(向后兼容)
+### 协议变更与版本策略
 
-| 消息 | 字段 | 兼容性 |
+**版本策略(定案)**:纯**新增可选字段不 bump v**(v=1 保持);`sort_echo` 回显使旧 daemon 的降级可被 UI 识别——旧 daemon 忽略 `sort` 字段时,响应回显 `sort_echo:""`(=relevance),完整窗口发现请求键与回显不符即状态栏提示「引擎版本过旧,排序未生效」并提示升级,**不静默展示错排序**。同包同版(App 与随包引擎)为正常交付形态,跨版本混跑仅在用户手工混装时发生。
+
+| 消息 | 变更 | 兼容性 |
 |---|---|---|
-| Request::Query | `sort: Option<String>`(serde default) | 旧客户端缺省 → relevance;旧 daemon 收到未知字段(serde 默认忽略)→ 仍按 relevance 返回 |
-| Response::Query | `stat_ms: Option<f64>`(default) | 旧客户端忽略 |
+| Request::Query | 新增 `sort: Option<String>`(serde default) | 旧客户端缺省 → relevance;旧 daemon 忽略未知字段 |
+| Response::Query | 新增 `sort_echo: String`(serde default 空串) | 旧客户端忽略;空串 = 旧 daemon(实际按 relevance) |
+
+(`stat_ms` 为 v1 已在协议中的字段,本版不含变更。)
 
 ### 悬浮条窗口行为(platform/mac.rs)
 
@@ -101,11 +120,22 @@ pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort
 
 ```
 输入事件 → debounce(60ms) → 发起查询(带代际号 n)
-响应到达 → n < 当前代际?丢弃 : 渲染
+响应到达 → n < 当前代际 → 丢弃 : 渲染
 排序变更 → 同代际机制重查(sort 参数变化,不重新输入)
 ```
 
-- 代际号防「慢响应后到覆盖新结果」的闪回;离线/拉起中状态机显式(Idle/Searching/EngineStarting/Offline)。
+**状态机显式建模**(含 daemon 两个非结果响应分支):
+
+| 状态 | 进入条件 | 界面 |
+|---|---|---|
+| Idle | 空词(含 ⌃⌥Space 空词打开) | 清空结果,不发起请求 |
+| Searching | 防抖命中后发起 | 上一轮结果保留至新结果到达(整体替换,不闪) |
+| EngineStarting | socket 不可连且拉起中 | 角标「启动引擎中」,请求排队重试 ≤3s |
+| Offline | 拉起失败/daemon 退出且离线索引可用 | 结果来自离线索引,角标标注 |
+| Empty | 响应 total=0 | 「无匹配项」空态 |
+| Warming | 响应 error code=warming(索引未挂载) | 「索引构建中」占位(非错误样式);JSON 解析失败等其余 error 走错误态 |
+
+- 代际号防「慢响应后到覆盖新结果」的闪回;`parse`(空词)已在 Idle 拦下,不到 daemon。
 
 ## 技术实现决策表
 
@@ -116,7 +146,8 @@ pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort
 | 平台补丁 | objc2 + objc2-app-kit(unsafe 集中 platform/mac.rs,SAFETY 逐处) |
 | 托盘/快捷键/自启 | tray-icon / global-hotkey(tauri 系)/ SMAppService(经 objc2 或 launchd plist 兜底) |
 | 进程编排 | 单实例 flock;daemon 探测=socket connect;拉起=spawn CLI;退出只退 App |
-| 查询会话 | 防抖 60ms + 代际号 + 显式状态机(纯逻辑,单测覆盖) |
+| 查询会话 | 防抖 60ms + 代际号 + 六态状态机(Idle/Searching/EngineStarting/Offline/Empty/Warming,纯逻辑单测覆盖) |
+| 交付形态 | .app bundle(LSUIElement=1)+ 随包 CLI;bundle.sh 手工组装;引擎定位随包优先、PATH 兜底、全失败列路径 |
 | 引擎扩展 | execute_sorted 两段式(stat 仅候选集);协议 sort 字段向后兼容 |
 | 错误处理 | 每类失败给出可操作提示(引擎缺失/快捷键冲突/文件已删);禁静默 |
 | 测试策略 | 引擎排序 TDD;会话纯逻辑 TDD;UI 实机验收清单;v1 全量回归 |
@@ -128,19 +159,23 @@ pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort
 | PoC-1:跨 Space/浮动级别不生效 | 降级「当前 Space 可见」,产品文档标注;不阻塞其余功能 |
 | PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space/⌃Space);以实机结果定默认 |
 | PoC-3:NSMenu 阻塞式弹出与 egui 事件循环 | NSMenu 弹出走嵌套 run loop(阻塞当前线程)——在 eframe 主线程弹出需验证无卡死/输入错乱;不通过则菜单弹出移至独立线程或改用 popUpMenuPositioningItem 非模态 |
+| PoC-4:eframe 隐藏 CPU 0% vs 唤起 <100ms 的两线拉扯 | 隐藏视口 `ControlFlow::Wait` 实测 CPU;唤起路径(热键事件 → 显示 → 首帧)实测延迟;若 >100ms 排查 `with_visible(false)` ↔ 显示的首帧成本(预渲染/keep-warm 折中) |
+| PoC-5:SMAppService + ad-hoc 签名的自启 | 先做注册/注销小验证再全量接;不通改用 LaunchAgent plist 兜底(功能等价,登录时启动) |
+| LSUIElement(无 Dock 图标)与键盘焦点 | 菜单栏应用接收键盘输入前常需显式 `NSApp.activate`;悬浮条唤起与完整窗口打开时逐一处处理(PoC-1 同批验证) |
+| .app 组装与随包引擎定位 | bundle.sh 组装后实机验证三种定位路径(随包命中/ PATH 兜底/全失败报错列路径) |
 | 中文字体豆腐块(egui 默认字体无 CJK) | 启动时加载系统中文字体(苹方/思源),实现期首个验收项 |
-| egui 隐藏视口仍在渲染(CPU 不为 0) | 隐藏时 `ControlFlow::Wait` + 不请求重绘;验收红线盯 `top` |
-| 大命中集按大小/时间排序的 stat 风暴 | 仅在点列头时触发;候选集 stat 并行化(rayon);耗时随响应告知 |
+| 大命中集按大小/时间排序的 stat 风暴 | 仅在点列头时触发;候选集 stat 并行化(rayon);耗时随响应告知;UI 出「排序中…」 |
 | objc2 unsafe 缺陷 | 集中单文件 + SAFETY 注释 + PoC 期最小验证面;失败降级路径明确 |
 | 并行会话(本仓另有改动在进行) | app 工作为全新目录,与 engine/cli 现改动零文件重叠;提交精确 add |
 
 ## 测试与验证
 
 - **TDD(engine)**:`execute_sorted` —— 四列排序正确(含降序、稳定决胜、limit 边界)、sort=Relevance 与 v1 execute 逐字节同结果(回归钉);协议 sort 字段兼容(缺省/未知值)。
-- **TDD(app 纯逻辑)**:session 防抖(注入时钟)、代际丢弃(乱序响应注入)、状态机转移。
-- **v1 回归**:engine 79 项全绿;CLI 冒烟(迁移后 start/query/status/stop/离线)。
+- **TDD(app 纯逻辑)**:session 防抖(注入时钟)、代际丢弃(乱序响应注入)、状态机六态转移(含空词/warming/offline 分支)。
+- **v1 回归**:全仓 91 项(engine lib 77 + parity 2 + cli 12)全绿 + fsevents_live 2 项实机;CLI 冒烟(protocol/client 迁移后 start/query/status/stop/离线全链路)。
+- **命令链(声明完成前置,承接 v1 口径)**:`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` 全绿;涉 App/打包的改动另跑实机验收清单。
 - **实机验收**(product「验收标准」逐条):双形态链路/多屏/全屏/批量/托盘/自启真实重启/性能四项;中文字体渲染为实现期首个验收项(egui 默认字体无 CJK,加载系统字体)。
-- **PoC 验收(前置)**:P1 objc2 补丁(跨 Space 实测:切 Space 悬浮条仍在);P2 ⌥Space 注册(中文输入法环境实测);P3 NSMenu 原生弹出(egui 主线程弹菜单无卡死/输入错乱)。
+- **PoC 验收(前置)**:P1 objc2 补丁(跨 Space + 浮动级别 + LSUIElement 焦点,切 Space 实测);P2 ⌥Space 注册(中文输入法环境实测);P3 NSMenu 原生弹出(egui 主线程弹菜单无卡死/输入错乱);P4 eframe 隐藏 CPU 与唤起延迟(两红线兼容实测);P5 SMAppService + ad-hoc 自启注册/注销。
 
 ## 后续工作(v2.1 边界)
 

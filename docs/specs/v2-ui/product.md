@@ -248,7 +248,7 @@ v1 状态契约四态(building/ready/reconciling/degraded)+ 未运行 + 离线,�
 
 - **纯逻辑 TDD(engine)**:`execute_sorted` 四列排序正确性/截断边界/与默认排序共存;协议 `sort` 字段兼容(缺省=relevance,旧请求不受影响)。
 - **纯逻辑(客户端侧)**:查询会话的防抖与响应代际号(丢弃过期响应);排序状态机(点击列头切换升/降/默认)。
-- **v1 回归**:79 项测试全绿;CLI 冒烟(协议 crate 提升后 start/query/status/stop/离线全链路)。
+- **v1 回归**:全仓 91 项(engine lib 77 + parity 2 + cli 12)全绿;CLI 冒烟(protocol/client 迁移后 start/query/status/stop/离线全链路)。
 - **实机验收**(egui 渲染不做自动化,与 v1 同策略):
   - 双形态全链路(场景 1/3/4/5 逐条复现)
   - 多屏、全屏应用、深浅色跟随
