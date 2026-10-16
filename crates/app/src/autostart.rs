@@ -113,12 +113,8 @@ pub fn status() -> Result<Status> {
     status_of(&svc)
 }
 
-/// 已注册?(对托盘「勾选态」的口径:enabled / requiresApproval 都算已注册)。
-pub fn is_registered() -> Result<bool> {
-    Ok(status()?.is_registered())
-}
-
-/// 已启用?(任务签名口径:仅 enabled;requiresApproval 视为未启用)。
+/// 已启用?(托盘「勾选态」口径:仅 enabled;requiresApproval 视为未启用——
+/// 用户尚未在系统设置放行,登录时不会被拉起)。
 pub fn is_enabled() -> Result<bool> {
     Ok(status()? == Status::Enabled)
 }
@@ -151,19 +147,21 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
 pub fn register_at_startup(data_dir: &Path) -> Result<()> {
     let packaged = in_product_bundle();
     // 未打包不进状态查询:PoC-5 坑① 下 status 无意义,直接按未打包短路。
-    let enabled = if packaged {
-        match is_registered() {
-            Ok(v) => v,
+    // 命中已注册分支时把**精确状态**(enabled / requiresApproval)记入日志:
+    // 两态都算「已注册」,但要不要提示用户去系统设置放行只能看精确态。
+    let (registered, note) = if packaged {
+        match status() {
+            Ok(s) => (s.is_registered(), s.note()),
             Err(err) => {
                 // 查询失败按未注册处理(下一步 register 有幂等兜底),不静默。
                 log::warn!("开机自启:状态查询失败,按未注册处理: {err:#}");
-                false
+                (false, "状态查询失败")
             }
         }
     } else {
-        false
+        (false, "未打包")
     };
-    match startup_decision(packaged, opt_out_path(data_dir).exists(), enabled) {
+    match startup_decision(packaged, opt_out_path(data_dir).exists(), registered) {
         StartupDecision::SkipNotPackaged => {
             log::info!("开机自启:开发形态(未打包 .app),跳过默认注册");
             Ok(())
@@ -173,7 +171,7 @@ pub fn register_at_startup(data_dir: &Path) -> Result<()> {
             Ok(())
         }
         StartupDecision::SkipEnabled => {
-            log::info!("开机自启:已在登录项中注册");
+            log::info!("开机自启:已在登录项中注册 —— {note}");
             Ok(())
         }
         StartupDecision::Register => {

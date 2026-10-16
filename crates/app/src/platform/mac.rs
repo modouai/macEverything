@@ -138,11 +138,12 @@ pub fn last_space_change() -> Option<SpaceChange> {
     }
 }
 
-/// 注册 Space 变更观察者(进程内一次;主线程)。失败仅留痕:豁免退化为不生效。
-fn ensure_space_observer(mtm: MainThreadMarker, st: &mut PaletteState) {
-    if st.space_observer.is_some() {
-        return;
-    }
+/// 创建并注册 Space 变更观察者(进程内一次;主线程)。
+///
+/// 重入安全:创建 + 注册全程**不持 PALETTE 借用**(AppKit 调用可能被 winit 同步派发
+/// → 重入一帧 → 帧内 `reanchor`/`ensure_patched` 会 borrow_mut;持借用即 panic)。
+/// 返回值由调用方经短借用存入状态保活。
+fn make_space_observer(mtm: MainThreadMarker) -> Retained<SpaceObserver> {
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
     let observer = SpaceObserver::new(mtm);
     // SAFETY:observer 为本进程存活对象(Retained 存于 PaletteState 保活,通知中心持弱引用);
@@ -156,11 +157,13 @@ fn ensure_space_observer(mtm: MainThreadMarker, st: &mut PaletteState) {
         );
     }
     log::info!("Space 变更通知观察者已注册(NSWorkspaceActiveSpaceDidChangeNotification)");
-    st.space_observer = Some(observer);
+    observer
 }
 
 /// 漂移计数(与 PoC-1 续同口径:每帧核对,漂移即重施并留痕)。
-#[derive(Default)]
+///
+/// `Copy`:漂移核对在借用外做(AppKit 调用可能重入一帧),计数取出→核对→写回。
+#[derive(Default, Clone, Copy)]
 struct Drift {
     level: u32,
     behavior: u32,
@@ -251,61 +254,91 @@ pub fn attach_root(cc: &eframe::CreationContext<'_>) {
 ///
 /// 视口窗由 eframe 在「注册该视口的 pass」结束时创建,故首帧找不到属正常,
 /// 下帧再试(调用方在未接上时排下一帧)。
+///
+/// 重入安全(硬要求):本函数也从**主队列直调块**调用(hotkey.rs 的直显路径),
+/// 而 AppKit 调用可能被 winit 同步派发(`maybe_queue_event`:不在事件处理中即
+/// 立即 `handle_event`)→ 重入一帧 → 帧内 `draw_palette` 会 `borrow_mut` PALETTE。
+/// 故状态访问一律收窄成「短借用」:原生调用(改类/属性/first responder/漂移重施)
+/// 全在借用外。
 pub fn ensure_patched() -> Result<()> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("ensure_patched 非主线程调用"));
     };
-    PALETTE.with(|cell| {
-        let mut st = cell.borrow_mut();
-        ensure_space_observer(mtm, &mut st); // 进程内一次;与窗口接线解耦
-        if st.palette.is_none() {
-            let Some(win) = find_palette_window(mtm, st.root.as_deref()) else {
-                return Ok(()); // 视口窗未创建;下帧再试
-            };
-            convert(&mut st, &win)?;
-            st.palette = Some(win);
-        }
-        // 结构体解构拿不相交可变借用:palette 只读、drift 可写。
-        let PaletteState { palette, drift, .. } = &mut *st;
-        let Some(win) = palette.as_ref() else {
-            return Ok(()); // 上面刚置位,理论不可达
+    // ① 短借用:状态快照(是否需要注册观察者 / 是否已接窗 / 根窗句柄)
+    let (need_observer, attached, root) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (
+            st.space_observer.is_none(),
+            st.palette.is_some(),
+            st.root.clone(),
+        )
+    });
+    if need_observer {
+        let observer = make_space_observer(mtm); // 借用外
+        PALETTE.with(|cell| cell.borrow_mut().space_observer = Some(observer));
+    }
+    if !attached {
+        let Some(win) = find_palette_window(mtm, root.as_deref()) else {
+            return Ok(()); // 视口窗未创建;下帧再试
         };
-        reassert(drift, win);
-        Ok(())
-    })
+        // ② 借用外:换类 + 五要素 + 补丁 a(可重入,不持状态借用)
+        let (orig_class, class_before) = convert(&win)?;
+        PALETTE.with(|cell| {
+            let mut st = cell.borrow_mut();
+            st.orig_class = Some(orig_class);
+            st.class_before = class_before;
+            st.palette = Some(win);
+        });
+    }
+    // ③ 漂移核对(借用外;计数取出→核对→写回)
+    let (win, drift) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.palette.clone(), st.drift)
+    });
+    let Some(win) = win else {
+        return Ok(()); // 上面刚置位,理论不可达
+    };
+    let mut drift = drift;
+    reassert(&mut drift, &win);
+    PALETTE.with(|cell| cell.borrow_mut().drift = drift);
+    Ok(())
 }
 
 /// 唤起悬浮条:补丁 → 多屏定位(鼠标所在屏,居中偏上)→ 补 first responder →
 /// `orderFrontRegardless`(不激活 app、不切 Space)→ `makeKeyWindow`(成 key 不夺前台,
 /// PoC-1b 结论 #6)。
+///
+/// 重入安全(硬要求):本函数会从**主队列直调块**(hotkey.rs 的直显路径)调用。
+/// `setFrameOrigin` 会触发 `windowDidMove` 通知,而 winit 的 `maybe_queue_event` 在
+/// 「不在事件处理中」时**同步派发** → 重入一帧(实测栈:setFrameOrigin →
+/// window_did_move → eframe run_ui_and_paint → draw_palette)。故:
+/// ① 全程不持 PALETTE 借用(帧内 `reanchor`/`ensure_patched` 会 borrow_mut);
+/// ② 窗口句柄经短借用取出(Retained 保活),后续原生调用全在借用外。
 pub fn show_palette() -> Result<()> {
     ensure_patched()?;
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("show_palette 非主线程调用"));
     };
-    PALETTE.with(|cell| {
-        let mut st = cell.borrow_mut();
-        let Some(win) = st.palette.clone() else {
-            return Err(anyhow!("悬浮条窗口未就绪(视口尚未创建)"));
-        };
-        let anchor = position_palette(&win, mtm);
-        st.anchor = Some(anchor);
-        // 顺序照 PoC-1b `show_and_make_key`:先补 first responder,再 orderFrontRegardless,
-        // 最后 makeKeyWindow(定位先于显示,避免可见后跳位)。
-        let responder_ok = restore_first_responder(&win);
-        win.orderFrontRegardless();
-        win.makeKeyWindow();
-        log::info!(
-            "悬浮条唤起:origin=({:.0}, {:.0}) 顶边 y={:.0} 高 {:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
-            anchor.x,
-            anchor.top_y - anchor.h,
-            anchor.top_y,
-            anchor.h,
-            win.isKeyWindow(),
-            win.isVisible()
-        );
-        Ok(())
-    })
+    let win = PALETTE
+        .with(|cell| cell.borrow().palette.clone())
+        .ok_or_else(|| anyhow!("悬浮条窗口未就绪(视口尚未创建)"))?;
+    let anchor = position_palette(&win, mtm);
+    // 顺序照 PoC-1b `show_and_make_key`:先补 first responder,再 orderFrontRegardless,
+    // 最后 makeKeyWindow(定位先于显示,避免可见后跳位)。
+    let responder_ok = restore_first_responder(&win);
+    win.orderFrontRegardless();
+    win.makeKeyWindow();
+    PALETTE.with(|cell| cell.borrow_mut().anchor = Some(anchor)); // 短借用回写(重锚用)
+    log::info!(
+        "悬浮条唤起:origin=({:.0}, {:.0}) 顶边 y={:.0} 高 {:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        anchor.x,
+        anchor.top_y - anchor.h,
+        anchor.top_y,
+        anchor.h,
+        win.isKeyWindow(),
+        win.isVisible()
+    );
+    Ok(())
 }
 
 /// 显示完整窗口(根窗):激活 app + 置前 + 成 key/main。
@@ -318,23 +351,27 @@ pub fn show_root_window() -> Result<()> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("show_root_window 非主线程调用"));
     };
+    // 重入安全(同 show_palette):句柄短借用取出,AppKit 调用全在借用外
+    // (activate/orderFront 可被 winit 同步派发 → 重入一帧)。
+    let root = PALETTE
+        .with(|cell| cell.borrow().root.clone())
+        .ok_or_else(|| anyhow!("根窗句柄未记录(attach_root 未执行)"))?;
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
-    PALETTE.with(|cell| {
-        let st = cell.borrow();
-        let Some(root) = st.root.clone() else {
-            return Err(anyhow!("根窗句柄未记录(attach_root 未执行)"));
-        };
-        root.orderFrontRegardless();
-        root.makeKeyWindow();
-        root.makeMainWindow();
-        log::info!(
-            "完整窗口(根窗)唤起:isVisible={} isKey={}",
-            root.isVisible(),
-            root.isKeyWindow()
-        );
-        Ok(())
-    })
+    root.orderFrontRegardless();
+    root.makeKeyWindow();
+    root.makeMainWindow();
+    let f = root.frame();
+    log::info!(
+        "完整窗口(根窗)唤起:isVisible={} isKey={} frame={:.0}x{:.0}@({:.0},{:.0})",
+        root.isVisible(),
+        root.isKeyWindow(),
+        f.size.width,
+        f.size.height,
+        f.origin.x,
+        f.origin.y
+    );
+    Ok(())
 }
 
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。
@@ -443,50 +480,69 @@ pub fn reanchor() {
     let Some(_mtm) = MainThreadMarker::new() else {
         return; // 非主线程:no-op(不该发生)
     };
-    PALETTE.with(|cell| {
-        let mut st = cell.borrow_mut();
-        let (Some(win), Some(a)) = (st.palette.clone(), st.anchor) else {
-            return;
-        };
-        let h = win.frame().size.height;
-        if (h - a.h).abs() < 0.5 {
-            return; // 高度未变:不动
-        }
-        win.setFrameOrigin(NSPoint::new(a.x, a.top_y - h));
-        st.anchor = Some(Anchor { h, ..a });
+    // 重入安全:句柄与锚点短借用取出;setFrameOrigin 在借用外(会触发
+    // windowDidMove → 可能同步重入一帧,帧内会 borrow_mut)。
+    let (win, anchor) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.palette.clone(), st.anchor)
     });
+    let (Some(win), Some(a)) = (win, anchor) else {
+        return;
+    };
+    let h = win.frame().size.height;
+    if (h - a.h).abs() < 0.5 {
+        return; // 高度未变:不动
+    }
+    win.setFrameOrigin(NSPoint::new(a.x, a.top_y - h));
+    PALETTE.with(|cell| cell.borrow_mut().anchor = Some(Anchor { h, ..a }));
 }
 
 /// 退出/销毁前还原窗口类(否则 winit drop → abort;spike 三方对照实证)。
 pub fn revert_class() {
-    PALETTE.with(|cell| {
-        let mut st = cell.borrow_mut();
-        let (Some(win), Some(orig)) = (st.palette.clone(), st.orig_class) else {
-            return;
-        };
-        let obj: *mut AnyObject = (Retained::as_ptr(&win) as *const NSWindow)
-            .cast_mut()
-            .cast();
-        let cur = obj_class(obj);
-        if class_name(cur) == st.class_before {
-            return; // 已是原类(重复调用/未换类)
-        }
-        // SAFETY:orig 是换类前 runtime 实测读到的类指针(类对象由运行时持有,存活);
-        // 换回是 `object_setClass` 的逆操作,实例大小不变的前提同换类时。
-        let old = unsafe { &*objc2::ffi::object_setClass(obj, orig) };
-        log::info!(
-            "悬浮条窗口类还原:{} → {}(原类回读 {})",
-            class_name(cur),
-            st.class_before,
-            class_name(old)
-        );
-        st.orig_class = None;
+    // 重入安全(同 show_palette):状态短借用取出,object_setClass 在借用外。
+    let (win, orig, class_before) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.palette.clone(), st.orig_class, st.class_before.clone())
     });
+    let (Some(win), Some(orig)) = (win, orig) else {
+        return;
+    };
+    let obj: *mut AnyObject = (Retained::as_ptr(&win) as *const NSWindow)
+        .cast_mut()
+        .cast();
+    let cur = obj_class(obj);
+    if class_name(cur) == class_before {
+        return; // 已是原类(重复调用/未换类)
+    }
+    // SAFETY:orig 是换类前 runtime 实测读到的类指针(类对象由运行时持有,存活);
+    // 换回是 `object_setClass` 的逆操作,实例大小不变的前提同换类时。
+    let old = unsafe { &*objc2::ffi::object_setClass(obj, orig) };
+    log::info!(
+        "悬浮条窗口类还原:{} → {}(原类回读 {})",
+        class_name(cur),
+        class_before,
+        class_name(old)
+    );
+    PALETTE.with(|cell| cell.borrow_mut().orig_class = None);
 }
 
 /// 是否已接上悬浮条窗(诊断/首帧接线轮询用)。
 pub fn attached() -> bool {
     PALETTE.with(|cell| cell.borrow().palette.is_some())
+}
+
+/// 根窗当前原生可见性(`NSWindow.isVisible()` 回读;首帧纠偏核对用)。
+/// 未记录根窗句柄(attach_root 未执行/非主线程)→ None。
+pub fn root_visible() -> Option<bool> {
+    let _mtm = MainThreadMarker::new()?;
+    PALETTE.with(|cell| cell.borrow().root.as_ref().map(|w| w.isVisible()))
+}
+
+/// 悬浮条窗当前原生可见性(`NSWindow.isVisible()` 回读;诊断用)。
+/// 未接上窗/非主线程 → None。
+pub fn palette_visible() -> Option<bool> {
+    let _mtm = MainThreadMarker::new()?;
+    PALETTE.with(|cell| cell.borrow().palette.as_ref().map(|w| w.isVisible()))
 }
 
 // ---------------------------------------------------------------------------
@@ -523,7 +579,10 @@ fn find_palette_window(
 }
 
 /// 换类:NSWindow → `MacePalettePanel`(实例大小须一致,否则拒绝)。
-fn convert(st: &mut PaletteState, win: &NSWindow) -> Result<()> {
+///
+/// 重入安全:不碰 PALETTE 状态——原类指针与类名**返回给调用方**存(调用方短借用写回)。
+/// 期间 `configure` 的 AppKit 调用可重入一帧,帧内状态访问须无借用冲突。
+fn convert(win: &NSWindow) -> Result<(*const AnyClass, String)> {
     let obj: *const AnyObject = (win as *const NSWindow).cast::<AnyObject>();
     let before = obj_class(obj);
     let size_before = before.instance_size();
@@ -539,16 +598,15 @@ fn convert(st: &mut PaletteState, win: &NSWindow) -> Result<()> {
     // SAFETY:win 指向本进程存活的 NSWindow;目标类为 NSPanel 子类且实例大小
     // 已实测一致(上一步),满足 object_setClass 的前提;返回旧类指针。
     let old = unsafe { &*objc2::ffi::object_setClass(obj.cast_mut(), target as *const AnyClass) };
-    st.class_before = class_name(before);
-    st.orig_class = Some(before as *const AnyClass);
+    let class_before = class_name(before);
     log::info!(
         "悬浮条窗换类:{} → {}(旧类回读 {};实例大小 {size_before}=={size_target})",
-        st.class_before,
+        class_before,
         class_name(target),
         class_name(old)
     );
     configure(win);
-    Ok(())
+    Ok((before as *const AnyClass, class_before))
 }
 
 /// 换类后施加属性(五要素的 2~4 + NSPanel 三属性 + 补丁 a)。

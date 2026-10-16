@@ -670,3 +670,129 @@ touch /tmp/poc1b-actor-quit                                            # 收尾
 **遗留**:ghost 态(豁免后可见未聚焦,点他应用无聚焦事件)靠 150ms 轮询兜底,最终两轮未复现属罕见路径;一次启动 315ms 后无对应切换的 spurious 通知(±500ms 内可能误豁免,低风险)。
 
 **取证**:`/tmp/mce14b-final-1.png`;commit `6e8500b`。
+
+---
+
+## Task 21:终验收(全链路 + 性能四项 + 启动形态修复)
+
+**状态**:✅ 自动化可及部分全过——启动形态修复 ✅、⌥⇧F 补实现 ✅、性能 ①✅(中位 95ms,4/5 轮 <100ms)②✅(59~71ms)③❌(136~138M,超 <100MB 预算,栈基线所致)④✅(0.0%);全链路六项 ✅(离线项 UI 层与真键盘/真鼠标项转「终验收人工清单」)。
+
+**环境**:macOS 27.0(Apple Silicon)、真实数据目录(**1,278,754 条目**)、终版 release 构建(`release/macEverything.app`,ad-hoc 签名)。
+**测量时状态注记**:本轮大部分测量在**屏幕锁定**期间完成(会话锁 `CGSSessionScreenIsLocked=1` → 真热键/CGEvent 均不可达);真热键项在辉哥解锁后补测(见①)。锁定期测量用**主队列直调探针**(与热键泵完全同路径,见下)与 app.sock 触发,已如实标注口径。
+
+### 一、启动形态修复(Task 9 遗留:根窗 `with_visible(true)` 打包后登录自启弹窗)
+
+**落地**:
+- `crates/app/src/main.rs`:根窗 builder 改 `with_visible(false)`;
+- `crates/app/src/ui/mod.rs` `logic()` **首帧纠偏**:发 `ViewportCommand::Visible(false)`(日志 `根窗首帧纠偏`)。
+
+**为什么必须纠偏**(实锁源码):eframe 0.37 在首帧 `post_rendering` 里**无条件** `set_visible(true)`(`native/epi_integration.rs:443-450`,白闪修复;`create_glutin_windowed_context` 也一直压着 `.with_visible(false)`)——builder 挡不住它。
+**为什么不闪**(源码链路):eframe 的视口命令在**同帧稍后**应用(`handle_viewport_output` → `viewport.process_commands`,在 `post_rendering` 之后),中间不回事件循环 → `orderFront` 与紧随的 `orderOut` 落在同一轮 run loop,窗口未经 WindowServer 合成。
+
+**实机取证**(终版构建;`open release/macEverything.app` + CGWindowList 1ms 守望 + 原生回读):
+- 启动全程无窗口出现:根窗 `name="macEverything" bounds=(285,107 900x632)` **onscreen=false**、悬浮条 `layer=3 (435,254 600x44)` **onscreen=false**;应用侧回读 `两窗皆隐回读:根窗 isVisible=Some(false) 悬浮条 isVisible=None(尚未创建)`(Native `NSWindow.isVisible()`)。
+- 打开路径从「初始隐藏」状态可用:⌥⇧F 直调实测 `完整窗口(根窗)唤起:isVisible=true isKey=false frame=900x632@(285,217)`(AppKit frame;内容 900x600 + 标题栏);托盘「打开完整窗口」/「缺口面板」/悬浮条 ⌥↵/app.sock 各入口共用同一份实现(`results_open` / `palette_show`,单一实现)。
+- 注:屏幕上锁期间 CGWindowList 会把根窗条目的 bounds 报成 `0x0`(窗口清单伪值);以 AppKit `frame`/`isVisible` 回读为准,解锁后复测清单 bounds 恢复正常(900x632)。
+
+### 二、⌥⇧F 补实现(规格要求但此前完全缺失)
+
+product §2 与验收标准要求「完整窗口 **⌥⇧F** 直达」;**此前实现里没有任何 ⌥⇧F 注册**(全仓搜 `KeyF`/`⌥⇧F` 零命中,任务 15 只做了 ⌥Space 族)。本次补齐:
+- `hotkey::direct_key() = (ALT|SHIFT, Code::KeyF, "⌥⇧F")`,独立注册(失败只留痕、不降级——完整窗口入口仍有托盘与 ⌥↵);
+- 命中走与 ⌥Space **相同的主队列直调**路径,动作 = 托盘「打开完整窗口」同款(`results_open` = 聚焦搜索框 + 状态补查 + 原生唤起);
+- 实测:`完整窗口直达键注册成功:⌥⇧F(id=33619992)` + `完整窗口(根窗)唤起:…frame=900x632`。
+- 「空词打开」的落地解释:⌥⇧F 与托盘入口同语义(不携带悬浮条查询词);悬浮条 ⌥↵ 才带词入窗。
+
+### 三、性能四项(真实环境实测)
+
+| # | 红线 | 实测 | 测量法 | 判定 |
+|---|---|---|---|---|
+| ① | 唤起 <100ms | **真 ⌥Space 5 轮:97.6 / 114.3 / 92.3 / 89.1 / 95.4ms(中位 95.4;4/5 达标)**;进程内分解:系统投递 +51.0ms / 直调排入 +0.06ms / 原生唤起 **0.6ms**(稳态) | t0(注入前落盘纪元纳秒)→ CGWindowList 首次 `onscreen=true`(1ms 轮询);分解用插桩 epoch 对齐 | ⚠️ 达标(边缘) |
+| ② | 输入到结果 <150ms | **59 / 60 / 61 / 66 / 68 / 68 / 68.6 / 71.1ms**(8 轮,中位 ≈67ms) | 真键盘注入 5 字符(最后一个字符后落盘 t0)→ 结果落地点打点 | ✅ |
+| ③ | 常驻内存 <100MB | **136M(两窗皆隐基线)/ 138M(悬浮条+完整窗口使用后)**;RSS 164.5MB;vmmap physical 101.5M / peak 181.8M | `top -l 2 -s 1 -pid <pid> -stats mem`(区间值)+ `ps -o rss` + `vmmap -summary` | ❌ 超预算 |
+| ④ | 隐藏态 CPU 0% | **12/12 采样 = 0.0%**;累计 CPU 0:00.48 → 0:00.49(60s 增量 10ms ≈ 0.017%) | 两窗皆隐 60s;`top -l 2 -s 1 -pid <pid> -stats cpu` 每 ~5s 一点 ×12 + `ps -o time=` 交叉校验 | ✅ |
+
+**① 分解与对照**(证据:同一次启动的插桩 epoch + 外部守望):
+
+```
+t0(⌥Space 注入前)                    +0.0ms
+泵收到热键(系统投递:HID→WindowServer
+  →Carbon 热键→crate channel→泵线程)   +51.0ms   ← 最大一块,非 App 可控
+主队列直调块进入                        +51.1ms   ← App 内唤起链路起点(+0.06ms)
+原生唤起完成(orderFrontRegardless)      +72.2ms   ← 首轮 21.1ms(setFrameOrigin 触发一帧重入);稳态 0.6ms
+CGWindowList 观测到 onscreen=true      +106.7ms  ← WindowServer 合成 + 1ms 轮询观测
+```
+
+- **旧路径对照(证明修复有效)**:同机同环境,`app.sock` 二次启动唤起走「帧内消费」路径 = **155.16ms**(受 eframe 对**不可见窗口**跨线程 repaint 的 ≥100ms 节流,`native/run.rs:27`;与 Task 15 遗留判断一致)。
+- **稳态 App 内链路 = 0.7ms**(直调 0.06ms + 原生唤起 0.6ms;`setFrameOrigin` 位置未变时不再触发通知重入)。首轮 21ms 系 `setFrameOrigin` → `windowDidMove` → winit **同步派发** → eframe 重入一帧(见「实现要点」)。
+- 结论:①的残量在**系统热键投递(~51ms)**与**WindowServer 合成观测(~34ms)**,非 App 侧;App 侧已从「≥100ms 节流」压到亚毫秒。
+
+**② 备注(已定性的异态)**:palette 视口被**遮挡**(`occluded=Some(true)`,覆盖窗口压住它)时,eframe 对 occluded 视口**跳过 ui pass**(`glow_integration.rs` `show_ui=false`),`draw_palette` 不跑 → 防抖帧不发 → 输入→结果掉到 **481~512ms**(实测 5 轮,遮挡态由 `ViewportInfo` 插桩当场证实)。该行为**非本任务引入**(既有结构),影响面 = 悬浮条被覆盖时(此时用户也看不见它);修法候选见「遗留」。
+
+### 四、全链路六项(自动化可及部分)
+
+| # | 项 | 结果 | 取证 |
+|---|---|---|---|
+| 1 | 冷启动全链(kill 全部 → `open` .app → 自动拉起引擎 → ⌥Space 可搜) | ✅ | 日志 `拉起引擎: …/release/macEverything.app/Contents/MacOS/macEverything`(**随包 CLI**)+ `引擎已就绪`;进程实证 pid 路径 = 包内;真热键 ⌥Space + 真键盘输入实测出结果(截图:`proje` → 2317 项) |
+| 2 | 增量(真实文件改动 → ≤1s 可搜) | ✅ | 新建文件 → 可搜 **267ms**(两轮一致;轮询粒度 ~25ms,含查询往返) |
+| 3 | 离线(stop 引擎 → 显示离线结果) | ✅(客户端层) | `stop` 后查询走离线直读:`[离线索引 · 生成于 2026-10-16 11:53:08 UTC] 共 2316 项 · 匹配 3.9ms`;App 存活、托盘在。**UI 层角标显示转人工清单**(需真键盘发起查询) |
+| 4 | 二次启动唤起(app.sock) | ✅ | 第二实例 `已有实例在运行(app.sock 可连),发送唤起命令后退出` → 首实例 `二次启动唤起:显示悬浮条` + 窗口 onscreen 翻转 |
+| 5 | 归零(`macEverything stop` → App 仍活) | ✅ | stop 后 `macEverything-app` 进程存活(etime 连续)、悬浮条/托盘照常 |
+| 6 | 重启前自启态检查 | ✅ | `开机自启:已在登录项中注册 —— 已启用(系统设置「登录项」可见)` = **enabled**(Task 20 终态复验;本次为此把状态说明写进日志,判定不再依赖 `is_registered()` 粗粒度) |
+
+### 五、实现要点(本任务引入;两处实测踩坑)
+
+1. **热键动作主队列直调**(`hotkey.rs` + `ui/mod.rs`):⌥Space/⌥⇧F 命中后经 `dispatch2::DispatchQueue::main().exec_async` 在主线程直调 `palette_toggle` / `results_open`,不等帧——产品形态两窗皆隐,跨线程 repaint 被 eframe 节流 ≥100ms(实测旧路径 155ms);直调目标由 `ui::App::new` 回填,拿不到共享锁时动作入兜底队列交 `logic` 消费(不静默丢)。
+2. **重入安全(锁纪律,实测死锁后定)**:直调块内做 AppKit 调用时,AppKit 通知会被 winit **同步派发**(`app_state.rs::maybe_queue_event`:不在事件处理中即立即 `handle_event`)→ 重入一帧 → 帧内 `logic`/`draw_palette` 要拿同一把锁。实测栈:`show_palette → setFrameOrigin → windowDidMove → eframe run_ui_and_paint → draw_palette → Mutex::lock` = 主线程自锁(进程挂死)。定案:**原生调用(show_palette/show_root_window)一律在锁外**;平台层状态访问收窄成「短借用」(AppKit 调用不持 `PALETTE` RefCell 借用);`ensure_patched` / `convert` / `reanchor` / `revert_class` 同规则重构。`SpaceObserver` 注册亦拆为借用外创建 + 短借用存状态。
+
+### 六、遗留与发现
+
+1. **③ 内存超预算(不达标,如实记录)**:136~138M vs <100MB。两窗皆隐的**基线即 136M** → 超预算与窗口使用无关,是 eframe+glow+glutin(两 GL 上下文)+ 系统 CJK 字体回退的栈级足迹(vmmap:Malloc Small dirty 58.5M、IOAccelerator 2.6M)。旁证:本项目 PoC-3 单窗 demo 同口径 RSS 已 125~135MB。**降本方向**(未实施,建议单独立任务):egui 字体图集按需裁剪 / 单视口化 / glow→wgpu 对照。
+2. **遮挡态输入→结果退化到 ~500ms**(见三②备注):修法候选——`App::logic` 也驱动 `palette.tick`(logic 在遮挡/隐藏下仍跑),并让遮挡期的排帧请求落到 ROOT;需单独验证(遮挡语义、双驱动去重)。
+3. **热键投递 ~51ms** 为系统侧(HID→Carbon),真键盘同路径;若未来要求更严,只能换更底层的触发面(超出本任务)。
+4. **屏幕锁定期的测量口径**:真热键/真键盘项部分由进程内直调探针代跑(与热键泵同路径,已标注);解屏后已用真 ⌥Space 复测①、真键盘复测②。
+
+### 终验收人工清单(辉哥执行;每条 = 操作 → 预期)
+
+> 前置:从 `release/macEverything.app` 启动(App 在跑时先托盘退出)。屏锁无法测的真键盘/真鼠标项集中在此。
+
+**A. 启动形态与托盘(本次修复面)**
+1. 退出 App(托盘「退出」)→ 重新 `open release/macEverything.app` → 预期:**不弹任何窗口**,仅菜单栏图标出现;⌥Space 悬浮条可唤出。
+2. 菜单栏图标**左键**点一下 → 悬浮条出现;再点一下 → 隐藏。
+3. 右键菜单逐项:引擎状态(六态文案)/⚠N 个目录未收录(有缺口时)/打开搜索/打开完整窗口/**开机自启(勾选态=真实注册态)**/退出;点「打开完整窗口」→ 完整窗口到前台。
+4. 完整窗口右上角关闭 → **不退出 App**(托盘仍在);⌥⇧F(任意应用前台)重新打开完整窗口。
+
+**B. 悬浮条键位与真键盘(此前多为合成键)**
+5. ⌥Space 唤起 → **用真键盘**(含中文输入法)输入「报告」→ 结果即时出现;↑↓ 选择、↵ 打开(文件用默认应用、目录进 Finder)、⌘↵ 在 Finder 显示、Esc 隐藏。
+6. **中文 IME**:拼音组字(候选窗)态下直接按 Esc/↵——预期:只作用输入法,不误触隐藏/打开。
+7. 悬浮条唤起后**不点击**直接打字 → 光标已在输入框(唤起即打字)。
+8. 悬浮条拖动到副屏附近唤起(鼠标先移到副屏)→ 出现在**鼠标所在屏**居中偏上;在他人全屏应用 Space 里唤起 → 仍可见(PoC-1b/任务 14 结论复验)。
+9. 唤起居输入清空;⌥Space 再按 = 隐藏。
+
+**C. 完整窗口(任务 17 遗留)**
+10. 列宽拖拽(名称/大小/修改时间/路径)→ 拖动生效、不闪;双击行 → 默认应用打开。
+11. 多选:**shift 范围选 / ⌘ 点选切换 / ⌘A 全选**;选中行的右键菜单按选中类型收敛(见下)。
+12. 点列头排序:同列升降切换、异列换键重查;状态栏「排序中…」→ 结果整体替换。**排序方向手感**:大小/时间列首次点击应为「大到小 / 新到旧」(desc 语义修复后复验);total > 1000 截断集下,降序结果头几条应是全库最大/最新(而非截断集内反转)。
+13. 大结果集(如 `path:/Users` 或单字母)滚动流畅(虚拟化生效),不出现空白行。
+
+**D. 原生右键菜单三形态(任务 18)**
+14. 单选**文件**:打开 / 在访达中打开 / 在访达中显示 / 拷贝路径 —— 逐项执行;「拷贝路径」后到终端 `pbpaste` 核对路径 == 选中项路径。
+15. 单选**目录**:三项(打开=进入 / 在访达中显示 / 拷贝路径;不出现重复语义「在访达中打开」)。
+16. **混选**(文件+目录):四项逐项执行(打开=逐项打开)。
+17. 菜单观感为**原生 macOS 菜单**(深浅色跟随系统);Esc 取消、↑↓ 导航。
+
+**E. 引擎与离线(全链③ UI 层)**
+18. 引擎须运行;执行 `macEverything stop` → 悬浮条/完整窗口内发起查询 → 预期:结果仍出现(内容 = 落盘索引,通常与在线一致/略滞后到上次构建时刻)——**状态区/角标呈「离线索引(生成于 …)」**;`macEverything start` 恢复。
+19. 删除/新增一个文件 → 1s 内可搜;`macEverything status` 与界面状态一致(六态文案)。
+
+**F. 系统与自启(重启项)**
+20. **系统设置 → 通用 → 登录项与扩展**:应见 **macEverything**(已启用);如出现「需要批准」提示,点允许。
+21. **真实重启一次** → 登录后:菜单栏图标在、⌥Space 可搜(自启 + 自动拉起闭环);`ps aux | grep macEverything` 可见随包 CLI 引擎进程。
+22. `~/Library/Application Support/macEverything/` 内无 `autostart-off` 标记时,重启后自启保持开启;若在第 3 步取消过勾选,重启后应**不再**自动启动(用户意图记住)。
+
+**G. 历史残留清理**
+23. poc1b 遗留四项:三指滑动切桌面 Space 时悬浮条是否跟随(桌面 Space 场景)、系统深浅色切换 → 悬浮条/完整窗口即时跟随。
+24. poc5 残留注销:`/tmp/poc5.app/Contents/MacOS/poc5-binary unregister`(若 `/tmp/poc5.app` 已不存在,则「系统设置 → 登录项」里手动移除 poc5 条目);`~/Applications/poc5.app` 与 `/tmp/poc5.app` 可移废纸篓。
+25. Chrome/Edge **真全屏**(非自建 actor)下唤起悬浮条 → 面板压在内容上、可输入(任务 14 为自建 actor,留真应用一测)。
+
+**H. 内存预算复核(③ 超预算的现场确认)**
+26. Activity Monitor 或 `top -pid $(pgrep -f macEverything-app)` 看 MEM:两窗皆隐与两窗用过后各记一次(基线 ~136M / 用后 ~138M,预期同量级;若显著增长需回报)。

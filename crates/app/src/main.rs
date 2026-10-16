@@ -49,10 +49,12 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
             .with_inner_size([900.0, 600.0])
-            .with_visible(true),
-        // ↑ 完整窗口启动即显示:开发期入口(窗口内 dev 按钮唤起悬浮条/退出)。
-        // 产品形态(两窗皆隐、LSUIElement、托盘/热键入口)待 Task 15/16/17/20;
-        // 悬浮条视口自身启动隐藏(ui::palette_builder 的 visible(false))。
+            // 产品形态(Task 21):两窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
+            // 待命。eframe 0.37 在首帧 post_rendering 里**无条件** set_visible(true)
+            // (native/epi_integration.rs:443-450,白闪修复),故 with_visible(false)
+            // 本身不足以保持隐藏:首帧纠偏在 `ui::App::logic`(发 Visible(false),
+            // 命令在同帧 post_rendering 之后应用,窗口不经 WindowServer 合成,不闪烁)。
+            .with_visible(false),
         ..Default::default()
     };
     eframe::run_native(

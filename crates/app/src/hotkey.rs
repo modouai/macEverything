@@ -1,12 +1,13 @@
-//! 全局热键:⌥Space 族唤起/隐藏切换(Task 15;product §1「按下 ⌥Space(全局快捷键)
-//! → 悬浮条出现;再按 ⌥Space 或 Esc 或失焦 → 隐藏」)。
+//! 全局热键:⌥Space 族唤起/隐藏切换 + ⌥⇧F 完整窗口直达(Task 15/21;
+//! product §1「按下 ⌥Space(全局快捷键)→ 悬浮条出现;再按 ⌥Space 或 Esc 或失焦 →
+//! 隐藏」、§2「全局快捷键 ⌥⇧F 直达」)。
 //!
 //! ## 默认键与降级链(PoC-2 定案)
 //!
 //! 三候选本机全部注册成功、无系统符号热键占用(PoC-2 结论表 #1/#2);辉哥确认
 //! ⌥Space 无冲突 → 默认键 = ⌥Space,注册失败按 `candidates()` 顺序自动降级。
-//! plan 原稿曾把「事件泵」写成 UI 帧内 `GlobalHotKeyEvent::receiver().try_recv()`,
-//! 实测接线后偏离为「后台线程阻塞收 + 唤醒 UI 帧」,理由见下节。
+//! ⌥⇧F(product §2:字母键避开空格族的系统占用)独立注册;注册失败不降级
+//! (完整窗口入口仍有托盘与悬浮条 ⌥↵),日志留痕。
 //!
 //! ## 事件泵为什么必须带唤醒(与 plan 示意的差异,证据链)
 //!
@@ -21,20 +22,32 @@
 //!    repaint 请求(eframe 0.37 的 `WinitAppWrapper` 未实现 `about_to_wait`,winit 的
 //!    `AboutToWait`/`NewEvents` 都不触发帧)→ 隐藏/空闲期只 try_recv 收不到 —— 事件
 //!    会滞留在 channel 里直到下一帧(可能永不发生);
-//! 4. 故事件泵线程除收事件外还负责**唤醒**:`ctx.request_repaint_of(ROOT)` 走
-//!    eframe 的 `set_request_repaint_callback`(EventLoopProxy),任意线程可调、
-//!    可唤醒 Wait 中的事件循环(PoC-4 结论 #5 已实证)。
+//! 4. 故事件泵线程除收事件外还负责唤醒(见下节)。
+//!
+//! ## 动作直调(主队列)与帧内兜底(Task 21;为什么不能只靠「叫帧」)
+//!
+//! 唤醒 UI 的传统做法是泵线程 `ctx.request_repaint_of(ROOT)`(eframe 的
+//! `EventLoopProxy`,任意线程可调)。但产品形态两窗皆隐(Task 21 启动形态),而
+//! eframe 对**不可见窗口**的跨线程 repaint 请求有硬性节流 ≥100ms
+//! (`native/run.rs:27` `INVISIBLE_WINDOW_REPAINT_INTERVAL`;`run.rs:355-380` 的
+//! `is_invisible_or_minimized` 分支)——等帧即破「唤起响应 <100ms」红线
+//! (Task 15 遗留,Task 21 实测复现后修)。
+//!
+//! 故按下后**主队列直调动作**(`dispatch2::DispatchQueue::main().exec_async`;
+//! PoC-4 native 路径同法:块在主线程执行、不等帧,对外可见中位 16.7ms):
+//! - 悬浮条经原生 `orderFrontRegardless` 显示后窗口即 `isVisible`,随后的
+//!   repaint 请求不再落进节流;
+//! - 直调目标由 ui 层在共享态构造完成后回填(`attach`;install 时共享态尚不存在),
+//!   回调实现即 `App` 帧内同一份逻辑(见 ui/mod.rs `toggle_palette_locked` 等);
+//! - 回调拿不到共享锁(帧内持锁:如原生右键菜单弹出期的嵌套 run loop)时返回
+//!   false → 动作入**兜底队列** + 叫帧,由 `App::logic` 的 `poll_action` 消费——
+//!   该路径受上述 ≤100ms 节流,属罕见兜底,不静默丢弃。
 //!
 //! 线程模型与 CPU:线程阻塞在 crossbeam `recv`(park,非忙等);隐藏期无帧、无线程
-//! 唤醒,CPU 0%(product §1 红线)。按下触发后:计数 +1(帧内消费,一帧至多切换一次,
-//! 连按合并)+ 请求 ROOT 重绘 → `logic` 补跑 → `poll_toggle` 返回 true。
-//!
-//! 节流注记:ROOT 窗不可见时 eframe 对跨线程 repaint 请求有 100ms 节流
-//! (`run.rs:27 INVISIBLE_WINDOW_REPAINT_INTERVAL`)。开发形态根窗可见不受影响;
-//! 产品形态(两窗皆隐)的唤醒延迟上界 ≈ 100ms + 帧耗时,Task 17/20 接线时复测。
+//! 唤醒,CPU 0%(product §1 红线)。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -57,8 +70,25 @@ pub fn candidates() -> [(Modifiers, Code, &'static str); 3] {
     ]
 }
 
+/// 完整窗口直达键(product §2:⌥⇧F;显示名与注册同源,禁散落字符串)。
+pub fn direct_key() -> (Modifiers, Code, &'static str) {
+    (Modifiers::ALT | Modifiers::SHIFT, Code::KeyF, "⌥⇧F")
+}
+
 /// 全部候选注册失败时的悬浮条提示(托盘唤起 Task 16 接,先给文案)。
 pub const UNAVAILABLE_NOTE: &str = "快捷键不可用,可从托盘唤起";
+
+/// 热键动作(直调回调与兜底队列共用;ui 层按此分派到同一份实现)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// ⌥Space:唤起/隐藏切换(悬浮条)。
+    TogglePalette,
+    /// ⌥⇧F:完整窗口直达(product §2)。
+    OpenResults,
+}
+
+/// 主队列直调目标:主线程执行,返回 true = 已即时处理(不再入兜底队列)。
+pub type DispatchFn = Arc<dyn Fn(Action) -> bool + Send + Sync + 'static>;
 
 /// 按 `candidates()` 顺序注册,首个成功即返回 `(命中的 HotKey, 显示名)`;
 /// 全部失败 → `Err`(附逐个候选的失败原因)。
@@ -107,8 +137,10 @@ pub struct HotkeyRuntime {
     name: Option<String>,
     /// 悬浮条提示(降级/不可用;默认键正常 = None)。
     note: Option<String>,
-    /// 事件泵计数(泵线程 fetch_add;`poll_toggle` 帧内消费)。
-    counter: Option<Arc<AtomicU64>>,
+    /// 主队列直调目标(ui 层启动期回填;未回填时按下走兜底队列)。
+    on_action: Arc<OnceLock<DispatchFn>>,
+    /// 兜底队列(直调未竟的动作;`poll_action` 帧内消费)。
+    deferred: Arc<Mutex<VecDeque<Action>>>,
 }
 
 impl HotkeyRuntime {
@@ -121,10 +153,19 @@ impl HotkeyRuntime {
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
     }
+
+    /// 回填主队列直调目标(ui 层在共享态构造完成后调用;进程内一次)。
+    pub fn attach(&self, f: impl Fn(Action) -> bool + Send + Sync + 'static) {
+        if self.on_action.set(Arc::new(f)).is_err() {
+            log::warn!("热键直调目标重复回填(忽略后填)");
+        }
+    }
 }
 
-/// 注册默认热键并起事件泵线程(主线程调用;失败不中断 App,降级为提示 + 日志)。
+/// 注册热键并起事件泵线程(主线程调用;失败不中断 App,降级为提示 + 日志)。
 pub fn install(ctx: &egui::Context) -> HotkeyRuntime {
+    let on_action: Arc<OnceLock<DispatchFn>> = Arc::new(OnceLock::new());
+    let deferred: Arc<Mutex<VecDeque<Action>>> = Arc::new(Mutex::new(VecDeque::new()));
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => manager,
         Err(err) => {
@@ -133,61 +174,111 @@ pub fn install(ctx: &egui::Context) -> HotkeyRuntime {
                 _manager: None,
                 name: None,
                 note: note_for(None),
-                counter: None,
+                on_action,
+                deferred,
             };
         }
     };
-    match register_default(&manager) {
+    // 完整窗口直达键(⌥⇧F):失败只留痕,不降级(入口仍有托盘与悬浮条 ⌥↵)。
+    let (dmods, dcode, dname) = direct_key();
+    let direct = HotKey::new(Some(dmods), dcode);
+    let direct = match manager.register(direct) {
+        Ok(()) => {
+            log::info!("完整窗口直达键注册成功:{dname}(id={})", direct.id());
+            Some(direct)
+        }
+        Err(err) => {
+            log::warn!("完整窗口直达键({dname})注册失败(入口仍有托盘与悬浮条 ⌥↵):{err}");
+            None
+        }
+    };
+    // ⌥Space 族(降级链):全失败只降级提示,不影响 ⌥⇧F 的命中。
+    let (space, name, note) = match register_default(&manager) {
         Ok((hotkey, name)) => {
             log::info!("全局热键注册成功:{name}(id={})", hotkey.id());
-            let counter = spawn_event_pump(ctx.clone(), hotkey);
             let note = note_for(Some(&name));
             if let Some(text) = &note {
                 log::warn!("热键降级:{text}");
             }
-            HotkeyRuntime {
-                _manager: Some(manager),
-                name: Some(name),
-                note,
-                counter: Some(counter),
-            }
+            (Some(hotkey), Some(name), note)
         }
         Err(err) => {
             log::error!("全局热键不可用({UNAVAILABLE_NOTE}):{err:#}");
-            HotkeyRuntime {
-                _manager: Some(manager),
-                name: None,
-                note: note_for(None),
-                counter: None,
-            }
+            (None, None, note_for(None))
         }
+    };
+    if space.is_some() || direct.is_some() {
+        spawn_event_pump(
+            ctx.clone(),
+            space,
+            direct,
+            Arc::clone(&on_action),
+            Arc::clone(&deferred),
+        );
+    }
+    HotkeyRuntime {
+        _manager: Some(manager),
+        name,
+        note,
+        on_action,
+        deferred,
     }
 }
 
-/// UI 帧内消费(每帧至多切换一次):有待处理按下 → true 并清零。
-pub fn poll_toggle(runtime: &HotkeyRuntime) -> bool {
-    runtime
-        .counter
-        .as_ref()
-        .is_some_and(|c| c.swap(0, Ordering::AcqRel) > 0)
+/// UI 帧内消费一条兜底动作(无则 None;直调路径正常时队列恒空)。
+pub fn poll_action(runtime: &HotkeyRuntime) -> Option<Action> {
+    let mut q = match runtime.deferred.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    q.pop_front()
 }
 
-/// 事件泵线程:阻塞收官方 channel(零轮询),命中注册键的 Pressed → 计数 + 唤醒 UI。
-fn spawn_event_pump(ctx: egui::Context, registered: HotKey) -> Arc<AtomicU64> {
-    let hits = Arc::new(AtomicU64::new(0));
-    let pump_hits = Arc::clone(&hits);
+/// 事件泵线程:阻塞收官方 channel(零轮询);命中注册键的 Pressed → 主队列直调动作。
+///
+/// `space` = ⌥Space 族命中键、`direct` = ⌥⇧F(各自 None = 该键未注册成功,不参与判定)。
+fn spawn_event_pump(
+    ctx: egui::Context,
+    space: Option<HotKey>,
+    direct: Option<HotKey>,
+    on_action: Arc<OnceLock<DispatchFn>>,
+    deferred: Arc<Mutex<VecDeque<Action>>>,
+) {
     let spawned = std::thread::Builder::new()
         .name("hotkey-pump".to_string())
         .spawn(move || {
             // 静态 channel(PoC-2 用法:receiver 全局唯一,本线程是唯一消费者)。
             let rx = GlobalHotKeyEvent::receiver();
             while let Ok(event) = rx.recv() {
-                if is_toggle_press(&event, registered) {
-                    pump_hits.fetch_add(1, Ordering::AcqRel);
-                    // 唤醒 ROOT 视口帧(App::logic 的宿主;模块注释「事件泵为什么
-                    // 必须带唤醒」);窗口不可见时该帧退化为 logic-only。
+                let action = if space.is_some_and(|k| is_toggle_press(&event, k)) {
+                    Some(Action::TogglePalette)
+                } else if direct.is_some_and(|k| is_toggle_press(&event, k)) {
+                    Some(Action::OpenResults)
+                } else {
+                    None
+                };
+                let Some(action) = action else { continue };
+                // 直调块:`Context`/共享态句柄均 Send+Sync;块本身在主线程执行。
+                let ctx = ctx.clone();
+                let on_action = Arc::clone(&on_action);
+                let deferred = Arc::clone(&deferred);
+                dispatch2::DispatchQueue::main().exec_async(move || {
+                    if let Some(f) = on_action.get() {
+                        if f(action) {
+                            log::info!("热键动作 {action:?}:主队列直调完成");
+                            return;
+                        }
+                    }
+                    // 兜底:直调目标未回填或共享锁被持(帧内拼锁/嵌套 run loop)→
+                    // 入列 + 叫帧。不可见窗口的跨线程 repaint 请求被 eframe 节流
+                    // ≥100ms,故该路径仅兜底,不静默丢弃。
+                    log::info!("热键动作 {action:?}:转帧内兜底队列");
+                    match deferred.lock() {
+                        Ok(mut q) => q.push_back(action),
+                        Err(poisoned) => poisoned.into_inner().push_back(action),
+                    }
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
-                }
+                });
             }
         });
     match spawned {
@@ -197,7 +288,6 @@ fn spawn_event_pump(ctx: egui::Context, registered: HotKey) -> Arc<AtomicU64> {
         }
         Err(err) => log::error!("热键事件泵线程启动失败(热键将无响应):{err}"),
     }
-    hits
 }
 
 #[cfg(test)]
@@ -217,6 +307,15 @@ mod tests {
         for (_, code, _) in list {
             assert_eq!(code, Code::Space, "族内三候选均为 Space 键");
         }
+    }
+
+    /// 完整窗口直达键 = ⌥⇧F(product §2:字母键,避开空格族系统占用)。
+    #[test]
+    fn direct_key_is_alt_shift_f() {
+        let (mods, code, name) = direct_key();
+        assert_eq!(name, "⌥⇧F");
+        assert_eq!(code, Code::KeyF);
+        assert_eq!(mods, Modifiers::ALT | Modifiers::SHIFT);
     }
 
     /// 命中判定:只认注册键的 Pressed;Released(松开)与他键不触发。
@@ -240,32 +339,29 @@ mod tests {
         assert!(!is_toggle_press(&other, registered), "他键不触发");
     }
 
-    /// 帧内消费语义:无按下 = false;积压 N 次按下 = 一次 true 后清零(连按合并)。
+    /// 兜底队列:空 = None;入列动作按先进先出逐条消费,取尽不再重复。
     #[test]
-    fn poll_toggle_consumes_pending_presses() {
-        let counter = Arc::new(AtomicU64::new(0));
+    fn poll_action_drains_deferred_fifo() {
         let runtime = HotkeyRuntime {
             _manager: None,
             name: None,
             note: None,
-            counter: Some(Arc::clone(&counter)),
+            on_action: Arc::new(OnceLock::new()),
+            deferred: Arc::new(Mutex::new(VecDeque::new())),
         };
-        assert!(!poll_toggle(&runtime), "无按下");
-        counter.fetch_add(3, Ordering::AcqRel);
-        assert!(poll_toggle(&runtime), "积压按下 → true");
-        assert!(!poll_toggle(&runtime), "已消费,不重复触发");
-    }
-
-    /// 未注册(全失败/管理器创建失败)时 poll_toggle 恒 false(不误触发)。
-    #[test]
-    fn poll_toggle_without_registration_never_fires() {
-        let runtime = HotkeyRuntime {
-            _manager: None,
-            name: None,
-            note: Some(UNAVAILABLE_NOTE.to_string()),
-            counter: None,
-        };
-        assert!(!poll_toggle(&runtime));
+        assert_eq!(poll_action(&runtime), None, "队列空");
+        {
+            let mut q = runtime.deferred.lock().unwrap();
+            q.push_back(Action::TogglePalette);
+            q.push_back(Action::OpenResults);
+        }
+        assert_eq!(
+            poll_action(&runtime),
+            Some(Action::TogglePalette),
+            "先入先出"
+        );
+        assert_eq!(poll_action(&runtime), Some(Action::OpenResults));
+        assert_eq!(poll_action(&runtime), None, "取尽不再重复");
     }
 
     /// 提示文案:默认键正常不打扰;降级提示改用键;全失败提示托盘兜底。

@@ -203,6 +203,30 @@ pub fn attached() -> bool {
     }
 }
 
+/// 根窗当前原生可见性(首帧纠偏核对;非 macOS/未接句柄恒 None)。
+pub fn root_visible() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::root_visible()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 悬浮条窗当前原生可见性(诊断;非 macOS/未接窗恒 None)。
+pub fn palette_visible() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::palette_visible()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

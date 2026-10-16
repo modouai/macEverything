@@ -7,11 +7,20 @@
 //!
 //! 托盘本体(图标/菜单/事件泵)在 `tray.rs`;本文件只做两件事:
 //! ① `logic()` 每帧消费托盘动作(`drain_tray`:`TogglePalette` 与热键共用
-//!    `toggle_palette`;`OpenResults` = 唤起完整窗口并聚焦搜索框;`ToggleAutostart`
-//!    = SMAppService 注册/注销 + 用户意图标记(Task 20);`Quit` = 置 `quitting` 后走
-//!    根窗关闭的干净退出路径,引擎常驻;`LaunchEngine` 放工作线程)并把最新引擎
-//!    快照落到菜单项(`TrayRuntime::sync`)。
-//! ② 两个带查询词 / 无查询词的「打开完整窗口」入口共用 `show_root_window`。
+//!    `palette_toggle`;`OpenResults` = 唤起完整窗口并聚焦搜索框;
+//!    `ToggleAutostart` = SMAppService 注册/注销 + 用户意图标记(Task 20);
+//!    `Quit` = 置 `quitting` 后走根窗关闭的干净退出路径,引擎常驻;
+//!    `LaunchEngine` 放工作线程)并把最新引擎快照落到菜单项(`TrayRuntime::sync`)。
+//! ② 三个带查询词 / 无查询词的「打开完整窗口」入口(托盘/⌥⇧F/悬浮条 ⌥↵)
+//!    共用 `results_open` / `show_root_window`。
+//!
+//! ## 热键动作的主队列直调(Task 21)
+//!
+//! 热键(⌥Space/⌥⇧F)不走「泵线程叫帧 → logic 消费」——不可见窗口的跨线程
+//! repaint 请求被 eframe 节流 ≥100ms,等帧即破「唤起 <100ms」红线。动作在主队列
+//! 块里直调本文件的 `palette_toggle` / `results_open`(与帧内同一份实现);
+//! `logic` 只消费直调拿不到锁时的兜底队列(细节与证据见 hotkey.rs 模块注释
+//! 「动作直调与帧内兜底」;锁纪律见本文件「悬浮条显隐」段)。
 //!
 //! ## 视口形态(Task 14 定案,L1/L2 处置)
 //!
@@ -98,13 +107,96 @@ fn palette_viewport_id() -> egui::ViewportId {
 }
 
 /// 显示完整窗口(根视口):平台层原生唤起(activate + 置前),失败退回 egui 命令。
-/// 悬浮条 ⌥↵ 与托盘「打开完整窗口」/ 缺口项共用(单一实现,勿复制第三份)。
+/// 悬浮条 ⌥↵、托盘「打开完整窗口」/ 缺口项、⌥⇧F 直达共用(单一实现,勿复制第四份)。
 fn show_root_window(ctx: &egui::Context) {
     if let Err(err) = platform::show_root_window() {
         log::warn!("根窗原生唤起失败,退回 egui 命令:{err}");
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
     }
     ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
+// ---------------------------------------------------------------------------
+// 悬浮条显隐 / 完整窗口打开(单一实现;帧内与主队列直调共用)
+//
+// ## 锁纪律(硬要求,实测踩坑)
+//
+// 这些函数会从**主队列直调块**(hotkey.rs 的直显路径)调用。块内做 AppKit 调用时,
+// AppKit 通知会被 winit **同步派发**(`app_state.rs::maybe_queue_event`:不在事件
+// 处理中即立即 `handle_event`)→ 重入一帧 → 帧内 `logic`/`draw_palette` 要拿同一把
+// `shared` 锁。实测栈(2026-10-16):show_palette → setFrameOrigin → windowDidMove →
+// winit → eframe run_ui_and_paint → draw_palette → `Mutex::lock` → 主线程自锁。
+// 故:**原生调用(平台层 show_palette/show_root_window)一律在锁外执行**;
+// 状态读写收窄为短锁;`send_viewport_cmd`(只入 egui 队列,无 AppKit 调用)可持锁。
+
+/// 取共享锁(毒锁兜底;锁内无 panic 期望)。主线程短占用。
+fn lock_shared(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
+    match shared.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// 悬浮条隐藏的状态部分(不含命令下发;调用方可持锁调用)。
+fn hide_palette_state(s: &mut Shared) {
+    s.palette_visible = false;
+    s.palette.reset(); // 隐藏后清空输入(product §1)
+}
+
+/// 下发悬浮条隐藏命令(egui 命令 → winit `orderOut`;视口与窗口保留,不销毁)。
+/// 只入 egui 队列、无 AppKit 调用 → 可在外层持锁时调用。
+fn send_palette_hide(ctx: &egui::Context, reason: &str) {
+    ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
+    log::info!("悬浮条隐藏({reason})");
+}
+
+/// 隐藏悬浮条(帧内与直调共用;`reason` 只进日志,区分热键/托盘/Esc 等来源)。
+fn palette_hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str) {
+    hide_palette_state(&mut lock_shared(shared));
+    send_palette_hide(ctx, reason);
+}
+
+/// 唤起悬浮条(帧内与直调共用):平台层原生显示 → 复位会话 → 主题即时补查 →
+/// 请求悬浮条视口重绘。返回是否已唤起(false = 窗口未就绪,调用方决定兜底)。
+///
+/// 顺序(与 PoC-4 native 路径同构):先让窗口在屏(内容为上一帧),再复位状态并
+/// 请求重绘——上屏延迟与内容刷新解耦。
+fn palette_show(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> bool {
+    match platform::show_palette() {
+        Ok(()) => {
+            {
+                let mut s = lock_shared(shared);
+                s.palette.reset(); // 每次唤起都是全新查询(product §1)
+                s.palette_visible = true;
+                s.theme.check_now(ctx); // 隐藏期切过外观:亮起立即补查
+            }
+            ctx.request_repaint_of(palette_viewport_id());
+            true
+        }
+        Err(err) => {
+            // 窗口未就绪/非 macOS:native 路径不可用,如实留痕不静默
+            log::warn!("悬浮条唤起失败(保持隐藏):{err}");
+            false
+        }
+    }
+}
+
+/// 切换悬浮条显示态(托盘左键/「打开搜索」/热键/二次启动共用)。
+fn palette_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str) -> bool {
+    let visible = lock_shared(shared).palette_visible;
+    if visible {
+        palette_hide(shared, ctx, reason);
+        true
+    } else {
+        palette_show(shared, ctx)
+    }
+}
+
+/// 打开完整窗口(托盘「打开完整窗口」/「缺口面板」/⌥⇧F 直达共用):
+/// 聚焦搜索框 + 补查引擎状态后原生唤到前台(原生调用在锁外,见锁纪律)。
+fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
+    lock_shared(shared).results.on_window_shown();
+    show_root_window(ctx);
 }
 
 /// 悬浮条视口 builder(常量;每 pass 传同一份——`patch` 无差异则无命令/无重建)。
@@ -129,10 +221,14 @@ pub struct App {
     fonts_logged: bool,
     /// 首帧接线已尝试次数(见 `PATCH_ATTACH_ATTEMPTS`)。
     attach_attempts: u32,
+    /// 根窗首帧隐藏纠偏已发出(产品形态两窗皆隐;见 `logic` 首帧纠偏注释)。
+    root_hide_issued: bool,
+    /// 纠偏回读已留痕一次(原生 `isVisible()` 核对;见 `logic`)。
+    root_hide_verified: bool,
     /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 已接)。
     quitting: bool,
-    /// 全局热键运行时(Task 15):manager 保活 + 事件泵计数;
-    /// 泵线程命中即请求 ROOT 重绘,`logic` 里 `poll_toggle` 消费(见 hotkey.rs)。
+    /// 全局热键运行时(Task 15/21):manager 保活 + 事件泵;命中走主队列直调
+    /// (本文件 `App::new` 回填目标),`logic` 只消费兜底队列(见 hotkey.rs)。
     hotkey: hotkey::HotkeyRuntime,
     /// 菜单栏托盘(Task 16);None = 安装失败(已留痕,其余入口照常)。
     tray: Option<tray::TrayRuntime>,
@@ -169,21 +265,50 @@ impl App {
         // 平台层:记录根窗句柄(悬浮条窗与根窗同为 NSApp.windows() 成员,须区分)。
         platform::attach_root(cc);
         let hotkey_note = hotkey.note().map(str::to_string);
+        let shared = Arc::new(Mutex::new(Shared {
+            palette: palette::PaletteState::new(
+                cc,
+                paths.clone(),
+                palette_viewport_id(),
+                hotkey_note,
+            ),
+            results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
+            theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
+            palette_visible: false, // 启动隐藏(产品形态:两窗皆隐,仅菜单栏图标)
+        }));
+        // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
+        // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,
+        // 动作转帧内兜底队列,不阻塞。预检通过后,实际实现内部短锁读写、
+        // 原生调用在锁外(锁纪律见本文件「悬浮条显隐」段)。
+        let dispatch_target: Arc<dyn Fn(hotkey::Action) -> bool + Send + Sync> = {
+            let shared = Arc::clone(&shared);
+            let ctx = cc.egui_ctx.clone();
+            Arc::new(move |action| {
+                match shared.try_lock() {
+                    Ok(g) => drop(g),                               // 锁空闲:继续
+                    Err(std::sync::TryLockError::Poisoned(_)) => {} // 毒锁:继续(无锁内 panic 期望)
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                }
+                match action {
+                    hotkey::Action::TogglePalette => palette_toggle(&shared, &ctx, "热键"),
+                    hotkey::Action::OpenResults => {
+                        results_open(&shared, &ctx);
+                        true
+                    }
+                }
+            })
+        };
+        hotkey.attach({
+            let t = Arc::clone(&dispatch_target);
+            move |action| t(action)
+        });
         Self {
             incoming,
-            shared: Arc::new(Mutex::new(Shared {
-                palette: palette::PaletteState::new(
-                    cc,
-                    paths.clone(),
-                    palette_viewport_id(),
-                    hotkey_note,
-                ),
-                results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
-                theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
-                palette_visible: false, // 启动隐藏(plan 骨架:.with_visible(false))
-            })),
+            shared,
             fonts_logged: false,
             attach_attempts: 0,
+            root_hide_issued: false,
+            root_hide_verified: false,
             quitting: false,
             hotkey,
             tray,
@@ -212,36 +337,19 @@ impl App {
         }
     }
 
-    /// 唤起悬浮条(每次全新查询,product §1):平台层原生显示 → 复位会话 →
-    /// 主题即时补查(L4:隐藏期不排帧,亮起时补查一次)→ 请求悬浮条视口首帧。
-    ///
-    /// 顺序:先让窗口在屏(内容为上一帧),再复位状态并请求重绘——上屏延迟
-    /// 与内容刷新解耦(与 PoC-4 native 路径同构)。
+    /// 唤起悬浮条(帧内版本;实现与热键主队列直调共用 `palette_show`)。
     fn show_palette(&mut self, ctx: &egui::Context) {
-        match platform::show_palette() {
-            Ok(()) => {
-                {
-                    let mut s = self.shared();
-                    s.palette.reset(); // 每次唤起都是全新查询(product §1)
-                    s.palette_visible = true;
-                    s.theme.check_now(ctx); // 隐藏期切过外观:亮起立即补查
-                }
-                ctx.request_repaint_of(palette_viewport_id());
-            }
-            Err(err) => {
-                // 窗口未就绪/非 macOS:native 路径不可用,如实留痕不静默
-                log::warn!("悬浮条唤起失败(保持隐藏):{err}");
-            }
-        }
+        palette_show(&self.shared, ctx);
     }
 
-    /// 切换悬浮条显示态(托盘左键 / 菜单「打开搜索」与热键共用)。
-    fn toggle_palette(&mut self, ctx: &egui::Context) {
-        if self.shared().palette_visible {
-            self.hide_palette(ctx);
-        } else {
-            self.show_palette(ctx);
-        }
+    /// 切换悬浮条显示态(托盘左键 / 菜单「打开搜索」与热键兜底共用)。
+    fn toggle_palette(&mut self, ctx: &egui::Context, reason: &str) {
+        palette_toggle(&self.shared, ctx, reason);
+    }
+
+    /// 打开完整窗口(托盘「打开完整窗口」/「缺口面板」/ ⌥⇧F 直达共用)。
+    fn open_results(&mut self, ctx: &egui::Context) {
+        results_open(&self.shared, ctx);
     }
 
     /// 消费托盘动作(Task 16):泵线程已为本帧请求 ROOT 重绘(与热键同模式,见 tray.rs)。
@@ -250,20 +358,19 @@ impl App {
             match msg {
                 TrayMsg::TogglePalette => {
                     log::info!("托盘:切换悬浮条");
-                    self.toggle_palette(ctx);
+                    self.toggle_palette(ctx, "托盘");
                 }
                 TrayMsg::OpenResults => {
                     // 完整窗口(Task 17):聚焦搜索框 + 补查引擎状态后原生唤到前台。
                     log::info!("托盘:打开完整窗口");
-                    self.shared().results.on_window_shown();
-                    show_root_window(ctx);
+                    self.open_results(ctx);
                 }
                 TrayMsg::OpenGaps => {
                     // 缺口项(product §3):同一开窗路径 + 展开缺口面板(Task 19);
                     // 清单经 on_window_shown 触发的状态补查落地(status.gaps 同源)。
                     log::info!("托盘:打开完整窗口(缺口面板)");
                     self.shared().results.open_gaps();
-                    show_root_window(ctx);
+                    self.open_results(ctx);
                 }
                 TrayMsg::ToggleAutostart => {
                     // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按真实注册结果校准——
@@ -311,21 +418,34 @@ impl App {
             }
         }
     }
-
-    /// 隐藏悬浮条(egui 命令 → winit `orderOut`;视口与窗口保留,状态复位)。
-    fn hide_palette(&mut self, ctx: &egui::Context) {
-        {
-            let mut s = self.shared();
-            s.palette_visible = false;
-            s.palette.reset();
-        }
-        ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
-        log::info!("悬浮条隐藏(热键/托盘切换/dev 按钮)");
-    }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 首帧纠偏(产品形态:两窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
+        // eframe 0.37 在首帧 post_rendering 里**无条件** `set_visible(true)`
+        //(`native/epi_integration.rs:443-450`,白闪修复;`create_glutin_windowed_context`
+        // 也把它压着 `.with_visible(false)`),故 builder 的 with_visible(false) 本身
+        // 不足以保持隐藏。纠偏:首帧 logic 发 `Visible(false)` —— 该命令在同帧
+        // `handle_viewport_output` 应用(post_rendering 之后,中间不回事件循环),
+        // 窗口不经 WindowServer 合成,全程无 onscreen 条目(实测见 poc-results)。
+        if !self.root_hide_issued {
+            self.root_hide_issued = true;
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::Visible(false),
+            );
+            ctx.request_repaint(); // 排下一帧做原生回读(纠偏命令在本帧末才应用)
+            log::info!("根窗首帧纠偏:Visible(false)(产品形态两窗皆隐)");
+        } else if !self.root_hide_verified {
+            self.root_hide_verified = true;
+            log::info!(
+                "两窗皆隐回读:根窗 isVisible={:?} 悬浮条 isVisible={:?}(期望恒 false;None = 尚未创建)",
+                platform::root_visible(),
+                platform::palette_visible()
+            );
+        }
+
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
@@ -341,14 +461,23 @@ impl eframe::App for App {
             tray.sync();
         }
 
-        // 全局热键(Task 15):事件泵线程已为本帧请求 ROOT 重绘(hotkey.rs 模块注释
-        // 「事件泵为什么必须带唤醒」)→ 消费按下计数并按可见态切换唤起/隐藏。
-        if hotkey::poll_toggle(&self.hotkey) {
-            log::info!(
-                "热键 {} 按下:切换悬浮条",
-                self.hotkey.name().unwrap_or("(未注册)")
-            );
-            self.toggle_palette(ctx);
+        // 全局热键(Task 15/21):正常路径已在主队列直调完成(不等帧,绕开不可见
+        // 窗口 ≥100ms 的 repaint 节流;hotkey.rs 模块注释「动作直调与帧内兜底」),
+        // 此处只消费**兜底队列**(直调目标未回填或共享锁被持时的罕见遗留)。
+        while let Some(action) = hotkey::poll_action(&self.hotkey) {
+            match action {
+                hotkey::Action::TogglePalette => {
+                    log::info!(
+                        "热键 {} 兜底:切换悬浮条",
+                        self.hotkey.name().unwrap_or("(未注册)")
+                    );
+                    self.toggle_palette(ctx, "热键兜底");
+                }
+                hotkey::Action::OpenResults => {
+                    log::info!("热键 ⌥⇧F 兜底:打开完整窗口");
+                    self.open_results(ctx);
+                }
+            }
         }
 
         // 平台补丁:找悬浮条窗(首见即施加)/漂移核对(可见期)。
@@ -440,20 +569,17 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 视口关闭请求(如 ⌘W):视同隐藏并压回隐藏态,不让视口悬空
     // (eframe 对子视口的关闭请求不自行处理,须由应用消费)。
     if ctx.input(|i| i.viewport().close_requested()) {
-        s.palette_visible = false;
-        s.palette.reset();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        log::info!("悬浮条视口关闭请求:按隐藏处理");
+        hide_palette_state(&mut s);
+        send_palette_hide(&ctx, "视口关闭请求");
     }
 
     let action = s.palette.draw(ui);
     match action {
         Some(palette::Action::Hide) => {
-            s.palette_visible = false;
-            s.palette.reset(); // 隐藏后清空输入(product §1)
-                               // 隐藏走 egui 命令:eframe → winit orderOut(视口窗保留,不销毁)
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            log::info!("悬浮条隐藏(Esc/打开成功/失焦)");
+            // 状态部分就地改(已持锁);命令下发共用 `send_palette_hide`
+            // (egui 命令只入队列、无 AppKit 调用,持锁安全)。
+            hide_palette_state(&mut s);
+            send_palette_hide(&ctx, "Esc/打开成功/失焦");
         }
         Some(palette::Action::FullWindow) => {
             // ⌥↵:查询词灌入完整窗口并立即查询(空词 = 清空态开窗);随后聚焦 + 补查状态。
@@ -465,8 +591,11 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             s.palette_visible = false;
             s.palette.reset();
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            // 根窗走平台层原生(activate + 置前;单发 egui 命令不切 Space,实测)。
+            // 根窗走平台层原生(activate + 置前;单发 egui 命令不切 Space,实测):
+            // 出锁再调(锁纪律——原生调用可被 winit 同步派发,持锁即自锁)。
+            drop(s);
             show_root_window(&ctx);
+            return; // 开窗后本 pass 结束(悬浮条已隐藏,下面不再排帧)
         }
         None => {}
     }
