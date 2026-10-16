@@ -1,0 +1,19 @@
+[package]
+name = "poc1b-npanel"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "poc1b-npanel"
+path = "src/main.rs"
+
+[[bin]]
+name = "poc1b-fs-actor"
+path = "src/bin/fs_actor.rs"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "system_fonts"] }
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSApplication", "NSRunningApplication", "NSView", "NSScreen", "NSPanel", "NSResponder", "NSEvent", "NSGraphicsContext"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSGeometry", "NSProcessInfo"] }
+raw-window-handle = "0.6.2"
