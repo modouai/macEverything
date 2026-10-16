@@ -28,6 +28,15 @@ const FLUSH_DIRTY_LIMIT: u64 = 10_000;
 const BATCH_WINDOW: Duration = Duration::from_millis(100);
 /// 首扫流式聚合批大小:每批持写锁聚合后即释放,批间查询可见已扫部分(product 场景 2)。
 const SCAN_CHUNK: usize = 50_000;
+/// 重扫冷却:两次全量重扫的最小间隔(防「重扫→新 dropped→重扫」退化振荡;
+/// 实测真实实例曾 420 次重复重扫,索引永在重扫、日志刷屏)。
+const RESCAN_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// 事件是否已被全量重扫覆盖(≤ 重扫开始时刻的全局水位)。独立成函数便于单测
+/// 钉住比较语义:覆盖点是「小于等于」——floor 本身的事件同属历史。
+fn event_covered_by_rescan(ev_id: u64, rescan_floor: u64) -> bool {
+    ev_id <= rescan_floor
+}
 
 /// 状态四态(product §1 契约)。
 pub mod state {
@@ -123,6 +132,11 @@ pub struct EngineState {
     /// 语义保证「落盘水位 ≤ 索引内容对应的事件」——重启重放必覆盖「已收未应用」
     /// 的变更(否则 stop/崩溃前 100ms 窗口内的变更永久丢失)。
     applied_event_id: AtomicU64,
+    /// 重扫覆盖水位(全量重扫开始时取的全局事件 ID)。id ≤ 此值的事件已被重扫
+    /// 内容覆盖,重扫完成后积压在通道里的陈旧事件(含其携带的丢弃标记)直接跳过。
+    /// 不跳则死循环:重扫 10-30s 期间消费停摆 → 内核缓冲溢出产生新 dropped 标记
+    /// → 又触发重扫(实测 420 次重复重扫,日志刷屏且索引永在重扫)。
+    rescan_floor: AtomicU64,
     stopping: AtomicBool,
     dirty: AtomicU64,
     last_flush: Mutex<Instant>,
@@ -144,6 +158,7 @@ impl EngineState {
             built_at: AtomicU64::new(0),
             seen_event_id: AtomicU64::new(0),
             applied_event_id: AtomicU64::new(0),
+            rescan_floor: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             dirty: AtomicU64::new(0),
             last_flush: Mutex::new(Instant::now()),
@@ -511,6 +526,7 @@ fn consume_events(
     let mut batcher = DirBatcher::new(BATCH_WINDOW, watcher::system_now());
     let mut replay_events: u64 = 0;
     let mut stream_errored = false;
+    let mut last_rescan: Option<Instant> = None;
 
     loop {
         if state.stopping.load(Ordering::Relaxed) {
@@ -518,6 +534,12 @@ fn consume_events(
         }
         match rx.recv_timeout(Duration::from_millis(150)) {
             Ok(ev) => {
+                // 已被全量重扫覆盖的陈旧事件直接跳过。必须先于一切语义判定——
+                // 重扫期间消费停摆、内核缓冲溢出产生的 dropped 标记就在其中,
+                // 它们正是「重扫 → 又一批 dropped → 又重扫」死循环的燃料。
+                if event_covered_by_rescan(ev.id, state.rescan_floor.load(Ordering::Relaxed)) {
+                    continue;
+                }
                 state.seen_event_id.fetch_max(ev.id, Ordering::Relaxed);
                 if fsevents::is_history_done(ev.flags) {
                     if is_replay {
@@ -551,8 +573,20 @@ fn consume_events(
                     continue;
                 }
                 if fsevents::is_dropped(ev.flags) {
+                    // 冷却双保险:rescan_floor 兜住重扫期间积压的旧标记,但重扫**之后**
+                    // 新产生的 dropped(重扫自身引起的缓冲溢出)仍需限频,防退化振荡。
+                    if let Some(t) = last_rescan {
+                        if t.elapsed() < RESCAN_COOLDOWN {
+                            log::warn!(
+                                "重扫冷却期内再收丢弃标记({:.0}s 前刚重扫过),已忽略",
+                                t.elapsed().as_secs_f64()
+                            );
+                            continue;
+                        }
+                    }
                     log::warn!("收到丢弃类标记,转全量重扫兜底");
                     degrade_and_rescan(&state, &paths);
+                    last_rescan = Some(Instant::now());
                     continue;
                 }
                 replay_events += 1;
@@ -639,8 +673,10 @@ fn sampling_finds_gap(state: &EngineState, paths: &DaemonPaths) -> bool {
 }
 
 /// 降级:全量重扫重建索引,替换 holder 并重落盘,回就绪。
+/// 覆盖水位在扫描**之前**取(id > floor 的变更仍会被正常 diff,重扫未必包含)。
 fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
     state.set_state(state::DEGRADED);
+    let floor = fsevents::current_event_id();
     let roots = state.roots.lock().unwrap().clone();
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
     let threads = std::thread::available_parallelism()
@@ -656,6 +692,11 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
     *state.gaps.lock().unwrap() = gap_list;
     state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
     *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+    // 水位推进到覆盖点:重扫内容 = 截至 floor 的磁盘状态;floor 以下积压的陈旧
+    // 事件(含触发本轮重扫的 dropped 标记)从此刻起被消费循环跳过。
+    state.seen_event_id.fetch_max(floor, Ordering::Relaxed);
+    state.applied_event_id.fetch_max(floor, Ordering::Relaxed);
+    state.rescan_floor.fetch_max(floor, Ordering::Relaxed);
     rebuild_dir_map(state);
     flush(state, paths);
     state.set_state(state::READY);
@@ -1078,6 +1119,41 @@ mod tests {
             state.seen_event_id.fetch_max(id, Ordering::Relaxed);
         }
         assert_eq!(state.seen_event_id.load(Ordering::Relaxed), 200);
+    }
+
+    /// 重扫覆盖跳过钉——死循环修复核心(实测真实实例 420 次重复重扫:
+    /// 重扫期间消费停摆→内核缓冲溢出→新 dropped 标记→又重扫)。
+    /// 突变比较符(≤ → <)或删除此检查,循环即可能回归。
+    #[test]
+    fn stale_events_below_rescan_floor_are_skipped() {
+        assert!(event_covered_by_rescan(100, 100), "floor 本身属历史事件");
+        assert!(event_covered_by_rescan(99, 100));
+        assert!(
+            !event_covered_by_rescan(101, 100),
+            "floor 之后的变更是新事件"
+        );
+        assert!(!event_covered_by_rescan(1, 0), "未重扫过时无覆盖");
+    }
+
+    /// 重扫推进覆盖水位:degrade_and_rescan 后 floor 必须 ≥ 重扫开始时刻的全局
+    /// 水位且已应用水位同步推进,否则积压事件不被跳过、死循环回归。
+    #[test]
+    fn rescan_advances_floor_and_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        let state = EngineState::new();
+        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let before = fsevents::current_event_id();
+        degrade_and_rescan(&state, &paths);
+        let floor = state.rescan_floor.load(Ordering::Relaxed);
+        assert!(floor >= before, "覆盖水位取重扫开始时刻");
+        assert!(state.applied_event_id.load(Ordering::Relaxed) >= floor);
+        assert_eq!(*state.state_name.lock().unwrap(), state::READY);
+        assert!(paths.index_file().exists(), "重扫后落盘");
     }
 
     /// 排除路径校验钉(tech.md 契约:必须为扫描根内绝对路径,否则拒绝)。
