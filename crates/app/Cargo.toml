@@ -10,6 +10,9 @@ path = "src/main.rs"
 [dependencies]
 client = { path = "../client" }
 protocol = { path = "../protocol" }
+# session 直接复用 engine::query::SortKey(ADR-7:app 经 client 承载层依赖 engine 已许可;
+# Rust 2018+ 依赖非传递可见,故显式声明)。
+engine = { path = "../engine" }
 # 0.37 一律带 system_fonts:仅 default_fonts 时中文渲染为方框(PoC-1 实测,
 # 见 docs/specs/v2-ui/poc-results.md「与 plan 示意的接线差异」#3)。
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts"] }

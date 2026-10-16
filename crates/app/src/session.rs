@@ -1,0 +1,223 @@
+//! 查询会话:防抖 + 代际号 + 六态状态机(纯逻辑;时钟由调用方传入,测试可注入)。
+
+use std::time::{Duration, Instant};
+
+/// 六态(tech.md 表):Idle 空词不请求;Searching 请求中/有结果;EngineStarting 拉起中;
+/// Offline 离线结果;Empty total=0;Warming 索引未挂载;Error 其余错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    Idle,
+    Searching,
+    EngineStarting,
+    Offline,
+    Empty,
+    Warming,
+    Error(String),
+}
+
+// 定案(v2 plan Task 11):直接复用 engine::query::SortKey
+pub use engine::query::SortKey;
+
+/// 防抖窗到期后应发起的查询(代际号供响应到达时校验)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fire {
+    pub query: String,
+    pub sort: SortKey,
+    pub generation: u64,
+}
+
+pub struct Session {
+    debounce: Duration,
+    /// 最近一次输入(串, 时刻);窗口内只保留最新
+    pending: Option<(String, Instant)>,
+    /// 最近一次已发起的查询(串, 排序);排序变更时按此串重发
+    last_fired: Option<(String, SortKey)>,
+    sort: SortKey,
+    generation: u64,
+    pub state: State,
+}
+
+impl Session {
+    pub fn new(debounce: Duration) -> Self {
+        Self {
+            debounce,
+            pending: None,
+            last_fired: None,
+            sort: SortKey::Relevance,
+            generation: 0,
+            state: State::Idle,
+        }
+    }
+
+    /// 输入变更:更新 pending(窗口内只保留最新);空词 → 清 pending/last_fired + State::Idle
+    /// (last_fired 同清:排序变更不得复活空查询)。
+    pub fn on_input(&mut self, text: &str, now: Instant) {
+        if text.is_empty() {
+            self.pending = None;
+            self.last_fired = None;
+            self.state = State::Idle;
+        } else {
+            self.pending = Some((text.to_string(), now));
+        }
+    }
+
+    /// 排序变更:同串重发 —— 窗内有 pending 保持原串、刷新时刻;无 pending 按
+    /// last_fired 的串构造 pending(代际号在下一次 pending_at 自然 +1);
+    /// 两者皆无(空词/从未发起)→ 不动。
+    pub fn on_sort_change(&mut self, key: SortKey, now: Instant) {
+        self.sort = key;
+        let query = self
+            .pending
+            .as_ref()
+            .map(|(q, _)| q.clone())
+            .or_else(|| self.last_fired.as_ref().map(|(q, _)| q.clone()));
+        if let Some(query) = query {
+            self.pending = Some((query, now));
+        }
+    }
+
+    /// 窗口到期(自最近一次输入/排序变更起算 debounce)且有待发 → 发起
+    /// (gen+=1, State=Searching);否则 None。
+    pub fn pending_at(&mut self, now: Instant) -> Option<Fire> {
+        let (query, at) = self.pending.as_ref()?;
+        if now < *at + self.debounce {
+            return None;
+        }
+        let query = query.clone();
+        self.pending = None;
+        self.generation += 1;
+        self.state = State::Searching;
+        self.last_fired = Some((query.clone(), self.sort));
+        Some(Fire {
+            query,
+            sort: self.sort,
+            generation: self.generation,
+        })
+    }
+
+    /// 代际校验:当代(= 最近一次 pending_at 发出的代)接受,旧代丢弃。
+    pub fn accept_response(&mut self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    /// 响应错误码 → 状态:"warming"(索引未挂载)→ Warming;其余 → Error(code)。
+    pub fn mark_error(&mut self, code: &str) {
+        self.state = if code == "warming" {
+            State::Warming
+        } else {
+            State::Error(code.to_string())
+        };
+    }
+
+    /// 响应 total → 状态:0 → Empty(无匹配项);>0 → Searching(有结果)。
+    pub fn mark_total(&mut self, total: u32) {
+        self.state = if total == 0 {
+            State::Empty
+        } else {
+            State::Searching
+        };
+    }
+
+    pub fn mark_engine_starting(&mut self) {
+        self.state = State::EngineStarting;
+    }
+
+    pub fn mark_offline(&mut self) {
+        self.state = State::Offline;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn debounce_coalesces_keystrokes() {
+        let mut s = Session::new(Duration::from_millis(60));
+        let base = Instant::now();
+        s.on_input("a", base);
+        s.on_input("ab", base + Duration::from_millis(20));
+        s.on_input("abc", base + Duration::from_millis(40));
+        assert_eq!(
+            s.pending_at(base + Duration::from_millis(80)),
+            None,
+            "窗口未到"
+        );
+        let fire = s
+            .pending_at(base + Duration::from_millis(110))
+            .expect("窗口到应发起");
+        assert_eq!(fire.query, "abc");
+        assert_eq!(fire.generation, 1, "三次输入合并为一代");
+    }
+
+    #[test]
+    fn stale_response_discarded() {
+        let mut s = Session::new(Duration::from_millis(10));
+        let base = Instant::now();
+        s.on_input("a", base);
+        let g1 = s
+            .pending_at(base + Duration::from_millis(20))
+            .unwrap()
+            .generation;
+        s.on_input("ab", base + Duration::from_millis(30));
+        let g2 = s
+            .pending_at(base + Duration::from_millis(50))
+            .unwrap()
+            .generation;
+        assert!(g2 > g1);
+        assert!(!s.accept_response(g1), "旧代响应丢弃");
+        assert!(s.accept_response(g2), "当代响应接受");
+    }
+
+    #[test]
+    fn empty_query_idles() {
+        let mut s = Session::new(Duration::from_millis(10));
+        let base = Instant::now();
+        s.on_input("", base);
+        assert_eq!(
+            s.pending_at(base + Duration::from_millis(50)),
+            None,
+            "空词不发起"
+        );
+        assert!(matches!(s.state, State::Idle));
+    }
+
+    #[test]
+    fn warming_and_error_states() {
+        let mut s = Session::new(Duration::from_millis(10));
+        s.mark_error("warming");
+        assert!(matches!(s.state, State::Warming));
+        s.mark_error("parse");
+        assert!(matches!(s.state, State::Error(_)));
+    }
+
+    #[test]
+    fn sort_change_refires_same_query() {
+        let mut s = Session::new(Duration::from_millis(10));
+        let base = Instant::now();
+        s.on_input("a", base);
+        let f1 = s.pending_at(base + Duration::from_millis(20)).unwrap();
+        s.on_sort_change(SortKey::Size, base + Duration::from_millis(30));
+        let f2 = s.pending_at(base + Duration::from_millis(50)).unwrap();
+        assert_eq!(f2.query, f1.query);
+        assert_ne!(f2.generation, f1.generation);
+        assert_eq!(f2.sort, SortKey::Size);
+    }
+
+    #[test]
+    fn engine_lifecycle_states() {
+        let mut s = Session::new(Duration::from_millis(10));
+        s.mark_engine_starting();
+        assert!(matches!(s.state, State::EngineStarting));
+        s.mark_offline();
+        assert!(matches!(s.state, State::Offline));
+        s.mark_total(0);
+        assert!(matches!(s.state, State::Empty), "total=0 → Empty");
+        s.mark_total(3);
+        assert!(
+            matches!(s.state, State::Searching),
+            "有结果回 Searching/有结果态"
+        );
+    }
+}

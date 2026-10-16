@@ -6,6 +6,9 @@
 
 mod engine_launcher;
 mod platform;
+// Task 11 纯逻辑模块:当前仅由单测消费,Task 12 接悬浮条后由 UI 层调用并删除 allow。
+#[allow(dead_code)]
+mod session;
 mod single_instance;
 mod ui;
 
