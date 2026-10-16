@@ -88,6 +88,7 @@ pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort
 | 多屏定位 | 唤起时取鼠标所在屏(NSEvent.mouseLocation 或 winit monitor)→ 计算居中偏上坐标 → `set_outer_position`(官方) |
 | 无边框/透明/圆角 | `ViewportBuilder { decorations:false, transparent:true, ... }`(官方)+ egui 自绘圆角阴影 |
 | 置顶 | `with_always_on_top`(官方) |
+| 右键菜单 | **原生 NSMenu**(objc2):egui 收到右键 → 构建 NSMenu(NSMenuItem + target/action 桥回 Rust)→ `popUpContextMenu` 于鼠标位置;菜单项语义见 product §2。非自绘:观感/键盘导航/异屏缩放均随系统 |
 
 ### 进程编排
 
@@ -126,6 +127,7 @@ pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort
 |---|---|
 | PoC-1:跨 Space/浮动级别不生效 | 降级「当前 Space 可见」,产品文档标注;不阻塞其余功能 |
 | PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space/⌃Space);以实机结果定默认 |
+| PoC-3:NSMenu 阻塞式弹出与 egui 事件循环 | NSMenu 弹出走嵌套 run loop(阻塞当前线程)——在 eframe 主线程弹出需验证无卡死/输入错乱;不通过则菜单弹出移至独立线程或改用 popUpMenuPositioningItem 非模态 |
 | 中文字体豆腐块(egui 默认字体无 CJK) | 启动时加载系统中文字体(苹方/思源),实现期首个验收项 |
 | egui 隐藏视口仍在渲染(CPU 不为 0) | 隐藏时 `ControlFlow::Wait` + 不请求重绘;验收红线盯 `top` |
 | 大命中集按大小/时间排序的 stat 风暴 | 仅在点列头时触发;候选集 stat 并行化(rayon);耗时随响应告知 |
@@ -137,8 +139,8 @@ pub fn execute_sorted(view: &dyn IndexView, plan: &QueryPlan, limit: usize, sort
 - **TDD(engine)**:`execute_sorted` —— 四列排序正确(含降序、稳定决胜、limit 边界)、sort=Relevance 与 v1 execute 逐字节同结果(回归钉);协议 sort 字段兼容(缺省/未知值)。
 - **TDD(app 纯逻辑)**:session 防抖(注入时钟)、代际丢弃(乱序响应注入)、状态机转移。
 - **v1 回归**:engine 79 项全绿;CLI 冒烟(迁移后 start/query/status/stop/离线)。
-- **实机验收**(product「验收标准」逐条):双形态链路/多屏/全屏/批量/托盘/自启真实重启/性能四项。
-- **PoC 验收(前置)**:P1 objc2 补丁(跨 Space 实测:切 Space 悬浮条仍在);P2 ⌥Space 注册(你的输入法环境实测);P3 中文字体渲染。
+- **实机验收**(product「验收标准」逐条):双形态链路/多屏/全屏/批量/托盘/自启真实重启/性能四项;中文字体渲染为实现期首个验收项(egui 默认字体无 CJK,加载系统字体)。
+- **PoC 验收(前置)**:P1 objc2 补丁(跨 Space 实测:切 Space 悬浮条仍在);P2 ⌥Space 注册(中文输入法环境实测);P3 NSMenu 原生弹出(egui 主线程弹菜单无卡死/输入错乱)。
 
 ## 后续工作(v2.1 边界)
 
