@@ -18,7 +18,16 @@ engine = { path = "../engine" }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts"] }
 egui_extras = "0.37"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSApplication", "NSPanel"] }
+# NSResponder/NSAppearance:ui/theme.rs 经 NSApplication.effectiveAppearance 读系统外观
+# (sharedApplication 挂在 NSResponder feature 下、外观 API 挂在 NSAppearance 下;
+# 0.3.2 的 NSApplication/NSWindow feature 不含 NSResponder,须显式列出)。
+objc2-app-kit = { version = "0.3", features = [
+    "NSWindow",
+    "NSApplication",
+    "NSPanel",
+    "NSResponder",
+    "NSAppearance",
+] }
 raw-window-handle = "0.6"
 anyhow = "1"
 log = { workspace = true, features = ["std"] }
