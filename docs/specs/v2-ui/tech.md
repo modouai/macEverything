@@ -107,6 +107,7 @@ pub fn execute_sorted(
 | 跨 Space(含他人全屏) | **NSPanel 改类五要素**(见 ADR-8;poc1b spike 定稿:`scripts/poc/poc1b_nspanel` 为可直接移植的实现参考) |
 | 浮动级别 | `setLevel(NSFloatingWindowLevel)`(PoC 实测;winit always_on_top 已自带 level 3,补丁增量在 collectionBehavior) |
 | 失焦隐藏 | eframe `WindowEvent::Focused(false)` → `ViewportCommand::Visible(false)`(官方) |
+| **显示路径(定案)** | 显示必须走 **native `orderFrontRegardless()`**(主线程经 DispatchQueue 投递)+ `ctx.request_repaint()`;**禁用 winit `Visible(true)` 唤起**——PoC-4 实测 eframe 0.37 对不可见窗口的跨线程唤起有 100ms 硬节流(`run.rs` 源码),唤起 132ms 超线;native 路径对外中位 **16.7ms**,且与 NSPanel 五要素(ADR-8)同路 |
 | 多屏定位 | 唤起时取鼠标所在屏(NSEvent.mouseLocation 或 winit monitor)→ 计算居中偏上坐标 → `set_outer_position`(官方) |
 | 无边框/透明/圆角 | `ViewportBuilder { decorations:false, transparent:true, ... }`(官方)+ egui 自绘圆角阴影 |
 | 置顶 | `with_always_on_top`(官方) |
@@ -162,7 +163,7 @@ pub fn execute_sorted(
 | PoC-1:跨 Space/浮动级别 | **已定稿通过**(NSPanel 改类五要素+两补丁,spike 双取证);NSPanel 改类的复杂度即代价(KVO 主题链路断→自建探测;关窗还原类防 abort) |
 | PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space / ⌃⌥⇧Space;⌃Space 族为系统输入法占用,不在候选池);以实机结果定默认 |
 | PoC-3:NSMenu 阻塞式弹出与 egui 事件循环 | NSMenu 弹出走嵌套 run loop(阻塞当前线程)——在 eframe 主线程弹出需验证无卡死/输入错乱;不通过则菜单弹出移至独立线程或改用 popUpMenuPositioningItem 非模态 |
-| PoC-4:eframe 隐藏 CPU 0% vs 唤起 <100ms 的两线拉扯 | 隐藏视口 `ControlFlow::Wait` 实测 CPU;唤起路径(热键事件 → 显示 → 首帧)实测延迟;若 >100ms 排查 `with_visible(false)` ↔ 显示的首帧成本(预渲染/keep-warm 折中) |
+| PoC-4:eframe 隐藏 CPU 0% vs 唤起 <100ms | **已定稿通过**:隐藏 119.9s 零帧 CPU 恒 0;唤起走 native `orderFrontRegardless`(对外中位 16.7ms / P99 56ms,红线内);egui `Visible(true)` 路径因 eframe 100ms 硬节流弃用;keep-warm 实测 0.8% CPU 纯亏不采 |
 | PoC-5:SMAppService + ad-hoc 签名的自启 | 先做注册/注销小验证再全量接;不通改用 LaunchAgent plist 兜底(功能等价,登录时启动) |
 | LSUIElement(无 Dock 图标)与键盘焦点 | 菜单栏应用接收键盘输入前常需显式 `NSApp.activate`;悬浮条唤起与完整窗口打开时逐一处处理(PoC-1 同批验证) |
 | .app 组装与随包引擎定位 | bundle.sh 组装后实机验证三种定位路径(随包命中/ PATH 兜底/全失败报错列路径) |
