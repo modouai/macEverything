@@ -64,17 +64,29 @@ pub enum Payload {
         stat_ms: f64,
         /// true = 结果来自落盘索引(daemon 不在),角标标注「离线索引」。
         offline: bool,
+        /// 实际生效的排序键回显(relevance/name/size/mtime/path;旧 daemon = 空串)。
+        /// 完整窗口比对 `requested_sort` 识别「排序未生效」,防静默错排序。
+        sort_echo: String,
+        /// 本次请求下发的排序键(None = relevance/未请求);随响应携带,与回显比对。
+        requested_sort: Option<&'static str>,
     },
-    /// 查询失败;engine_down = daemon 不可连(拉起中/未运行)。
-    Failed { engine_down: bool },
+    /// 查询失败;engine_down = daemon 不可连(拉起中/未运行);
+    /// code = 引擎响应错误码(None = 连接/离线路径失败)——「warming」= 索引未挂载,
+    /// 会话态进 Warming(tech 六态表),否则进 Error。
+    Failed {
+        engine_down: bool,
+        code: Option<String>,
+    },
 }
 
 /// 引擎状态(status 子命令数据面;悬浮条角标与完整窗口状态栏共用)。
 pub struct EngineStatus {
     pub state: String,
     pub entry_count: u32,
-    /// 权限缺口目录数(status.gaps;完整窗口缺口徽标用,悬浮条不显示)。
-    pub gaps: u32,
+    /// 权限缺口清单(status.gaps;完整窗口徽标与面板用,悬浮条不显示)。
+    pub gaps: Vec<protocol::Gap>,
+    /// 落盘索引生成时刻(unix 秒;0 = 未取)——离线状态栏「生成于 …」用。
+    pub built_at: u64,
 }
 
 /// 绘制产出的动作,交上层(`ui::App`)执行。
@@ -225,6 +237,7 @@ impl PaletteState {
                 elapsed_ms,
                 stat_ms,
                 offline,
+                ..
             } => {
                 self.results = entries;
                 self.total = total;
@@ -239,13 +252,14 @@ impl PaletteState {
                     self.session.mark_total(total); // 0 → Empty;>0 → 有结果
                 }
             }
-            Payload::Failed { engine_down } => {
+            Payload::Failed { engine_down, code } => {
                 self.results.clear();
                 self.total = 0;
                 if engine_down {
                     self.session.mark_engine_starting(); // daemon 不可连:引擎未就绪
                 } else {
-                    self.session.mark_error("query");
+                    // 错误码分流:warming = 索引未挂载 → 占位态(六态表),其余 → Error
+                    self.session.mark_error(code.as_deref().unwrap_or("query"));
                 }
             }
         }
@@ -633,26 +647,24 @@ pub(crate) fn spawn_query_worker(
                 elapsed_ms: out.elapsed_ms,
                 stat_ms: out.stat_ms,
                 offline: out.offline_built_at.is_some(),
+                sort_echo: out.sort_echo,
+                requested_sort: sort,
             },
             Err(err) => {
                 // 失败分流:daemon 不可连(引擎拉起中/未运行)与查询级错误,角标不同
                 let engine_down = client::connect(&paths).is_none();
-                log::warn!("查询失败(engine_down={engine_down}):{err}");
-                Payload::Failed { engine_down }
+                log::warn!(
+                    "查询失败(engine_down={engine_down}, code={}):{}",
+                    err.code.as_deref().unwrap_or("-"),
+                    err.message
+                );
+                Payload::Failed {
+                    engine_down,
+                    code: err.code,
+                }
             }
         };
-        let engine = match client::status(&paths) {
-            Ok(StatusOutcome::Reported(r)) => Some(EngineStatus {
-                state: r.state,
-                entry_count: r.entry_count,
-                gaps: r.gaps.len() as u32,
-            }),
-            Ok(StatusOutcome::NoIndex) => None,
-            Err(err) => {
-                log::warn!("引擎状态查询失败:{err}");
-                None
-            }
-        };
+        let engine = engine_status(&paths);
         let _ = tx.send(QueryResult {
             generation: fire.generation,
             payload,
@@ -662,6 +674,24 @@ pub(crate) fn spawn_query_worker(
         // 完整窗口:根视口隐藏期 eframe 走 run_logic,状态照常落地,不破隐藏零帧)。
         ctx.request_repaint_of(viewport);
     });
+}
+
+/// 引擎状态快照(查询线程顺带 / 完整窗口状态补查 / 重启后校准共用,勿复制第二份;
+/// 失败留痕返回 None——不静默)。
+pub(crate) fn engine_status(paths: &DaemonPaths) -> Option<EngineStatus> {
+    match client::status(paths) {
+        Ok(StatusOutcome::Reported(r)) => Some(EngineStatus {
+            state: r.state,
+            entry_count: r.entry_count,
+            gaps: r.gaps,
+            built_at: r.built_at,
+        }),
+        Ok(StatusOutcome::NoIndex) => None,
+        Err(err) => {
+            log::warn!("引擎状态查询失败:{err}");
+            None
+        }
+    }
 }
 
 /// 默认应用打开(reveal=false → 目录 = 访达进入)或访达显示(reveal=true,`open -R`)。
@@ -788,7 +818,8 @@ mod tests {
         let eng = |s: &str| EngineStatus {
             state: s.into(),
             entry_count: 12,
-            gaps: 0,
+            gaps: Vec::new(),
+            built_at: 0,
         };
         assert_eq!(
             badge_note(&State::Searching, Some(&eng("building"))).as_deref(),

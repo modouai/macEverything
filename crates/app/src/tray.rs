@@ -61,8 +61,10 @@ const ICON_FG: [u8; 3] = [255, 255, 255];
 pub enum TrayMsg {
     /// 左键点击 / 菜单「打开搜索」:切换悬浮条显示态。
     TogglePalette,
-    /// 菜单「打开完整窗口」/ 缺口项(唤起完整窗口;缺口面板 Task 19 接)。
+    /// 菜单「打开完整窗口」:唤起完整窗口并聚焦搜索框。
     OpenResults,
+    /// 缺口项:唤起完整窗口并展开缺口面板(product §3)。
+    OpenGaps,
     /// 菜单「开机自启」:Task 20 前占位(勾选态只在内存,见 `TrayRuntime::autostart_checked`)。
     ToggleAutostart,
     /// 菜单「退出」:退 App(引擎常驻,product §5)。
@@ -108,8 +110,8 @@ pub fn gaps_label(gaps: u32) -> String {
 fn dispatch(menu_id: &MenuId) -> Option<TrayMsg> {
     Some(match menu_id.0.as_str() {
         ids::STATE => TrayMsg::LaunchEngine,
-        // 缺口项点击:完整窗口(Task 19 接展开缺口清单;日志留痕在 spawn_menu_pump)。
-        ids::GAPS => TrayMsg::OpenResults,
+        // 缺口项:完整窗口 + 展开缺口面板(product §3;Task 19 接)
+        ids::GAPS => TrayMsg::OpenGaps,
         ids::OPEN_SEARCH => TrayMsg::TogglePalette,
         ids::OPEN_WINDOW => TrayMsg::OpenResults,
         ids::AUTOSTART => TrayMsg::ToggleAutostart,
@@ -325,9 +327,8 @@ fn spawn_menu_pump(ctx: egui::Context, tx: Sender<TrayMsg>) {
                     log::warn!("托盘菜单未知 id({}):忽略", event.id.0);
                     continue;
                 };
-                if msg == TrayMsg::OpenResults && event.id.0 == ids::GAPS {
-                    // 点击 → 唤起完整窗口(展开缺口清单 Task 19 接)
-                    log::info!("托盘缺口项点击:打开完整窗口(缺口面板 Task 19 接)");
+                if msg == TrayMsg::OpenGaps {
+                    log::info!("托盘缺口项点击:打开完整窗口并展开缺口面板");
                 }
                 if send_msg(&tx, msg) {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -500,7 +501,7 @@ mod tests {
     fn dispatch_maps_menu_ids() {
         let cases = [
             (ids::STATE, TrayMsg::LaunchEngine),
-            (ids::GAPS, TrayMsg::OpenResults),
+            (ids::GAPS, TrayMsg::OpenGaps),
             (ids::OPEN_SEARCH, TrayMsg::TogglePalette),
             (ids::OPEN_WINDOW, TrayMsg::OpenResults),
             (ids::AUTOSTART, TrayMsg::ToggleAutostart),

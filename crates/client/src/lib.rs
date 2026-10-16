@@ -128,6 +128,23 @@ pub struct QueryOutcome {
     pub offline_built_at: Option<u64>,
 }
 
+/// 查询失败(带响应错误码):UI 依码区分状态(如 `warming` = 索引未挂载,
+/// 见 session.rs 六态表);CLI 按 message 展示。连接/离线路径失败无码(code=None)。
+#[derive(Debug)]
+pub struct QueryError {
+    /// 引擎响应 Error.code;None = 连接建立/离线直读等无码失败。
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for QueryError {}
+
 /// 查询:daemon 在线走 socket;不在则直读落盘索引离线降级。
 /// sort = 列排序键(name/size/mtime/path);None = relevance(CLI 与 v1 调用方语义)。
 /// desc = 反转该键的自然方向(false = 自然方向,不发该字段——与 19b 前客户端同形);
@@ -138,10 +155,14 @@ pub fn query(
     limit: u32,
     sort: Option<&str>,
     desc: bool,
-) -> Result<QueryOutcome> {
+) -> Result<QueryOutcome, QueryError> {
     let limit = limit.min(RESULT_CAP);
+    let no_code = |e: anyhow::Error| QueryError {
+        code: None,
+        message: e.to_string(),
+    };
     if let Some(mut s) = connect(paths) {
-        let resp = expect_ok(call(
+        let resp = call(
             &mut s,
             &Request::Query {
                 v: protocol::PROTOCOL_VERSION,
@@ -152,7 +173,8 @@ pub fn query(
                 // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
                 desc: desc.then_some(true),
             },
-        )?)?;
+        )
+        .map_err(no_code)?;
         match resp {
             Response::Query {
                 entries,
@@ -168,10 +190,18 @@ pub fn query(
                 sort_echo,
                 offline_built_at: None,
             }),
-            other => bail!("意外响应: {other:?}"),
+            // Error 不并进 expect_ok:错误码须上行到 UI(状态呈现按码分流)
+            Response::Error { code, message } => Err(QueryError {
+                code: Some(code),
+                message,
+            }),
+            other => Err(QueryError {
+                code: None,
+                message: format!("意外响应: {other:?}"),
+            }),
         }
     } else {
-        offline_query(paths, q, limit)
+        offline_query(paths, q, limit).map_err(no_code)
     }
 }
 

@@ -22,8 +22,18 @@
 //! spawn_query_worker}`)、排序键 → 协议串(`palette::sort_str`)、打开动作
 //! (`palette::open_path`)自 palette 复用。Task 18(原生右键菜单)已接:右键行 →
 //! 标准表格语义收敛选中 → 原生 NSMenu(`platform::popup_menu`,阻塞弹出)→
-//! 动作执行(`ui/menu_actions.rs`);Task 19(缺口面板/sort_echo/状态栏补全)
-//! 在本文件基础上加。
+//! 动作执行(`ui/menu_actions.rs`)。
+//!
+//! ## Task 19 状态栏补全(缺口面板 / sort_echo / 重启引擎)
+//!
+//! - 三段:计数(总数/耗时) · 索引状态(§7 完整窗口列,离线带生成时刻) · 缺口徽标;
+//! - 缺口徽标(⚠ N 个目录未收录,`tray::gaps_label` 同文案)→ 点击展开面板:
+//!   逐行「目录 + 原因」,数据 = status.gaps(与 CLI `status` 同源,展示口径同款:
+//!   最多 20 行 + 余量计数);
+//! - sort_echo 校验:请求了非 relevance 键而回显为空(旧 daemon)或异键 → 该响应
+//!   的排序未生效,状态栏红字 +「重启引擎」按钮(stop → start,`client::stop` +
+//!   `engine_launcher::ensure_engine`);重启完成清提示并按当前列/方向重查;
+//! - 「排序中…」= `sorting_inflight`(fire 置位、当代响应落地清除,见 `apply`)。
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -31,12 +41,14 @@ use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::engine_launcher;
 use crate::platform;
 use crate::session::{Session, SortKey, State};
+use crate::tray;
 use crate::ui::menu_actions;
 use crate::ui::palette::{self, EngineStatus, Payload, QueryResult};
-use client::{DaemonPaths, StatusOutcome};
-use protocol::HitEntry;
+use client::DaemonPaths;
+use protocol::{Gap, HitEntry};
 
 /// 查询上限(与悬浮条同口径:协议上限一次取满;product §2「展示前 K 条」的 K)。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
@@ -74,11 +86,16 @@ pub struct ResultsState {
     pub anchor: Option<usize>,
     /// 排序/查询在途(状态栏「排序中…」;fire 置位,当代响应到达清除)。
     pub sorting_inflight: bool,
+    /// 排序未生效:请求了非 relevance 键但响应回显为空(旧 daemon)或异键
+    /// (离线路径恒回 relevance 亦落此)。状态栏红字 +「重启引擎」按钮。
+    pub sort_stale: bool,
+    /// 引擎重启在途(按钮点击后显示「重启中…」并禁重复发起)。
+    pub engine_restarting: bool,
+    /// 缺口面板展开态(徽标点击切换;缺口归零或结果会话更替时收起)。
+    pub gaps_open: bool,
     pub input: String,
     /// 瞬时提示(打开失败/查询失败;显示于状态栏)。
     pub status_note: Option<String>,
-    /// 缺口徽标:未收录目录数(0 = 不显示;点击展开面板 Task 19 接)。
-    pub gaps_badge: Option<usize>,
     /// 引擎状态快照(status 面;状态栏「索引状态」段)。
     engine: Option<EngineStatus>,
     /// 是否已取过一次引擎状态(区分「未检查」与「引擎未运行」)。
@@ -98,6 +115,15 @@ pub struct ResultsState {
     /// 状态补查通道(独立小通道;无代际语义,与查询结果互不干扰)。
     status_tx: mpsc::Sender<Option<EngineStatus>>,
     status_rx: mpsc::Receiver<Option<EngineStatus>>,
+    /// 引擎重启结果通道(sort_echo 未生效的修复动作;worker → tick)。
+    restart_tx: mpsc::Sender<RestartOutcome>,
+    restart_rx: mpsc::Receiver<RestartOutcome>,
+}
+
+/// 引擎重启结果(worker → tick);失败带可展示文案(落状态栏,不静默)。
+enum RestartOutcome {
+    Ok,
+    Err(String),
 }
 
 impl ResultsState {
@@ -106,6 +132,7 @@ impl ResultsState {
     pub fn new(ctx: egui::Context, paths: DaemonPaths) -> Self {
         let (tx, rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
+        let (restart_tx, restart_rx) = mpsc::channel();
         Self {
             session: Session::new(palette::DEBOUNCE),
             results: Vec::new(),
@@ -117,9 +144,11 @@ impl ResultsState {
             selection: BTreeSet::new(),
             anchor: None,
             sorting_inflight: false,
+            sort_stale: false,
+            engine_restarting: false,
+            gaps_open: false,
             input: String::new(),
             status_note: None,
-            gaps_badge: None,
             engine: None,
             engine_known: false,
             // 启动即显示窗口(dev 形态):首帧补查状态 + 聚焦搜索框。
@@ -133,6 +162,8 @@ impl ResultsState {
             rx,
             status_tx,
             status_rx,
+            restart_tx,
+            restart_rx,
         }
     }
 
@@ -141,6 +172,13 @@ impl ResultsState {
     pub fn on_window_shown(&mut self) {
         self.focus_input_pending = true;
         self.status_refresh_pending = true;
+    }
+
+    /// 托盘缺口项(product §3):唤起完整窗口并展开缺口面板。
+    /// 缺口清单经 `on_window_shown` 触发的状态补查落地(面板内容 = status.gaps)。
+    pub fn open_gaps(&mut self) {
+        self.gaps_open = true;
+        self.on_window_shown();
     }
 
     /// 悬浮条 ⌥↵:把查询词灌入并立即查询(清旧结果——旧词结果不得在新词下滞留;
@@ -155,6 +193,7 @@ impl ResultsState {
         self.anchor = None;
         self.status_note = None;
         self.sorting_inflight = false;
+        self.sort_stale = false; // 旧结果作废 → 排序警示随旧结果清
         if !q.is_empty() {
             // 防抖到期帧(调用点在悬浮条 pass,须定向 ROOT)
             self.ctx
@@ -163,7 +202,7 @@ impl ResultsState {
     }
 
     /// 每帧驱动(App::logic 调用;根窗隐藏期也经 run_logic 收取响应,状态不落后):
-    /// 补查状态 → 防抖到期发查询 → 收两路回投。
+    /// 补查状态 → 防抖到期发查询 → 收三路回投(结果/状态/重启)。
     pub fn tick(&mut self, now: Instant) {
         if self.status_refresh_pending {
             self.status_refresh_pending = false;
@@ -187,9 +226,22 @@ impl ResultsState {
             self.engine = engine;
             self.engine_known = true;
         }
-        // 缺口徽标跟随引擎快照:查询回投与状态补查两路都在此同步
-        // (只开窗不查询时,补查也要能亮徽标)。
-        self.gaps_badge = self.engine.as_ref().map(|e| e.gaps as usize);
+        while let Ok(outcome) = self.restart_rx.try_recv() {
+            self.apply_restart(outcome);
+        }
+        // 缺口徽标与面板都读引擎快照(查询回投与状态补查两路都在此同步):
+        // 归零即收起面板(徽标同源消失,面板不留悬空)。
+        if self.gaps().is_empty() {
+            self.gaps_open = false;
+        }
+    }
+
+    /// 缺口清单(status.gaps;引擎快照为真源,徽标计数与面板逐行同读此处)。
+    fn gaps(&self) -> &[Gap] {
+        self.engine
+            .as_ref()
+            .map(|e| e.gaps.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 一次性引擎状态补查(独立小通道;失败留痕并置「未知」——不静默)。
@@ -198,18 +250,7 @@ impl ResultsState {
         let ctx = self.ctx.clone();
         let tx = self.status_tx.clone();
         std::thread::spawn(move || {
-            let engine = match client::status(&paths) {
-                Ok(StatusOutcome::Reported(r)) => Some(EngineStatus {
-                    state: r.state,
-                    entry_count: r.entry_count,
-                    gaps: r.gaps.len() as u32,
-                }),
-                Ok(StatusOutcome::NoIndex) => None,
-                Err(err) => {
-                    log::warn!("完整窗口状态补查失败:{err}");
-                    None
-                }
-            };
+            let engine = palette::engine_status(&paths);
             let _ = tx.send(engine);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
         });
@@ -229,6 +270,8 @@ impl ResultsState {
                 elapsed_ms,
                 stat_ms,
                 offline,
+                sort_echo,
+                requested_sort,
             } => {
                 self.results = entries;
                 self.total = total;
@@ -237,23 +280,37 @@ impl ResultsState {
                 self.selection.clear();
                 self.anchor = None;
                 self.status_note = None;
+                // sort_echo 校验(tech 定案):请求了非 relevance 键而回显为空
+                // (旧 daemon 忽略 sort)或异键 → 本响应排序未生效,不静默展示。
+                // 离线路径恒回 relevance,请求列排序时同落此分支(重启引擎即修复,
+                // 见 restart_engine 对「daemon 未在运行」的容错)。
+                self.sort_stale = sort_not_applied(requested_sort, &sort_echo);
+                if self.sort_stale {
+                    log::warn!("排序未生效:请求 {requested_sort:?} 回显 {sort_echo:?}(旧引擎?)");
+                }
                 if offline {
                     self.session.mark_offline();
                 } else {
                     self.session.mark_total(total);
                 }
             }
-            Payload::Failed { engine_down } => {
+            Payload::Failed { engine_down, code } => {
                 self.results.clear();
                 self.total = 0;
                 self.selection.clear();
                 self.anchor = None;
+                self.sort_stale = false; // 结果已清,排序警示随旧结果作废
                 if engine_down {
                     self.session.mark_engine_starting();
                     self.status_note = Some("引擎未就绪".into());
                 } else {
-                    self.session.mark_error("query");
-                    self.status_note = Some("查询失败".into());
+                    // 错误码分流(tech 六态表):warming = 索引未挂载 → 占位态,
+                    // 红字换中性(状态栏索引状态段与空态提示承担呈现)。
+                    self.session.mark_error(code.as_deref().unwrap_or("query"));
+                    self.status_note = match self.session.state {
+                        State::Warming => None,
+                        _ => Some("查询失败".into()),
+                    };
                 }
             }
         }
@@ -287,6 +344,7 @@ impl ResultsState {
         let mut open_row: Option<usize> = None;
         let mut context_click: Option<(usize, egui::Pos2)> = None;
         let mut gaps_clicked = false;
+        let mut restart_clicked = false;
         let (shift_down, cmd_down) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
 
         // 行间无缝(item_spacing.y = 0):选中/斑马底连成整块(表格式观感)。
@@ -311,8 +369,13 @@ impl ResultsState {
             })
             .inner;
 
-        // —— 底部:状态栏骨架(N 项 · 匹配/读取 ms · 索引状态 | 排序中 | 缺口徽标 | 提示)——
+        // —— 底部:状态栏(N 项 · 匹配/读取 ms | 索引状态 | 排序中 | 排序未生效
+        //    (红字 + 重启按钮)| 缺口徽标 | 提示)+ 缺口面板(展开时在上,状态行恒驻底)——
         egui::Panel::bottom("results-status").show(ui, |ui| {
+            let gaps = self.gaps();
+            if self.gaps_open && !gaps.is_empty() {
+                draw_gaps_panel(ui, gaps);
+            }
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -327,17 +390,33 @@ impl ResultsState {
                     .weak(),
                 );
                 ui.separator();
-                if let Some(note) = index_note(self.engine.as_ref(), self.engine_known) {
+                if let Some(note) =
+                    index_note(self.engine.as_ref(), &self.session.state, self.engine_known)
+                {
                     ui.label(egui::RichText::new(note).small().weak());
                 }
                 if self.sorting_inflight {
                     ui.label(egui::RichText::new("排序中…").small().weak());
                 }
-                let gaps = self.gaps_badge.unwrap_or(0);
-                if gaps > 0 {
+                // 排序未生效(tech 定案:请求键与回显不符):红字 + 重启引擎动作
+                if self.sort_stale {
                     let warn = ui.visuals().warn_fg_color;
+                    ui.label(
+                        egui::RichText::new("引擎版本过旧,排序未生效")
+                            .small()
+                            .color(warn),
+                    );
+                    if self.engine_restarting {
+                        ui.label(egui::RichText::new("重启中…").small().weak());
+                    } else if ui.button(egui::RichText::new("重启引擎").small()).clicked() {
+                        restart_clicked = true;
+                    }
+                }
+                if !gaps.is_empty() {
+                    let warn = ui.visuals().warn_fg_color;
+                    // 文案与托盘缺口项同源(tray::gaps_label,product §2/§3 逐字)
                     let badge = egui::Label::new(
-                        egui::RichText::new(format!("⚠ {gaps} 个目录未收录"))
+                        egui::RichText::new(tray::gaps_label(gaps.len() as u32))
                             .small()
                             .color(warn),
                     )
@@ -462,7 +541,17 @@ impl ResultsState {
             self.open_context_menu(i, pos, frame);
         }
         if gaps_clicked {
-            log::info!("缺口徽标点击:展开缺口清单(Task 19 接面板)");
+            self.gaps_open = !self.gaps_open;
+            log::info!(
+                "缺口徽标点击:{}缺口面板(共 {} 个目录)",
+                if self.gaps_open { "展开" } else { "收起" },
+                self.gaps().len()
+            );
+            // 面板增删发生在绘制之后:排下一帧刷出(点击帧内容为旧态)
+            self.ctx.request_repaint();
+        }
+        if restart_clicked {
+            self.restart_engine();
         }
 
         // —— 输入变更 → 防抖查询(预编辑文本不上屏不触发;与悬浮条同款)——
@@ -476,6 +565,7 @@ impl ResultsState {
                 self.selection.clear();
                 self.anchor = None;
                 self.status_note = None;
+                self.sort_stale = false;
             } else {
                 ctx.request_repaint_after(palette::DEBOUNCE);
             }
@@ -501,6 +591,63 @@ impl ResultsState {
             .on_sort_change(key, request_desc(key, self.sort_asc), Instant::now());
         self.ctx
             .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
+    }
+
+    /// 重启引擎(排序未生效的修复动作;tech 定案:随包 CLI stop → start)。
+    /// 阻塞(stop 往返 + 拉起 ≤3s 连通轮询)放工作线程;在途期间按钮显示「重启中…」。
+    /// 停失败分两类:daemon 未在运行(离线场景)= 无需停,不阻断启动;其余如实留痕。
+    fn restart_engine(&mut self) {
+        if self.engine_restarting {
+            log::warn!("重启引擎:已在途,忽略重复发起");
+            return;
+        }
+        self.engine_restarting = true;
+        log::info!("排序未生效:重启引擎(stop → start)");
+        self.ctx.request_repaint(); // 置位发生在绘制之后:排下一帧刷出「重启中…」
+        let paths = self.paths.clone();
+        let ctx = self.ctx.clone();
+        let tx = self.restart_tx.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            match client::stop(&paths) {
+                Ok(n) => log::info!("重启引擎:已停 daemon(最终 {n} 条)"),
+                Err(err) => log::info!("重启引擎:停止跳过({err})"),
+            }
+            let outcome = match engine_launcher::ensure_engine(&paths) {
+                Ok(()) => {
+                    log::info!("重启引擎:新引擎就绪({}ms)", t0.elapsed().as_millis());
+                    RestartOutcome::Ok
+                }
+                Err(err) => {
+                    log::warn!("重启引擎失败:{err:#}");
+                    RestartOutcome::Err(format!("引擎重启失败:{err}"))
+                }
+            };
+            let _ = tx.send(outcome);
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+    }
+
+    /// 重启结果落地(tick 收取):成功 → 清红字 + 状态补查 + 按当前列/方向重查
+    /// (新引擎接管后排序才真正生效);失败 → 红字保留 + 状态栏提示原因(不静默)。
+    fn apply_restart(&mut self, outcome: RestartOutcome) {
+        self.engine_restarting = false;
+        match outcome {
+            RestartOutcome::Ok => {
+                self.sort_stale = false;
+                // 新引擎状态校准(索引状态段),并按当前列/方向同串重查
+                // (与列头点击同一路径:新引擎接管后排序才真正生效)
+                self.status_refresh_pending = true;
+                self.session.on_sort_change(
+                    self.sort,
+                    request_desc(self.sort, self.sort_asc),
+                    Instant::now(),
+                );
+                self.ctx
+                    .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
+            }
+            RestartOutcome::Err(msg) => self.status_note = Some(msg),
+        }
     }
 
     /// 右键菜单(Task 18):标准表格语义先把点击行并入选中(不在选中集 → 单选它),
@@ -653,20 +800,79 @@ fn counts_text(total: u32, shown: usize, elapsed_ms: f64, stat_ms: f64) -> Strin
     s
 }
 
-/// 索引状态段(product §7 完整窗口列;skeleton 版——缺口面板/sort_echo 提示 Task 19 细化)。
+/// sort_echo 校验(tech 定案,纯函数):仅「请求了非 relevance 键」时校验回显——
+/// 缺省/relevance 不校验(旧 daemon 无 echo 字段亦兼容)。回显为空串(旧 daemon
+/// 忽略 sort)或异键 = 排序未生效。desc 方向不在 echo 范围(Task 19b 定案),
+/// 不比对:文案只说排序未生效,不声称方向。
+fn sort_not_applied(requested: Option<&str>, echo: &str) -> bool {
+    requested.is_some_and(|key| echo != key)
+}
+
+/// 缺口清单展示切片(与 CLI `status` 同口径:最多 20 行 + 余量计数)。
+fn gaps_display(gaps: &[Gap]) -> (&[Gap], usize) {
+    const MAX: usize = 20;
+    let shown = gaps.len().min(MAX);
+    (&gaps[..shown], gaps.len() - shown)
+}
+
+/// 缺口面板(状态栏上方:标题 + 逐行「目录 + 原因」;超 20 行给余量计数)。
+/// 数据 = status.gaps(与 CLI `status` 同源;行格式同 CLI 口径)。
+fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
+    let (rows, rest) = gaps_display(gaps);
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(format!("权限缺口({} 个目录,未收录):", gaps.len()))
+            .small()
+            .weak(),
+    );
+    egui::ScrollArea::vertical()
+        .max_height(140.0)
+        .id_salt("gaps-panel")
+        .show(ui, |ui| {
+            for g in rows {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(egui::RichText::new(&g.path).small());
+                    ui.label(
+                        egui::RichText::new(format!("({})", g.reason))
+                            .small()
+                            .weak(),
+                    );
+                });
+            }
+        });
+    if rest > 0 {
+        ui.label(
+            egui::RichText::new(format!("… 其余 {rest} 个"))
+                .small()
+                .weak(),
+        );
+    }
+    ui.add_space(2.0);
+}
+
+/// 索引状态段(product §7 完整窗口列)。引擎快照优先;快照缺失(未运行/取不到)时
+/// 会话态兜底(与悬浮条角标同口径:warming/引擎拉起中可见)。
 /// 返回 None = 尚未取到(窗口刚开、状态补查未回),不占位。
-fn index_note(engine: Option<&EngineStatus>, known: bool) -> Option<String> {
-    match engine {
-        Some(e) => Some(match e.state.as_str() {
+fn index_note(engine: Option<&EngineStatus>, state: &State, known: bool) -> Option<String> {
+    if let Some(e) = engine {
+        return Some(match e.state.as_str() {
             client::state::BUILDING => format!("索引构建中({} 条)", e.entry_count),
             client::state::READY => "就绪".into(),
             client::state::RECONCILING => "索引补齐中(结果可能不全)".into(),
             client::state::DEGRADED => "索引重扫中(结果可能不全)".into(),
-            client::state::OFFLINE => "离线索引".into(),
+            client::state::OFFLINE => {
+                format!("离线索引 · 生成于 {}", mtime_text(Some(e.built_at)))
+            }
             other => other.to_string(),
-        }),
-        None if known => Some("引擎未运行".into()),
-        None => None,
+        });
+    }
+    match state {
+        State::Warming => Some("索引构建中".into()),
+        State::EngineStarting => Some("引擎启动中".into()),
+        State::Offline => Some("离线索引".into()), // 无快照:生成时刻不可得
+        _ if known => Some("引擎未运行".into()),
+        _ => None,
     }
 }
 
@@ -863,37 +1069,355 @@ mod tests {
 
     #[test]
     fn index_note_six_states() {
-        let eng = |s: &str| EngineStatus {
+        let idle = State::Idle;
+        let eng = |s: &str, built_at: u64| EngineStatus {
             state: s.into(),
             entry_count: 12,
-            gaps: 0,
+            gaps: Vec::new(),
+            built_at,
         };
         assert_eq!(
-            index_note(Some(&eng(client::state::BUILDING)), true).as_deref(),
+            index_note(Some(&eng(client::state::BUILDING, 0)), &idle, true).as_deref(),
             Some("索引构建中(12 条)")
         );
         assert_eq!(
-            index_note(Some(&eng(client::state::READY)), true).as_deref(),
+            index_note(Some(&eng(client::state::READY, 0)), &idle, true).as_deref(),
             Some("就绪")
         );
         assert_eq!(
-            index_note(Some(&eng(client::state::RECONCILING)), true).as_deref(),
+            index_note(Some(&eng(client::state::RECONCILING, 0)), &idle, true).as_deref(),
             Some("索引补齐中(结果可能不全)")
         );
         assert_eq!(
-            index_note(Some(&eng(client::state::DEGRADED)), true).as_deref(),
+            index_note(Some(&eng(client::state::DEGRADED, 0)), &idle, true).as_deref(),
             Some("索引重扫中(结果可能不全)")
         );
+        // 离线带生成时刻(§7 完整窗口列「离线索引 · 生成于 …」;0 = 未取 → 占位)
         assert_eq!(
-            index_note(Some(&eng(client::state::OFFLINE)), true).as_deref(),
-            Some("离线索引")
+            index_note(Some(&eng(client::state::OFFLINE, 0)), &idle, true).as_deref(),
+            Some("离线索引 · 生成于 —")
         );
         assert_eq!(
-            index_note(None, true).as_deref(),
+            index_note(
+                Some(&eng(client::state::OFFLINE, 1_700_000_000)),
+                &idle,
+                true
+            ),
+            Some(format!("离线索引 · 生成于 {}", fmt_mtime(1_700_000_000)))
+        );
+        assert_eq!(
+            index_note(None, &idle, true).as_deref(),
             Some("引擎未运行"),
             "已查过且无状态 = 未运行/无索引"
         );
-        assert_eq!(index_note(None, false), None, "未查过不占位");
+        assert_eq!(index_note(None, &idle, false), None, "未查过不占位");
+    }
+
+    /// 快照缺失时会话态兜底(六态全出口:warming / 引擎拉起中 / 离线在状态栏可见)。
+    #[test]
+    fn index_note_falls_back_to_session_state() {
+        assert_eq!(
+            index_note(None, &State::Warming, true).as_deref(),
+            Some("索引构建中"),
+            "warming(索引未挂载)占位非错误"
+        );
+        assert_eq!(
+            index_note(None, &State::EngineStarting, true).as_deref(),
+            Some("引擎启动中")
+        );
+        assert_eq!(
+            index_note(None, &State::Offline, true).as_deref(),
+            Some("离线索引"),
+            "无快照:生成时刻不可得,只报离线"
+        );
+        // 有快照时快照优先(会话态不覆盖)
+        let eng = EngineStatus {
+            state: client::state::READY.into(),
+            entry_count: 1,
+            gaps: Vec::new(),
+            built_at: 0,
+        };
+        assert_eq!(
+            index_note(Some(&eng), &State::Warming, true).as_deref(),
+            Some("就绪")
+        );
+    }
+
+    /// sort_echo 校验表(tech 定案):缺省/relevance 不校验(旧 daemon 兼容);
+    /// 请求列键而回显空串(旧 daemon)或异键 → 排序未生效。
+    #[test]
+    fn sort_not_applied_only_for_column_requests() {
+        assert!(!sort_not_applied(None, ""), "无排序/缺省 relevance:不校验");
+        assert!(!sort_not_applied(None, "relevance"));
+        assert!(!sort_not_applied(Some("size"), "size"), "回显相符");
+        assert!(!sort_not_applied(Some("mtime"), "mtime"));
+        assert!(
+            sort_not_applied(Some("size"), ""),
+            "空串 = 旧 daemon 忽略 sort"
+        );
+        assert!(sort_not_applied(Some("size"), "relevance"), "回显不符");
+        assert!(sort_not_applied(Some("mtime"), "size"), "回显异键");
+    }
+
+    /// 缺口清单展示切片:与 CLI status 同口径(20 行封顶 + 余量计数)。
+    #[test]
+    fn gaps_display_caps_at_20_rows() {
+        let g = |i: usize| Gap {
+            path: format!("/root/{i}"),
+            reason: "Permission denied".into(),
+        };
+        let all: Vec<Gap> = (0..25).map(g).collect();
+        let (rows, rest) = gaps_display(&all);
+        assert_eq!(rows.len(), 20, "前 20 行");
+        assert_eq!(rest, 5, "余量计数");
+        assert_eq!(rows[0].path, "/root/0");
+        assert_eq!(rows[19].path, "/root/19");
+        let few: Vec<Gap> = (0..3).map(g).collect();
+        let (rows, rest) = gaps_display(&few);
+        assert_eq!((rows.len(), rest), (3, 0), "不足 20 全展示");
+    }
+
+    /// 测试用命中响应(字段缺省值集中一处)。
+    fn hits_resp(generation: u64, sort_echo: &str, requested: Option<&'static str>) -> QueryResult {
+        QueryResult {
+            generation,
+            payload: Payload::Hits {
+                entries: Vec::new(),
+                total: 0,
+                elapsed_ms: 0.0,
+                stat_ms: 0.0,
+                offline: false,
+                sort_echo: sort_echo.into(),
+                requested_sort: requested,
+            },
+            engine: None,
+        }
+    }
+
+    /// 排序请求生命周期:代际丢弃不动在途;当代响应清「排序中…」并按回显落警示;
+    /// 失败清警示(结果已清,旧排序无意义)。
+    #[test]
+    fn sorting_inflight_and_sort_echo_warning_lifecycle() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx, daemon_paths_for_test());
+        let now = Instant::now();
+        st.session.on_input("报告", now);
+        let fire = st
+            .session
+            .pending_at(now + palette::DEBOUNCE)
+            .expect("防抖到期应发起");
+        st.sorting_inflight = true; // tick 的置位动作(线程不跑;排序中提示 = 此位)
+
+        // 旧代响应:丢弃——排序中保持、警示不落
+        st.apply(hits_resp(fire.generation - 1, "", Some("size")));
+        assert!(st.sorting_inflight, "旧代丢弃,在途保持");
+        assert!(!st.sort_stale, "旧代不落警示");
+
+        // 当代响应 + 旧 daemon 空回显:排序中解除、警示亮起
+        st.apply(hits_resp(fire.generation, "", Some("size")));
+        assert!(!st.sorting_inflight, "当代响应清「排序中…」");
+        assert!(st.sort_stale, "请求 size 回显空串 = 排序未生效");
+
+        // 回显相符的响应:警示清除
+        st.session.on_input("报告", now);
+        let fire2 = st
+            .session
+            .pending_at(now + palette::DEBOUNCE * 2)
+            .expect("第二次发起");
+        st.apply(hits_resp(fire2.generation, "size", Some("size")));
+        assert!(!st.sort_stale, "回显相符即清警示");
+
+        // 失败:警示一并清(结果已清)
+        st.apply(hits_resp(fire2.generation, "", Some("size")));
+        assert!(st.sort_stale);
+        st.session.on_input("报告", now);
+        let fire3 = st
+            .session
+            .pending_at(now + palette::DEBOUNCE * 3)
+            .expect("第三次发起");
+        st.apply(QueryResult {
+            generation: fire3.generation,
+            payload: Payload::Failed {
+                engine_down: false,
+                code: Some("warming".into()),
+            },
+            engine: None,
+        });
+        assert!(!st.sort_stale, "失败响应不携带排序结论");
+        assert!(
+            matches!(st.session.state, State::Warming),
+            "错误码分流到 Warming"
+        );
+        assert_eq!(st.status_note, None, "warming 占位非错误:不给红字");
+    }
+
+    /// 重启动作落地:成功 → 清红字 + 按当前列/方向同串重查;失败 → 红字保留 + 提示原因。
+    #[test]
+    fn restart_outcome_clears_warning_and_refires() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx, daemon_paths_for_test());
+        let now = Instant::now();
+        st.session.on_input("报告", now);
+        let fire = st
+            .session
+            .pending_at(now + palette::DEBOUNCE)
+            .expect("防抖到期应发起");
+        st.apply(hits_resp(fire.generation, "", Some("size")));
+        assert!(st.sort_stale);
+
+        // 在途:重复发起被忽略(按钮态)
+        st.engine_restarting = true;
+        st.restart_engine();
+        assert!(st.engine_restarting, "在途不重复发起");
+
+        // 成功落地:清红字,并按当前列/方向重查(列头点击同一路径)
+        st.sort = SortKey::Size;
+        st.sort_asc = true;
+        st.apply_restart(RestartOutcome::Ok);
+        assert!(!st.engine_restarting);
+        assert!(!st.sort_stale, "重启成功清红字");
+        assert!(st.status_refresh_pending, "重启后补查引擎状态");
+        let refire = st
+            .session
+            .pending_at(now + palette::DEBOUNCE * 2)
+            .expect("重启后同串重查");
+        assert_eq!(refire.query, "报告");
+        assert_eq!(refire.sort, SortKey::Size, "按当前列重查");
+        assert!(!refire.desc, "Size 升 = 自然方向");
+
+        // 失败落地:红字保留 + 原因可见(不静默)
+        st.sort_stale = true;
+        st.apply_restart(RestartOutcome::Err("引擎重启失败:x".into()));
+        assert!(st.sort_stale, "失败不清红字(排序仍未生效)");
+        assert!(!st.engine_restarting);
+        assert_eq!(st.status_note.as_deref(), Some("引擎重启失败:x"));
+    }
+
+    /// 缺口面板:展开态随缺口归零自动收起;徽标/面板/红字/按钮出帧不 panic。
+    #[test]
+    fn gaps_panel_toggle_and_auto_close() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        let gap = |p: &str| Gap {
+            path: p.into(),
+            reason: "Permission denied (os error 13)".into(),
+        };
+        st.engine = Some(EngineStatus {
+            state: client::state::READY.into(),
+            entry_count: 3,
+            gaps: vec![gap("/private/a"), gap("/private/b")],
+            built_at: 0,
+        });
+        st.engine_known = true;
+        assert_eq!(st.gaps().len(), 2, "徽标计数 = status.gaps");
+
+        // 展开(徽标点击的落地;tray 缺口项 = open_gaps 同置位)+ 红字/按钮同帧
+        st.gaps_open = true;
+        st.sort_stale = true;
+        run_frame(&ctx, &mut st);
+        assert!(st.gaps_open, "帧绘制不动展开态");
+
+        // 缺口归零 → tick 自动收起(徽标同源消失,面板不留悬空)
+        st.engine = Some(EngineStatus {
+            state: client::state::READY.into(),
+            entry_count: 3,
+            gaps: Vec::new(),
+            built_at: 0,
+        });
+        st.tick(Instant::now());
+        assert!(!st.gaps_open, "缺口归零即收起");
+        run_frame(&ctx, &mut st);
+    }
+
+    /// warming(索引未挂载)端到端:桩 daemon 按线上协议回 `Error{code:"warming"}`。
+    /// 真实 daemon 的该窗口只在进程启动到索引挂载之间(毫秒级,无法稳定复现),
+    /// 桩锁全链:响应码 → QueryError.code → Payload::Failed → State::Warming →
+    /// 占位文案(非红字),覆盖 Task 19 新增的错误码接线。
+    #[test]
+    fn warming_code_from_daemon_renders_placeholder() {
+        use std::io::{Read, Write};
+
+        let dir = std::env::temp_dir().join(format!("mce-warming-stub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建桩数据目录");
+        let sock = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("绑定桩 socket");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut len = [0u8; 4];
+                if s.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let n = u32::from_le_bytes(len) as usize;
+                let mut buf = vec![0u8; n];
+                if s.read_exact(&mut buf).is_err() {
+                    continue;
+                }
+                let Ok(req) = protocol::decode_request(&buf) else {
+                    continue;
+                };
+                let resp = match req {
+                    // 查询:索引未挂载(daemon.rs 同文案)
+                    protocol::Request::Query { .. } => protocol::Response::Error {
+                        code: "warming".into(),
+                        message: "索引构建中,暂不可查".into(),
+                    },
+                    // 其余(状态补查):构建中快照
+                    _ => protocol::Response::Status {
+                        state: client::state::BUILDING.into(),
+                        entry_count: 0,
+                        gaps: Vec::new(),
+                        io_error_count: 0,
+                        built_at: 0,
+                        index_file: "/stub/index.bin".into(),
+                    },
+                };
+                let body = protocol::encode(&resp).expect("编码桩响应");
+                let _ = s.write_all(&body);
+                let _ = s.flush();
+            }
+        });
+
+        let mut h = LiveHarness::new(DaemonPaths {
+            data_dir: dir.clone(),
+        });
+        h.st.set_query("报告");
+        h.settle();
+        assert!(
+            matches!(h.st.session.state, State::Warming),
+            "warming 码 → Warming 占位态(实际 {:?})",
+            h.st.session.state
+        );
+        assert_eq!(h.st.status_note, None, "占位非错误:不给红字");
+        assert!(h.st.results.is_empty());
+        // 状态栏文案:引擎快照(building)优先 → §7「索引构建中(N 条)」
+        let note = index_note(h.st.engine.as_ref(), &h.st.session.state, h.st.engine_known);
+        assert_eq!(note.as_deref(), Some("索引构建中(0 条)"));
+        h.frame(); // 文案上屏(出帧不 panic)
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 测试数据目录(不存在的路径:任何线程(spawn_status)在隔离下快速失败,不碰真实数据)。
+    fn daemon_paths_for_test() -> DaemonPaths {
+        DaemonPaths {
+            data_dir: std::path::PathBuf::from("/nonexistent-mce-test"),
+        }
+    }
+
+    /// 单帧绘制(无后端;纹理增量显式清空——epaint 要求:不处理须 clear)。
+    fn run_frame(ctx: &egui::Context, st: &mut ResultsState) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None));
+        out.textures_delta.clear();
     }
 
     #[test]
@@ -931,8 +1455,216 @@ mod tests {
     //       live_results_window_walkthrough --nocapture
     // ⚠ 排序断言要求 daemon 含 Task 8b 的 sort + Task 19b 的 desc 支持:旧版 daemon
     //    静默忽略 sort(退 relevance)或忽略 desc(降序请求回升序,排序断言失败即
-    //    此因);换当前构建起的 daemon 再跑(Task 19 的 sort_echo 校验接上后
-    //    「排序未生效」在界面上可见)。
+    //    此因);换当前构建起的 daemon 再跑。
+    //
+    // Task 19 新增两条走查(见各自注释的场景与前置):
+    //   live_sort_echo_old_daemon_restart(旧 daemon → 红字 → 重启 → 生效)
+    //   live_gaps_badge_and_states(缺口徽标/面板数据 + 离线文案)
+
+    /// 隔离/真实共用的数据目录(HOME 派生;与 CLI/App 同规)。
+    fn live_paths() -> DaemonPaths {
+        let home = std::env::var_os("HOME").expect("HOME 未设置");
+        DaemonPaths {
+            data_dir: std::path::PathBuf::from(home)
+                .join("Library/Application Support/macEverything"),
+        }
+    }
+
+    /// 走查台(Task 19 两条走查共用):一帧 = tick + draw(无后端;1200×800 画布)。
+    struct LiveHarness {
+        ctx: egui::Context,
+        st: ResultsState,
+    }
+
+    impl LiveHarness {
+        fn new(paths: DaemonPaths) -> Self {
+            let ctx = egui::Context::default();
+            let st = ResultsState::new(ctx.clone(), paths);
+            Self { ctx, st }
+        }
+
+        fn frame(&mut self) {
+            self.st.tick(Instant::now());
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let Self { ctx, st } = self;
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None));
+            out.textures_delta.clear(); // 无后端消费;epaint 要求:不处理须 clear
+        }
+
+        /// 防抖到期 + 排帧至在途结束;返回是否观测到「排序中…」期。
+        fn settle(&mut self) -> bool {
+            std::thread::sleep(std::time::Duration::from_millis(90));
+            let deadline = Instant::now() + std::time::Duration::from_secs(20);
+            let mut saw = false;
+            loop {
+                self.frame();
+                saw |= self.st.sorting_inflight;
+                if !self.st.sorting_inflight {
+                    return saw;
+                }
+                assert!(Instant::now() < deadline, "查询 20s 未回");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// Task 19 走查①(旧 daemon):排序请求 → 回显不符 → 红字警示 → 重启引擎
+    /// (真实 stop → start)→ 警示清除且新引擎上排序真正生效(升序断言)。
+    ///
+    /// 跑法(隔离;PATH 首段须为**当前构建**的 target/debug,旧 daemon 由绝对路径
+    /// 手动起——重启动作经 `ensure_engine` 从 PATH 取新引擎接管):
+    /// ```text
+    /// T=$(mktemp -d); mkdir -p $T/home $T/root
+    /// 造样本:seq 1 30 | xargs -I{} touch $T/root/sample-report-{}.pdf
+    /// HOME=$T/home MCE_ROOTS=$T/root <旧构建>/target/debug/macEverything start
+    /// HOME=$T/home PATH=<本仓>/target/debug:$PATH \
+    ///   cargo test -p macEverything-app -- --ignored live_sort_echo_old_daemon_restart --nocapture
+    /// ```
+    #[test]
+    #[ignore = "实机走查:需隔离 HOME + MCE_ROOTS,且 daemon 为旧版(无 sort_echo)构建"]
+    fn live_sort_echo_old_daemon_restart() {
+        use std::time::Duration;
+
+        let paths = live_paths();
+        assert!(
+            client::connect(&paths).is_some(),
+            "旧版 daemon 须已按测试注释的跑法在隔离环境启动"
+        );
+        let mut h = LiveHarness::new(paths.clone());
+
+        // 1) 查询 → 列头排序:请求 size,旧 daemon 回显空串 → 警示位亮起
+        h.st.set_query("report");
+        h.settle();
+        assert!(
+            h.st.total > 0,
+            "隔离根应预置 sample-report-*.pdf(total={})",
+            h.st.total
+        );
+        assert!(h.st.gaps().is_empty(), "无缺口环境:徽标不显示(gaps 为空)");
+        h.st.on_header_click(SortKey::Size);
+        assert!(h.settle(), "排序重查应有「排序中…」期");
+        assert!(
+            h.st.sort_stale,
+            "旧 daemon(sort_echo 缺省空串)应触发「引擎版本过旧,排序未生效」"
+        );
+        println!("[实机] 旧 daemon:sort_stale=true(状态栏红字 + 重启按钮)");
+
+        // 2) 重启引擎(按钮动作本身;真实 stop → start)
+        h.st.restart_engine();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while h.st.engine_restarting {
+            h.frame();
+            assert!(Instant::now() < deadline, "重启 20s 未完成");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!h.st.sort_stale, "重启成功:红字应清除");
+        println!("[实机] 重启完成:sort_stale=false");
+
+        // 3) 新引擎上排序真正生效:重查(set_query 走全链路;冷启动窗口内重试)
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            h.st.set_query("report");
+            h.settle();
+            if !h.st.results.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "重启后 30s 内新引擎未出结果(状态:{:?})",
+                h.st.session.state
+            );
+        }
+        assert!(!h.st.sort_stale, "新引擎回显相符:无警示");
+        let sizes: Vec<u64> = h.st.results.iter().filter_map(|e| e.size).collect();
+        assert!(
+            sizes.windows(2).all(|w| w[0] <= w[1]),
+            "重启后 size 升序应成立:{:?}",
+            &sizes[..sizes.len().min(5)]
+        );
+        println!(
+            "[实机] 重启后排序生效:size 升序前 5 = {:?}",
+            &sizes[..sizes.len().min(5)]
+        );
+    }
+
+    /// Task 19 走查②(缺口 + 离线文案):隔离根含不可读目录 → status.gaps 非空 →
+    /// 窗口快照/徽标/面板与 CLI `status` 逐行同源;停 daemon → 离线文案(生成于…)。
+    ///
+    /// 跑法(隔离):
+    /// ```text
+    /// T=$(mktemp -d); mkdir -p $T/home $T/root/locked
+    /// 造样本:seq 1 5 | xargs -I{} touch $T/root/sample-report-{}.pdf
+    /// chmod 000 $T/root/locked
+    /// HOME=$T/home MCE_ROOTS=$T/root <当前构建>/target/debug/macEverything start
+    /// HOME=$T/home ./target/debug/deps/macEverything_app-<hash> --ignored \
+    ///   live_gaps_badge_and_states --nocapture
+    /// ```
+    #[test]
+    #[ignore = "实机走查:需隔离 HOME + MCE_ROOTS(根内预置不可读目录)"]
+    fn live_gaps_badge_and_states() {
+        let paths = live_paths();
+        assert!(
+            client::connect(&paths).is_some(),
+            "daemon 须已按测试注释的跑法启动"
+        );
+        let mut h = LiveHarness::new(paths.clone());
+
+        // 1) 查询一次(状态随查询并入 + 徽标同帧同步)
+        h.st.set_query("report");
+        h.settle();
+
+        // 2) 缺口清单:窗口快照 vs CLI status 独立查询逐行对照(同一数据面)
+        let ui_gaps: Vec<Gap> = h.st.gaps().to_vec();
+        assert!(!ui_gaps.is_empty(), "隔离根须预置不可读目录(chmod 000)");
+        let cli_gaps = match client::status(&paths).expect("CLI 侧 status 查询") {
+            client::StatusOutcome::Reported(r) => r.gaps,
+            client::StatusOutcome::NoIndex => panic!("隔离环境应有索引"),
+        };
+        assert_eq!(ui_gaps.len(), cli_gaps.len(), "徽标计数 = CLI status 条数");
+        for (ui_row, cli_row) in ui_gaps.iter().zip(&cli_gaps) {
+            assert_eq!(ui_row.path, cli_row.path, "缺口目录逐行同源");
+            assert_eq!(ui_row.reason, cli_row.reason, "缺口原因逐行同源");
+        }
+        println!(
+            "[实机] 缺口 {} 个(与 CLI status 逐行一致):{:?}",
+            ui_gaps.len(),
+            ui_gaps
+                .iter()
+                .map(|g| (g.path.as_str(), g.reason.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        // 3) 徽标点击/托盘项 → 展开面板:出帧不 panic;面板行 = gaps_display 切片
+        h.st.open_gaps();
+        assert!(h.st.gaps_open);
+        h.frame();
+        let (rows, rest) = gaps_display(h.st.gaps());
+        assert_eq!(rows.len(), ui_gaps.len().min(20), "面板行数");
+        assert_eq!(rows.len() + rest, ui_gaps.len(), "余量计数守恒");
+        println!("[实机] 缺口面板展开:{} 行 + 余 {rest}", rows.len());
+
+        // 4) 离线:停 daemon → 重查(直读落盘索引)→ 离线文案带生成时刻(§7)
+        let n = client::stop(&paths).expect("stop daemon");
+        println!("[实机] daemon 已停(最终 {n} 条),进入离线直读");
+        h.st.set_query("report");
+        h.settle();
+        assert!(
+            h.st.total > 0,
+            "离线直读落盘索引应有命中(total={})",
+            h.st.total
+        );
+        let note = index_note(h.st.engine.as_ref(), &h.st.session.state, h.st.engine_known)
+            .expect("状态栏索引状态段");
+        assert!(note.starts_with("离线索引"), "离线文案:{note}");
+        assert!(note.contains("生成于"), "§7 离线列带生成时刻:{note}");
+        println!("[实机] 状态栏索引段:{note}");
+    }
 
     /// 真机全链路:真实引擎查高频词 → 表格落数(draw 全渲染无 panic)→
     /// 列头排序(升/降/换列)→ 多选(单选/shift/⌘A)。
@@ -965,13 +1697,17 @@ mod tests {
         };
 
         // 防抖到期(60ms)+ 查询线程回投:排帧至在途结束。
-        let settle = |st: &mut ResultsState| {
+        // 返回是否观测到「排序中…」段(sorting_inflight=true 至少一帧——
+        // 发起帧即置位,响应线程不可能先于该帧回投,故正常路径恒 true)。
+        let settle = |st: &mut ResultsState| -> bool {
             std::thread::sleep(Duration::from_millis(90));
             let deadline = Instant::now() + Duration::from_secs(20);
+            let mut saw_inflight = false;
             loop {
                 frame(st);
+                saw_inflight |= st.sorting_inflight;
                 if !st.sorting_inflight {
-                    return;
+                    return saw_inflight;
                 }
                 assert!(Instant::now() < deadline, "查询 20s 未回");
                 std::thread::sleep(Duration::from_millis(20));
@@ -980,7 +1716,10 @@ mod tests {
 
         // 1) 输入即搜:高频词 .pdf(实机百万级索引 → 数千命中)
         st.set_query(".pdf");
-        settle(&mut st);
+        assert!(
+            settle(&mut st),
+            "在途期状态栏应出现「排序中…」(sorting_inflight)"
+        );
         assert!(st.total > 0, "「.pdf」应有命中(total={})", st.total);
         assert!(!st.results.is_empty(), "结果表应有行");
         // 名称含词(v1 匹配语义:文件名,大小写不敏感)
@@ -1008,13 +1747,17 @@ mod tests {
         let sizes_of =
             |st: &ResultsState| -> Vec<u64> { st.results.iter().filter_map(|e| e.size).collect() };
         st.on_header_click(SortKey::Size);
-        settle(&mut st);
+        assert!(settle(&mut st), "排序重查在途期应出现「排序中…」");
         assert!(st.sort_asc, "首次点「大小」= 升序(小在前)");
         let asc = sizes_of(&st);
         assert!(
             asc.windows(2).all(|w| w[0] <= w[1]),
             "大小升序在前 5 项不成立:{:?}",
             &asc[..asc.len().min(5)]
+        );
+        assert!(
+            !st.sort_stale,
+            "当前构建 daemon 回显相符:不得误报「排序未生效」"
         );
         println!("[实机] 大小升序前 5:{:?}", &asc[..asc.len().min(5)]);
 

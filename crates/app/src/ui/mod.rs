@@ -251,10 +251,16 @@ impl App {
                     self.toggle_palette(ctx);
                 }
                 TrayMsg::OpenResults => {
-                    // 完整窗口(Task 17):聚焦搜索框 + 补查引擎状态后原生唤到前台
-                    // (缺口项同入口;展开缺口清单 Task 19 接)。
+                    // 完整窗口(Task 17):聚焦搜索框 + 补查引擎状态后原生唤到前台。
                     log::info!("托盘:打开完整窗口");
                     self.shared().results.on_window_shown();
+                    show_root_window(ctx);
+                }
+                TrayMsg::OpenGaps => {
+                    // 缺口项(product §3):同一开窗路径 + 展开缺口面板(Task 19);
+                    // 清单经 on_window_shown 触发的状态补查落地(status.gaps 同源)。
+                    log::info!("托盘:打开完整窗口(缺口面板)");
+                    self.shared().results.open_gaps();
                     show_root_window(ctx);
                 }
                 TrayMsg::ToggleAutostart => {
