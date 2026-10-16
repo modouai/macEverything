@@ -15,7 +15,7 @@
 //! 两条路径(串行/并行)的分类语义由 `classify_entry` 单点保证。
 use crate::entry::NO_PARENT;
 use crate::index::Index;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// 扫描缺口:权限类逐条留痕(目录 + errno 文案),其余 IO 错误只计数。
@@ -140,7 +140,8 @@ fn scan_serial(roots: &[PathBuf], excludes: &[PathBuf]) -> (Index, ScanGaps) {
 
 /// 聚合记录:目录条目携带自身原始路径(`raw`,dir_map 键——目录名非 UTF-8 时
 /// lossy 名重建的键会与弹队原始路径漂移,macOS 不可达但 Linux ext4 可触发)。
-enum Rec {
+/// pub:daemon 首扫流式聚合复用(分片可见)。
+pub enum Rec {
     Dir {
         parent: PathBuf,
         name: String,
@@ -154,10 +155,14 @@ enum Rec {
 
 /// 并行遍历(ADR-6):共享目录队列(work-sharing:纯 FIFO 消费,空队即退),
 /// 活跃线程 = min(threads, 可用逻辑核)。各线程把分类结果写入**线程本地分片**
-/// (无逐条全局锁),scope 结束一次性上收;单线程两轮聚合保证「父条目号先于子 +
-/// 路径集合确定」。注意:条目号/arena 布局随线程交织,不做字节级稳定——此为
-/// ADR-6「分片按队列顺序聚合」的已登记偏差(见 plan 实现偏差 #3)。
-fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
+/// (无逐条全局锁),scope 结束一次性上收;记录按路径深度稳定排序后才返回,
+/// 保证聚合侧「父记录先于子记录」。注意:条目号/arena 布局随线程交织,不做
+/// 字节级稳定——此为 ADR-6「分片按队列顺序聚合」的已登记偏差(见 plan 偏差 #3)。
+pub fn collect_records(
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    threads: usize,
+) -> (Vec<Rec>, ScanGaps) {
     use std::sync::Mutex;
 
     let queue: Mutex<VecDeque<PathBuf>> = Mutex::new(roots.iter().cloned().collect());
@@ -219,41 +224,59 @@ fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (In
         }
     });
 
-    // 聚合(单线程):根先登记;记录经深度拓扑排序(见下),父目录必先于子处理;
-    // 第一轮全部目录、第二轮全部文件为冗余兜底。
-    let mut index = Index::new();
-    let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
+    let mut recs: Vec<Rec> = shards.into_iter().flatten().collect();
+    // 分片交织破坏 shard 内「父先于子」的因果序:子目录记录可能落在序号更小的
+    // shard,flatten 后先于父被消费,dir_map 查父即 miss panic(全量套件实测
+    // flake)。按**条目自身在树中的深度**稳定排序恢复拓扑序:目录的自身深度 =
+    // 其 raw 路径段数;文件的自身深度 = 父路径段数 + 1——同深度的目录记录必先于
+    // 其直接子文件(单轮聚合含跨类型父子,「文件用父深度」会让两者同深度,
+    // 反序时子先于父即 miss)。深度相同者互不为祖先,顺序无关。
+    // sort_by_cached_key:key 为整路径 components 遍历,cached 版每记录只算一次
+    // (sort_by_key 会按比较次数重复解析路径,百万记录下聚合段多付千万次遍历)
+    recs.sort_by_cached_key(|r| match r {
+        Rec::Dir { raw, .. } => raw.components().count(),
+        Rec::File { parent, .. } => parent.components().count() + 1,
+    });
+    (recs, gaps.into_inner().unwrap())
+}
+
+/// 聚合前登记根条目(键为原始路径形态,与 `apply_records` 的 dir_map 同规则)。
+pub fn seed_roots(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, roots: &[PathBuf]) {
     for root in roots {
         // 根条目名 = 完整绝对路径(与串行臂一致,full_path 可直接使用)
         let name = root.to_string_lossy().into_owned();
         let idx = index.insert(&name, NO_PARENT, true);
         dir_map.insert(root.clone(), idx);
     }
-    let mut recs: Vec<Rec> = shards.into_iter().flatten().collect();
-    // 分片交织破坏 shard 内「父先于子」的因果序:子目录记录可能落在序号更小的
-    // shard,flatten 后先于父被消费,dir_map 查父即 miss panic(全量套件实测
-    // flake)。按路径深度稳定排序恢复拓扑序——父路径段数恒少于子,深度相同者
-    // 互不为祖先、顺序无关。
-    // sort_by_cached_key:key 为整路径 components 遍历,cached 版每记录只算一次
-    // (sort_by_key 会按比较次数重复解析路径,百万记录下聚合段多付千万次遍历)
-    recs.sort_by_cached_key(|r| match r {
-        Rec::Dir { raw, .. } => raw.components().count(),
-        Rec::File { parent, .. } => parent.components().count(),
-    });
-    for rec in &recs {
-        if let Rec::Dir { parent, name, raw } = rec {
-            let pidx = dir_map[parent];
-            let idx = index.insert(name, pidx, true);
-            dir_map.insert(raw.clone(), idx);
+}
+
+/// 把记录切片聚合进 index。前置:dir_map 已含根(`seed_roots`);切片内父记录
+/// 先于子记录(`collect_records` 的深度排序保证,跨批亦然——深度单调不减)。
+/// 可分批调用,批间索引处于一致可查询状态(首扫分片可见的实现载体)。
+pub fn apply_records(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, recs: &[Rec]) {
+    for rec in recs {
+        match rec {
+            Rec::Dir { parent, name, raw } => {
+                let pidx = dir_map[parent];
+                let idx = index.insert(name, pidx, true);
+                dir_map.insert(raw.clone(), idx);
+            }
+            Rec::File { parent, name } => {
+                let pidx = dir_map[parent];
+                index.insert(name, pidx, false);
+            }
         }
     }
-    for rec in &recs {
-        if let Rec::File { parent, name } = rec {
-            let pidx = dir_map[parent];
-            index.insert(name, pidx, false);
-        }
-    }
-    (index, gaps.into_inner().unwrap())
+}
+
+/// 并行扫描入口(一次性):遍历 → 深度排序 → 聚合。
+fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
+    let (recs, gaps) = collect_records(roots, excludes, threads);
+    let mut index = Index::new();
+    let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
+    seed_roots(&mut index, &mut dir_map, roots);
+    apply_records(&mut index, &mut dir_map, &recs);
+    (index, gaps)
 }
 
 #[cfg(test)]
@@ -467,6 +490,37 @@ mod tests {
         assert_eq!(gaps.io_errors, 0);
         assert!(index.entry_count() > 0);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// 流式聚合等价钉(首扫分片可见的载体):分批 apply_records 的最终索引
+    /// 必须与一次性 scan_roots 完全一致(条目数 + 全路径集合)。
+    /// 突变「apply_records 依赖切片全局排序而非深度单调」时此测必红。
+    #[test]
+    fn staged_apply_equals_one_shot_scan() {
+        let t = fixture();
+        fs::create_dir_all(t.path().join("a/b/c/d")).unwrap();
+        fs::write(t.path().join("a/b/c/d/deep.txt"), "").unwrap();
+        let roots = vec![t.path().to_path_buf()];
+        let excl = vec![t.path().join("node_modules")];
+
+        let (one_shot, _) = scan_roots(&roots, &excl, 4);
+
+        let (recs, _) = collect_records(&roots, &excl, 4);
+        let mut staged = Index::new();
+        let mut dir_map = HashMap::new();
+        seed_roots(&mut staged, &mut dir_map, &roots);
+        // 逐条聚合(最严切分):任何「子记录先于父记录」的排序缺陷都会在此暴露
+        for chunk in recs.chunks(1) {
+            apply_records(&mut staged, &mut dir_map, chunk);
+        }
+
+        assert_eq!(staged.entry_count(), one_shot.entry_count());
+        let paths = |i: &Index| -> std::collections::BTreeSet<String> {
+            (0..i.entries.len() as u32)
+                .map(|k| i.full_path(k).to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(paths(&staged), paths(&one_shot), "分批聚合与一次性结果一致");
     }
 
     /// 名字式排除:相对名(如 node_modules)匹配路径任一组件——任意层级的

@@ -26,6 +26,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const FLUSH_DIRTY_LIMIT: u64 = 10_000;
 /// 事件合批静默窗(tech.md 增量管线)。
 const BATCH_WINDOW: Duration = Duration::from_millis(100);
+/// 首扫流式聚合批大小:每批持写锁聚合后即释放,批间查询可见已扫部分(product 场景 2)。
+const SCAN_CHUNK: usize = 50_000;
 
 /// 状态四态(product §1 契约)。
 pub mod state {
@@ -627,7 +629,14 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             // 随后从该水位建流重放必覆盖(diff 幂等)。若取在扫描完成后,
             // 扫描读过该目录之后才出现的变更将永久缺失(无任何后续机制补回)。
             let water = fsevents::current_event_id();
-            let (idx, gaps) = engine::scanner::scan_roots(&roots, &excludes, threads);
+            // 流式首扫(product 场景 2「建索引期间搜索」):先挂「仅含根」的索引,
+            // 再按批聚合,批间释放写锁——首扫期间 query 返回已扫部分、status 可见进度。
+            // (重扫路径不这样做:tech.md 要求「重扫期间旧索引可查」,新索引建成才替换。)
+            let mut index = Index::new();
+            let mut staging_map: HashMap<PathBuf, u32> = HashMap::new();
+            engine::scanner::seed_roots(&mut index, &mut staging_map, &roots);
+            *state.holder.write().unwrap() = IndexHolder::Mutable(index);
+            let (recs, gaps) = engine::scanner::collect_records(&roots, &excludes, threads);
             state.built_at.store(now_secs(), Ordering::Relaxed);
             *state.gaps.lock().unwrap() = gaps
                 .permission
@@ -638,9 +647,14 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
                 })
                 .collect();
             state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
+            for chunk in recs.chunks(SCAN_CHUNK) {
+                let mut h = state.holder.write().unwrap();
+                if let IndexHolder::Mutable(idx) = &mut *h {
+                    engine::scanner::apply_records(idx, &mut staging_map, chunk);
+                }
+            }
             state.applied_event_id.store(water, Ordering::Relaxed);
             state.seen_event_id.store(water, Ordering::Relaxed);
-            *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
             rebuild_dir_map(&state);
             flush(&state, &paths);
             state.set_state(state::READY);
