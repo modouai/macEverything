@@ -96,6 +96,7 @@ pub fn execute_sorted(
 | 消息 | 变更 | 兼容性 |
 |---|---|---|
 | Request::Query | 新增 `sort: Option<String>`(serde default) | 旧客户端缺省 → relevance;旧 daemon 忽略未知字段 |
+| Request::Query | 新增 `desc: Option<bool>`(serde default;**语义 = 反转自然方向**,非绝对升/降) | 缺省/false = 引擎自然方向(名升/大小升/mtime 降/路径升);旧 daemon 忽略 → 方向失效(Task 19 的 sort_echo 提示兜底) |
 | Response::Query | 新增 `sort_echo: String`(serde default 空串) | 旧客户端忽略;空串 = 旧 daemon(实际按 relevance) |
 
 (`stat_ms` 为 v1 已在协议中的字段,本版不含变更。)
