@@ -1,27 +1,37 @@
 # 架构总览
 
-macEverything 的引擎架构:自建全盘文件名索引,不走 Spotlight。本文是**实现态**的架构说明;设计决策的完整推导过程见 `specs/v1-core/tech.md`(6 个 ADR)。
+macEverything 的引擎架构:自建全盘文件名索引,不走 Spotlight。本文是**实现态**的架构说明;设计决策的完整推导过程见 `specs/v1-core/tech.md`(6 个 ADR)与 `specs/v2-ui/tech.md`(v2.0 图形界面,ADR-7/8)。
 
 ## 总体结构
 
 ```
-┌──────────────────────────────┐        Unix socket         ┌─────────────────────┐
-│  macEverything start (daemon) │◄──── 长度前缀 JSON ────────►│  query / status /   │
-│  ┌────────────────────────┐  │                            │  stop / exclude     │
-│  │ engine (纯逻辑库)        │  │                            │  (client 命令)       │
-│  │  扫描 → 索引 → 查询      │  │                            └─────────────────────┘
-│  │  FSEvents → diff → 索引  │  │                                     │
-│  │  落盘 (mmap 同构布局)    │  │                              离线降级:daemon 不在
-│  └────────────────────────┘  │                              时直读落盘索引自答
-└──────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  macEverything.app(v2.0 GUI,eframe/egui)     │
+│  悬浮条(⌥Space)/ 完整窗口(⌥⇧F)/ 托盘         │
+│  全局热键 / 开机自启 / 引擎定位与拉起        │
+└────────────────────────┬─────────────────────┘
+                         │  crates/client(共享客户端承载层)
+                         │  Unix socket · 长度前缀 JSON
+┌────────────────────────▼─────────────────────┐
+│  macEverything start(daemon)                 │
+│  ┌────────────────────────────────────────┐  │
+│  │  engine(纯逻辑库)                      │  │
+│  │   扫描 → 索引 → 查询                   │  │
+│  │   FSEvents → diff → 索引               │  │
+│  │   落盘(mmap 同构布局)                  │  │
+│  └────────────────────────────────────────┘  │
+└──────────────────────────────────────────────┘
 ```
 
-两个 crate:
+五个 crate:
 
 | crate | 职责 | 关键模块 |
 |---|---|---|
 | `engine` | 全部业务逻辑,可独立测试 | entry / arena / index / query / scanner / persist / fsevents / watcher / reconcile / config |
-| `cli` | 引擎宿主与命令行 | protocol(消息契约)/ daemon(宿主)/ client(五命令)/ main |
+| `protocol` | 协议契约(唯一真相:v1 从 cli 迁出,ADR-7) | 消息类型 / 编解码 / 校验 / 版本 |
+| `client` | 客户端承载层(唯一行为真相:v1 从 cli 迁出,ADR-7) | DaemonPaths / 连接 / stat_rows / 状态常量 / 离线降级 |
+| `cli` | 引擎宿主与命令行 | daemon(宿主)/ 子命令(五命令)/ main |
+| `app` | 图形界面(GUI,v2.0) | main(启动编排)/ session(查询会话)/ ui(双视口)/ platform(平台补丁)/ hotkey / tray / autostart / single_instance / engine_launcher |
 
 ## 六大设计决策(实现态摘要)
 
@@ -90,6 +100,40 @@ FSEvents 回调(专用线程 runloop)
 - **重放追平**:HistoryDone 标记前强制 drain 全部 pending 事件再置「就绪」(否则就绪早于索引追上)。
 - 排除目录不入 listing(防增量把首扫排除的子树拉回索引)。
 
+## v2.0 增补:图形界面(实现态摘要)
+
+设计推导见 `specs/v2-ui/tech.md`(ADR-7/ADR-8);逐项实测与终验收记录见 `specs/v2-ui/poc-results.md`。
+
+### 层结构:app 是第二个客户端,不内嵌引擎
+
+- 单 daemon 模型不变:app 与 CLI 同为 daemon 的客户端;app 依赖 engine 经 client 承载层发生(排序键等纯逻辑复用)。
+- **双视口**:ROOT 视口 = 完整结果窗口;第二视口 = 悬浮条,采用 **deferred + 常驻**(独立渲染 pass——主窗被完全遮挡/不在当前 Space 时悬浮条照常工作;隐藏走 `orderOut` 不销毁,窗口唯一销毁点 = 进程退出)。
+- 查询会话在 UI 侧纯逻辑化(防抖 60ms + 代际号防闪回 + 六态状态机);UI 线程不做阻塞查询(工作线程 + mpsc 回投,按代际丢弃旧响应)。
+
+### ADR-7:协议与客户端承载层提升为共享 crate(protocol + client)
+
+App 需要与 CLI 同款协议与客户端行为(连接 / 按需 stat / 离线降级 / 状态常量),照搬即复制且双漂移(契约与行为两处真相)。定案:提升为 `crates/protocol`(纯契约,零业务依赖)+ `crates/client`(客户端承载层);cli 与 app 共用,engine 零业务改动(仅 query 排序扩展)。
+
+### ADR-8:悬浮条 = eframe/egui 单栈 + 运行期 NSPanel 改类
+
+跨 Space(含他人全屏)、浮动级别在 winit 公开 API 无路径(PoC-1 实证:普通 NSWindow 四种组合全部失败,外证 tauri#11488)。定案:eframe 单技术栈 + 运行期 `object_setClass` 把 winit 窗口换成自定义 NSPanel 子类。生效组合**五要素缺一不可**:
+
+1. 自定义子类覆写 `canBecomeKeyWindow` → true(裸 NSPanel 跨 Space 可,但收不到键盘)
+2. `setStyleMask(原 mask | NonactivatingPanel)`(跨全屏硬条件)
+3. `setLevel(Floating)`
+4. `setCollectionBehavior(CanJoinAllSpaces | FullScreenAuxiliary)`
+5. 显示走 `orderFrontRegardless` / `makeKeyWindow`(成 key 而不夺前台)
+
+两必带补丁:a) 改 styleMask 后补 `makeFirstResponder(contentView)`(否则键盘链路断);b) 关窗前还原窗口类(否则 winit drop → `panic in a function that cannot unwind` abort;视口常驻形态下还原点收敛到进程退出 `on_exit`)。unsafe 集中于 `crates/app/src/platform/mac.rs` 单模块。
+
+配套实现要点(均源码级实证,详见 poc-results):
+
+- **显示路径 native**:唤起必须走主线程 `orderFrontRegardless` + `makeKeyWindow`——eframe 对不可见窗口的跨线程唤起有 100ms 硬节流(`native/run.rs` 源码),winit `Visible(true)` 路径对外中位 117ms 破红线;native 路径对外可见中位 16.7ms,且与「不夺前台/跨全屏」本就同路。
+- **热键动作主队列直调**:⌥Space/⌥⇧F 命中后经 `DispatchQueue.main` 在主线程序直调动作(与帧内同一份实现),不等帧——产品形态两窗皆隐,帧路受同一节流(实测旧路径 155ms);直调拿不到共享锁时入兜底队列由帧内消费,不静默丢。
+- **切 Space 失焦豁免**:失焦沿 → 宽限期 800ms 待决 → Space 变更通知按「锚失焦时刻」判(实测通知多晚于失焦 265~550ms,曾漏判);点击导致的失焦经鼠标键状态当帧判出、立即隐藏。
+- **主题跟随自建探测**:改类断掉 winit 的主题 KVO(`NSKVONotifying_WinitWindow` 被移除),改为渲染帧查询系统外观(`NSApp.effectiveAppearance`),仅在悬浮条可见期按节流检查。
+- **排帧纪律**:只在悬浮条可见期排帧(含主题检查);全隐藏期不排帧,事件循环回 `Wait`——隐藏态 CPU 0% 的机制。
+
 ## 生命周期
 
 ### 冷启动(有落盘索引)
@@ -123,7 +167,9 @@ load_mmap 校验 → Shared 视图(立即可查)→ 后台物化(拷贝为可变
 
 Unix socket(数据目录 `daemon.sock`,0600)+ 4 字节小端长度前缀 + JSON;消息含协议版本字段;长度上限 1MB;exclude 路径须绝对。daemon 不在时的离线降级:query/status 直读落盘索引并标注「离线」,exclude/stop 报错提示。
 
-## 性能实测(百万文件,Apple M5 + NVMe,`scripts/bench.sh`)
+## 性能实测
+
+引擎口径(百万文件,Apple M5 + NVMe,`scripts/bench.sh`):
 
 | 指标 | 红线 | 实测 | 余量 |
 |---|---|---|---|
@@ -134,7 +180,19 @@ Unix socket(数据目录 `daemon.sock`,0600)+ 4 字节小端长度前缀 + JSON;
 | 停机重放(万级事件) | ≤ 2s | 0.03s | — |
 | 完整性对拍 | 零差异 | parity 测试通过 | — |
 
-真实环境(123 万条目):5 个真实关键词查询全部 2.3-3.0ms;空闲 CPU 0%;常驻 ~90MB。
+真实环境(123 万条目):5 个真实关键词查询全部 2.3-3.0ms;空闲 CPU 0%;引擎常驻 ~90MB。
+
+图形界面口径(v2.0 终验收,真实索引 127.8 万条目,release + ad-hoc 签名):
+
+| 指标 | 红线 | 实测 | 判定 |
+|---|---|---|---|
+| 悬浮条唤起 | < 100ms | 真 ⌥Space 5 轮中位 **95.4ms**(4/5 达标);App 内链路 0.7ms,残量在系统热键投递 ~51ms 与 WindowServer 合成 | 达标(边缘) |
+| 输入到结果 | < 150ms | 中位 **~67ms**(8 轮 59~71ms) | 达标 |
+| 隐藏态 CPU | 0% | 12/12 采样 0.0%(两窗皆隐 60s,累计 +10ms) | 达标 |
+| 界面常驻内存 | < 100MB | **136M(两窗皆隐基线)/ 138M(使用后)** | **未达标**(栈基线,见已知限制) |
+| 引擎自动拉起 | ≤ 3s 可搜 | 冷启动全链:随包 CLI 拉起 + 真热键真键盘出结果 | 达标 |
+| 界面侧增量可搜 | ≤ 1s | 新建文件 → 可搜 267ms | 达标 |
+| 全链路六项 | — | 冷启动 / 增量 / 离线 / 二次启动唤起 / 归零 / 自启态 6/6 通过 | 达标 |
 
 ## 已知限制(如实挂账)
 
@@ -143,3 +201,6 @@ Unix socket(数据目录 `daemon.sock`,0600)+ 4 字节小端长度前缀 + JSON;
 - 非 UTF-8 文件名按 U+FFFD 替换收录(条目不丢,名称字节与磁盘非严格一致)。
 - 冻结窗口:stop 后消费线程 ≤150ms 收尾期内的最后变更由下次启动重放兜底(最终一致)。
 - 外置盘/网络盘不扫描;正则与 `size:`/`dm:` 过滤器属 v2 候选。
+- **界面常驻内存 ~136MB**(超「<100MB」设计红线):两窗皆隐的基线即 136M,与窗口使用无关——eframe + glow + glutin(两 GL 上下文)+ 系统 CJK 字体回退的栈级足迹。降本方向(未实施):字体图集按需裁剪 / 单视口化 / glow→wgpu 对照。
+- **遮挡态退化**:悬浮条被其他窗口完全遮挡时,输入到结果退化到 ~500ms(eframe 对遮挡视口跳过 ui pass,防抖帧不发);悬浮条正常可见时不受影响。修法候选:`App::logic` 也驱动悬浮条 tick(遮挡/隐藏下 logic 仍跑)。
+- **离线不排序**:daemon 不在时完整窗口列头排序不生效(结果恒按匹配质量序);状态栏红字提示并提供「重启引擎」动作。

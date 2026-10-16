@@ -1,9 +1,14 @@
 # macEverything v2.0 图形界面 技术规格
 
-**Status:** 已确认
-**version:** 1.0.0
+**Status:** 已确认(实现完成,实测回填;含终验收偏差清单)
+**version:** 1.1.0
+**prev_version:** 1.0.0
 **updated:** 2026-10-16
-**产品依据:** product.md v1.0.0(v2-ui)
+**产品依据:** product.md v1.0.0(v2-ui;验收偏差见 product「验收偏差」节)
+**changes:**
+- (1.1.0)v2.0 实现完成回填:新增「实现偏差清单」五项(内存基线 136M / 遮挡态输入
+  退化 / ⌥⇧F 补实现 / 热键主队列直调 / bundle 双可执行结构);终验收实测与逐项
+  取证见 poc-results.md「Task 21」
 
 ---
 
@@ -193,3 +198,13 @@ pub fn execute_sorted(
 ## 后续工作(v2.1 边界)
 
 设置页(排除目录/自启开关/语言选择 UI)、i18n 中英、快捷键自定义 UI、毛玻璃材质、完整窗口增强(打开方式子菜单/图标列)。
+
+## 实现偏差清单(v2.0 终验收回填)
+
+**已知实现偏差**(与初始设计的差异,均已落代码注释;逐项取证见 poc-results.md「Task 21」):
+
+1. **内存基线 136M(红线 <100MB 未达)**:两窗皆隐的基线即 136M——超预算与窗口使用无关,是 eframe + glow + glutin(两 GL 上下文)+ 系统 CJK 字体回退的栈级足迹(vmmap:Malloc Small dirty 58.5M、IOAccelerator 2.6M);旁证:PoC-3 单窗 demo 同口径 RSS 已 125~135MB。降本方向(未实施,建议单独立任务):egui 字体图集按需裁剪 / 单视口化 / glow→wgpu 对照。
+2. **遮挡态输入→结果退化到 ~500ms**:悬浮条被其他窗口覆盖(occluded)时,eframe 对 occluded 视口跳过 ui pass(`glow_integration.rs` `show_ui=false`),防抖帧不发(实测 481~512ms)。非本版引入(既有结构),且发生在用户看不见悬浮条的期间;修法候选——`App::logic` 也驱动 `palette.tick`(logic 在遮挡/隐藏下仍跑),并让遮挡期排帧请求落到 ROOT,需单独验证(遮挡语义、双驱动去重)。
+3. **⌥⇧F 为 Task 21 补实现**:product §2 与验收标准要求「完整窗口 ⌥⇧F 直达」,Task 15 只注册了 ⌥Space 族;Task 21 补齐(独立注册,失败只留痕不降级——完整窗口入口仍有托盘与悬浮条 ⌥↵)。「空词打开」的落地解释:⌥⇧F 与托盘入口同语义(不携带悬浮条查询词);悬浮条 ⌥↵ 才带词入窗。
+4. **热键动作走「主队列直调」而非纯帧内消费**:eframe 对不可见窗口的跨线程 repaint 有 ≥100ms 硬节流,而产品形态两窗皆隐,纯「叫帧 → 帧内消费」路径实测 155ms、破唤起红线;命中后经 `DispatchQueue.main` 在主线程序直调动作(与帧内同一份实现),帧内只消费「直调拿不到共享锁」时的兜底队列(不静默丢)。
+5. **bundle 双可执行结构**:App 主可执行定名 `macEverything-app`(CFBundleExecutable),引擎 CLI 同目录 `Contents/MacOS/macEverything`(随包)——两可执行同目录不同名,避免覆盖与「定位自命中」(App 按 `current_exe` 同目录找 CLI 时不会找到自己);bundle 标识 `com.example.maceverything` 为自启条目身份键,与路径、可执行名无关(PoC-5 实证)。
