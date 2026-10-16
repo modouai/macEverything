@@ -66,8 +66,7 @@ impl Session {
     /// 排序变更:同串重发 —— 窗内有 pending 保持原串、刷新时刻;无 pending 按
     /// last_fired 的串构造 pending(代际号在下一次 pending_at 自然 +1);
     /// 两者皆无(空词/从未发起)→ 不动。
-    // Task 17(完整窗口点列头排序)消费;悬浮条不用此能力(product §8)。
-    #[allow(dead_code)]
+    /// 消费方:完整窗口点列头排序(ui/results.rs);悬浮条不用此能力(product §8)。
     pub fn on_sort_change(&mut self, key: SortKey, now: Instant) {
         self.sort = key;
         let query = self

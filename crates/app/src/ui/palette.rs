@@ -69,17 +69,19 @@ pub enum Payload {
     Failed { engine_down: bool },
 }
 
-/// 引擎状态(status 子命令数据面;角标用)。
+/// 引擎状态(status 子命令数据面;悬浮条角标与完整窗口状态栏共用)。
 pub struct EngineStatus {
     pub state: String,
     pub entry_count: u32,
+    /// 权限缺口目录数(status.gaps;完整窗口缺口徽标用,悬浮条不显示)。
+    pub gaps: u32,
 }
 
 /// 绘制产出的动作,交上层(`ui::App`)执行。
 pub enum Action {
     /// 隐藏悬浮条(打开成功 / Esc / 失焦)。
     Hide,
-    /// ⌥↵:打开完整窗口并带当前查询词(Task 17 消费 `full_window_request`)。
+    /// ⌥↵:打开完整窗口并带当前查询词(上层消费 `full_window_request` → `ResultsState::set_query`)。
     FullWindow,
 }
 
@@ -98,7 +100,7 @@ pub struct PaletteState {
     pub hotkey_note: Option<String>,
     /// 列表渲染行数(初始 20,滚到底 +20,至 `results.len()`)。
     pub visible_rows: usize,
-    /// ⌥↵ 置位:完整窗口待带入的查询词(Task 17 消费)。
+    /// ⌥↵ 置位:完整窗口待带入的查询词(`ui::draw_palette` 转交 `ResultsState::set_query`)。
     pub full_window_request: Option<String>,
 
     paths: DaemonPaths,
@@ -199,49 +201,16 @@ impl PaletteState {
         }
     }
 
-    /// 发起查询:工作线程执行,结果经 mpsc 回投并唤醒 UI。
+    /// 发起查询:工作线程执行,结果经 mpsc 回投并唤醒悬浮条视口。
     fn spawn_query(&mut self, fire: Fire) {
-        let paths = self.paths.clone();
-        let ctx = self.ctx.clone();
-        let viewport = self.viewport;
-        let tx = self.tx.clone();
-        let sort = sort_str(fire.sort);
-        std::thread::spawn(move || {
-            let payload = match client::query(&paths, &fire.query, QUERY_LIMIT, sort) {
-                Ok(out) => Payload::Hits {
-                    entries: out.entries,
-                    total: out.total,
-                    elapsed_ms: out.elapsed_ms,
-                    stat_ms: out.stat_ms,
-                    offline: out.offline_built_at.is_some(),
-                },
-                Err(err) => {
-                    // 失败分流:daemon 不可连(引擎拉起中/未运行)与查询级错误,角标不同
-                    let engine_down = client::connect(&paths).is_none();
-                    log::warn!("查询失败(engine_down={engine_down}):{err}");
-                    Payload::Failed { engine_down }
-                }
-            };
-            let engine = match client::status(&paths) {
-                Ok(StatusOutcome::Reported(r)) => Some(EngineStatus {
-                    state: r.state,
-                    entry_count: r.entry_count,
-                }),
-                Ok(StatusOutcome::NoIndex) => None,
-                Err(err) => {
-                    log::warn!("引擎状态查询失败:{err}");
-                    None
-                }
-            };
-            let _ = tx.send(QueryResult {
-                generation: fire.generation,
-                payload,
-                engine,
-            });
-            // 跨线程唤醒:定向悬浮条视口(根视口隐藏/遮挡时不被根窗节流拖住;
-            // 面板已隐藏则该帧被 eframe 按不可见视口跳过,不破隐藏零帧)。
-            ctx.request_repaint_of(viewport);
-        });
+        spawn_query_worker(
+            self.paths.clone(),
+            self.ctx.clone(),
+            self.viewport,
+            self.tx.clone(),
+            fire,
+            QUERY_LIMIT,
+        );
     }
 
     /// 结果应用:代际校验(旧代丢弃)→ 命中集/失败分支 → 角标重算。
@@ -469,7 +438,7 @@ impl PaletteState {
         } else if keys.cmd_enter {
             action = self.open_selected(true);
         } else if keys.alt_enter {
-            // Task 17 消费:打开完整窗口并带当前查询词
+            // 打开完整窗口并带当前查询词(上层消费)
             self.full_window_request = Some(self.input.clone());
             action = Some(Action::FullWindow);
         } else if keys.esc {
@@ -574,36 +543,11 @@ impl PaletteState {
     /// reveal=true → 访达显示(⌘↵)。成功 → Some(Hide)(product §1:打开后自动隐藏)。
     fn open_selected(&mut self, reveal: bool) -> Option<Action> {
         let path = self.results.get(self.selected)?.path.clone();
-        if std::fs::metadata(&path).is_err() {
-            // 边界(product §边界):文件已删 → 提示,不隐藏、不静默
-            self.status_note = Some("文件不存在,索引可能待更新".into());
-            return None;
-        }
-        log::info!(
-            "{}:{path}",
-            if reveal {
-                "访达显示(⌘↵)"
-            } else {
-                "默认应用打开"
-            }
-        );
-        let mut cmd = std::process::Command::new("open");
-        if reveal {
-            cmd.arg("-R");
-        }
-        cmd.arg(&path);
-        match cmd.spawn() {
-            Ok(mut child) => {
-                // 收尸 + 失败留痕(open 非零退出 = 系统未打开该文件)
-                std::thread::spawn(move || match child.wait() {
-                    Ok(st) if !st.success() => log::warn!("open 退出异常({st}):{path}"),
-                    Ok(_) => {}
-                    Err(e) => log::warn!("等待 open 退出失败:{e}"),
-                });
-                Some(Action::Hide)
-            }
-            Err(e) => {
-                self.status_note = Some(format!("打开失败:{e}"));
+        match open_path(&path, reveal) {
+            Ok(()) => Some(Action::Hide),
+            Err(msg) => {
+                // 边界(product §边界):文件已删/打开失败 → 提示,不隐藏、不静默
+                self.status_note = Some(msg);
                 None
             }
         }
@@ -668,8 +612,93 @@ impl Keys {
     }
 }
 
+/// 发起一次查询的工作线程(`client::query` + 顺带 `client::status`),结果经 mpsc
+/// 回投并定向唤醒 `viewport`。悬浮条与完整窗口共用(勿复制第二份;UI 线程绝不做
+/// 阻塞查询——模块头注「查询执行模型」)。结果行至多 `limit` 条(协议上限内)。
+pub(crate) fn spawn_query_worker(
+    paths: DaemonPaths,
+    ctx: egui::Context,
+    viewport: egui::ViewportId,
+    tx: mpsc::Sender<QueryResult>,
+    fire: Fire,
+    limit: u32,
+) {
+    let sort = sort_str(fire.sort);
+    std::thread::spawn(move || {
+        let payload = match client::query(&paths, &fire.query, limit, sort) {
+            Ok(out) => Payload::Hits {
+                entries: out.entries,
+                total: out.total,
+                elapsed_ms: out.elapsed_ms,
+                stat_ms: out.stat_ms,
+                offline: out.offline_built_at.is_some(),
+            },
+            Err(err) => {
+                // 失败分流:daemon 不可连(引擎拉起中/未运行)与查询级错误,角标不同
+                let engine_down = client::connect(&paths).is_none();
+                log::warn!("查询失败(engine_down={engine_down}):{err}");
+                Payload::Failed { engine_down }
+            }
+        };
+        let engine = match client::status(&paths) {
+            Ok(StatusOutcome::Reported(r)) => Some(EngineStatus {
+                state: r.state,
+                entry_count: r.entry_count,
+                gaps: r.gaps.len() as u32,
+            }),
+            Ok(StatusOutcome::NoIndex) => None,
+            Err(err) => {
+                log::warn!("引擎状态查询失败:{err}");
+                None
+            }
+        };
+        let _ = tx.send(QueryResult {
+            generation: fire.generation,
+            payload,
+            engine,
+        });
+        // 跨线程唤醒:定向目标视口(悬浮条:根视口隐藏/遮挡时不被根窗节流拖住;
+        // 完整窗口:根视口隐藏期 eframe 走 run_logic,状态照常落地,不破隐藏零帧)。
+        ctx.request_repaint_of(viewport);
+    });
+}
+
+/// 默认应用打开(reveal=false → 目录 = 访达进入)或访达显示(reveal=true,`open -R`)。
+/// 悬浮条与完整窗口共用(勿复制第二份);失败返回可展示的提示(None 之外不静默)。
+pub(crate) fn open_path(path: &str, reveal: bool) -> Result<(), String> {
+    if std::fs::metadata(path).is_err() {
+        return Err("文件不存在,索引可能待更新".into());
+    }
+    log::info!(
+        "{}:{path}",
+        if reveal {
+            "访达显示(⌘↵)"
+        } else {
+            "默认应用打开"
+        }
+    );
+    let mut cmd = std::process::Command::new("open");
+    if reveal {
+        cmd.arg("-R");
+    }
+    cmd.arg(path);
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // 收尸 + 失败留痕(open 非零退出 = 系统未打开该文件)
+            let path = path.to_string();
+            std::thread::spawn(move || match child.wait() {
+                Ok(st) if !st.success() => log::warn!("open 退出异常({st}):{path}"),
+                Ok(_) => {}
+                Err(e) => log::warn!("等待 open 退出失败:{e}"),
+            });
+            Ok(())
+        }
+        Err(e) => Err(format!("打开失败:{e}")),
+    }
+}
+
 /// 会话排序键 → 协议字符串(daemon `parse_sort_key` 接受形态;缺省 = relevance)。
-fn sort_str(key: SortKey) -> Option<&'static str> {
+pub(crate) fn sort_str(key: SortKey) -> Option<&'static str> {
     match key {
         SortKey::Relevance => None,
         SortKey::Name => Some("name"),
@@ -758,6 +787,7 @@ mod tests {
         let eng = |s: &str| EngineStatus {
             state: s.into(),
             entry_count: 12,
+            gaps: 0,
         };
         assert_eq!(
             badge_note(&State::Searching, Some(&eng("building"))).as_deref(),

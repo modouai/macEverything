@@ -1,13 +1,13 @@
 //! UI 层:双视口壳。
 //!
-//! 主视口(ROOT)= 完整结果窗口(Task 17 填结果表格);
+//! 主视口(ROOT)= 完整结果窗口(`ui/results.rs`,Task 17:表格虚拟化/列排序/多选);
 //! 第二视口 = 悬浮条(Task 12 UI;Task 14 接平台层:跨 Space/浮动级别/失焦隐藏/多屏定位)。
 //!
 //! ## 菜单栏托盘(Task 16)
 //!
 //! 托盘本体(图标/菜单/事件泵)在 `tray.rs`;本文件只做两件事:
 //! ① `logic()` 每帧消费托盘动作(`drain_tray`:`TogglePalette` 与热键共用
-//!    `toggle_palette`;`OpenResults` = 完整窗口占位,Task 17 接管;`ToggleAutostart`
+//!    `toggle_palette`;`OpenResults` = 唤起完整窗口并聚焦搜索框;`ToggleAutostart`
 //!    Task 20 前占位;`Quit` = 置 `quitting` 后走根窗关闭的干净退出路径,引擎常驻;
 //!    `LaunchEngine` 放工作线程)并把最新引擎快照落到菜单项(`TrayRuntime::sync`)。
 //! ② 两个带查询词 / 无查询词的「打开完整窗口」入口共用 `show_root_window`。
@@ -51,6 +51,7 @@
 //! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
 
 pub mod palette;
+pub mod results;
 pub mod theme;
 
 use eframe::egui;
@@ -140,6 +141,8 @@ pub struct App {
 pub struct Shared {
     /// 悬浮条状态与查询会话(Task 12)。
     pub palette: palette::PaletteState,
+    /// 完整窗口(根视口)状态与查询会话(Task 17;与悬浮条各自防抖/代际)。
+    pub results: results::ResultsState,
     /// 主题跟随(节流 + 已应用值;Task 13 起为局部状态,Task 14 收进共享态)。
     pub theme: theme::ThemeFollow,
     /// 悬浮条可见标志(真源;排帧门禁与按钮态都读它)。
@@ -172,6 +175,7 @@ impl App {
                     palette_viewport_id(),
                     hotkey_note,
                 ),
+                results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
                 theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
                 palette_visible: false, // 启动隐藏(plan 骨架:.with_visible(false))
             })),
@@ -246,9 +250,10 @@ impl App {
                     self.toggle_palette(ctx);
                 }
                 TrayMsg::OpenResults => {
-                    // Task 17 接管完整窗口内容;此处先把根窗唤到前台(缺口项同入口,
-                    // 展开缺口清单 Task 19 接)。
-                    log::info!("托盘:打开完整窗口(Task 17 前的占位)");
+                    // 完整窗口(Task 17):聚焦搜索框 + 补查引擎状态后原生唤到前台
+                    // (缺口项同入口;展开缺口清单 Task 19 接)。
+                    log::info!("托盘:打开完整窗口");
+                    self.shared().results.on_window_shown();
                     show_root_window(ctx);
                 }
                 TrayMsg::ToggleAutostart => {
@@ -305,6 +310,11 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
+
+        // 完整窗口(Task 17):结果会话推进——防抖到期发查询、收两路回投。
+        // 放 logic(而非 ui)使根窗隐藏期(close=隐藏)也经 eframe run_logic 收响应,
+        // 状态不落后到下次显示;空闲无 pending 时不产生任何帧,不破隐藏零帧。
+        self.shared().results.tick(Instant::now());
 
         // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/
         // 文本更新要求主线程——muda 约束;快照由刷新线程写、悬停/点击/拉起后触发)。
@@ -369,33 +379,10 @@ impl eframe::App for App {
             }
         }
 
-        // 主视口:完整窗口占位(Task 17 填表格)。
-        ui.heading("macEverything");
-        ui.label("完整结果窗口(占位——Task 17)");
-        ui.separator();
-        let palette_visible = self.shared().palette_visible;
-        if ui
-            .button(if palette_visible {
-                "隐藏悬浮条"
-            } else {
-                "显示悬浮条(dev 入口;⌥Space 热键 / 托盘左键)"
-            })
-            .clicked()
+        // 主视口:完整结果窗口(Task 17;product §2)。
         {
-            if palette_visible {
-                self.hide_palette(&ctx);
-            } else {
-                self.show_palette(&ctx);
-            }
-        }
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("关闭本窗口 = 隐藏(不退出);悬浮条 ⌥↵ 可再打开本窗口").weak());
-        if ui
-            .button("退出 App(dev 入口;托盘菜单「退出」同路径)")
-            .clicked()
-        {
-            self.quitting = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let mut s = self.shared();
+            s.results.draw(ui);
         }
 
         // 悬浮条第二视口:常驻注册(deferred;隐藏不销毁,L1/L2 选路 A)。
@@ -451,10 +438,12 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             log::info!("悬浮条隐藏(Esc/打开成功/失焦)");
         }
         Some(palette::Action::FullWindow) => {
-            // Task 17 消费查询词;此处先把完整窗口(根视口)唤起
+            // ⌥↵:查询词灌入完整窗口并立即查询(空词 = 清空态开窗);随后聚焦 + 补查状态。
             if let Some(q) = s.palette.full_window_request.take() {
-                log::info!("⌥↵:打开完整窗口并带查询词 {q:?}(Task 17 消费)");
+                log::info!("⌥↵:打开完整窗口并带查询词 {q:?}");
+                s.results.set_query(&q);
             }
+            s.results.on_window_shown();
             s.palette_visible = false;
             s.palette.reset();
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));

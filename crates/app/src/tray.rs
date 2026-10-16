@@ -61,7 +61,7 @@ const ICON_FG: [u8; 3] = [255, 255, 255];
 pub enum TrayMsg {
     /// 左键点击 / 菜单「打开搜索」:切换悬浮条显示态。
     TogglePalette,
-    /// 菜单「打开完整窗口」/ 缺口项(Task 19 接缺口面板;先做完整窗口占位)。
+    /// 菜单「打开完整窗口」/ 缺口项(唤起完整窗口;缺口面板 Task 19 接)。
     OpenResults,
     /// 菜单「开机自启」:Task 20 前占位(勾选态只在内存,见 `TrayRuntime::autostart_checked`)。
     ToggleAutostart,
@@ -326,7 +326,7 @@ fn spawn_menu_pump(ctx: egui::Context, tx: Sender<TrayMsg>) {
                     continue;
                 };
                 if msg == TrayMsg::OpenResults && event.id.0 == ids::GAPS {
-                    // Task 19 接展开缺口清单;此处留痕(点击 → 完整窗口占位)
+                    // 点击 → 唤起完整窗口(展开缺口清单 Task 19 接)
                     log::info!("托盘缺口项点击:打开完整窗口(缺口面板 Task 19 接)");
                 }
                 if send_msg(&tx, msg) {

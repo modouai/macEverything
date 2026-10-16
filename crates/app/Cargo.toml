@@ -46,6 +46,8 @@ raw-window-handle = "0.6"
 # (eframe 的 NSApplication::run 即此循环;事件泵细节见 src/hotkey.rs 模块注释)。
 global-hotkey = "0.6"
 anyhow = "1"
+# Task 17:完整窗口「修改时间」列按本地时区显示(localtime_r;cli 的 fmt_time 是 UTC)。
+libc.workspace = true
 log = { workspace = true, features = ["std"] }
 # Task 16 菜单栏托盘(实锁 0.26.1;菜单走其 re-export 的 muda)。
 # 关默认 features:默认的 libappindicator 只服务 Linux 后端,本仓交付面仅 macOS,
