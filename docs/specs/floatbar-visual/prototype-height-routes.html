@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>悬浮条高度 · 两线路原型（A 固定高 / B 窗内动画）</title>
+<style>
+  :root{
+    --panel-bg: rgba(250,250,252,.94);
+    --panel-stroke: rgba(0,0,0,.10);
+    --text: #1d1d1f; --text-2:#6e6e73; --text-3:#98989d;
+    --row-hover: rgba(0,0,0,.045); --row-sel: rgba(0,122,255,.13);
+    --divider: rgba(0,0,0,.08);
+    --key-bg: rgba(0,0,0,.06); --key-stroke: rgba(0,0,0,.10);
+    --panel-shadow: 0 24px 64px -14px rgba(0,0,0,.38);
+    --page-bg1:#e8ebf1; --page-bg2:#dde2ec;
+    --doc-bg:#ffffff; --doc-text:#3a3a3c;
+    --ctrl-bg: rgba(255,255,255,.85); --ctrl-stroke: rgba(0,0,0,.10); --ctrl-text:#1d1d1f;
+    --winbox: rgba(0,122,255,.06); --winbox-line: rgba(0,122,255,.45);
+  }
+  body.dark{
+    --panel-bg: rgba(40,40,42,.95);
+    --panel-stroke: rgba(255,255,255,.13);
+    --text:#f5f5f7; --text-2:#a1a1a6; --text-3:#8e8e93;
+    --row-hover: rgba(255,255,255,.06); --row-sel: rgba(10,132,255,.25);
+    --divider: rgba(255,255,255,.10);
+    --key-bg: rgba(255,255,255,.13); --key-stroke: rgba(255,255,255,.10);
+    --panel-shadow: 0 24px 64px -14px rgba(0,0,0,.65);
+    --page-bg1:#2a2d35; --page-bg2:#20222a;
+    --doc-bg:#f4f4f6; --doc-text:#48484a;
+    --ctrl-bg: rgba(40,40,42,.88); --ctrl-stroke: rgba(255,255,255,.14); --ctrl-text:#f5f5f7;
+    --winbox: rgba(10,132,255,.08); --winbox-line: rgba(10,132,255,.55);
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; }
+  body{
+    font-family:-apple-system,"PingFang SC","Helvetica Neue",system-ui,sans-serif;
+    background: linear-gradient(160deg, var(--page-bg1), var(--page-bg2));
+    overflow:hidden; color:var(--text);
+  }
+
+  /* —— 模拟桌面：背后放一份文档，给悬浮条阴影一个落点 —— */
+  .desktop{ position:absolute; inset:0; }
+  .mockdoc{
+    position:absolute; left:50%; top:220px; transform:translateX(-50%);
+    width:820px; padding:48px 56px; border-radius:10px;
+    background:var(--doc-bg); color:var(--doc-text);
+    box-shadow:0 10px 40px rgba(0,0,0,.12);
+  }
+  .mockdoc h1{ font-size:22px; margin-bottom:18px; color:#1d1d1f; }
+  body.dark .mockdoc h1{ color:#3a3a3c; }
+  .mockdoc p{ font-size:14px; line-height:2; color:inherit; opacity:.85; }
+
+  /* —— 悬浮条定位：距顶 110、水平居中（对齐 visual.md §1.1）—— */
+  .floatwrap{ position:absolute; top:110px; left:50%; transform:translateX(-50%); width:700px; }
+
+  /* B 的透明窗口边界（勾选可见；覆盖层，仅作检查用） */
+  .winbox{
+    position:absolute; left:0; top:0; width:700px; height:466px;
+    background:transparent; border:1.5px dashed var(--winbox-line);
+    border-radius:14px; display:none;
+    z-index:5; pointer-events:none;
+  }
+  .winbox.show{ display:block; }
+  .winbox .wlabel{
+    position:absolute; left:12px; bottom:8px; font-size:11px; color:var(--winbox-line);
+    background:var(--panel-bg); padding:2px 8px; border-radius:6px;
+  }
+
+  /* —— 面板本体：高度由 JS 驱动；overflow:hidden 即「裁切」—— */
+  .panel{
+    position:relative; width:700px; overflow:hidden;
+    background:var(--panel-bg);
+    border:1px solid var(--panel-stroke);
+    border-radius:12px;
+    box-shadow:var(--panel-shadow);
+    backdrop-filter: blur(20px);
+  }
+  .inner{ display:flex; flex-direction:column; }
+
+  /* 搜索行：高 64 */
+  .searchrow{ height:64px; flex:0 0 64px; display:flex; align-items:center; gap:14px; padding:0 20px; }
+  .sicon{ width:20px; height:20px; flex:0 0 20px; opacity:.45; }
+  .sicon svg{ width:20px; height:20px; display:block; }
+  #q{
+    flex:1; border:none; outline:none; background:transparent;
+    font-size:21px; color:var(--text); font-family:inherit; caret-color:#0a84ff;
+  }
+  #q::placeholder{ color:var(--text-3); }
+  .openfull{
+    width:28px; height:28px; flex:0 0 28px; border-radius:7px; border:none;
+    background:transparent; color:var(--text-2); font-size:15px; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .openfull:hover{ background:var(--row-hover); }
+
+  .divider{ height:1px; flex:0 0 1px; background:var(--divider); }
+
+  /* 结果区：flex:1 → 高度 = inner 高 − 其余三段 */
+  .list{ flex:1 1 auto; min-height:0; overflow-y:auto; padding:8px; }
+  .row{
+    height:56px; border-radius:8px; padding:0 12px;
+    display:flex; align-items:center; gap:12px; cursor:default;
+    margin-bottom:2px;
+  }
+  .row:last-child{ margin-bottom:0; }
+  .row.hov{ background:var(--row-hover); }
+  .row.sel{ background:var(--row-sel); }
+  .ricon{
+    width:32px; height:32px; flex:0 0 32px; border-radius:8px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:9px; font-weight:700; letter-spacing:.3px; color:#fff;
+  }
+  .rtext{ flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
+  .rname{ font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rdir{ font-size:12px; color:var(--text-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ract{ font-size:12px; color:var(--text-3); display:none; flex:0 0 auto; }
+  .row.sel .ract{ display:block; }
+
+  .empty{
+    height:100%; display:flex; align-items:center; justify-content:center;
+    color:var(--text-3); font-size:14px;
+  }
+
+  /* 页脚：高 38 */
+  .footer{ height:38px; flex:0 0 38px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; }
+  .count{ font-size:12px; color:var(--text-3); }
+  .keys{ display:flex; gap:16px; }
+  .kitem{ display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-3); }
+  .key{
+    font-size:11px; padding:3px 6px; border-radius:4px;
+    background:var(--key-bg); border:1px solid var(--key-stroke);
+    color:var(--text-2); line-height:1;
+  }
+
+  /* —— 吉祥物：面板的兄弟节点，锚点 = 面板顶边与右缘（§2.9）—— */
+  .mascot{
+    position:absolute; left:100%; top:6px; margin-left:14px;
+    height:112px; pointer-events:none;
+    filter:drop-shadow(0 6px 14px rgba(0,0,0,.18));
+  }
+  body.no-mascot .mascot{ display:none; }
+
+  /* —— 控制条（悬浮于底部，不干扰 110px 顶距的观感）—— */
+  .ctrl{
+    position:absolute; left:50%; bottom:18px; transform:translateX(-50%);
+    display:flex; align-items:center; gap:18px;
+    background:var(--ctrl-bg); border:1px solid var(--ctrl-stroke);
+    color:var(--ctrl-text);
+    border-radius:12px; padding:10px 16px; font-size:13px;
+    box-shadow:0 8px 30px rgba(0,0,0,.18); backdrop-filter: blur(16px);
+    white-space:nowrap;
+  }
+  .seg{ display:flex; background:var(--key-bg); border-radius:8px; padding:3px; }
+  .seg button{
+    border:none; background:transparent; color:var(--ctrl-text); opacity:.65;
+    font-size:13px; font-family:inherit; padding:5px 14px; border-radius:6px; cursor:pointer;
+  }
+  .seg button.on{ background:var(--panel-bg); opacity:1; box-shadow:0 1px 4px rgba(0,0,0,.14); font-weight:600; }
+  .ctrl label{ display:flex; align-items:center; gap:6px; opacity:.85; cursor:pointer; }
+  .ctrl input[type=checkbox]{ accent-color:#0a84ff; }
+  .ctrl .sep{ width:1px; height:20px; background:var(--divider); }
+  .readout{ font-variant-numeric: tabular-nums; opacity:.85; }
+  .readout b{ font-weight:600; }
+  .hint{
+    position:absolute; left:50%; bottom:72px; transform:translateX(-50%);
+    font-size:12px; color:var(--ctrl-text); opacity:.7;
+    background:var(--ctrl-bg); border-radius:8px; padding:6px 12px;
+    border:1px solid var(--ctrl-stroke);
+  }
+</style>
+</head>
+<body>
+
+<div class="desktop">
+  <div class="mockdoc">
+    <h1>区域B省工程建设项目 2026 年度工作安排</h1>
+    <p>各有关单位：为进一步规范项目管理流程，现将本年度重点工作安排通知如下……（此窗口仅为背景示意，用于观察悬浮条阴影与遮挡关系）</p>
+    <p>一、项目立项与预算执行；二、季度进度汇总与验收；三、档案归档与数据备份。请各单位于每月 25 日前报送进度台账……</p>
+    <p>二〇二六年十月</p>
+  </div>
+
+  <div class="floatwrap">
+    <div class="winbox" id="winbox">
+      <span class="wlabel">透明窗口边界 700 × 466（窗口恒为最大尺寸；面板外区域透明）</span>
+    </div>
+
+    <div class="panel" id="panel">
+      <div class="inner" id="inner">
+        <div class="searchrow">
+          <span class="sicon">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+              <circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4.5 4.5" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <input id="q" placeholder="搜索文件" autocomplete="off" spellcheck="false">
+          <button class="openfull" title="打开完整窗口">⤢</button>
+        </div>
+        <div class="divider"></div>
+        <div class="list" id="list"></div>
+        <div class="divider"></div>
+        <div class="footer">
+          <span class="count" id="count">输入关键词搜索</span>
+          <span class="keys">
+            <span class="kitem"><span class="key">↵</span>打开</span>
+            <span class="kitem"><span class="key">⌥↵</span>完整窗口</span>
+            <span class="kitem"><span class="key">⌘↵</span>访达</span>
+            <span class="kitem"><span class="key">esc</span>清空</span>
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <img class="mascot" src="./蓝色文件夹与放大镜吉祥物-透明.png" alt="吉祥物">
+  </div>
+</div>
+
+<div class="hint" id="hint"></div>
+
+<div class="ctrl">
+  <span>水平线路：</span>
+  <div class="seg">
+    <button id="mA" class="on">A 固定高面板</button>
+    <button id="mB">B 固定窗内动画</button>
+  </div>
+  <span class="sep"></span>
+  <label id="lblCollapse"><input type="checkbox" id="collapse" checked> A：空态塌到最小（两档）</label>
+  <label id="lblBox"><input type="checkbox" id="showbox"> B：显示透明窗边界</label>
+  <span class="sep"></span>
+  <label><input type="checkbox" id="theme"> 深色</label>
+  <label><input type="checkbox" id="mascotOn" checked> 显示吉祥物</label>
+  <span class="sep"></span>
+  <span class="readout" id="readout"></span>
+</div>
+
+<script>
+/* ================= 数据与布局常量（对齐 visual.md 数值） ================= */
+const ROW_H = 56, GAP = 2, LIST_PAD_V = 16;      // 结果区：行 56 / 行距 2 / 上下内边距 8+8
+const CHROME = 64 + 1 + 1 + 38;                  // 搜索行 + 两条分隔线 + 页脚
+const MAX_ROWS = 6;                              // 结果区固定容纳 6 行
+const LIST_MAX = MAX_ROWS * ROW_H + (MAX_ROWS - 1) * GAP + LIST_PAD_V;  // 362
+const LIST_MIN = 72;                             // 空态最小高（1 行 56 + 内边距 16）
+const PANEL_MAX = CHROME + LIST_MAX;             // 466
+const PANEL_MIN = CHROME + LIST_MIN;             // 176
+const PANEL_W = 700;
+
+const DIRS = [
+  "/Users/hui/项目/区域B工程",
+  "/Users/hui/Documents/公文/2026",
+  "/Users/hui/Desktop",
+  "/Users/hui/Downloads",
+  "/Volumes/数据盘/归档/2025",
+  "/Users/hui/项目/区域B工程/src",
+];
+const NAMES = [
+  "区域B换季方案.docx", "区域B项目立项书.pdf", "区域B工程进度表.xlsx",
+  "区域B会议纪要-2026-10.docx", "区域B预算总表.xlsx", "区域B工程验收单.pdf",
+  "区域B团队名单.xlsx", "区域B省供应商名录.xlsx", "区域B省地图.png",
+  "湖南出差申请.docx", "太湖项目资料.zip", "湖泊调研报告.docx", "西湖设计方案.png",
+  "会议纪要模板.docx", "年度工作总结-2025.docx", "关于规范文件管理的通知.pdf",
+  "项目周报-W42.docx", "季度预算执行表.xlsx", "合同评审记录.pdf", "采购清单.xlsx",
+  "报销台账-10月.xlsx", "会议照片-2026-10.zip", "设计稿-悬浮条-v2.fig",
+  "安装包-macEverything-2.0.dmg", "字体-思源黑体.zip", "readme.md", "main.rs",
+  "architecture.md", "budget-2026.xlsx", "meeting-notes.md", "annual-report.pdf",
+  "q3-review.pptx", "photo-library.jpg", "backup-2025.tar.gz", "发票-10月.pdf",
+  "培训签到表.xlsx", "客户拜访记录.docx", "需求评审要点.md", "发布检查单.md",
+  "数据字典.xlsx", "接口文档.pdf", "部署脚本.sh", "release-notes.txt",
+];
+const FILES = [];
+NAMES.forEach((n, i) => FILES.push({ name: n, dir: DIRS[i % DIRS.length] }));
+
+const EXT_COLOR = {
+  docx:"#3b82f6", doc:"#3b82f6", pdf:"#ef4444", xlsx:"#22a06b", xls:"#22a06b",
+  png:"#8b5cf6", jpg:"#8b5cf6", fig:"#8b5cf6", zip:"#f59e0b", gz:"#f59e0b",
+  dmg:"#64748b", md:"#0ea5e9", rs:"#64748b", pptx:"#f97316", txt:"#64748b", sh:"#64748b",
+};
+const extOf = n => (n.includes(".") ? n.split(".").pop().toLowerCase() : "file");
+
+/* ================= 状态 ================= */
+let mode = "A";            // A | B
+let collapse = true;       // A 变体：空态塌到最小（默认开，对齐 §2.7 不塌陷但无大留白）
+let query = "";
+let hits = [];
+let sel = 0;
+let animH = PANEL_MAX;     // B：当前绘制高（逐帧逼近 target）
+let rafId = null, lastT = 0;
+
+const $ = id => document.getElementById(id);
+const panel = $("panel"), inner = $("inner"), list = $("list");
+const input = $("q"), count = $("count"), readout = $("readout"), hint = $("hint");
+
+/* ================= 高度计算 ================= */
+function listH(n){
+  if (n <= 0) return LIST_MIN;
+  const used = Math.min(n, MAX_ROWS);
+  return Math.min(used * ROW_H + (used - 1) * GAP + LIST_PAD_V, LIST_MAX);
+}
+/** 自然内容高（B 的动画目标；A 除非塌陷变体否则恒为最大） */
+const naturalH = n => CHROME + listH(n);
+/** 本帧应绘制/呈现的面板高 */
+function drawnTargetH(n){
+  if (mode === "A") return collapse && n === 0 ? PANEL_MIN : PANEL_MAX;
+  return naturalH(n);
+}
+
+/* ================= 渲染 ================= */
+function render(){
+  query = input.value.trim();
+  hits = query
+    ? FILES.filter(f => (f.name + f.dir).toLowerCase().includes(query.toLowerCase()))
+    : [];
+  sel = Math.min(sel, Math.max(hits.length - 1, 0));
+  if (sel < 0) sel = 0;
+
+  // 行
+  list.innerHTML = hits.length
+    ? hits.map((f, i) => {
+        const ext = extOf(f.name);
+        const color = EXT_COLOR[ext] || "#94a3b8";
+        return `<div class="row ${i === sel ? "sel" : ""}" data-i="${i}">
+          <div class="ricon" style="background:${color}">${ext.slice(0,4).toUpperCase()}</div>
+          <div class="rtext">
+            <div class="rname">${esc(f.name)}</div>
+            <div class="rdir">${esc(f.dir)}</div>
+          </div>
+          <span class="ract">打开 ↵</span>
+        </div>`;
+      }).join("")
+    : `<div class="empty">${query ? "无匹配项" : "输入关键词搜索全盘文件"}</div>`;
+
+  // 页脚计数
+  count.textContent = query
+    ? (hits.length ? `${hits.length} 个结果` : "无匹配项")
+    : "输入关键词搜索";
+
+  // 布局高（内容按目标高排版）+ 呈现高（A 瞬变 / B 动画）
+  const n = hits.length;
+  const target = drawnTargetH(n);
+  if (mode === "A"){
+    inner.style.height = target + "px";
+    panel.style.height = target + "px";
+    updateReadout(target, n);
+  } else {
+    const nat = naturalH(n);
+    inner.style.height = nat + "px";
+    scheduleAnim(nat, n);
+  }
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+
+/* ================= B：逐帧平滑逼近（与实机同一族曲线：τ=70ms、上限 900px/s、3px 吸附） ================= */
+function scheduleAnim(target, n){
+  if (rafId === null){ lastT = performance.now(); rafId = requestAnimationFrame(step); }
+  step.target = target; step.n = n;
+}
+function step(t){
+  const dt = Math.min((t - lastT) / 1000, 0.1);
+  lastT = t;
+  const target = step.target;
+  const diff = target - animH;
+  if (Math.abs(diff) < 3){
+    animH = target;
+  } else {
+    const k = 1 - Math.exp(-dt / 0.070);
+    const maxStep = 900 * dt;
+    animH += Math.max(-maxStep, Math.min(maxStep, diff * k));
+  }
+  panel.style.height = animH + "px";
+  updateReadout(animH, step.n ?? hits.length);
+  if (Math.abs(target - animH) < 0.5){ rafId = null; return; }
+  rafId = requestAnimationFrame(step);
+}
+function stopAnim(){ if (rafId !== null){ cancelAnimationFrame(rafId); rafId = null; } }
+
+/* ================= 读数与提示 ================= */
+function updateReadout(h, n){
+  const rows = Math.min(n, MAX_ROWS);
+  if (mode === "A"){
+    readout.innerHTML = `面板高 <b>${Math.round(h)}</b>（恒定）｜ 结果 <b>${n}</b> 行${n > MAX_ROWS ? `（显示 ${MAX_ROWS}，可滚动）` : ""}`;
+  } else {
+    const done = Math.abs((step.target ?? h) - h) < 0.5;
+    readout.innerHTML = `面板高 <b>${Math.round(h)}</b>${done ? "（已收敛）" : "（动画中）"}｜ 结果 <b>${n}</b> 行${n > MAX_ROWS ? `（显示 ${MAX_ROWS}，可滚动）` : ""}`;
+  }
+  hint.textContent = mode === "A"
+    ? "A 固定高（参照 Raycast）：面板几何恒定，结果区内部滚动，打字/删除全程零次窗口尺寸变化。代价：少结果时留白——Raycast 用建议列表填白，本原型留白，可用空态区/页脚消化。"
+    : "B 窗内动画（参照 Spotlight）：透明窗口恒为 700×466（可勾选看边界），可见面板逐帧平滑逼近内容高——空态不留白、结果到来平滑生长，且全程不触碰窗口几何。";
+}
+
+/* ================= 交互 ================= */
+input.addEventListener("input", render);
+input.addEventListener("keydown", e => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp"){
+    e.preventDefault();
+    if (!hits.length) return;
+    sel = Math.max(0, Math.min(hits.length - 1, sel + (e.key === "ArrowDown" ? 1 : -1)));
+    render();
+    const el = list.querySelector(".row.sel");
+    el && el.scrollIntoView({ block:"nearest" });
+  } else if (e.key === "Escape"){
+    input.value = ""; sel = 0; render();
+  }
+});
+list.addEventListener("mousemove", e => {
+  const row = e.target.closest(".row");
+  list.querySelectorAll(".row.hov").forEach(r => r.classList.remove("hov"));
+  if (row) row.classList.add("hov");
+});
+list.addEventListener("click", e => {
+  const row = e.target.closest(".row");
+  if (row){ sel = +row.dataset.i; render(); }
+});
+
+// 模式切换
+function setMode(m){
+  stopAnim();
+  mode = m;
+  $("mA").classList.toggle("on", m === "A");
+  $("mB").classList.toggle("on", m === "B");
+  $("lblCollapse").style.opacity = m === "A" ? "" : ".35";
+  $("collapse").disabled = m !== "A";
+  $("lblBox").style.opacity = m === "B" ? "" : ".35";
+  $("showbox").disabled = m !== "B";
+  $("winbox").classList.toggle("show", m === "B" && $("showbox").checked);
+  if (m === "B"){
+    // 从当前高度出发，动画到内容高（演示「生长/收缩」本身）
+    animH = parseFloat(panel.style.height) || PANEL_MAX;
+  }
+  render();
+  input.focus();
+}
+$("mA").onclick = () => setMode("A");
+$("mB").onclick = () => setMode("B");
+$("collapse").onchange = e => { collapse = e.target.checked; render(); input.focus(); };
+$("showbox").onchange = e => { $("winbox").classList.toggle("show", e.target.checked); input.focus(); };
+$("theme").onchange = e => { document.body.classList.toggle("dark", e.target.checked); input.focus(); };
+$("mascotOn").onchange = e => { document.body.classList.toggle("no-mascot", !e.target.checked); input.focus(); };
+
+/* ================= 启动 ================= */
+setMode("A");
+input.focus();
+</script>
+</body>
+</html>
