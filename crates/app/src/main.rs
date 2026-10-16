@@ -2,8 +2,10 @@
 //!
 //! 启动序列(Task 10):app.sock 单实例(二次启动在 acquire 内唤起已有实例
 //! 并退出)→ 引擎探测/拉起(失败不阻塞 UI;悬浮条内展示错误 Task 12 接,
-//! 此处 stderr 留痕)→ eframe 主循环(双视口壳,平台行为 Task 14 接)。
+//! 此处 stderr 留痕)→ 开机自启默认注册(Task 20,product §4;打包形态才生效)
+//! → eframe 主循环(双视口壳,平台行为 Task 14 接)。
 
+mod autostart;
 mod engine_launcher;
 mod hotkey;
 mod platform;
@@ -35,6 +37,12 @@ fn main() -> anyhow::Result<()> {
     // 1) 引擎探测/拉起:失败不阻塞 UI(错误展示 Task 12 接,此处 stderr 留痕)
     if let Err(err) = engine_launcher::ensure_engine(&paths) {
         eprintln!("引擎未就绪: {err:#}");
+    }
+
+    // 2) 开机自启(Task 20,product §4):首次启动默认注册;用户曾主动关闭
+    // (数据目录标记)则不默认注册,开发形态(未打包)跳过。失败不阻塞启动。
+    if let Err(err) = autostart::register_at_startup(&paths.data_dir) {
+        log::warn!("开机自启默认注册未完成: {err:#}");
     }
 
     let native_options = eframe::NativeOptions {

@@ -8,8 +8,9 @@
 //! 托盘本体(图标/菜单/事件泵)在 `tray.rs`;本文件只做两件事:
 //! ① `logic()` 每帧消费托盘动作(`drain_tray`:`TogglePalette` 与热键共用
 //!    `toggle_palette`;`OpenResults` = 唤起完整窗口并聚焦搜索框;`ToggleAutostart`
-//!    Task 20 前占位;`Quit` = 置 `quitting` 后走根窗关闭的干净退出路径,引擎常驻;
-//!    `LaunchEngine` 放工作线程)并把最新引擎快照落到菜单项(`TrayRuntime::sync`)。
+//!    = SMAppService 注册/注销 + 用户意图标记(Task 20);`Quit` = 置 `quitting` 后走
+//!    根窗关闭的干净退出路径,引擎常驻;`LaunchEngine` 放工作线程)并把最新引擎
+//!    快照落到菜单项(`TrayRuntime::sync`)。
 //! ② 两个带查询词 / 无查询词的「打开完整窗口」入口共用 `show_root_window`。
 //!
 //! ## 视口形态(Task 14 定案,L1/L2 处置)
@@ -60,6 +61,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::autostart;
 use crate::engine_launcher;
 use crate::hotkey;
 use crate::platform;
@@ -264,10 +266,19 @@ impl App {
                     show_root_window(ctx);
                 }
                 TrayMsg::ToggleAutostart => {
-                    // Task 20 前占位:勾选态只在内存(勾选动作已由 muda 在菜单侧翻转,
-                    // 真源即菜单项自身;持久化与 SMAppService 注册/注销 Task 20 接)。
+                    // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按真实注册结果校准——
+                    // 成功保留勾选并落下/清除「用户关闭」标记(下次启动不再默认注册),
+                    // 失败(如开发形态未打包)复原勾选 + 日志(无角标面,不静默)。
                     let checked = self.tray.as_ref().is_some_and(|t| t.autostart_checked());
-                    log::info!("托盘:开机自启勾选 → {checked}(占位;Task 20 接真实注册)");
+                    match autostart::apply_user_choice(&self.paths.data_dir, checked) {
+                        Ok(note) => log::info!("托盘:开机自启 → {note}"),
+                        Err(err) => {
+                            log::warn!("托盘:开机自启设置失败(勾选复原): {err:#}");
+                            if let Some(tray) = &self.tray {
+                                tray.set_autostart_checked(!checked);
+                            }
+                        }
+                    }
                 }
                 TrayMsg::Quit => {
                     // 退出只退 App,引擎常驻(product §5)。走 dev 退出按钮同一条干净

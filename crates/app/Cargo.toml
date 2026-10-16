@@ -43,7 +43,14 @@ objc2-app-kit = { version = "0.3", features = [
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification
 # 为回调参数类型(Task 14b 直接引用,不依赖 feature 统一带来的可用性)。
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification"] }
+# NSBundle(Task 20):autostart 经 NSBundle.mainBundle().bundleIdentifier() 校验
+# 「在 .app 内」(PoC-5 坑①:无 bundle 调 register 不报错且注册独立条目)。
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification", "NSBundle"] }
+# Task 20 开机自启:ServiceManagement 的 objc2 官方 binding(实锁 0.3.2,与 objc2 0.6 同代;
+# 生成代码自带 `#[link(name = "ServiceManagement", kind = "framework")]`,框架随链接加载)。
+# 关默认 features:本任务只用 SMAppService(注册/注销/状态)+ SMErrors(错误码),
+# block2/core-foundation/security 均用不到,不开。
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService", "SMErrors"] }
 raw-window-handle = "0.6"
 # Task 15 全局热键(PoC-2 实锁 0.6.4;macOS 后端 = Carbon RegisterEventHotKey)。
 # 注意 crate 文档:macOS 上 manager 必须在主线程创建,且需主线程事件循环在跑

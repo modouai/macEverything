@@ -65,7 +65,8 @@ pub enum TrayMsg {
     OpenResults,
     /// 缺口项:唤起完整窗口并展开缺口面板(product §3)。
     OpenGaps,
-    /// 菜单「开机自启」:Task 20 前占位(勾选态只在内存,见 `TrayRuntime::autostart_checked`)。
+    /// 菜单「开机自启」(Task 20:真实注册态;muda 已按点击翻转勾选,成败由
+    /// `ui::drain_tray` 经 `autostart::apply_user_choice` 校准)。
     ToggleAutostart,
     /// 菜单「退出」:退 App(引擎常驻,product §5)。
     Quit,
@@ -130,7 +131,8 @@ pub struct TrayRuntime {
     state_item: MenuItem,
     /// 缺口项(有缺口才挂;归零即移除)。
     gaps_item: Option<MenuItem>,
-    /// 「开机自启」勾选项(勾选态即内存真源;Task 20 换真实注册态)。
+    /// 「开机自启」勾选项(勾选态 = 真实注册态;Task 20 起,操作成败在
+    /// `ui::drain_tray` 里校准——muda 只按点击翻转,不反映注册结果)。
     autostart: CheckMenuItem,
     /// 动作消息(泵线程 → 帧内 `poll`)。
     rx: Receiver<TrayMsg>,
@@ -154,9 +156,15 @@ impl TrayRuntime {
         self.refresh_tx.clone()
     }
 
-    /// 「开机自启」当前勾选态(Task 20 前为内存占位:即菜单项自身,点击由 muda 翻转)。
+    /// 「开机自启」当前勾选态(菜单项即勾选真源:安装时按真实注册态初始化,
+    /// 点击由 muda 翻转,失败时经 [`Self::set_autostart_checked`] 复原)。
     pub fn autostart_checked(&self) -> bool {
         self.autostart.is_checked()
+    }
+
+    /// 校准勾选态(注册/注销失败时复原;muda 自身只按点击翻转,不反映调用成败)。
+    pub fn set_autostart_checked(&self, checked: bool) {
+        self.autostart.set_checked(checked);
     }
 
     /// 主线程每帧调用:快照有变才动菜单项(状态文本/可点击性、缺口项增删)。
@@ -214,9 +222,17 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
     let state_item = MenuItem::with_id(ids::STATE, state_label(""), true, None);
     let open_search = MenuItem::with_id(ids::OPEN_SEARCH, "打开搜索", true, None);
     let open_window = MenuItem::with_id(ids::OPEN_WINDOW, "打开完整窗口", true, None);
-    // Task 20 前占位:勾选态只在内存(菜单项自身);默认勾选 = product §4
-    //「首次启动 App 时注册自启(默认开启)」。
-    let autostart = CheckMenuItem::with_id(ids::AUTOSTART, "开机自启", true, true, None);
+    // Task 20:勾选态 = 真实注册态(SMAppService):勾选 = 登录时会自动启动
+    // (= status Enabled;requiresApproval 视为未启用——用户尚未在系统设置放行)。
+    // 启动默认注册已在 main 里跑过(产品 §4「首次启动 App 时注册自启」),此处查询
+    // 即反映注册结果;开发形态(未打包)查询失败 → 未勾选呈现,点击时经
+    // apply_user_choice 报「未打包」并复原。
+    let autostart_checked = crate::autostart::is_enabled().unwrap_or_else(|err| {
+        log::debug!("托盘:开机自启状态不可用(按未勾选呈现): {err:#}");
+        false
+    });
+    let autostart =
+        CheckMenuItem::with_id(ids::AUTOSTART, "开机自启", true, autostart_checked, None);
     let quit = MenuItem::with_id(ids::QUIT, "退出", true, None);
     let separator = PredefinedMenuItem::separator();
     menu.append_items(&[
