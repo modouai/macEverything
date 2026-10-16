@@ -53,11 +53,13 @@ use protocol::{Gap, HitEntry};
 /// 查询上限(与悬浮条同口径:协议上限一次取满;product §2「展示前 K 条」的 K)。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
 /// 数据行高(px;行间 item_spacing 置零,选中/斑马底连成整块)。
-const ROW_H: f32 = 22.0;
+/// 随全局字号基准(Body 15)定:行高小于文字高时,视觉行与点击命中区错位
+/// (「偏上/偏下才点得到」,2026-10-16 实机反馈)——字号基准上调须同步此值。
+const ROW_H: f32 = 28.0;
 /// 表头行高(px)。
-const HEADER_H: f32 = 22.0;
-/// 搜索行高(px;与悬浮条输入行一致)。
-const INPUT_H: f32 = 26.0;
+const HEADER_H: f32 = 28.0;
+/// 搜索行高(px;与悬浮条输入行一并放大)。
+const INPUT_H: f32 = 30.0;
 
 /// 表格列:(排序键, 标题, 初始宽, 最小宽);末列占余宽(不可拖)。
 /// 顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径。
@@ -204,6 +206,12 @@ impl ResultsState {
     /// 每帧驱动(App::logic 调用;根窗隐藏期也经 run_logic 收取响应,状态不落后):
     /// 补查状态 → 防抖到期发查询 → 收三路回投(结果/状态/重启)。
     pub fn tick(&mut self, now: Instant) {
+        // 在途防抖逐帧补排(与悬浮条同款;根因见 `Session::pending_delay`:
+        // 同一 pass 里 0ms 立即重绘请求会吞掉 60ms 防抖请求)。
+        if let Some(delay) = self.session.pending_delay(now) {
+            self.ctx
+                .request_repaint_after_for(delay, egui::ViewportId::ROOT);
+        }
         if self.status_refresh_pending {
             self.status_refresh_pending = false;
             self.spawn_status();

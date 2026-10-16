@@ -49,6 +49,19 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
             .with_inner_size([900.0, 600.0])
+            // 透明根窗(硬要求,勿删):eframe 0.37 的 glow 后端只有一个全局 GL config
+            // (glow_integration.rs:76「one painter shared by all viewports」),
+            // 其透明位取自**根视口** builder(`with_transparency(native_options.viewport
+            // .transparent.unwrap_or(false))`,glow_integration.rs:1212)。子视口(悬浮条)
+            // 自己的 with_transparent 只影响窗口属性,改不了该 config;config 报
+            // supports_transparency()==Some(false) 时,glutin_winit::finalize_window
+            // (glutin-winit-0.5.0/src/lib.rs:199-202)会把窗口属性**强制**改回不透明。
+            // 实测后果:悬浮条圆角外区域渲染为近黑(像素取证 (8,8,8),底层为 (41,44,53)),
+            // 且 eframe 留痕「Cannot create transparent window: the GL config does not support it」。
+            // macOS CGL 的 config.transparency 只是回显模板位(cgl/config.rs:123),
+            // 像素格式本身恒带 8 位 alpha——故此位对根窗只是「允许透明」,根窗自绘不透明
+            // 底,观感不变;PoC-1b 单视口实测即此路径(透明像素取证 alpha 220)。
+            .with_transparent(true)
             // 产品形态(Task 21):两窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
             // 待命。eframe 0.37 在首帧 post_rendering 里**无条件** set_visible(true)
             // (native/epi_integration.rs:443-450,白闪修复),故 with_visible(false)
@@ -82,12 +95,25 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe 启动失败: {e}"))
 }
 
+/// 诊断开关缓存(进程内只读一次:本函数在每条日志的 `enabled` 里调用)。
+fn trace_eframe() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MCE_TRACE_EFRAME").is_some())
+}
+
 /// 极简日志:stderr(与 cli 的 init_logger 同形态;文件日志待 Task 10 接数据目录)。
 fn init_logger() {
     struct StderrLogger;
 
     impl log::Log for StderrLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            // 诊断开关:设 MCE_TRACE_EFRAME=1 时放行 eframe/egui 的 Trace 日志(排帧定位)。
+            if trace_eframe()
+                && (metadata.target().starts_with("eframe")
+                    || metadata.target().starts_with("egui"))
+            {
+                return metadata.level() <= log::LevelFilter::Trace;
+            }
             metadata.level() <= log::LevelFilter::Info
         }
 
@@ -100,7 +126,12 @@ fn init_logger() {
         fn flush(&self) {}
     }
 
+    let max = if trace_eframe() {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Info
+    };
     if log::set_boxed_logger(Box::new(StderrLogger)).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(max);
     }
 }

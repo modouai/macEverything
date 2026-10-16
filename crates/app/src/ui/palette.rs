@@ -32,9 +32,32 @@ pub const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(800);
 /// 靠全局鼠标键状态识别,须低延迟轮询;该态通常只在豁免后的常驻期短暂存在。
 pub const GHOST_POLL: Duration = Duration::from_millis(150);
 /// 悬浮条窗口宽度(与中央视口创建处的 ViewportBuilder 一致)。
-pub const PANEL_W: f32 = 600.0;
+/// 2026-10-16 辉哥实机反馈「窗口偏小」:600 → 720。
+pub const PANEL_W: f32 = 720.0;
 /// 初始窗口高度(仅输入行;结果出现后自适应增高)。
-pub const INITIAL_H: f32 = 44.0;
+/// = 2×`PANEL_PAD_Y`(10) + `INPUT_H`(32) + 描边 2(egui `Frame` 的 outer_rect
+/// 逐边加 stroke 宽,frame.rs:483)= 54。2026-10-16:44 → 54(上下留白)。
+pub const INITIAL_H: f32 = 54.0;
+
+// ---------------------------------------------------------------------------
+// 字号档(悬浮条用;全局基准 +2 号在 ui/mod.rs::install_base_text_styles)
+//
+// 单点定义:未来「自定义字号」设置项(v2.1 候选)改这几处常量即可。输入框与
+// 结果行用比全局 Body(15)更大的放大档(辉哥 2026-10-16 定:输入框 17、
+// 结果行 16、目录灰字 13、计数/角标 12)。
+/// 输入框字号。
+pub const FONT_INPUT: f32 = 17.0;
+/// 结果行文件名。
+pub const FONT_ROW: f32 = 16.0;
+/// 结果行目录灰字。
+pub const FONT_DIR: f32 = 13.0;
+/// 计数行 / 状态角标 / 空态。
+pub const FONT_META: f32 = 12.0;
+
+/// 结果行/输入框字号(proportional;供 RichText/TextEdit 直接引用)。
+fn font(size: f32) -> egui::FontId {
+    egui::FontId::proportional(size)
+}
 
 /// 首查按协议上限请求一次(product §1 分页语义:不重查、不翻页请求)。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
@@ -43,8 +66,17 @@ const ROWS_INITIAL: usize = 20;
 const ROWS_STEP: usize = 20;
 /// 列表区最大高度(行数少时收缩到内容高;超出滚动)。
 const LIST_MAX_H: f32 = 322.0;
-/// 输入行高度。
-const INPUT_H: f32 = 26.0;
+/// 面板四周内边距(左右, 上下);`INITIAL_H` = 2×上下内边距 + 输入行高。
+const PANEL_PAD_X: i8 = 14;
+const PANEL_PAD_Y: i8 = 10;
+/// 输入行(输入框)高度:17pt 文字 + 上下留白(文本内垂直居中)。
+const INPUT_H: f32 = 32.0;
+/// 面板圆角。
+const PANEL_RADIUS: u8 = 12;
+/// 结果行圆角(选中高亮块的柔和圆角)与行内边距(左右, 上下)。
+const ROW_RADIUS: u8 = 6;
+const ROW_PAD_X: i8 = 8;
+const ROW_PAD_Y: i8 = 3;
 
 /// 工作线程回投的查询结果。
 pub struct QueryResult {
@@ -141,6 +173,14 @@ pub struct PaletteState {
     scroll_to_selected: bool,
     /// 已下发的窗口高度(变化才发 InnerSize,防每帧抖动)。
     last_h: Option<f32>,
+    /// 本视口 pass 计数与上帧起始(首帧成本定位:与「距上帧」联立可见
+    /// tessellate/paint 耗时——我们的回调返回后才出图)。
+    pass_seq: u64,
+    last_pass_start: Option<Instant>,
+    /// 最近一次唤起时刻(`on_shown` 置;唤起后 1.5s 内逐帧留痕,之后停)。
+    show_at: Option<Instant>,
+    /// 在途查询(代际号, 发起时刻):响应落地时记往返。
+    query_sent: Option<(u64, Instant)>,
 }
 
 impl PaletteState {
@@ -177,7 +217,16 @@ impl PaletteState {
             last_focused: None,
             scroll_to_selected: false,
             last_h: None,
+            pass_seq: 0,
+            last_pass_start: None,
+            show_at: None,
+            query_sent: None,
         }
+    }
+
+    /// 唤起打点(首帧计时起点;`ui::palette_show` 调用)。
+    pub fn on_shown(&mut self, now: Instant) {
+        self.show_at = Some(now);
     }
 
     /// 每次唤起/隐藏后复位(product §1:重复唤起居输入清空,每次都是全新查询)。
@@ -205,6 +254,11 @@ impl PaletteState {
     /// 每帧驱动(悬浮条视口回调 `ui::draw_palette` 调用):防抖到期发查询;
     /// 收工作线程结果(根视口被完全遮挡、`logic` 不跑时仍由此驱动,Task 14)。
     pub fn tick(&mut self, now: Instant) {
+        // 在途防抖逐帧补排(根因见 `Session::pending_delay`:同帧 0ms 立即重绘请求
+        // 会吞掉 60ms 防抖请求;不补排则要等下一次偶然重绘才发查询,实测 ~500ms)。
+        if let Some(delay) = self.session.pending_delay(now) {
+            self.ctx.request_repaint_after_for(delay, self.viewport);
+        }
         if let Some(fire) = self.session.pending_at(now) {
             self.spawn_query(fire);
         }
@@ -215,6 +269,7 @@ impl PaletteState {
 
     /// 发起查询:工作线程执行,结果经 mpsc 回投并唤醒悬浮条视口。
     fn spawn_query(&mut self, fire: Fire) {
+        self.query_sent = Some((fire.generation, Instant::now()));
         spawn_query_worker(
             self.paths.clone(),
             self.ctx.clone(),
@@ -229,6 +284,14 @@ impl PaletteState {
     fn apply(&mut self, res: QueryResult) {
         if !self.session.accept_response(res.generation) {
             return; // Task 11 代际防护:慢响应后到不得覆盖新结果
+        }
+        if let Some((g, t0)) = self.query_sent.take() {
+            if g == res.generation {
+                log::info!(
+                    "查询往返:gen={g} {:.1}ms(输入→结果落地)",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         match res.payload {
             Payload::Hits {
@@ -269,6 +332,65 @@ impl PaletteState {
     /// 绘制悬浮条;返回交上层的动作。
     pub fn draw(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let ctx = ui.ctx().clone();
+        // 首程诊断打点(唤起后 1.5s 内逐帧留痕,之后停;常态零开销):
+        // pass# / 自唤起 / 距上帧(上帧含 tessellate+paint)/ 本帧回调体耗时 /
+        // 输入事件到达时刻 / 字体图集布局耗时 / 本帧排帧因(谁叫的帧)。
+        // 缘起:2026-10-16「唤起后首次出结果慢」定位(根因 = 防抖排帧被吞,见
+        // `Session::pending_delay`;此处打点是定位手段,留住供后续回归对照)。
+        let pass_t0 = Instant::now();
+        self.pass_seq += 1;
+        let since_last_ms = self
+            .last_pass_start
+            .map(|l| pass_t0.duration_since(l).as_secs_f64() * 1000.0);
+        self.last_pass_start = Some(pass_t0);
+        let since_show = self.show_at.map(|s| pass_t0.duration_since(s));
+        if since_show.is_some() {
+            // 输入事件到达打点(字到帧的延迟定位)。
+            let evs: Vec<String> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .map(|e| match e {
+                        egui::Event::Text(t) => format!("Text({t:?})"),
+                        egui::Event::Ime(ev) => format!("Ime({ev:?})"),
+                        egui::Event::Key { key, .. } => format!("Key({key:?})"),
+                        _ => String::new(),
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+            if !evs.is_empty() {
+                log::info!(
+                    "悬浮条输入事件到达:t={}ms 事件={evs:?} 输入={:?}",
+                    platform::monotonic_ms(),
+                    self.input
+                );
+            }
+            // 字体图集打点:显式按输入框字号布局一次(此刻才真正构建字形图集,
+            // 含 system_fonts 中文回退),把「字体加载」从整体耗时里单列。
+            let ft = Instant::now();
+            ui.fonts_mut(|f| {
+                let _ = f.layout_no_wrap(
+                    "搜索文件…".to_owned(),
+                    font(FONT_INPUT),
+                    egui::Color32::WHITE,
+                );
+            });
+            let causes: Vec<String> = ui
+                .ctx()
+                .repaint_causes()
+                .iter()
+                .map(|c| format!("{}:{} {}", c.file, c.line, c.reason))
+                .collect();
+            log::info!(
+                "悬浮条首帧计时:pass#{} 自唤起 {:.1}ms,距上帧 {},字体布局打点 {:.1}ms,排帧因={causes:?}",
+                self.pass_seq,
+                since_show.map(|d| d.as_secs_f64() * 1000.0).unwrap_or_default(),
+                since_last_ms
+                    .map(|v| format!("{v:.1}ms"))
+                    .unwrap_or_else(|| "-".into()),
+                ft.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         self.track_ime(ui);
 
         // 键位:先于 TextEdit 消费——TextEdit 读到的事件表不再含这些键
@@ -300,11 +422,11 @@ impl PaletteState {
         let frame = egui::Frame::new()
             .fill(ui.visuals().window_fill)
             .stroke(ui.visuals().window_stroke)
-            .corner_radius(egui::CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(10, 8))
+            .corner_radius(egui::CornerRadius::same(PANEL_RADIUS))
+            .inner_margin(egui::Margin::symmetric(PANEL_PAD_X, PANEL_PAD_Y))
             .show(ui, |ui| {
-                // 内容宽 = 窗宽 - 边距 - 描边
-                ui.set_width(PANEL_W - 22.0);
+                // 内容宽 = 窗宽 - 左右边距 - 描边
+                ui.set_width(PANEL_W - 2.0 * PANEL_PAD_X as f32 - 2.0);
                 // —— 输入行:输入框占满余宽,角标贴右 ——
                 // 定高子区(不可用 with_layout:其子区吃满剩余高度,行被垂直居中
                 // → 面板高度翻倍空半屏)。
@@ -315,7 +437,7 @@ impl PaletteState {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if let Some(note) = &note {
-                                ui.label(egui::RichText::new(note).small().weak());
+                                ui.label(egui::RichText::new(note).size(FONT_META).weak());
                                 ui.add_space(6.0);
                             }
                             let w = ui.available_width();
@@ -323,6 +445,7 @@ impl PaletteState {
                                 [w, INPUT_H],
                                 egui::TextEdit::singleline(input)
                                     .id_salt("palette-input")
+                                    .font(font(FONT_INPUT))
                                     .hint_text("搜索文件…"),
                             )
                         },
@@ -334,7 +457,7 @@ impl PaletteState {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(note)
-                            .small()
+                            .size(FONT_META)
                             .color(ui.visuals().warn_fg_color),
                     );
                 }
@@ -342,11 +465,11 @@ impl PaletteState {
                 // —— 结果列表 / 空态 / 计数行 ——
                 if self.results.is_empty() {
                     if matches!(self.session.state, State::Empty) {
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("无匹配项").weak());
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("无匹配项").size(FONT_META).weak());
                     }
                 } else {
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     let rows = self.results.len().min(self.visible_rows);
                     let results = &self.results;
                     let selected = self.selected;
@@ -359,24 +482,28 @@ impl PaletteState {
                             for (i, e) in results.iter().take(rows).enumerate() {
                                 let is_sel = i == selected;
                                 let bg = if is_sel {
-                                    ui.visuals().selection.bg_fill
+                                    selection_fill(ui.visuals())
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
                                 let row = egui::Frame::new()
                                     .fill(bg)
-                                    .corner_radius(egui::CornerRadius::same(4))
-                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .corner_radius(egui::CornerRadius::same(ROW_RADIUS))
+                                    .inner_margin(egui::Margin::symmetric(ROW_PAD_X, ROW_PAD_Y))
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
                                         ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 8.0;
-                                            ui.label(egui::RichText::new(&e.name).strong());
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            ui.label(
+                                                egui::RichText::new(&e.name)
+                                                    .strong()
+                                                    .size(FONT_ROW),
+                                            );
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(dir_display(&e.path))
-                                                        .small()
-                                                        .weak(),
+                                                        .size(FONT_DIR)
+                                                        .color(dir_text_color(ui.visuals())),
                                                 )
                                                 .truncate(),
                                             );
@@ -397,13 +524,13 @@ impl PaletteState {
                     at_bottom = rows < self.results.len()
                         && out.state.clamped_offset().y + out.inner_rect.height()
                             >= out.content_size.y - 4.0;
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(format!(
                             "共 {} 项 · 匹配 {:.1} ms · 读取 {:.1} ms",
                             self.total, self.elapsed_ms, self.stat_ms
                         ))
-                        .small()
+                        .size(FONT_META)
                         .weak(),
                     );
                 }
@@ -420,6 +547,16 @@ impl PaletteState {
         // 组合中的预编辑文本不触发查询(IME 未上屏;提交/取消帧 composing 已复位,
         // 照常按最终文本查询)。
         if input_resp.changed() && !self.ime_composing {
+            // 打点只覆盖「唤起后 1.5s」(首程诊断窗口);常态输入不逐键留痕,
+            // 查询往返另有 `查询往返` 一行。
+            if self.show_at.is_some() {
+                log::info!(
+                    "输入变更处理:t={}ms 输入={:?}(防抖 {}ms 起算)",
+                    platform::monotonic_ms(),
+                    self.input,
+                    DEBOUNCE.as_millis()
+                );
+            }
             let now = Instant::now();
             self.session.on_input(&self.input, now);
             if self.input.is_empty() {
@@ -550,7 +687,24 @@ impl PaletteState {
             _ => {}
         }
 
+        self.pass_end(pass_t0);
         action
+    }
+
+    /// 帧尾计时结算(pass 体耗时 + 唤起后窗口期收尾)。
+    fn pass_end(&mut self, pass_t0: Instant) {
+        if let Some(since_show) = self.show_at {
+            let d = pass_t0.elapsed();
+            log::info!(
+                "悬浮条首帧结算:pass#{} 自唤起 {:.1}ms,回调体 {:.1}ms",
+                self.pass_seq,
+                since_show.elapsed().as_secs_f64() * 1000.0,
+                d.as_secs_f64() * 1000.0
+            );
+            if since_show.elapsed() > Duration::from_millis(1500) {
+                self.show_at = None; // 常态停表(不再逐帧留痕)
+            }
+        }
     }
 
     /// 打开选中项:reveal=false → 默认应用打开(目录 = 访达进入);
@@ -759,13 +913,27 @@ fn badge_note(state: &State, engine: Option<&EngineStatus>) -> Option<String> {
     }
 }
 
-/// 所在目录(展示用):去掉文件名后中间省略。
+/// 所在目录(展示用):去掉文件名后中间省略(宽窗 720 下容 64 字符)。
 fn dir_display(path: &str) -> String {
     let dir = match path.rsplit_once('/') {
         Some((d, _)) => d,
         None => path,
     };
-    elide_middle(dir, 56)
+    elide_middle(dir, 64)
+}
+
+/// 选中行高亮:主题 selection 色的柔和版(降不透明度),深浅主题通用——
+/// 直接铺 `selection.bg_fill` 是饱和蓝块,抢结果文字(2026-10-16 实机反馈)。
+fn selection_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    let c = visuals.selection.bg_fill;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 60)
+}
+
+/// 结果行目录灰字:`text_color` 降不透明度到「可读但不抢」。
+/// 不用 `weak()`:egui 默认 weak 档位过淡,叠加小字号后不可读(实机反馈)。
+fn dir_text_color(visuals: &egui::Visuals) -> egui::Color32 {
+    let c = visuals.text_color();
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150)
 }
 
 /// 中间省略:超长取「前一半…后一半」(保留首尾信息)。

@@ -106,6 +106,32 @@ fn palette_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("palette")
 }
 
+/// 全局字号基准(两视口共用;2026-10-16 辉哥实机反馈「整体字号偏小,放大两号」)。
+///
+/// 字号基准**单点设置**:未来「自定义字号」设置项(v2.1 候选)只需改这一处,
+/// 悬浮条与完整窗口自动同基准。egui 默认档(egui-0.37 style.rs:1524 实测):
+/// Small 9 / Body 13 / Button 13 / Heading 18 / Monospace 13 → 统一 +2:
+/// 11 / 15 / 15 / 20 / 15。幂等(写死目标值,不累加);两主题都写
+/// (`all_styles_mut`——egui 的 Style 按主题各存一份,只改当前主题会在切换后丢)。
+/// 悬浮条另有更细的字号档(ui/palette.rs 的 `FONT_*` 常量,直接引用 FontId)。
+fn install_base_text_styles(ctx: &egui::Context) {
+    ctx.all_styles_mut(|s| {
+        let set = |s: &mut egui::Style, ts: egui::TextStyle, size: f32| {
+            // 保留原 family(Monospace 档不能改成 proportional)
+            let family = s
+                .text_styles
+                .get(&ts)
+                .map_or(egui::FontFamily::Proportional, |f| f.family.clone());
+            s.text_styles.insert(ts, egui::FontId::new(size, family));
+        };
+        set(s, egui::TextStyle::Small, 11.0);
+        set(s, egui::TextStyle::Body, 15.0);
+        set(s, egui::TextStyle::Button, 15.0);
+        set(s, egui::TextStyle::Heading, 20.0);
+        set(s, egui::TextStyle::Monospace, 15.0);
+    });
+}
+
 /// 显示完整窗口(根视口):平台层原生唤起(activate + 置前),失败退回 egui 命令。
 /// 悬浮条 ⌥↵、托盘「打开完整窗口」/ 缺口项、⌥⇧F 直达共用(单一实现,勿复制第四份)。
 fn show_root_window(ctx: &egui::Context) {
@@ -167,6 +193,7 @@ fn palette_show(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> bool {
             {
                 let mut s = lock_shared(shared);
                 s.palette.reset(); // 每次唤起都是全新查询(product §1)
+                s.palette.on_shown(std::time::Instant::now()); // 首帧计时起点(诊断)
                 s.palette_visible = true;
                 s.theme.check_now(ctx); // 隐藏期切过外观:亮起立即补查
             }
@@ -257,6 +284,8 @@ impl App {
         tray: Option<tray::TrayRuntime>,
     ) -> Self {
         probe_fonts();
+        // 字号基准(全局长大两号);悬浮条另有更细的字号档(ui/palette.rs 常量)。
+        install_base_text_styles(&cc.egui_ctx);
         // 首个 pass 之前先应用一次外观:egui 首帧按 System 偏好的 fallback(Dark)
         // 出图,logic() 里首查已晚于该帧 → 浅色系统启动会闪一帧深色。
         let theme = theme::current_theme();
@@ -540,6 +569,16 @@ impl eframe::App for App {
             palette_builder(),
             move |ui, _class| draw_palette(ui, &shared),
         );
+    }
+
+    /// 清屏色 = 全透明(两视口共用;eframe 默认 `(12,12,12,180)` 半透明黑)。
+    ///
+    /// 悬浮条圆角外区域靠这一层透出桌面:eframe 默认色会把整圈染成暗色
+    /// (实测圆角外 (20,21,24) = 默认色叠桌面 (41,44,53) 的合成——透明已生效但
+    /// 仍显"黑角"的另一半)。根视口不受影响:完整窗口内容被 `CentralPanel`
+    /// 不透明底铺满(ui/results.rs:443),清屏色不可见。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

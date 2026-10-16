@@ -113,6 +113,16 @@ impl Session {
         generation == self.generation
     }
 
+    /// 防抖窗口剩余时长(Some = 有查询在途未发)。调用方**每帧**据此补排 repaint:
+    /// egui 的排帧合并只触发「本帧最短的那次请求」(`context.rs:167` —
+    /// `delay < repaint_delay` 才回调),输入帧常伴 0ms 立即重绘请求,会把同一帧里
+    /// 更晚的 60ms 防抖请求吞掉;只排一次的实现会一直等到下一次偶然重绘
+    /// (实测:光标闪烁,~500ms)才发查询——「展开列表慢」的根因。
+    pub fn pending_delay(&self, now: Instant) -> Option<Duration> {
+        let (_, at) = self.pending.as_ref()?;
+        Some((*at + self.debounce).saturating_duration_since(now))
+    }
+
     /// 响应错误码 → 状态:"warming"(索引未挂载)→ Warming;其余 → Error(code)。
     pub fn mark_error(&mut self, code: &str) {
         self.state = if code == "warming" {
@@ -209,6 +219,41 @@ mod tests {
             .generation;
         s.on_input("", base + Duration::from_millis(30));
         assert!(!s.accept_response(g), "清空后旧代响应丢弃");
+    }
+
+    /// 防抖剩余时长(逐帧补排 repaint 用):无在途 → None;随帧收缩;到期/超期 → 0
+    /// (立即重绘);发起后/空词清空后 → None。
+    #[test]
+    fn pending_delay_tracks_debounce_window() {
+        let mut s = Session::new(Duration::from_millis(60));
+        let base = Instant::now();
+        assert_eq!(s.pending_delay(base), None, "无在途查询");
+        s.on_input("a", base);
+        assert_eq!(s.pending_delay(base), Some(Duration::from_millis(60)));
+        assert_eq!(
+            s.pending_delay(base + Duration::from_millis(40)),
+            Some(Duration::from_millis(20)),
+            "剩余时长随帧推进收缩"
+        );
+        assert_eq!(
+            s.pending_delay(base + Duration::from_millis(60)),
+            Some(Duration::ZERO),
+            "到期为 0"
+        );
+        assert_eq!(
+            s.pending_delay(base + Duration::from_secs(5)),
+            Some(Duration::ZERO),
+            "超期饱和为 0,不 panic"
+        );
+        let _ = s.pending_at(base + Duration::from_millis(60));
+        assert_eq!(
+            s.pending_delay(base + Duration::from_millis(60)),
+            None,
+            "发起后清空"
+        );
+        s.on_input("b", base);
+        s.on_input("", base);
+        assert_eq!(s.pending_delay(base), None, "空词清 pending");
     }
 
     #[test]
