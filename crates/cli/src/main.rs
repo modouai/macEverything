@@ -169,7 +169,8 @@ fn main() -> Result<()> {
             let q = args
                 .get(1)
                 .ok_or_else(|| anyhow!("用法: macEverything query \"关键词\""))?;
-            let out = client::query(&paths, q, 1000)?;
+            // CLI 查询无列排序入口:sort 传 None(= relevance),行为与 v1 一致
+            let out = client::query(&paths, q, 1000, None)?;
             print_query(&out);
             Ok(())
         }

@@ -587,7 +587,7 @@ fn run_query(view: &dyn IndexView, q: &str, limit: u32, sort: Option<&str>, cach
             let path = view.full_path_dyn(i);
             (i, stat_of(&path))
         }).collect();
-        for (i, m) in &rows { cache.insert(*i, *m); }   // 借用问题:cache 在闭包里可变——用 RefCell 或改为先收集再统一 insert(闭包外)
+        for (i, m) in &rows { cache.insert(*i, *m); }   // 借用问题定案:闭包捕获 &Mutex<HashMap>(内部可变性),见下「缓存填法」
         rows.into_iter().map(|(_, m)| m).collect()
     };
     // ... execute_sorted 调用、响应组装时 stat_rows 先查 cache
@@ -596,7 +596,7 @@ fn run_query(view: &dyn IndexView, q: &str, limit: u32, sort: Option<&str>, cach
 }
 ```
 
-**缓存填法(定案)**:`meta_of` 闭包只 stat 并返回(不写 map,避开 `&dyn Fn` 捕获可变态的借用冲突);`execute_sorted` 返回后 daemon 对 `out.hits` 行统一回填 cache(排序后剩余行正是响应需要的 K 行,其余候选无需 stat)。tech.md「缓存 map」描述按此同步。
+**缓存填法(定案,8b 实施定稿)**:`meta_of` 闭包捕获 `&Mutex<HashMap<u32, MetaRow>>`,每批 stat 后写入该 map(`&dyn Fn` 下经 Mutex 取内部可变性,免 FnMut 借用冲突;草稿的 `&mut cache` 形参作废)。排序完成后响应组装对 `out.hits` 行**查 map 命中优先**,未命中再经 `stat_rows` 并行补全——Size/Mtime 排序下结果行在排序轮已 stat(hits ⊆ 候选集),零重查;Relevance/Name/Path 下缓存为空、全部走补全轮,与 v1 行为一致。tech.md「stat 归属与去重」按此同步。
 
 - [ ] **Step 4: 测试 + `<check>` + CLI 冒烟(老查询不变;`sort` 经 CLI 无入口,以 cargo test 与后续 App 验收为准)**
 

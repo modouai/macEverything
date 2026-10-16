@@ -121,12 +121,16 @@ pub struct QueryOutcome {
     pub total: u32,
     pub elapsed_ms: f64,
     pub stat_ms: f64,
+    /// 实际生效的排序键回显(relevance/name/size/mtime/path)。调用方比对请求键
+    /// 与回显:不符(含旧 daemon 的空串)= 排序未生效,须提示而非静默展示错排序。
+    pub sort_echo: String,
     /// Some(落盘索引生成时刻) = 离线直读落盘索引;None = daemon 在线应答。
     pub offline_built_at: Option<u64>,
 }
 
 /// 查询:daemon 在线走 socket;不在则直读落盘索引离线降级。
-pub fn query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOutcome> {
+/// sort = 列排序键(name/size/mtime/path);None = relevance(CLI 与 v1 调用方语义)。
+pub fn query(paths: &DaemonPaths, q: &str, limit: u32, sort: Option<&str>) -> Result<QueryOutcome> {
     let limit = limit.min(RESULT_CAP);
     if let Some(mut s) = connect(paths) {
         let resp = expect_ok(call(
@@ -135,6 +139,7 @@ pub fn query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOutcome> {
                 v: protocol::PROTOCOL_VERSION,
                 query: q.into(),
                 limit,
+                sort: sort.map(String::from),
             },
         )?)?;
         match resp {
@@ -143,11 +148,13 @@ pub fn query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOutcome> {
                 total,
                 elapsed_ms,
                 stat_ms,
+                sort_echo,
             } => Ok(QueryOutcome {
                 entries,
                 total,
                 elapsed_ms,
                 stat_ms,
+                sort_echo,
                 offline_built_at: None,
             }),
             other => bail!("意外响应: {other:?}"),
@@ -158,6 +165,8 @@ pub fn query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOutcome> {
 }
 
 /// 离线查询:直读落盘索引自答(调用方须标注离线并给出索引生成时刻)。
+/// 离线路径只做 relevance(无 daemon 侧排序轮 stat 缓存),回显如实为 "relevance":
+/// 调用方请求了列排序时,可比对回显识别「排序未生效」。
 pub fn offline_query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOutcome> {
     let view = persist::load_mmap(&paths.index_file())
         .map_err(|e| anyhow!("daemon 未运行,且落盘索引不可用({e});先执行 macEverything start"))?;
@@ -181,6 +190,7 @@ pub fn offline_query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOu
         total: out.total,
         elapsed_ms: out.elapsed_ms,
         stat_ms,
+        sort_echo: "relevance".into(),
         offline_built_at: Some(view.meta.built_at),
     })
 }

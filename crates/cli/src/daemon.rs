@@ -2,15 +2,16 @@
 //! 单实例:绑定 EADDRINUSE 时 connect 探测——连得上 = 已在运行;连不上 = 崩溃
 //! 残留 stale socket,unlink 重绑。stop 经 socket 消息触发,响应在最终落盘后返回。
 use anyhow::{bail, Context, Result};
-use client::{stat_rows, state, DaemonPaths};
+use client::{stat_of, stat_rows, state, DaemonPaths};
 use engine::config;
 use engine::entry::NO_PARENT;
 use engine::fsevents::{self, FseStream};
 use engine::index::{Index, IndexView};
 use engine::persist::{self, IndexMeta, SharedView};
+use engine::query::{MetaRow, SortKey};
 use engine::reconcile;
 use engine::watcher::{self, DirBatcher};
-use protocol::{self, Gap, Request, Response};
+use protocol::{self, Gap, HitEntry, Request, Response};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -168,44 +169,124 @@ pub fn bind_single_instance(sock: &Path) -> Result<UnixListener> {
 
 // —— 查询执行(daemon 端,结果行按需 stat) ——
 
+/// sort 参数解析:字符串 → (列键, 回显串)。缺省/未知一律 relevance,回显即
+/// 真相——调用方比对请求键与回显识别「排序未生效」(旧 daemon 回显空串),不静默错排序。
+fn parse_sort_key(sort: Option<&str>) -> (SortKey, &'static str) {
+    match sort.unwrap_or("relevance") {
+        "name" => (SortKey::Name, "name"),
+        "size" => (SortKey::Size, "size"),
+        "mtime" => (SortKey::Mtime, "mtime"),
+        "path" => (SortKey::Path, "path"),
+        _ => (SortKey::Relevance, "relevance"),
+    }
+}
+
 /// 查询执行:匹配与排序在 holder 读锁内完成;结果行的 size/mtime 在**锁外**
 /// 并行读取——product 契约要求按需读取「并行执行、单独计时随输出给出」,
 /// 且 stat 不应持读锁阻塞增量 diff 的写锁获取。
-fn run_query(state: &EngineState, q: &str, limit: u32) -> Response {
+/// Size/Mtime 列排序是上述锁外纪律的显式例外:完整排序语义要求候选集全量键,
+/// 排序轮 meta_of 批量并行 stat 在读锁内(耗时随响应如实告知,tech.md 已标注);
+/// 结果行落入缓存 map,组装轮零重查、不触碰锁外 stat 路径。
+fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>) -> Response {
+    let (key, key_str) = parse_sort_key(sort);
     let Ok(plan) = engine::query::parse(q) else {
         return Response::Error {
             code: "parse".into(),
             message: "空查询".into(),
         };
     };
+    // 排序轮 stat 缓存:条目号 → (size, mtime)。meta_of 是 `&dyn Fn`,经 Mutex
+    // 取内部可变性写入(不走 FnMut 捕获);响应组装(锁外)按条目号命中优先。
+    let cache: Mutex<HashMap<u32, MetaRow>> = Mutex::new(HashMap::new());
     // 锁内:匹配 + 排序 + 结果行的名称/路径(纯内存拼接,微秒级)
-    let Some((rows, total, elapsed_ms)) = with_view(state, |v| {
-        let out = engine::query::execute(v, &plan, limit.min(1000) as usize);
-        let rows: Vec<(String, String)> = out
+    let Some((out, rows)) = with_view(state, |v| {
+        let meta_fn = |ids: &[u32]| -> Vec<MetaRow> {
+            use rayon::prelude::*;
+            let metas: Vec<MetaRow> = ids
+                .par_iter()
+                .map(|&i| stat_of(&v.full_path_dyn(i)))
+                .collect();
+            let mut c = cache.lock().unwrap();
+            for (&i, m) in ids.iter().zip(&metas) {
+                c.insert(i, *m);
+            }
+            metas
+        };
+        let out = engine::query::execute_sorted(v, &plan, limit.min(1000) as usize, key, &meta_fn);
+        let rows: Vec<(u32, String, String)> = out
             .hits
             .iter()
             .map(|h| {
                 (
+                    *h,
                     String::from_utf8_lossy(v.display_name(*h)).into_owned(),
                     v.full_path_dyn(*h),
                 )
             })
             .collect();
-        (rows, out.total, out.elapsed_ms)
+        (out, rows)
     }) else {
         return Response::Error {
             code: "warming".into(),
             message: "索引构建中,暂不可查".into(),
         };
     };
-    // 锁外:并行按需读取(慢速 syscall 不阻塞写锁)
-    let (entries, stat_ms) = stat_rows(rows);
+    // 锁外:缓存命中优先,未命中行并行补 stat(慢速 syscall 不阻塞写锁)
+    let (entries, complete_ms) = stat_with_cache(rows, &cache);
     Response::Query {
         entries,
-        total,
-        elapsed_ms,
-        stat_ms,
+        total: out.total,
+        elapsed_ms: out.elapsed_ms,
+        stat_ms: out.stat_ms + complete_ms,
+        sort_echo: key_str.into(),
     }
+}
+
+/// 响应组装的结果行读取:排序轮缓存(条目号 → (size, mtime))命中优先,
+/// 未命中行经 client::stat_rows 并行补 stat——Size/Mtime 排序下结果行在排序轮
+/// 已全量 stat,零重查;Relevance/Name/Path 排序下缓存为空,与 v1 行为一致。
+/// 返回 (条目, 补全轮读取耗时毫秒);响应 stat_ms = 排序轮 + 补全轮。
+fn stat_with_cache(
+    rows: Vec<(u32, String, String)>,
+    cache: &Mutex<HashMap<u32, MetaRow>>,
+) -> (Vec<HitEntry>, f64) {
+    let t = Instant::now();
+    let mut meta: Vec<MetaRow> = Vec::with_capacity(rows.len());
+    let mut miss: Vec<usize> = Vec::new();
+    {
+        let c = cache.lock().unwrap();
+        for (i, (id, ..)) in rows.iter().enumerate() {
+            match c.get(id) {
+                Some(&m) => meta.push(m),
+                None => {
+                    // 占位;下方补 stat 后按位覆盖,不会留在结果里
+                    miss.push(i);
+                    meta.push((None, None));
+                }
+            }
+        }
+    }
+    if !miss.is_empty() {
+        let miss_rows: Vec<(String, String)> = miss
+            .iter()
+            .map(|&i| (rows[i].1.clone(), rows[i].2.clone()))
+            .collect();
+        let (filled, _) = stat_rows(miss_rows);
+        for (&i, e) in miss.iter().zip(filled) {
+            meta[i] = (e.size, e.mtime);
+        }
+    }
+    let entries = rows
+        .into_iter()
+        .zip(meta)
+        .map(|((_, name, path), (size, mtime))| HitEntry {
+            name,
+            path,
+            size,
+            mtime,
+        })
+        .collect();
+    (entries, t.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Option<R> {
@@ -778,6 +859,7 @@ fn encode_response(resp: Response) -> serde_json::Result<Vec<u8>> {
         total,
         elapsed_ms,
         stat_ms,
+        sort_echo,
     } = resp
     else {
         // 非查询响应不该接近上限(状态/排除列表都是小对象):原样返回交 client 判定
@@ -790,6 +872,7 @@ fn encode_response(resp: Response) -> serde_json::Result<Vec<u8>> {
             total,
             elapsed_ms,
             stat_ms,
+            sort_echo: sort_echo.clone(),
         })?;
     }
     Ok(body)
@@ -806,7 +889,9 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         };
     }
     match req {
-        Request::Query { query, limit, .. } => run_query(state, &query, limit),
+        Request::Query {
+            query, limit, sort, ..
+        } => run_query(state, &query, limit, sort.as_deref()),
         Request::Status { .. } => {
             let name = *state.state_name.lock().unwrap();
             let entry_count = with_view(state, |v| {

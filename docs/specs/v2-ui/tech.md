@@ -73,8 +73,8 @@ pub enum SortKey { Relevance, Name, Size, Mtime, Path }
 
 /// meta_of:批量接口——入参为候选条目号切片,返回**按序对应**的 (大小, 修改时间)。
 /// daemon 侧实现内部并行(rayon 铺开 stat),engine 单次顺序调用,无 Sync 约束。
-/// 计分口径:elapsed_ms 含匹配+键计算+排序;stat_ms 为 engine 包住 meta_of 调用的耗时。
-/// 排序算出的元数据由 daemon 侧闭包自持(缓存 map,供响应组装时免重查);SortOutcome 不含 meta。
+/// 计分口径:elapsed_ms 只计匹配+键计算+排序(不含 stat);stat_ms 为 engine 包住 meta_of 调用的耗时。
+/// 排序算出的元数据由 daemon 侧闭包自持(捕获缓存 map,供响应组装时免重查);SortOutcome 不含 meta。
 pub fn execute_sorted(
     view: &dyn IndexView, plan: &QueryPlan, limit: usize,
     sort: SortKey, meta_of: &dyn Fn(&[u32]) -> Vec<(Option<u64>, Option<u64>)>,
@@ -84,7 +84,7 @@ pub fn execute_sorted(
 - `Relevance` = 现有 `execute`(委托,行为不变,不调 meta_of)。
 - `Name`/`Path`:匹配集全量排序(键来自 arena,零 stat),取前 limit。
 - `Size`/`Mtime`:**两段式**——先匹配得候选,对候选集调 `meta_of`(daemon 侧批量并行 stat;测试侧 mock),再排序取前 limit。
-- **stat 归属与去重(定案)**:daemon 的 meta_of 实现把批量 stat 结果**存入自持缓存 map**(闭包捕获);响应组装阶段的 `stat_rows` 先查该 map 命中则跳过,只对未命中行补 stat——「无重查」为契约,由 daemon 内部数据流保证。`stat_ms` = engine 包住 meta_of 调用的耗时(排序轮);补全轮沿用既有 v1 计时。
+- **stat 归属与去重(定案)**:daemon 的 meta_of 实现把批量 stat 结果**存入闭包捕获的 `&Mutex<HashMap<u32, MetaRow>>`**(每批 stat 后写入;`MetaOf` 是 `&dyn Fn`,经 Mutex 取内部可变性,不走 FnMut 捕获)。响应组装先查该 map,命中直接取、只对未命中行补 stat:Size/Mtime 排序下结果行已全量 stat(候选集包含截断后的 K 行),**零重查**;Relevance/Name/Path 下缓存为空、全部走补全轮,与 v1 行为一致。响应 `stat_ms` = 排序轮 meta_of 计时 + 补全轮计时(命中行零 syscall);补全轮沿用既有 v1 并行 stat 实现。
 - 排序稳定性:等值键用条目号决胜(确定性,同 v1 查询内约定)。
 - **排序键形态(定案)**:名称/路径键取 **display 原始形态 + Unicode 码点序**;不做本地化排序(与 Finder 的拼音/区域序不同,已知局限,文档标注)。中文与 ASCII 混排按码点,行为确定可复现。
 - 边界:limit=0 与全命中 0 条走既有路径。候选集全量 stat,不做抽样——完整排序语义要求全量键,耗时随响应如实告知(约 120 万条目全 stat 数百 ms 量级,仅点大小/时间列时触发;UI 出「排序中…」状态)。

@@ -253,9 +253,9 @@ pub enum SortKey {
     Path,
 }
 
-/// execute_sorted 的产出:elapsed_ms 计函数全程(匹配 + 键计算 + 排序,含 meta_of 调用),
-/// stat_ms 为包住 meta_of 的耗时(排序轮)。排序算出的元数据由 daemon 侧闭包自持
-/// (缓存 map,响应组装时免重查)——本结构不含 meta。
+/// execute_sorted 的产出:elapsed_ms 只计匹配 + 键计算 + 排序(裁决:不含 meta_of
+/// 的 stat 耗时——该耗时独计 stat_ms),stat_ms 为包住 meta_of 的耗时(排序轮)。
+/// 排序算出的元数据由 daemon 侧闭包自持(缓存 map,响应组装时免重查)——本结构不含 meta。
 pub struct SortOutcome {
     pub hits: Vec<u32>,
     pub total: u32,
@@ -338,10 +338,13 @@ pub fn execute_sorted(
         SortKey::Relevance => unreachable!("Relevance 已在入口委托 execute"),
     }
     hits.truncate(limit);
+    // 口径(裁决):elapsed_ms = 全程 − stat 轮耗时,即「匹配 + 键计算 + 排序」
+    // 不含任何 stat;stat_ms 独计 meta_of 耗时(与 v1 的 elapsed 不含 stat 同口径)。
+    let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0 - stat_ms;
     SortOutcome {
         hits,
         total,
-        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+        elapsed_ms,
         stat_ms,
     }
 }
@@ -855,6 +858,57 @@ mod sort_tests {
             .map(|h| String::from_utf8_lossy(i.display_name_of(*h)).into_owned())
             .collect();
         assert_eq!(names, vec!["c.txt", "a.txt", "b.txt"]); // size 10 < 20 < 30(升序)
+        assert!(out.stat_ms >= 0.0, "stat_ms 为耗时毫秒,恒非负");
+    }
+
+    /// 口径钉(裁决):elapsed_ms 只计匹配 + 键计算 + 排序,不含 meta_of 的
+    /// stat 耗时(该耗时独计 stat_ms)。meta 闭包睡 50ms:去掉减法(即回到
+    /// 含 stat 的旧口径)时 elapsed_ms ≥ stat_ms,断言必红。
+    #[test]
+    fn elapsed_ms_excludes_meta_of_time() {
+        let i = tree();
+        let plan = parse("*.txt").unwrap();
+        let slow = |ids: &[u32]| -> Vec<(Option<u64>, Option<u64>)> {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            ids.iter().map(|_| (Some(1), Some(1))).collect()
+        };
+        let out = execute_sorted(&i, &plan, 10, SortKey::Size, &slow);
+        assert!(
+            out.stat_ms >= 40.0,
+            "stat_ms 独计 meta_of 耗时(≥ 睡的 50ms):{}",
+            out.stat_ms
+        );
+        assert!(
+            out.elapsed_ms < out.stat_ms,
+            "elapsed_ms({}) 不得含 stat({})",
+            out.elapsed_ms,
+            out.stat_ms
+        );
+    }
+
+    /// 等值键按条目号决胜(确定性,同 v1 约定)。
+    /// 前提钉:relevance 序为 [y, x](名短在前),与条目号序相反——删掉决胜
+    /// 比较(`.then(a.cmp(b))`)时稳定排序保持 [y, x],本用例必红。
+    #[test]
+    fn equal_keys_tie_break_by_entry_id() {
+        let mut i = Index::new();
+        let d = i.insert("docs", NO_PARENT, true);
+        let x = i.insert("xx.txt", d, false); // 条目号小;名长 → relevance 里排后
+        let y = i.insert("y.txt", d, false); // 条目号大;名短 → relevance 里排前
+        let plan = parse("*.txt").unwrap();
+        assert_eq!(
+            execute(&i, &plan, 10).hits,
+            vec![y, x],
+            "前提:relevance 序与条目号序相反"
+        );
+        // 同 size、同 mtime
+        let same = |ids: &[u32]| -> Vec<(Option<u64>, Option<u64>)> {
+            ids.iter().map(|_| (Some(100), Some(5))).collect()
+        };
+        let out = execute_sorted(&i, &plan, 10, SortKey::Size, &same);
+        assert_eq!(out.hits, vec![x, y], "等值键按条目号决胜(确定性)");
+        let out_m = execute_sorted(&i, &plan, 10, SortKey::Mtime, &same);
+        assert_eq!(out_m.hits, vec![x, y], "mtime 等值同样按条目号决胜");
     }
 
     #[test]

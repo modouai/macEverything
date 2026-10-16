@@ -177,6 +177,7 @@ dependencies = [
  "libc",
  "log",
  "protocol",
+ "rayon",
  "serde_json",
  "tempfile",
 ]

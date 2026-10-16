@@ -13,6 +13,7 @@ engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 serde_json.workspace = true
 anyhow = "1"
+rayon.workspace = true
 log = { workspace = true, features = ["std"] }
 libc.workspace = true
 

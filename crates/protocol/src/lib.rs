@@ -12,12 +12,32 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "msg", rename_all = "snake_case")]
 pub enum Request {
-    Query { v: u32, query: String, limit: u32 },
-    Status { v: u32 },
-    Stop { v: u32 },
-    ExcludeAdd { v: u32, path: String },
-    ExcludeRemove { v: u32, path: String },
-    ExcludeList { v: u32 },
+    Query {
+        v: u32,
+        query: String,
+        limit: u32,
+        /// 列排序键(name/size/mtime/path);缺省 = relevance。纯新增可选字段
+        /// 不 bump v:旧 daemon 忽略未知字段,旧客户端缺省不发送此键。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sort: Option<String>,
+    },
+    Status {
+        v: u32,
+    },
+    Stop {
+        v: u32,
+    },
+    ExcludeAdd {
+        v: u32,
+        path: String,
+    },
+    ExcludeRemove {
+        v: u32,
+        path: String,
+    },
+    ExcludeList {
+        v: u32,
+    },
 }
 
 impl Request {
@@ -44,6 +64,11 @@ pub enum Response {
         /// 单独计时随输出给出)。缺省 0:容忍跨版本响应。
         #[serde(default)]
         stat_ms: f64,
+        /// 实际生效的排序键回显(relevance/name/size/mtime/path)。空串 = 旧
+        /// daemon 缺省(实际按 relevance);调用方比对请求键与回显,不一致即
+        /// 提示「引擎版本过旧,排序未生效」,防静默错排序。
+        #[serde(default)]
+        sort_echo: String,
     },
     Status {
         state: String,
@@ -122,6 +147,7 @@ mod tests {
             v: PROTOCOL_VERSION,
             query: "a b".into(),
             limit: 100,
+            sort: None,
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(
@@ -143,9 +169,58 @@ mod tests {
             total: 1,
             elapsed_ms: 0.8,
             stat_ms: 1.2,
+            sort_echo: "relevance".into(),
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(decode_response(&bytes[4..]).unwrap(), r);
+    }
+
+    /// 向后兼容钉:旧客户端(无 sort)/旧 daemon(无 sort_echo)的消息必须可解码,
+    /// 缺省语义 = relevance(空回显让调用方识别「请求键未生效」,防静默错排序)。
+    #[test]
+    fn query_sort_field_backward_compatible() {
+        let old_req = br#"{"msg":"query","v":1,"query":"a","limit":10}"#;
+        let r: Request = serde_json::from_slice(old_req).unwrap();
+        assert!(matches!(r, Request::Query { sort: None, .. }));
+        let old_resp = br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0}"#;
+        let p: Response = serde_json::from_slice(old_resp).unwrap();
+        assert!(matches!(p, Response::Query { sort_echo, .. } if sort_echo.is_empty()));
+    }
+
+    /// sort 编码→解码往返:请求与响应两侧的排序字段经长度头协议无损保留。
+    #[test]
+    fn sort_field_roundtrip() {
+        let r = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: Some("size".into()),
+        };
+        let b = encode(&r).unwrap();
+        assert_eq!(decode_request(&b[4..]).unwrap(), r);
+        let p = Response::Query {
+            entries: vec![],
+            total: 0,
+            elapsed_ms: 0.0,
+            stat_ms: 0.0,
+            sort_echo: "size".into(),
+        };
+        let b = encode(&p).unwrap();
+        assert_eq!(decode_response(&b[4..]).unwrap(), p);
+    }
+
+    /// sort=None(CLI/App 不传)编码不含 sort 键:v1 线上形态逐字节保持,
+    /// 混跑期旧 daemon 收到的消息与旧客户端完全同形。
+    #[test]
+    fn none_sort_omits_field_on_wire() {
+        let r = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+        };
+        let body = serde_json::to_string(&r).unwrap();
+        assert!(!body.contains("sort"), "None 不应序列化 sort 键:{body}");
     }
 
     #[test]
