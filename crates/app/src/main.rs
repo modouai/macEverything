@@ -6,8 +6,6 @@
 
 mod engine_launcher;
 mod platform;
-// Task 11 纯逻辑模块:当前仅由单测消费,Task 12 接悬浮条后由 UI 层调用并删除 allow。
-#[allow(dead_code)]
 mod session;
 mod single_instance;
 mod ui;
@@ -49,7 +47,7 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| {
             instance.attach_ui(cc.egui_ctx.clone());
-            Ok(Box::new(ui::App::new(cc, incoming)))
+            Ok(Box::new(ui::App::new(cc, incoming, paths)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 启动失败: {e}"))

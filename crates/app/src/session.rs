@@ -50,11 +50,13 @@ impl Session {
     }
 
     /// 输入变更:更新 pending(窗口内只保留最新);空词 → 清 pending/last_fired + State::Idle
-    /// (last_fired 同清:排序变更不得复活空查询)。
+    /// (last_fired 同清:排序变更不得复活空查询)并**推进代际号作废在途响应**
+    /// (清空输入后旧代结果不得回填)。
     pub fn on_input(&mut self, text: &str, now: Instant) {
         if text.is_empty() {
             self.pending = None;
             self.last_fired = None;
+            self.generation += 1; // 在途响应作废(Task 12 清空即清结果的语义)
             self.state = State::Idle;
         } else {
             self.pending = Some((text.to_string(), now));
@@ -64,6 +66,8 @@ impl Session {
     /// 排序变更:同串重发 —— 窗内有 pending 保持原串、刷新时刻;无 pending 按
     /// last_fired 的串构造 pending(代际号在下一次 pending_at 自然 +1);
     /// 两者皆无(空词/从未发起)→ 不动。
+    // Task 17(完整窗口点列头排序)消费;悬浮条不用此能力(product §8)。
+    #[allow(dead_code)]
     pub fn on_sort_change(&mut self, key: SortKey, now: Instant) {
         self.sort = key;
         let query = self
@@ -181,6 +185,21 @@ mod tests {
             "空词不发起"
         );
         assert!(matches!(s.state, State::Idle));
+    }
+
+    #[test]
+    fn clearing_input_discards_inflight_response() {
+        // 输入 → 发起(gen 1)→ 清空输入:在途响应到达时必须被作废
+        // (清空即清结果:旧代结果不得回填)。
+        let mut s = Session::new(Duration::from_millis(10));
+        let base = Instant::now();
+        s.on_input("报告", base);
+        let g = s
+            .pending_at(base + Duration::from_millis(20))
+            .expect("窗口到应发起")
+            .generation;
+        s.on_input("", base + Duration::from_millis(30));
+        assert!(!s.accept_response(g), "清空后旧代响应丢弃");
     }
 
     #[test]
