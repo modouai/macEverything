@@ -172,6 +172,25 @@ pub fn revert_class() {
     mac::revert_class();
 }
 
+/// 弹出原生右键菜单(阻塞;主线程)。`items` = (标题, tag);返回所选项 tag
+/// (None = 取消)。位置为视图坐标(与 egui 坐标同值,PoC-3 实测;见 mac.rs)。
+/// 非 macOS / 非主线程 / 取窗失败返回 None(留痕,调用方按取消处理)。
+pub fn popup_menu(
+    items: &[(&str, i64)],
+    at_view_pos: (f64, f64),
+    frame: &eframe::Frame,
+) -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::popup_menu(items, at_view_pos, frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (items, at_view_pos, frame);
+        None
+    }
+}
+
 /// 是否已接上悬浮条窗(诊断;未接上时调用方排下一帧完成接线)。
 pub fn attached() -> bool {
     #[cfg(target_os = "macos")]

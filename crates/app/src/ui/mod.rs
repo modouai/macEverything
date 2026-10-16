@@ -50,6 +50,7 @@
 //! 逐簇查系统字体(zh 语境 → 苹方;韩文 → AppleSDGothicNeo;emoji → Apple Color Emoji)。
 //! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
 
+pub mod menu_actions;
 pub mod palette;
 pub mod results;
 pub mod theme;
@@ -350,7 +351,7 @@ impl eframe::App for App {
         // 全隐藏期此处不排帧 → 事件循环回 Wait(隐藏态 CPU 0% 红线)。
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
         // 运行期字体回退留痕一次(诊断:实际命中的系统 CJK 字体;
@@ -379,10 +380,10 @@ impl eframe::App for App {
             }
         }
 
-        // 主视口:完整结果窗口(Task 17;product §2)。
+        // 主视口:完整结果窗口(Task 17;product §2;右键菜单 Task 18 需 Frame 取窗)。
         {
             let mut s = self.shared();
-            s.results.draw(ui);
+            s.results.draw(ui, frame);
         }
 
         // 悬浮条第二视口:常驻注册(deferred;隐藏不销毁,L1/L2 选路 A)。

@@ -18,8 +18,10 @@
 //!
 //! 查询消息类型与工作线程(`palette::{QueryResult, Payload, EngineStatus,
 //! spawn_query_worker}`)、排序键 → 协议串(`palette::sort_str`)、打开动作
-//! (`palette::open_path`)自 palette 复用。Task 18(原生右键菜单)/Task 19
-//! (缺口面板/sort_echo/状态栏补全)在本文件基础上加。
+//! (`palette::open_path`)自 palette 复用。Task 18(原生右键菜单)已接:右键行 →
+//! 标准表格语义收敛选中 → 原生 NSMenu(`platform::popup_menu`,阻塞弹出)→
+//! 动作执行(`ui/menu_actions.rs`);Task 19(缺口面板/sort_echo/状态栏补全)
+//! 在本文件基础上加。
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -27,7 +29,9 @@ use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::platform;
 use crate::session::{Session, SortKey, State};
+use crate::ui::menu_actions;
 use crate::ui::palette::{self, EngineStatus, Payload, QueryResult};
 use client::{DaemonPaths, StatusOutcome};
 use protocol::HitEntry;
@@ -255,8 +259,14 @@ impl ResultsState {
         self.engine_known = true;
     }
 
-    /// 绘制完整窗口(主视口)。返回动作由上层不需要——打开/失败都就地落在状态栏。
-    pub fn draw(&mut self, ui: &mut egui::Ui) {
+    /// 绘制完整窗口(主视口)。`frame` 供原生右键菜单取窗(调用方 = App::ui,根视口)。
+    /// 返回动作由上层不需要——打开/失败都就地落在状态栏。
+    pub fn draw(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        self.draw_impl(ui, Some(frame));
+    }
+
+    /// 绘制主体(`frame` = None 时禁用原生右键菜单:实机走查测试无 eframe Frame)。
+    fn draw_impl(&mut self, ui: &mut egui::Ui, frame: Option<&eframe::Frame>) {
         let ctx = ui.ctx().clone();
         self.track_ime(ui);
 
@@ -271,6 +281,7 @@ impl ResultsState {
         let mut sort_click: Option<SortKey> = None;
         let mut row_click: Option<(usize, bool, bool)> = None;
         let mut open_row: Option<usize> = None;
+        let mut context_click: Option<(usize, egui::Pos2)> = None;
         let mut gaps_clicked = false;
         let (shift_down, cmd_down) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
 
@@ -419,6 +430,13 @@ impl ResultsState {
                         let resp = row.response();
                         if resp.double_clicked() {
                             open_row = Some(i); // 双击 = 默认应用打开(product §2)
+                        } else if resp.secondary_clicked() {
+                            // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
+                            // 表格闭包外做(借用结束)
+                            match resp.interact_pointer_pos() {
+                                Some(pos) => context_click = Some((i, pos)),
+                                None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
+                            }
                         } else if resp.clicked() {
                             row_click = Some((i, shift_down, cmd_down));
                         }
@@ -435,6 +453,9 @@ impl ResultsState {
         }
         if let Some(i) = open_row {
             self.open_row(i);
+        }
+        if let Some((i, pos)) = context_click {
+            self.open_context_menu(i, pos, frame);
         }
         if gaps_clicked {
             log::info!("缺口徽标点击:展开缺口清单(Task 19 接面板)");
@@ -475,6 +496,55 @@ impl ResultsState {
         self.session.on_sort_change(key, Instant::now());
         self.ctx
             .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
+    }
+
+    /// 右键菜单(Task 18):标准表格语义先把点击行并入选中(不在选中集 → 单选它),
+    /// 按选中类型收敛菜单项(product §2 表),弹原生菜单并执行所选动作。
+    /// 弹出阻塞(嵌套 run loop,期间本帧冻结——PoC-3 定论);执行失败落状态栏。
+    fn open_context_menu(&mut self, row: usize, pos: egui::Pos2, frame: Option<&eframe::Frame>) {
+        // 1. 选中收敛(标准表格语义)
+        converge_selection(&mut self.selection, &mut self.anchor, row);
+        // 2. 选中行 → 路径集合 + 文件/目录计数 → 菜单项(按选中类型收敛)
+        let paths: Vec<String> = self
+            .selection
+            .iter()
+            .filter_map(|&i| self.results.get(i))
+            .map(|e| e.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return; // 理论不可达(selection 行号只在 results 内维护,两者同步清空)
+        }
+        let (files, dirs) = menu_actions::count_types(&paths);
+        let items = menu_actions::menu_items(files, dirs);
+        if items.is_empty() {
+            return; // 空选(理论不可达,见上)——不弹空菜单
+        }
+        let menu: Vec<(&str, i64)> = items.iter().map(|(title, a)| (*title, a.tag())).collect();
+        log::info!(
+            "右键菜单:选中 {} 行(文件 {files} · 目录 {dirs}),弹出于 ({:.0},{:.0})",
+            paths.len(),
+            pos.x,
+            pos.y
+        );
+        // 3. 弹出原生菜单(阻塞;菜单关闭后返回所选 tag)
+        let Some(frame) = frame else {
+            log::warn!("右键菜单:无 eframe Frame(测试路径),不弹出");
+            return;
+        };
+        let choice = platform::popup_menu(&menu, (pos.x as f64, pos.y as f64), frame);
+        // 4. 执行(未知 tag 留痕;失败落状态栏,不静默)
+        match choice {
+            None => log::info!("右键菜单:取消(未选择)"),
+            Some(tag) => match menu_actions::MenuAction::from_tag(tag) {
+                Some(action) => match menu_actions::execute(action, &paths) {
+                    Ok(()) => log::info!("右键菜单:执行 {action:?}({} 项)", paths.len()),
+                    Err(err) => self.status_note = Some(err.to_string()),
+                },
+                None => log::warn!("右键菜单:未知 tag {tag},忽略"),
+            },
+        }
+        // 阻塞期本帧未上屏:重绘刷出选中态 / 状态栏提示
+        self.ctx.request_repaint();
     }
 
     /// 双击:默认应用打开(palette::open_path 复用;失败落状态栏,不静默)。
@@ -537,6 +607,16 @@ fn apply_click(
         }
         *anchor = Some(row);
     } else {
+        selection.clear();
+        selection.insert(row);
+        *anchor = Some(row);
+    }
+}
+
+/// 右键点击行的选中收敛(纯逻辑,可测):点击行不在选中集 → 清旧选、设为唯一选中
+/// 并立锚(标准表格语义);已在选中集 → 保持多选不动(菜单动作作用于整组)。
+fn converge_selection(selection: &mut BTreeSet<usize>, anchor: &mut Option<usize>, row: usize) {
+    if !selection.contains(&row) {
         selection.clear();
         selection.insert(row);
         *anchor = Some(row);
@@ -760,6 +840,18 @@ mod tests {
     }
 
     #[test]
+    fn context_click_converges_selection() {
+        let mut sel = BTreeSet::from([1, 2, 3]);
+        let mut anchor = Some(1);
+        converge_selection(&mut sel, &mut anchor, 3);
+        assert_eq!(sel, BTreeSet::from([1, 2, 3]), "点击行已在选中集:保持多选");
+        assert_eq!(anchor, Some(1), "多选保持时锚点不动");
+        converge_selection(&mut sel, &mut anchor, 7);
+        assert_eq!(sel, BTreeSet::from([7]), "点击行不在选中集:收敛为唯一选中");
+        assert_eq!(anchor, Some(7));
+    }
+
+    #[test]
     fn shift_click_without_anchor_selects_single() {
         let mut sel = BTreeSet::new();
         let mut anchor = None;
@@ -875,7 +967,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let mut out = ctx.run_ui(input, |ui| st.draw(ui));
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None));
             // 无真实后端消费纹理增量;显式清空(epaint 要求:不处理须 clear)
             out.textures_delta.clear();
         };

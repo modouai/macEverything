@@ -35,6 +35,10 @@ objc2-app-kit = { version = "0.3", features = [
     # Task 14b 切 Space 豁免:NSWorkspace + NSWorkspaceActiveSpaceDidChangeNotification
     # (通知经 NSWorkspace.notificationCenter() 注册;该 feature 连带 foundation/NSNotification)。
     "NSWorkspace",
+    # Task 18 原生右键菜单:NSMenu/NSMenuItem(PoC-3 定稿路径;弹出还要求
+    # NSMenuItem + NSResponder + NSView 三 feature 同时在场)。
+    "NSMenu",
+    "NSMenuItem",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification
