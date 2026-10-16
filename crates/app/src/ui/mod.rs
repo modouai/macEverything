@@ -49,6 +49,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::hotkey;
 use crate::platform;
 use crate::single_instance::Incoming;
 
@@ -105,6 +106,9 @@ pub struct App {
     attach_attempts: u32,
     /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 接)。
     quitting: bool,
+    /// 全局热键运行时(Task 15):manager 保活 + 事件泵计数;
+    /// 泵线程命中即请求 ROOT 重绘,`logic` 里 `poll_toggle` 消费(见 hotkey.rs)。
+    hotkey: hotkey::HotkeyRuntime,
 }
 
 /// 两视口共享的运行时状态。
@@ -122,6 +126,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         incoming: Receiver<Incoming>,
         paths: client::DaemonPaths,
+        hotkey: hotkey::HotkeyRuntime,
     ) -> Self {
         probe_fonts();
         // 首个 pass 之前先应用一次外观:egui 首帧按 System 偏好的 fallback(Dark)
@@ -131,16 +136,18 @@ impl App {
         log::info!("启动外观:{theme:?}");
         // 平台层:记录根窗句柄(悬浮条窗与根窗同为 NSApp.windows() 成员,须区分)。
         platform::attach_root(cc);
+        let hotkey_note = hotkey.note().map(str::to_string);
         Self {
             incoming,
             shared: Arc::new(Mutex::new(Shared {
-                palette: palette::PaletteState::new(cc, paths, palette_viewport_id()),
+                palette: palette::PaletteState::new(cc, paths, palette_viewport_id(), hotkey_note),
                 theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
                 palette_visible: false, // 启动隐藏(plan 骨架:.with_visible(false))
             })),
             fonts_logged: false,
             attach_attempts: 0,
             quitting: false,
+            hotkey,
         }
     }
 
@@ -196,7 +203,7 @@ impl App {
             s.palette.reset();
         }
         ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
-        log::info!("悬浮条隐藏(dev 按钮)");
+        log::info!("悬浮条隐藏(热键/dev 按钮)");
     }
 }
 
@@ -204,6 +211,22 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
+
+        // 全局热键(Task 15):事件泵线程已为本帧请求 ROOT 重绘(hotkey.rs 模块注释
+        // 「事件泵为什么必须带唤醒」)→ 消费按下计数并按可见态切换唤起/隐藏。
+        if hotkey::poll_toggle(&self.hotkey) {
+            let visible = self.shared().palette_visible;
+            log::info!(
+                "热键 {} 按下:{}悬浮条",
+                self.hotkey.name().unwrap_or("(未注册)"),
+                if visible { "隐藏" } else { "唤起" }
+            );
+            if visible {
+                self.hide_palette(ctx);
+            } else {
+                self.show_palette(ctx);
+            }
+        }
 
         // 平台补丁:找悬浮条窗(首见即施加)/漂移核对(可见期)。
         // 视口窗由 eframe 在注册 pass 末尾创建:首帧找不到属正常,下帧重试(有上限)。

@@ -5,6 +5,7 @@
 //! 此处 stderr 留痕)→ eframe 主循环(双视口壳,平台行为 Task 14 接)。
 
 mod engine_launcher;
+mod hotkey;
 mod platform;
 mod session;
 mod single_instance;
@@ -50,7 +51,10 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| {
             instance.attach_ui(cc.egui_ctx.clone());
-            Ok(Box::new(ui::App::new(cc, incoming, paths)))
+            // 全局热键(Task 15):主线程 + NSApplication 就绪后注册(macOS 要求),
+            // 起事件泵线程;失败不中断启动(降级为悬浮条提示 + 日志)。
+            let hotkey = hotkey::install(&cc.egui_ctx);
+            Ok(Box::new(ui::App::new(cc, incoming, paths, hotkey)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 启动失败: {e}"))

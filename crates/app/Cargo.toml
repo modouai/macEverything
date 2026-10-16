@@ -41,5 +41,9 @@ objc2-app-kit = { version = "0.3", features = [
 # 为回调参数类型(Task 14b 直接引用,不依赖 feature 统一带来的可用性)。
 objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification"] }
 raw-window-handle = "0.6"
+# Task 15 全局热键(PoC-2 实锁 0.6.4;macOS 后端 = Carbon RegisterEventHotKey)。
+# 注意 crate 文档:macOS 上 manager 必须在主线程创建,且需主线程事件循环在跑
+# (eframe 的 NSApplication::run 即此循环;事件泵细节见 src/hotkey.rs 模块注释)。
+global-hotkey = "0.6"
 anyhow = "1"
 log = { workspace = true, features = ["std"] }

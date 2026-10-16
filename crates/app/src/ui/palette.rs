@@ -94,6 +94,8 @@ pub struct PaletteState {
     pub stat_ms: f64,
     /// 角标文案(§7 六态映射:建索引中/补齐中/重扫中/离线索引/引擎启动中/索引构建中)。
     pub status_note: Option<String>,
+    /// 热键提示(降级/不可用;Task 15)。常驻:不随唤起复位、不被查询结果覆盖。
+    pub hotkey_note: Option<String>,
     /// 列表渲染行数(初始 20,滚到底 +20,至 `results.len()`)。
     pub visible_rows: usize,
     /// ⌥↵ 置位:完整窗口待带入的查询词(Task 17 消费)。
@@ -132,6 +134,7 @@ impl PaletteState {
         cc: &eframe::CreationContext<'_>,
         paths: DaemonPaths,
         viewport: egui::ViewportId,
+        hotkey_note: Option<String>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
@@ -143,6 +146,7 @@ impl PaletteState {
             elapsed_ms: 0.0,
             stat_ms: 0.0,
             status_note: None,
+            hotkey_note,
             visible_rows: ROWS_INITIAL,
             full_window_request: None,
             paths,
@@ -307,6 +311,7 @@ impl PaletteState {
         }
 
         let note = self.status_note.clone();
+        let hotkey_note = self.hotkey_note.clone();
         let input = &mut self.input;
         let mut at_bottom = false;
         let frame = egui::Frame::new()
@@ -340,6 +345,16 @@ impl PaletteState {
                         },
                     )
                     .inner;
+
+                // —— 热键提示(Task 15;降级「已改用 X」/不可用;常驻不随唤起复位)——
+                if let Some(note) = &hotkey_note {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(note)
+                            .small()
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
 
                 // —— 结果列表 / 空态 / 计数行 ——
                 if self.results.is_empty() {
