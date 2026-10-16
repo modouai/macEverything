@@ -164,7 +164,7 @@ pub fn execute_sorted(
 | PoC-2:⌥Space 与输入法冲突 | 注册失败弹窗 + 备选位(⌥⇧Space / ⌃⌥⇧Space;⌃Space 族为系统输入法占用,不在候选池);以实机结果定默认 |
 | PoC-3:NSMenu 阻塞式弹出与 egui 事件循环 | NSMenu 弹出走嵌套 run loop(阻塞当前线程)——在 eframe 主线程弹出需验证无卡死/输入错乱;不通过则菜单弹出移至独立线程或改用 popUpMenuPositioningItem 非模态 |
 | PoC-4:eframe 隐藏 CPU 0% vs 唤起 <100ms | **已定稿通过**:隐藏 119.9s 零帧 CPU 恒 0;唤起走 native `orderFrontRegardless`(对外中位 16.7ms / P99 56ms,红线内);egui `Visible(true)` 路径因 eframe 100ms 硬节流弃用;keep-warm 实测 0.8% CPU 纯亏不采 |
-| PoC-5:SMAppService + ad-hoc 签名的自启 | 先做注册/注销小验证再全量接;不通改用 LaunchAgent plist 兜底(功能等价,登录时启动) |
+| PoC-5:SMAppService + ad-hoc 签名自启 | **已定稿通过**:ad-hoc 可用、无需 sudo/审批;坑:①无 bundle 调 register 不报错且注册独立条目→产品入口须校验 bundle id;②条目身份键 = bundle id(路径/可执行名无关);③注册态不进 launchctl 服务表(由 BTM 管理,排障走系统设置登录项);未签名 arm64 二进制直接 SIGKILL(ad-hoc 是硬门槛);真实重启验证留人工 |
 | LSUIElement(无 Dock 图标)与键盘焦点 | 菜单栏应用接收键盘输入前常需显式 `NSApp.activate`;悬浮条唤起与完整窗口打开时逐一处处理(PoC-1 同批验证) |
 | .app 组装与随包引擎定位 | bundle.sh 组装后实机验证三种定位路径(随包命中/ PATH 兜底/全失败报错列路径) |
 | 中文字体豆腐块(egui 默认字体无 CJK) | 启动时加载系统中文字体(苹方/思源),实现期首个验收项 |
