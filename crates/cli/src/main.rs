@@ -3,12 +3,42 @@ mod client;
 mod daemon;
 mod protocol;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 
 fn data_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME 未设置"))?;
     Ok(PathBuf::from(home).join("Library/Application Support/macEverything"))
+}
+
+/// 后台化:start 默认把引擎进程脱离终端(契约「后台运行」)。
+/// 实现 = spawn 自身带 MCE_FOREGROUND=1,父进程退出;stdio 接 /dev/null
+/// (日志走数据目录 daemon.log)。子进程由 launchd 接管,终端关闭不受影响。
+/// 调试可用 `MCE_FOREGROUND=1 macEverything start` 前台跑。
+fn spawn_background() -> Result<()> {
+    let exe = std::env::current_exe().map_err(|e| anyhow!("定位自身可执行文件失败: {e}"))?;
+    let mut child = std::process::Command::new(exe)
+        .arg("start")
+        .env("MCE_FOREGROUND", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("启动后台引擎失败: {e}"))?;
+    // 短窗口探测:子进程秒退 = 单实例拒绝(已在运行)或启动失败——如实报出而非静默
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    match child.try_wait() {
+        Ok(Some(status)) => bail!(
+            "引擎未启动(退出码 {status})。多半是已在运行(`macEverything status` 确认);\
+             其他原因见数据目录 daemon.log"
+        ),
+        Ok(None) => {
+            println!("引擎已在后台启动(pid {})。", child.id());
+            println!("查看进度:macEverything status;查询:macEverything query \"关键词\"");
+            Ok(())
+        }
+        Err(e) => bail!("检查后台进程失败: {e}"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -20,7 +50,13 @@ fn main() -> Result<()> {
         data_dir: data_dir()?,
     };
     match args.first().map(String::as_str) {
-        Some("start") => daemon::serve(paths),
+        Some("start") => {
+            if std::env::var_os("MCE_FOREGROUND").is_some() {
+                daemon::serve(paths)
+            } else {
+                spawn_background()
+            }
+        }
         Some("stop") => client::stop(&paths),
         Some("query") => {
             let q = args
