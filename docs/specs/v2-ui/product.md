@@ -1,6 +1,6 @@
 # macEverything v2.0 图形界面 产品规格
 
-**Status:** 写作中
+**Status:** 产品已确认
 **version:** 1.0.0
 **updated:** 2026-10-16
 **产品依据:** v1-core/product.md(v1 引擎已验收);本 spec 定义 v2.0 双形态图形界面

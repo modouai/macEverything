@@ -1,6 +1,6 @@
 # macEverything v2.0 图形界面 技术规格
 
-**Status:** 写作中
+**Status:** 已确认
 **version:** 1.0.0
 **updated:** 2026-10-16
 **产品依据:** product.md v1.0.0(v2-ui)
