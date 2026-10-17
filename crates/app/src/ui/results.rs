@@ -27,9 +27,10 @@
 //! ## Task 19 状态栏补全(缺口面板 / sort_echo / 重启引擎)
 //!
 //! - 三段:计数(总数/耗时) · 索引状态(§7 完整窗口列,离线带生成时刻) · 缺口徽标;
-//! - 缺口徽标(⚠ N 个目录未收录,`tray::gaps_label` 同文案)→ 点击展开面板:
-//!   逐行「目录 + 原因」,数据 = status.gaps(与 CLI `status` 同源,展示口径同款:
-//!   最多 20 行 + 余量计数);
+//! - 缺口徽标(Task 4 视觉:圆角 6 + 自绘警示三角 +「N 个目录未收录」,窗口内
+//!   不使用托盘 `tray::gaps_label` 的「⚠」前缀,文案本体与托盘同源)→ 点击展开
+//!   面板:逐行「目录 + 原因」,数据 = status.gaps(与 CLI `status` 同源,
+//!   展示口径同款:最多 20 行 + 余量计数);
 //! - sort_echo 校验:请求了非 relevance 键而回显为空(旧 daemon)或异键 → 该响应
 //!   的排序未生效,状态栏红字 +「重启引擎」按钮(stop → start,`client::stop` +
 //!   `engine_launcher::ensure_engine`);重启完成清提示并按当前列/方向重查;
@@ -43,7 +44,6 @@ use std::time::{Duration, Instant};
 use crate::engine_launcher;
 use crate::platform;
 use crate::session::{Session, SortKey, State};
-use crate::tray;
 use crate::ui::icons::{self, IconCache};
 use crate::ui::menu_actions;
 use crate::ui::palette::{self, EngineStatus, Payload, QueryResult};
@@ -498,70 +498,32 @@ impl ResultsState {
             })
             .inner;
 
-        // —— 底部:状态栏(N 项 · 匹配/读取 ms | 索引状态 | 排序中 | 排序未生效
-        //    (红字 + 重启按钮)| 缺口徽标 | 提示)+ 缺口面板(展开时在上,状态行恒驻底)——
+        // —— 底部:状态栏(顶部 1px 分隔线 + 28 内容,§3.6)+ 缺口面板(展开时在上)——
+        // min_size 固定状态行首帧高度(egui 面板尺寸跨帧记忆;缺省最小 20 会让
+        // 首帧从 20 长到 29 时向下溢出)。缺口面板展开时面板按内容增高。
         egui::Panel::bottom("results-status")
-            .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.status_fill))
+            .show_separator_line(false)
+            .min_size(window_tokens::STATUS_H + window_tokens::DIVIDER_H)
+            .frame(egui::Frame::NONE.fill(palette.status_fill))
             .show(ui, |ui| {
                 let gaps = self.gaps();
                 if self.gaps_open && !gaps.is_empty() {
                     draw_gaps_panel(ui, gaps);
                 }
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.label(
-                        egui::RichText::new(counts_text(
-                            self.total,
-                            self.results.len(),
-                            self.elapsed_ms,
-                            self.stat_ms,
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    if let Some(note) =
-                        index_note(self.engine.as_ref(), &self.session.state, self.engine_known)
-                    {
-                        ui.label(egui::RichText::new(note).small().weak());
-                    }
-                    if self.sorting_inflight {
-                        ui.label(egui::RichText::new("排序中…").small().weak());
-                    }
-                    // 排序未生效(tech 定案:请求键与回显不符):红字 + 重启引擎动作
-                    if self.sort_stale {
-                        let warn = ui.visuals().warn_fg_color;
-                        ui.label(
-                            egui::RichText::new("引擎版本过旧,排序未生效")
-                                .small()
-                                .color(warn),
-                        );
-                        if self.engine_restarting {
-                            ui.label(egui::RichText::new("重启中…").small().weak());
-                        } else if ui.button(egui::RichText::new("重启引擎").small()).clicked() {
-                            restart_clicked = true;
-                        }
-                    }
-                    if !gaps.is_empty() {
-                        let warn = ui.visuals().warn_fg_color;
-                        // 文案与托盘缺口项同源(tray::gaps_label,product §2/§3 逐字)
-                        let badge = egui::Label::new(
-                            egui::RichText::new(tray::gaps_label(gaps.len() as u32))
-                                .small()
-                                .color(warn),
-                        )
-                        .sense(egui::Sense::click());
-                        if ui.add(badge).clicked() {
-                            gaps_clicked = true;
-                        }
-                    }
-                    if let Some(note) = &self.status_note {
-                        let warn = ui.visuals().warn_fg_color;
-                        ui.label(egui::RichText::new(note).small().color(warn));
-                    }
-                });
-                ui.add_space(3.0);
+                // 状态栏顶部 1px 分隔线(§3.1 分隔线 3;28 内容另计,§3.2 高度推导)。
+                let (divider, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), window_tokens::DIVIDER_H),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(divider, egui::CornerRadius::ZERO, palette.divider);
+                let (row, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), window_tokens::STATUS_H),
+                    egui::Sense::hover(),
+                );
+                let action = draw_status_row(ui, row, self, &palette);
+                gaps_clicked |= action.gaps_clicked;
+                restart_clicked |= action.restart_clicked;
             });
 
         // —— 中部:表头(32 + 1 分隔线)+ 自定义虚拟化表格(§3.4 / §3.5) ——
@@ -598,14 +560,7 @@ impl ResultsState {
                     area.max,
                 );
                 if self.results.is_empty() {
-                    let mut empty_ui = ui.new_child(egui::UiBuilder::new().max_rect(table_rect));
-                    empty_ui.add_space(12.0);
-                    if let Some(msg) = empty_hint(&self.session.state) {
-                        empty_ui.horizontal(|ui| {
-                            ui.add_space(window_tokens::CONTENT_PAD_X);
-                            ui.label(egui::RichText::new(msg).weak());
-                        });
-                    }
+                    draw_empty_state(ui, table_rect, &self.input, &self.session.state, &palette);
                     return;
                 }
                 let results: &[HitEntry] = &self.results;
@@ -617,7 +572,13 @@ impl ResultsState {
                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
                 );
                 // 行间无缝(虚拟化按固定行高 30 计算);滚动条浮在内容上、不占内容宽,
-                // 表头与行因此同宽对齐(滚动条样式 Task 4 再收)。
+                // 表头与行因此同宽对齐。
+                //
+                // 已知偏差(Task 4 登记,交 Task 5 验收决定):egui 0.37 的 floating
+                // 滚动条并非「滚动时才出现」——可见性由悬停态驱动(悬停区域即淡入,
+                // dormant→active,见 scroll_area.rs 的 is_hovering_outer_rect 分支),
+                // 滚动本身不改变可见性。本轮不做自定义淡入,避免替换 ScrollArea 的
+                // 滚动/虚拟化路径。
                 table_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                 table_ui.spacing_mut().scroll.floating = true;
                 egui::ScrollArea::vertical()
@@ -705,6 +666,15 @@ impl ResultsState {
             self.focus_input_pending = false;
         }
         self.input_focused = input_resp.has_focus();
+
+        // —— 窗口内描边(最内层,压在所有分段之上;§4.2 window_stroke / §4.4) ——
+        // 原生窗口负责圆角裁剪与投影;内容层按同半径在窗口内侧补 1px 描边。
+        ui.painter().rect_stroke(
+            ui.max_rect(),
+            egui::CornerRadius::same(window_tokens::WINDOW_RADIUS),
+            egui::Stroke::new(window_tokens::WINDOW_STROKE, palette.window_stroke),
+            egui::StrokeKind::Inside,
+        );
     }
 
     /// 齿轮点击的 v2.1 提示:`status_note` + 到期时刻(由 tick 清除)。
@@ -1426,6 +1396,227 @@ fn counts_text(total: u32, shown: usize, elapsed_ms: f64, stat_ms: f64) -> Strin
     s
 }
 
+/// 状态栏左侧主文本(§3.6 / §3.7,纯函数):计数/耗时/截断/排序中/索引状态,
+/// 各段统一用「 · 」连接(不用「|」分隔条)。Idle(空词)隐藏计量段,只留索引状态;
+/// Empty(total=0 且有查询)只报「0 项」。
+fn status_text(
+    idle: bool,
+    total: u32,
+    shown: usize,
+    elapsed_ms: f64,
+    stat_ms: f64,
+    index: Option<&str>,
+    sorting: bool,
+) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    if !idle {
+        if total == 0 {
+            segments.push("0 项".into());
+        } else {
+            segments.push(counts_text(total, shown, elapsed_ms, stat_ms));
+        }
+        if sorting {
+            segments.push("排序中…".into());
+        }
+    }
+    if let Some(note) = index {
+        segments.push(note.into());
+    }
+    segments.join(" · ")
+}
+
+/// 窗口内缺口徽标文案(§3.6「N 个目录未收录」)。托盘项 `tray::gaps_label`
+/// 带「⚠」前缀;窗口用自绘警示三角替代图标,文本不重复符号。
+fn gap_badge_text(gaps: u32) -> String {
+    format!("{gaps} 个目录未收录")
+}
+
+/// 状态栏一行的交互产出(绘制闭包外落地)。
+#[derive(Default)]
+struct StatusAction {
+    gaps_clicked: bool,
+    restart_clicked: bool,
+}
+
+/// 状态栏内容行(高 28,§3.6):左 = 状态文本(11pt status_text)+ 排序未生效
+/// 红字/重启动作 + 瞬时提示;右 = 缺口徽标(仅 gaps>0)。左右内边距 16、
+/// 子元素间距 16。
+fn draw_status_row(
+    ui: &mut egui::Ui,
+    row: egui::Rect,
+    st: &ResultsState,
+    palette: &FullWindowPalette,
+) -> StatusAction {
+    let gaps = st.gaps();
+    let mut action = StatusAction::default();
+    let warn = ui.visuals().warn_fg_color;
+    let index = index_note(st.engine.as_ref(), &st.session.state, st.engine_known);
+    let text = status_text(
+        st.input.is_empty(),
+        st.total,
+        st.results.len(),
+        st.elapsed_ms,
+        st.stat_ms,
+        index.as_deref(),
+        st.sorting_inflight,
+    );
+
+    // 缺口徽标几何(右侧):文本 + 自绘警示三角。左侧文本的截断预算扣除它,
+    // 避免长状态文本压到徽标。
+    let badge_text = (!gaps.is_empty()).then(|| gap_badge_text(gaps.len() as u32));
+    let badge_galley = badge_text.as_deref().map(|text| {
+        ui.painter().layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(window_tokens::FONT_STATUS),
+            palette.gap_badge_text,
+        )
+    });
+    let badge_w = badge_galley.as_ref().map_or(0.0, |galley| {
+        window_tokens::GAP_ICON
+            + window_tokens::GAP_BADGE_GAP
+            + galley.size().x
+            + 2.0 * window_tokens::GAP_BADGE_PAD.1
+    });
+    let reserve = if badge_w > 0.0 {
+        badge_w + window_tokens::STATUS_GAP
+    } else {
+        0.0
+    };
+
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    // 可用宽 = 行宽 − 左内边距(由 add_space 消费) − 右内边距 − 徽标预留。
+    row_ui.set_max_width((row.width() - window_tokens::CONTENT_PAD_X - reserve).max(0.0));
+    row_ui.spacing_mut().item_spacing.x = window_tokens::STATUS_GAP;
+    row_ui.add_space(window_tokens::CONTENT_PAD_X);
+
+    if !text.is_empty() {
+        row_ui.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .size(window_tokens::FONT_STATUS)
+                    .color(palette.status_text),
+            )
+            .truncate(),
+        );
+    }
+    // 排序未生效(tech 定案:请求键与回显不符):红字 + 文字按钮(11pt)。
+    if st.sort_stale {
+        row_ui.add(egui::Label::new(
+            egui::RichText::new("引擎版本过旧,排序未生效")
+                .size(window_tokens::FONT_STATUS)
+                .color(warn),
+        ));
+        if st.engine_restarting {
+            row_ui.add(egui::Label::new(
+                egui::RichText::new("重启中…")
+                    .size(window_tokens::FONT_STATUS)
+                    .color(palette.status_text),
+            ));
+        } else if row_ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("重启引擎")
+                        .size(window_tokens::FONT_STATUS)
+                        .color(warn),
+                )
+                .frame(false),
+            )
+            .clicked()
+        {
+            action.restart_clicked = true;
+        }
+    }
+    // 瞬时提示(打开失败/查询失败/齿轮 v2.1):warn 色,11pt。
+    if let Some(note) = &st.status_note {
+        row_ui.add(
+            egui::Label::new(
+                egui::RichText::new(note)
+                    .size(window_tokens::FONT_STATUS)
+                    .color(warn),
+            )
+            .truncate(),
+        );
+    }
+
+    if let Some(galley) = badge_galley {
+        let badge_h = (galley.size().y + 2.0 * window_tokens::GAP_BADGE_PAD.0)
+            .max(window_tokens::GAP_ICON + 2.0 * window_tokens::GAP_BADGE_PAD.0);
+        let badge = egui::Rect::from_min_max(
+            egui::pos2(
+                row.right() - window_tokens::CONTENT_PAD_X - badge_w,
+                row.center().y - badge_h / 2.0,
+            ),
+            egui::pos2(
+                row.right() - window_tokens::CONTENT_PAD_X,
+                row.center().y + badge_h / 2.0,
+            ),
+        );
+        let resp = ui.interact(
+            badge,
+            ui.scope_id().with("results-gap-badge"),
+            egui::Sense::click(),
+        );
+        let fill = if resp.hovered() {
+            palette.gap_badge_fill.gamma_multiply(1.5)
+        } else {
+            palette.gap_badge_fill
+        };
+        ui.painter().rect_filled(
+            badge,
+            egui::CornerRadius::same(window_tokens::GAP_BADGE_RADIUS),
+            fill,
+        );
+        let icon = egui::Rect::from_min_size(
+            egui::pos2(
+                badge.left() + window_tokens::GAP_BADGE_PAD.1,
+                badge.center().y - window_tokens::GAP_ICON / 2.0,
+            ),
+            egui::Vec2::splat(window_tokens::GAP_ICON),
+        );
+        draw_warning_triangle(ui.painter(), icon, palette.gap_badge_text);
+        ui.painter().galley(
+            egui::pos2(
+                icon.right() + window_tokens::GAP_BADGE_GAP,
+                badge.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            palette.gap_badge_text,
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        action.gaps_clicked = resp.clicked();
+    }
+    action
+}
+
+/// 缺口徽标的警示三角(12×12,自绘;Lucide `triangle-alert` 风格:三角轮廓 +
+/// 竖线 + 点)。窗口内用图标替代托盘文案的「⚠」前缀。
+fn draw_warning_triangle(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.2, color);
+    let center_x = rect.center().x;
+    painter.add(egui::Shape::closed_line(
+        vec![
+            egui::pos2(center_x, rect.top() + 1.0),
+            egui::pos2(rect.right() - 1.0, rect.bottom() - 1.5),
+            egui::pos2(rect.left() + 1.0, rect.bottom() - 1.5),
+        ],
+        stroke,
+    ));
+    painter.line_segment(
+        [
+            egui::pos2(center_x, rect.top() + 4.5),
+            egui::pos2(center_x, rect.top() + 7.5),
+        ],
+        stroke,
+    );
+    painter.circle_filled(egui::pos2(center_x, rect.top() + 9.3), 0.7, color);
+}
+
 /// sort_echo 校验(tech 定案,纯函数):仅「请求了非 relevance 键」时校验回显——
 /// 缺省/relevance 不校验(旧 daemon 无 echo 字段亦兼容)。回显为空串(旧 daemon
 /// 忽略 sort)或异键 = 排序未生效。desc 方向不在 echo 范围(Task 19b 定案),
@@ -1445,36 +1636,49 @@ fn gaps_display(gaps: &[Gap]) -> (&[Gap], usize) {
 /// 数据 = status.gaps(与 CLI `status` 同源;行格式同 CLI 口径)。
 fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
     let (rows, rest) = gaps_display(gaps);
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(format!("权限缺口({} 个目录,未收录):", gaps.len()))
-            .small()
-            .weak(),
-    );
+    // 面板与状态行同向左内边距 16(状态栏面板 frame 为 NONE,需在此自排)。
+    let pad = window_tokens::CONTENT_PAD_X;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        ui.label(
+            egui::RichText::new(format!("权限缺口({} 个目录,未收录):", gaps.len()))
+                .size(window_tokens::FONT_STATUS)
+                .weak(),
+        );
+    });
     egui::ScrollArea::vertical()
         .max_height(140.0)
         .id_salt("gaps-panel")
         .show(ui, |ui| {
             for g in rows {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(egui::RichText::new(&g.path).small());
+                    ui.add_space(pad);
+                    ui.spacing_mut().item_spacing.x = window_tokens::GAP_BADGE_GAP;
+                    ui.label(
+                        egui::RichText::new(&g.path)
+                            .size(window_tokens::FONT_STATUS)
+                            .color(ui.visuals().text_color()),
+                    );
                     ui.label(
                         egui::RichText::new(format!("({})", g.reason))
-                            .small()
+                            .size(window_tokens::FONT_STATUS)
                             .weak(),
                     );
                 });
             }
         });
     if rest > 0 {
-        ui.label(
-            egui::RichText::new(format!("… 其余 {rest} 个"))
-                .small()
-                .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.label(
+                egui::RichText::new(format!("… 其余 {rest} 个"))
+                    .size(window_tokens::FONT_STATUS)
+                    .weak(),
+            );
+        });
     }
-    ui.add_space(2.0);
+    ui.add_space(4.0);
 }
 
 /// 索引状态段(product §7 完整窗口列)。引擎快照优先;快照缺失(未运行/取不到)时
@@ -1502,17 +1706,61 @@ fn index_note(engine: Option<&EngineStatus>, state: &State, known: bool) -> Opti
     }
 }
 
-/// 空结果区提示(按会话态;Error 由状态栏 status_note 承担,不再重复)。
-fn empty_hint(state: &State) -> Option<&'static str> {
-    match state {
-        State::Idle => Some("输入关键词开始搜索"),
-        State::Searching => Some("搜索中…"),
-        State::Empty => Some("无匹配项"),
-        State::EngineStarting => Some("引擎未就绪…"),
-        State::Warming => Some("索引构建中…"),
-        State::Offline => Some("无匹配项(离线索引)"),
-        State::Error(_) => None,
+/// 空态主/副文案(§2.7 空态文案表 + 完整窗口 §3.7;纯函数)。
+/// 空词恒为 Idle 文案;Offline 有结果时照常渲染表格,无结果按 Empty;
+/// Error 给出可操作副文案(不再只由状态栏承担)。
+fn empty_state_text(input: &str, state: &State) -> (&'static str, &'static str) {
+    if input.is_empty() {
+        return ("输入关键词开始搜索", "可搜文件名，也可搜路径");
     }
+    match state {
+        State::EngineStarting => ("启动引擎中", "请稍候…"),
+        State::Warming => ("索引构建中", "部分结果可能暂不可见"),
+        State::Error(_) => ("搜索失败", "请重试或检查引擎状态"),
+        // 首次查询尚无结果(防抖/在途)不误报「无匹配项」。
+        State::Searching => ("搜索中…", "请稍候…"),
+        State::Empty | State::Offline | State::Idle => ("无匹配项", "换个关键词试试"),
+    }
+}
+
+/// 空态(表格区,表头保留):主文案 14pt 文件名色 + 副文案 12pt 目录色,
+/// 纵向整块居中、间距 4(§2.7 空态几何)。
+fn draw_empty_state(
+    ui: &egui::Ui,
+    area: egui::Rect,
+    input: &str,
+    state: &State,
+    palette: &FullWindowPalette,
+) {
+    let (main, sub) = empty_state_text(input, state);
+    let painter = ui.painter();
+    let main_galley = painter.layout_no_wrap(
+        main.to_owned(),
+        egui::FontId::proportional(window_tokens::FONT_EMPTY_TITLE),
+        palette.file_name,
+    );
+    let sub_galley = painter.layout_no_wrap(
+        sub.to_owned(),
+        egui::FontId::proportional(window_tokens::FONT_TABLE),
+        // 完整窗口的「所在目录色」= 路径列次要文本色(§4.2 column_text)。
+        palette.column_text,
+    );
+    let main_h = main_galley.size().y;
+    let block_h = main_h + window_tokens::EMPTY_TEXT_GAP + sub_galley.size().y;
+    let top = area.center().y - block_h / 2.0;
+    painter.galley(
+        egui::pos2(area.center().x - main_galley.size().x / 2.0, top),
+        main_galley,
+        palette.file_name,
+    );
+    painter.galley(
+        egui::pos2(
+            area.center().x - sub_galley.size().x / 2.0,
+            top + main_h + window_tokens::EMPTY_TEXT_GAP,
+        ),
+        sub_galley,
+        palette.column_text,
+    );
 }
 
 /// 大小显示(与 cli 的 human_size 同边界;自写简版,不引依赖)。
@@ -2389,6 +2637,190 @@ mod tests {
         assert_eq!(st.status_note_until, None);
     }
 
+    /// 状态栏几何(§3.6):底 = 1px 分隔线 + 28 内容;右侧缺口徽标圆角 6、
+    /// 右内边距 16、垂直居中;窗口内文案不带「⚠」(自绘三角替代)。
+    #[test]
+    fn status_bar_geometry_and_gap_chip() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.input = "报告".into();
+        st.engine = Some(EngineStatus {
+            state: client::state::READY.into(),
+            entry_count: 3,
+            gaps: vec![
+                Gap {
+                    path: "/private/a".into(),
+                    reason: "Permission denied".into(),
+                },
+                Gap {
+                    path: "/private/b".into(),
+                    reason: "Permission denied".into(),
+                },
+            ],
+            built_at: 0,
+        });
+        st.engine_known = true;
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(1200.0, 800.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        out.textures_delta.clear();
+        let palette = window_tokens::dark();
+
+        // 状态栏底:29 = 1 分隔线 + 28 内容,贴窗口底。
+        let fill = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.fill == palette.status_fill => Some(r.rect),
+                _ => None,
+            })
+            .expect("状态栏底");
+        assert_eq!(
+            fill.height(),
+            window_tokens::STATUS_H + window_tokens::DIVIDER_H
+        );
+        assert_eq!(fill.bottom(), screen.y);
+        let row_top = fill.top() + window_tokens::DIVIDER_H;
+
+        // 顶部 1px 分隔线恰在状态行上方。
+        let divider = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == palette.divider
+                        && (r.rect.top() - fill.top()).abs() < 0.01
+                        && (r.rect.height() - window_tokens::DIVIDER_H).abs() < 0.01 =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .expect("状态栏顶部分隔线");
+        assert_eq!(divider.width(), screen.x);
+        assert_eq!(divider.bottom(), row_top);
+
+        // 缺口徽标:圆角 6、右内边距 16、在 28 行内垂直居中。
+        let chip = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.fill == palette.gap_badge_fill => Some(r),
+                _ => None,
+            })
+            .expect("缺口徽标");
+        assert_eq!(
+            chip.corner_radius,
+            egui::CornerRadius::same(window_tokens::GAP_BADGE_RADIUS)
+        );
+        assert_eq!(chip.rect.right(), screen.x - window_tokens::CONTENT_PAD_X);
+        assert_eq!(
+            chip.rect.center().y,
+            row_top + window_tokens::STATUS_H / 2.0
+        );
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "2 个目录未收录"),
+            "窗口内徽标文案;实际 {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains('⚠')), "不重复托盘前缀");
+        out.textures_delta.clear();
+    }
+
+    /// 空态(§2.7):表头保留,主/副文案在表格区整块居中、间距 4。
+    #[test]
+    fn empty_state_is_centered_with_header_kept() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(1200.0, 800.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+
+        let text_shape = |needle: &str| {
+            out.shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == needle => Some(t),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺文案「{needle}」"))
+        };
+        let main = text_shape("输入关键词开始搜索");
+        let sub = text_shape("可搜文件名，也可搜路径");
+        let center_x = screen.x / 2.0;
+        assert!((main.pos.x + main.galley.size().x / 2.0 - center_x).abs() < 0.5);
+        assert!((sub.pos.x + sub.galley.size().x / 2.0 - center_x).abs() < 0.5);
+        let gap = sub.pos.y - (main.pos.y + main.galley.size().y);
+        assert!(
+            (gap - window_tokens::EMPTY_TEXT_GAP).abs() < 0.01,
+            "主副文案间距 4(实际 {gap})"
+        );
+        // 表头保留(结构不塌陷);Idle 隐藏计量,状态栏无「项」。
+        for header in ["名称", "大小", "修改时间", "路径"] {
+            let _ = text_shape(header);
+        }
+        assert!(
+            !out.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.text().contains(" 项"))),
+            "Idle 状态栏隐藏计数"
+        );
+        out.textures_delta.clear();
+    }
+
+    /// 窗口内描边(Task 4):整窗最内层 1px、圆角 12,取 window_stroke token。
+    #[test]
+    fn window_inner_stroke_uses_token() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(1200.0, 800.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        let palette = window_tokens::dark();
+        let stroke = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r)
+                    if r.stroke.color == palette.window_stroke
+                        && (r.stroke.width - window_tokens::WINDOW_STROKE).abs() < f32::EPSILON =>
+                {
+                    Some(r)
+                }
+                _ => None,
+            })
+            .expect("窗口内描边");
+        assert_eq!(stroke.rect.min, egui::Pos2::ZERO);
+        assert_eq!(stroke.rect.max, screen.to_pos2());
+        assert_eq!(
+            stroke.corner_radius,
+            egui::CornerRadius::same(window_tokens::WINDOW_RADIUS)
+        );
+        assert_eq!(stroke.stroke_kind, egui::StrokeKind::Inside);
+        out.textures_delta.clear();
+    }
+
     /// 缺口面板:展开态随缺口归零自动收起;徽标/面板/红字/按钮出帧不 panic。
     #[test]
     fn gaps_panel_toggle_and_auto_close() {
@@ -2517,14 +2949,93 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// 空态文案映射(visual §2.7/§3.7 + Task 4):主/副文案逐态钉住;
+    /// Offline 无结果按 Empty;空词恒为 Idle 文案。
     #[test]
-    fn empty_hint_covers_states() {
-        assert_eq!(empty_hint(&State::Idle), Some("输入关键词开始搜索"));
-        assert_eq!(empty_hint(&State::Empty), Some("无匹配项"));
-        assert_eq!(empty_hint(&State::EngineStarting), Some("引擎未就绪…"));
-        assert_eq!(empty_hint(&State::Warming), Some("索引构建中…"));
-        assert_eq!(empty_hint(&State::Offline), Some("无匹配项(离线索引)"));
-        assert_eq!(empty_hint(&State::Error("x".into())), None, "错误走状态栏");
+    fn empty_state_copy_maps_all_states() {
+        let idle = ("输入关键词开始搜索", "可搜文件名，也可搜路径");
+        assert_eq!(empty_state_text("", &State::Idle), idle);
+        assert_eq!(empty_state_text("", &State::Empty), idle, "空词压过会话态");
+        assert_eq!(
+            empty_state_text("报告", &State::Empty),
+            ("无匹配项", "换个关键词试试")
+        );
+        assert_eq!(
+            empty_state_text("报告", &State::Offline),
+            ("无匹配项", "换个关键词试试"),
+            "离线无结果按 Empty"
+        );
+        assert_eq!(
+            empty_state_text("报告", &State::EngineStarting),
+            ("启动引擎中", "请稍候…")
+        );
+        assert_eq!(
+            empty_state_text("报告", &State::Warming),
+            ("索引构建中", "部分结果可能暂不可见")
+        );
+        assert_eq!(
+            empty_state_text("报告", &State::Error("x".into())),
+            ("搜索失败", "请重试或检查引擎状态")
+        );
+        assert_eq!(
+            empty_state_text("报告", &State::Searching),
+            ("搜索中…", "请稍候…")
+        );
+    }
+
+    /// 状态栏文本生成(§3.6/§3.7):连接符恒为「 · 」;Idle 隐藏计量;
+    /// Empty 只报「0 项」;截断注「展示前 K 条」。
+    #[test]
+    fn status_text_idle_empty_and_connectors() {
+        assert_eq!(
+            status_text(true, 42, 42, 3.2, 1.1, Some("就绪"), true),
+            "就绪",
+            "Idle 隐藏计量与排序中,只留索引状态"
+        );
+        assert_eq!(
+            status_text(true, 0, 0, 0.0, 0.0, None, false),
+            "",
+            "Idle 且状态未回:不占位"
+        );
+        assert_eq!(
+            status_text(false, 0, 0, 0.0, 0.0, Some("就绪"), false),
+            "0 项 · 就绪",
+            "Empty 只报 0 项"
+        );
+        let normal = status_text(false, 42, 42, 3.2, 1.1, Some("就绪"), false);
+        assert_eq!(normal, "42 项 · 匹配 3.2 ms · 读取 1.1 ms · 就绪");
+        assert!(normal.contains(" · "), "段间用「 · 」连接");
+        assert!(!normal.contains('|'), "不用「|」分隔条");
+        assert_eq!(
+            status_text(false, 8000, 1000, 12.5, 40.0, Some("就绪"), true),
+            "8000 项 · 匹配 12.5 ms · 读取 40.0 ms · 展示前 1000 条 · 排序中… · 就绪"
+        );
+        assert_eq!(
+            status_text(
+                false,
+                5,
+                5,
+                1.0,
+                2.0,
+                Some("离线索引 · 生成于 2026-10-16 09:03"),
+                false
+            ),
+            "5 项 · 匹配 1.0 ms · 读取 2.0 ms · 离线索引 · 生成于 2026-10-16 09:03",
+            "离线生成时刻并入索引段"
+        );
+    }
+
+    /// 缺口徽标文案:窗口内不带「⚠」(自绘三角替代),与托盘文案同源。
+    #[test]
+    fn gap_badge_text_has_no_warning_glyph() {
+        assert_eq!(gap_badge_text(3), "3 个目录未收录");
+        assert_eq!(gap_badge_text(1), "1 个目录未收录");
+        assert!(!gap_badge_text(12).contains('⚠'), "窗口内重复「⚠」即失格");
+        assert_eq!(
+            format!("⚠ {}", gap_badge_text(3)),
+            crate::tray::gaps_label(3),
+            "与托盘项文案同源(product §2/§3)"
+        );
     }
 
     #[test]

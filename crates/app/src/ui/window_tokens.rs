@@ -6,10 +6,6 @@
 //! 规则同悬浮条 token：绘制代码只读这里，禁散落色值/字号/几何值
 //! （visual.md §6.6「视图层不写条件分支」）。
 
-// token 表按规格一次建全、消费方分 Task 接入；测试逐项钉住数值。
-// 最迟 Task 4（状态栏/空态接入）后移除本 allow：届时全部 token 均应有消费者。
-#![allow(dead_code)]
-
 use eframe::egui;
 
 /// `#RRGGBBAA` → `Color32`。
@@ -26,9 +22,10 @@ fn c(hex: u32) -> egui::Color32 {
 #[derive(Clone, Copy)]
 pub struct FullWindowPalette {
     pub window_fill: egui::Color32,
-    /// §4.2 原生参考值：当前由系统窗口描边/阴影提供，不自绘；Task 4 后收窄/移除。
+    /// §4.2 窗口内描边（Task 4 起由内容层整窗内描边消费）。
     pub window_stroke: egui::Color32,
-    /// §4.2 原生参考值：当前由系统窗口描边/阴影提供，不自绘；Task 4 后收窄/移除。
+    /// §4.2 原生阴影参考值：由系统窗口阴影提供，不自绘；保留供规格对账。
+    #[allow(dead_code)] // 原生阴影不由应用绘制，字段仅供 §4.2 表对账（Task 4 定案）。
     pub window_shadow: egui::Color32,
     pub divider: egui::Color32,
     pub search_fill: egui::Color32,
@@ -113,10 +110,14 @@ pub fn palette(is_dark: bool) -> FullWindowPalette {
 // —— 字号（§4.3，逻辑点）——
 pub const FONT_QUERY: f32 = 14.0;
 pub const FONT_FILENAME: f32 = 13.0;
-/// 表头 / 大小 / 修改时间 / 路径。
+/// 表头 / 大小 / 修改时间 / 路径 / 空态副文案。
 pub const FONT_TABLE: f32 = 12.0;
 /// 状态栏 / 缺口徽标。
 pub const FONT_STATUS: f32 = 11.0;
+/// 空态主文案（floatbar-visual/visual.md §2.7：14pt，取文件名色）。
+pub const FONT_EMPTY_TITLE: f32 = 14.0;
+/// 空态主副文案间距（§2.7：4）。
+pub const EMPTY_TEXT_GAP: f32 = 4.0;
 
 // —— 标题栏（§3.1 / §4.5；齿轮取 settings-visual.md §3.1）——
 pub const TITLEBAR_H: f32 = 32.0;
@@ -167,9 +168,9 @@ pub const GAP_BADGE_GAP: f32 = 6.0;
 pub const GAP_ICON: f32 = 12.0;
 
 // —— 窗口（§3.2 / §4.4）——
-/// 原生参考值：窗口圆角/描边由 macOS 原生窗口提供，不自绘；Task 4 后收窄/移除。
+/// 窗口圆角（原生窗口裁剪；内容层内描边复用同值，Task 4 起消费）。
 pub const WINDOW_RADIUS: u8 = 12;
-/// 原生参考值：窗口圆角/描边由 macOS 原生窗口提供，不自绘；Task 4 后收窄/移除。
+/// 窗口内描边宽（§4.2 window_stroke；内容层整窗绘制，Task 4 起消费）。
 pub const WINDOW_STROKE: f32 = 1.0;
 
 #[cfg(test)]
@@ -331,8 +332,15 @@ mod tests {
     #[test]
     fn fonts_and_geometry_match_spec() {
         assert_eq!(
-            (FONT_QUERY, FONT_FILENAME, FONT_TABLE, FONT_STATUS),
-            (14.0, 13.0, 12.0, 11.0)
+            (
+                FONT_QUERY,
+                FONT_FILENAME,
+                FONT_TABLE,
+                FONT_STATUS,
+                FONT_EMPTY_TITLE,
+                EMPTY_TEXT_GAP
+            ),
+            (14.0, 13.0, 12.0, 11.0, 14.0, 4.0)
         );
 
         assert_eq!(TITLEBAR_H, 32.0);
