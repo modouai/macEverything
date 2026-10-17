@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use crate::platform;
 use crate::session::{Fire, Session, SortKey, State};
+use crate::ui::icons;
 use crate::ui::tokens as tk;
 use client::{DaemonPaths, StatusOutcome};
 use protocol::HitEntry;
@@ -165,6 +166,9 @@ pub struct PaletteState {
     pub visible_rows: usize,
     /// ⌥↵ 置位:完整窗口待带入的查询词(`ui::draw_palette` 转交 `ResultsState::set_query`)。
     pub full_window_request: Option<String>,
+    /// 结果行系统图标缓存(UTI 纹理 + 路径自定义图标;`reset` 清路径无自定义/
+    /// 失败条目,类型纹理与类型失败记录保留)。
+    icons: icons::IconCache,
 
     paths: DaemonPaths,
     ctx: egui::Context,
@@ -233,6 +237,39 @@ impl PaletteState {
         viewport: egui::ViewportId,
         hotkey_note: Option<String>,
     ) -> Self {
+        Self::with_icons(
+            egui_ctx,
+            paths,
+            viewport,
+            hotkey_note,
+            icons::IconCache::new(),
+        )
+    }
+
+    /// 测试构造:注入无 worker 的图标缓存,避免测试向 NSWorkspace 发假路径。
+    #[cfg(test)]
+    fn new_for_test(
+        egui_ctx: egui::Context,
+        paths: DaemonPaths,
+        viewport: egui::ViewportId,
+        hotkey_note: Option<String>,
+    ) -> Self {
+        Self::with_icons(
+            egui_ctx,
+            paths,
+            viewport,
+            hotkey_note,
+            icons::IconCache::without_worker(),
+        )
+    }
+
+    fn with_icons(
+        egui_ctx: egui::Context,
+        paths: DaemonPaths,
+        viewport: egui::ViewportId,
+        hotkey_note: Option<String>,
+        icons: icons::IconCache,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             session: Session::new(DEBOUNCE),
@@ -246,6 +283,7 @@ impl PaletteState {
             hotkey_note,
             visible_rows: ROWS_INITIAL,
             full_window_request: None,
+            icons,
             paths,
             ctx: egui_ctx,
             viewport,
@@ -285,6 +323,9 @@ impl PaletteState {
         self.input.clear();
         self.session.on_input("", Instant::now()); // Idle + 作废在途响应
         self.results.clear();
+        // 图标:清掉上次结果集的「无自定义/读取失败」路径缓存(自定义纹理保留;
+        // 超过 2048 条按插入序淘汰)。在途请求不取消,响应落地后照常入库。
+        self.icons.on_reset();
         self.total = 0;
         self.selected = 0;
         self.visible_rows = ROWS_INITIAL;
@@ -431,6 +472,8 @@ impl PaletteState {
     /// 绘制悬浮条;返回交上层的动作。
     pub fn draw(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let ctx = ui.ctx().clone();
+        // 图标:drain 工作线程响应 + 限量上传纹理(取图/解码在工作线程,不阻塞本帧)。
+        self.icons.begin_frame(&ctx);
         // 首程诊断打点(唤起后 1.5s 内逐帧留痕,之后停;常态零开销):
         // pass# / 自唤起 / 距上帧(上帧含 tessellate+paint)/ 本帧回调体耗时 /
         // 输入事件到达时刻 / 字体图集布局耗时 / 本帧排帧因(谁叫的帧)。
@@ -689,7 +732,9 @@ impl PaletteState {
                 } else {
                     ui.add_space(tk::LIST_PAD_V);
                     let rows = self.results.len().min(self.visible_rows);
+                    // 两个字段分开借:结果只读、图标缓存可变,闭包内不触碰 `self`。
                     let results = &self.results;
+                    let icons = &mut self.icons;
                     let selected = self.selected;
                     let scroll_sel = self.scroll_to_selected;
                     let mut clicked: Option<usize> = None;
@@ -700,7 +745,9 @@ impl PaletteState {
                             ui.spacing_mut().item_spacing.y = tk::ROW_GAP;
                             for (i, e) in results.iter().take(rows).enumerate() {
                                 let is_sel = i == selected;
-                                let row = draw_result_row(ui, e, is_sel, &t, panel_origin.x);
+                                let texture = icons.icon(ui.ctx(), e);
+                                let row =
+                                    draw_result_row(ui, e, is_sel, &t, panel_origin.x, texture);
                                 if row.clicked() {
                                     clicked = Some(i);
                                 }
@@ -1290,20 +1337,54 @@ fn draw_open_full_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32
     p.line_segment([c + egui::vec2(-5.0, 1.0), c + egui::vec2(-5.0, 5.0)], s);
 }
 
-/// 结果行图标位（32×32 裸放）。**占位**：Task 5 换 `NSWorkspace` 系统真实图标
-/// （§2.4「文件图标走系统真实图标」）；此处仅取扩展名示意，避免空槽。
-fn draw_file_icon_placeholder(p: &egui::Painter, rect: egui::Rect, name: &str, t: &tk::Palette) {
-    p.rect_filled(rect, egui::CornerRadius::same(6), t.divider);
-    let ext = match name.rsplit_once('.') {
-        Some((_, e)) if !e.is_empty() => e.to_uppercase(),
-        _ => "·".to_string(),
-    };
-    p.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        ext,
-        font(FONT_KEYCAP),
-        t.dir_text,
+/// 结果行图标兜底（visual.md §2.4「取图失败回落中性文档字形」）：32×32 内画
+/// 文档轮廓，**无块底**——系统图标本身有形状，块底会变成两层形状打架。
+fn draw_file_icon_fallback(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let (half_w, half_h, fold) = (7.5, 10.0, 5.0);
+    let (left, right) = (c.x - half_w, c.x + half_w);
+    let (top, bottom) = (c.y - half_h, c.y + half_h);
+    let stroke = egui::Stroke::new(1.4, color);
+    p.add(egui::Shape::closed_line(
+        vec![
+            egui::pos2(left, top),
+            egui::pos2(right - fold, top),
+            egui::pos2(right, top + fold),
+            egui::pos2(right, bottom),
+            egui::pos2(left, bottom),
+        ],
+        stroke,
+    ));
+    // 右上折角。
+    p.line_segment(
+        [
+            egui::pos2(right - fold, top),
+            egui::pos2(right - fold, top + fold),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(right - fold, top + fold),
+            egui::pos2(right, top + fold),
+        ],
+        stroke,
+    );
+    // 两条内容线，强化「文档」字形。
+    let line = egui::Stroke::new(1.0, color);
+    p.line_segment(
+        [
+            egui::pos2(left + 3.0, c.y + 1.0),
+            egui::pos2(right - 3.0, c.y + 1.0),
+        ],
+        line,
+    );
+    p.line_segment(
+        [
+            egui::pos2(left + 3.0, c.y + 4.5),
+            egui::pos2(right - 5.0, c.y + 4.5),
+        ],
+        line,
     );
 }
 
@@ -1324,6 +1405,7 @@ fn draw_result_row(
     is_sel: bool,
     t: &tk::Palette,
     panel_x: f32,
+    texture: Option<egui::TextureId>,
 ) -> egui::Response {
     // 占位分配（只为拿滚动区的 y 与点击响应）。
     let (slot, resp) = ui.allocate_exact_size(
@@ -1353,21 +1435,30 @@ fn draw_result_row(
     row_ui
         .painter()
         .rect_filled(rect, egui::CornerRadius::same(tk::ROW_RADIUS), bg);
-    let icon = egui::Rect::from_min_size(
+    let icon_rect = egui::Rect::from_min_size(
         egui::pos2(
             rect.min.x + tk::ROW_PAD_X,
             rect.center().y - tk::ROW_ICON / 2.0,
         ),
         egui::vec2(tk::ROW_ICON, tk::ROW_ICON),
     );
-    draw_file_icon_placeholder(row_ui.painter(), icon, &e.name, t);
+    if let Some(id) = texture {
+        row_ui.painter().image(
+            id,
+            icon_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        draw_file_icon_fallback(row_ui.painter(), icon_rect, t.dir_text);
+    }
     let name_c = if is_sel {
         t.file_name_selected
     } else {
         t.file_name
     };
     // 文本列（左对齐；`Ui::put` 是居中布局，不能用——改用定宽子 Ui 顶部左排）
-    let tx = icon.max.x + tk::ROW_INNER_GAP;
+    let tx = icon_rect.max.x + tk::ROW_INNER_GAP;
     let hint_w = if is_sel { tk::ACTION_HINT_W } else { 0.0 };
     let right = rect.max.x - tk::ROW_PAD_X - hint_w - 6.0;
     let col = egui::Rect::from_min_max(
@@ -1719,7 +1810,7 @@ mod tests {
     #[test]
     fn typing_height_sequence_is_smooth_and_fits_content() {
         let ctx = egui::Context::default();
-        let mut st = PaletteState::new(
+        let mut st = PaletteState::new_for_test(
             ctx.clone(),
             DaemonPaths {
                 data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
@@ -1920,7 +2011,7 @@ mod tests {
     #[test]
     fn panel_height_per_row_count() {
         let ctx = egui::Context::default();
-        let mut st = PaletteState::new(
+        let mut st = PaletteState::new_for_test(
             ctx.clone(),
             DaemonPaths {
                 data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
@@ -1962,7 +2053,7 @@ mod tests {
     #[test]
     fn window_height_policy_one_resize_per_change() {
         let ctx = egui::Context::default();
-        let mut st = PaletteState::new(
+        let mut st = PaletteState::new_for_test(
             ctx.clone(),
             DaemonPaths {
                 data_dir: std::path::PathBuf::from("/tmp/mce-probe"),

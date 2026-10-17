@@ -47,11 +47,14 @@ use objc2_app_kit::{
     NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
-use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey, NSURL,
+};
+use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
-use super::{monotonic_ms, SpaceChange, PALETTE_TITLE};
+use super::{monotonic_ms, SpaceChange, ICON_PX, PALETTE_TITLE};
 
 /// 顶边位置:可见区顶部向下 1/4(Spotlight 式「居中偏上」,product §1)。
 const TOP_INSET_FRACTION: f64 = 0.25;
@@ -1015,6 +1018,82 @@ fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> Anchor {
     let y = (top_y - h).max(visible.origin.y + EDGE_MARGIN);
     win.setFrameOrigin(NSPoint::new(x, y));
     Anchor { x, top_y, h }
+}
+
+// ---------------------------------------------------------------------------
+// 系统图标(Task 5;visual.md §2.4「文件图标走系统真实图标」)
+//
+// 类型图标走 `NSWorkspace.iconForContentType`(不按路径);仅当用户给单个文件设过
+// 自定义图标时才按路径读 `NSURLCustomIconKey`。`uti_for` 是廉价的 UTType 查询
+// (UI 线程);取图/数据化/缩放全部在 `mce-icon-loader` 工作线程串行执行,线程安全
+// 依据见 `ui/icons.rs` 模块注释。
+
+/// 解析文件的 UTI(目录 `UTTypeFolder`;无扩展名/解析失败回落 `UTTypeData`)。
+pub fn uti_for(extension: Option<&str>, is_dir: bool) -> String {
+    let resolved = if is_dir {
+        None
+    } else {
+        extension.and_then(|ext| UTType::typeWithFilenameExtension(&NSString::from_str(ext)))
+    };
+    // SAFETY:UTCoreTypes 静态量由 UniformTypeIdentifiers 框架在进程生命周期内提供;
+    // 此处只读借用,不写入、不跨线程移动,无别名/数据竞争。
+    let (folder, data) = unsafe { (UTTypeFolder, UTTypeData) };
+    let uti: &UTType = if is_dir {
+        folder
+    } else {
+        resolved.as_deref().unwrap_or(data)
+    };
+    uti.identifier().to_string()
+}
+
+/// 按 UTI 取系统图标并转 64×64 **预乘** RGBA。
+///
+/// 由图标工作线程调用:只做 `NSWorkspace` 查询与返回图像的 TIFF 数据化,不创建/
+/// 操作视图或窗口(跨线程依据见 `ui/icons.rs` 模块注释)。
+pub fn type_icon_rgba(uti: &str) -> Option<Vec<u8>> {
+    let uti = UTType::typeWithIdentifier(&NSString::from_str(uti))?;
+    let icon = NSWorkspace::sharedWorkspace().iconForContentType(&uti);
+    image_rgba(&icon)
+}
+
+/// 按路径读用户自定义图标(`NSURLCustomIconKey`);无自定义图标/读取失败 = `None`。
+///
+/// 返回 64×64 **预乘** RGBA;由图标工作线程调用,只读取资源属性与图像数据,
+/// 不触碰视图层。
+pub fn custom_icon_rgba(path: &str) -> Option<Vec<u8>> {
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    let mut value: Option<Retained<AnyObject>> = None;
+    // SAFETY:`getResourceValue:forKey:error:` 要求 `value` 出参由方法写入「正确
+    // 类型」的对象;先置 None,调用后 downcast 校验为 NSImage,类型不符即放弃。
+    let result = unsafe { url.getResourceValue_forKey_error(&mut value, NSURLCustomIconKey) };
+    if result.is_err() {
+        return None;
+    }
+    let icon = value?.downcast::<NSImage>().ok()?;
+    image_rgba(&icon)
+}
+
+/// `NSImage` → 64×64 **预乘** RGBA:TIFF 表示 → image 解码 → Lanczos 缩放。
+///
+/// 系统图标源通常 ≥512px,缩到 64px 即满足 Retina 2x 的 32pt 行图标。
+/// 已知代价:`TIFFRepresentation` 本机为 32 页/约 36.9MB,`image` 只解第一页
+/// (32pt 图标取首个表示已够用);这里直接借用 NSData 字节,不再整份拷进 Vec。
+fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
+    let tiff = icon.TIFFRepresentation()?;
+    let len = tiff.length();
+    if len == 0 {
+        return None;
+    }
+    // SAFETY:`tiff` 在同步解码期间保持存活;`bytes` 返回其内部只读缓冲区指针,
+    // 长度恰为 `length()`。切片只传给 `image::load_from_memory` 同步解码,期间
+    // NSData 不被修改/释放,不越界。
+    let bytes = unsafe {
+        let ptr: *const u8 = msg_send![&*tiff, bytes];
+        std::slice::from_raw_parts(ptr, len)
+    };
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let resized = decoded.resize_exact(ICON_PX, ICON_PX, image::imageops::FilterType::Lanczos3);
+    Some(resized.to_rgba8().into_raw())
 }
 
 #[cfg(test)]

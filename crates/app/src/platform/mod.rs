@@ -116,6 +116,58 @@ pub fn last_space_change() -> Option<SpaceChange> {
     }
 }
 
+/// 结果行图标纹理边长(px):32pt × 2x(Retina 位图)。
+///
+/// 平台层取图与 ui 层建纹理共用此值(单源,防两侧漂移)。
+pub const ICON_PX: u32 = 64;
+
+/// 解析文件的 UTI(目录走 `UTTypeFolder`;无扩展名/解析失败回落 `UTTypeData`)。
+///
+/// 只是廉价的 UTType 查询,UI 线程直接调用;取图/解码在图标工作线程。
+/// `extension` 由调用方从文件名取出(与 `ui::icons::type_key` 同一口径)。
+pub fn uti_for(extension: Option<&str>, is_dir: bool) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        mac::uti_for(extension, is_dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = extension;
+        if is_dir {
+            "public.folder"
+        } else {
+            "public.data"
+        }
+        .to_owned()
+    }
+}
+
+/// 按 UTI 取系统图标并转成 [`ICON_PX`] 见方 **预乘** RGBA(取图/解码/缩放在工作线程)。
+pub fn type_icon_rgba(uti: &str) -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::type_icon_rgba(uti)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = uti;
+        None
+    }
+}
+
+/// 按路径读用户自定义图标(64×64 **预乘** RGBA);无自定义图标/失败 = `None`。
+pub fn custom_icon_rgba(path: &str) -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::custom_icon_rgba(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// 记录根窗句柄(创建期一次)。
 pub fn attach_root(cc: &eframe::CreationContext<'_>) {
     #[cfg(target_os = "macos")]

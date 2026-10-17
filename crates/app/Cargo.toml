@@ -49,6 +49,9 @@ objc2-app-kit = { version = "0.3", features = [
     "NSColor",
     "NSImage",
     "NSBezierPath",
+    # Task 5 结果行真实图标:iconForContentType(UTI) 的 cfg 门槛(0.3.2 源码
+    # NSWorkspace.rs:132 要求 NSImage + objc2-uniform-type-identifiers 两个 feature)。
+    "objc2-uniform-type-identifiers",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification
@@ -57,7 +60,16 @@ objc2-app-kit = { version = "0.3", features = [
 # 「在 .app 内」(PoC-5 坑①:无 bundle 调 register 不报错且注册独立条目)。
 # 毛玻璃垫窗圆角遮罩(CALayer.cornerRadius;垫窗须与面板同圆角,否则四角露方角——实机)
 objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification", "NSBundle"] }
+# NSError/NSURL(Task 5):自定义图标经 NSURL.getResourceValue_forKey_error 读
+# NSURLCustomIconKey;该方法以 Result<_, Retained<NSError>> 表达失败,两 feature 缺一不可。
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification", "NSBundle", "NSError", "NSURL"] }
+# Task 5 结果行真实图标:扩展名 → UTI(目录/无扩展名回落 UTCoreTypes)。
+# 0.3.2 与 objc2 0.6 / objc2-foundation 0.3 同代;UTCoreTypes 提供 UTTypeFolder/UTTypeData。
+objc2-uniform-type-identifiers = { version = "0.3.2", features = ["UTType", "UTCoreTypes"] }
+# Task 5:NSImage.TIFFRepresentation → RGBA。image 已由 eframe/arboard 带入锁文件,
+# 显式声明直接依赖;只要 png+tiff 解码面(与既有依赖取并集,不新增构建面)。
+# png 保留:Task 9 吉祥物 PNG 解码也要用,勿随本任务收窄。
+image = { version = "0.25.10", default-features = false, features = ["png", "tiff"] }
 # Task 20 开机自启:ServiceManagement 的 objc2 官方 binding(实锁 0.3.2,与 objc2 0.6 同代;
 # 生成代码自带 `#[link(name = "ServiceManagement", kind = "framework")]`,框架随链接加载)。
 # 关默认 features:本任务只用 SMAppService(注册/注销/状态)+ SMErrors(错误码),

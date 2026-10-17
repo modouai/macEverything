@@ -60,6 +60,7 @@
 //! 逐簇查系统字体(zh 语境 → 苹方;韩文 → AppleSDGothicNeo;emoji → Apple Color Emoji)。
 //! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
 
+pub mod icons;
 pub mod menu_actions;
 pub mod palette;
 pub mod results;
