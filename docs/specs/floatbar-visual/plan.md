@@ -103,6 +103,13 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 - [ ] **Step 2:** egui 面板底改走 token 的 alpha 值（§4.1 面板底原值 `#191C21CC`/`#FFFFFFD6`）；非面板区域全透明。
 - [ ] **Step 3:** 深浅色切换时同步换 material；`<check>` + 实机。
 
+### Task 10 落地结论（2026-10-17，含全屏）
+
+- **全屏 Space 已解**：垫窗按「**先装 vibrancy → 排序 → 再换类 NSPanel + NonactivatingPanel**」构建——桌面与全屏 Space 磨砂一致。顺序是硬约束：先换类/直接 NSPanel 构造会打死 vibrancy（三轮实机对照）。
+- 圆角用官方 `maskImage`（`layer.masksToBounds` 同理会打死 vibrancy）。
+- 面板底/材质为实机迭代值：`UnderWindowBackground` + 40%（两主题同），已同步 `visual.md` §4.1；alpha 在材质之上是次要杠杆（50%→40% 肉眼无差）。
+- 垫窗显隐/跟随已有实机取证，无单测（纯 AppKit 路径）。
+
 ### Task 11: 位置与宽度回填
 
 - [ ] **Step 1:** 顶边改**固定 110**（`platform/mac.rs` 定位）；窄屏宽 = `min(700, 可见宽−48)`、下限 480。

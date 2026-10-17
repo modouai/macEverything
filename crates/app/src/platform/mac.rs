@@ -38,11 +38,14 @@ use anyhow::{anyhow, Result};
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
-use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSFloatingWindowLevel, NSMenu, NSMenuItem, NSPanel, NSResponder,
-    NSScreen, NSView, NSViewLayerContentsPlacement, NSWindow, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace, NSWorkspaceActiveSpaceDidChangeNotification,
+    NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel,
+    NSImage, NSMenu, NSMenuItem, NSPanel, NSResponder, NSScreen, NSView,
+    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -196,6 +199,12 @@ struct PaletteState {
     /// Space 变更观察者(持引用保活;通知中心持弱引用,不保活)。
     space_observer: Option<Retained<SpaceObserver>>,
     drift: Drift,
+    /// 毛玻璃垫窗(PoC-7 定案:面板窗下挂同级窗,承载 `NSVisualEffectView`)。
+    blur: Option<Retained<NSWindow>>,
+    /// 垫窗内容视图(持引用保活)。
+    vib: Option<Retained<NSVisualEffectView>>,
+    /// 上帧垫窗是否可见(显隐边沿检测:只在翻转时调 orderFront/orderOut)。
+    blur_visible: bool,
 }
 
 thread_local! {
@@ -638,6 +647,161 @@ pub fn revert_class() {
         class_name(old)
     );
     PALETTE.with(|cell| cell.borrow_mut().orig_class = None);
+    // 垫窗一并收掉(orderOut + 释放;进程退出前保持桌面干净)
+    let blur = PALETTE.with(|cell| cell.borrow_mut().blur.take());
+    if let Some(blur) = blur {
+        blur.orderOut(None);
+    }
+    PALETTE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.vib = None;
+        st.blur_visible = false;
+    });
+}
+
+/// 毛玻璃垫窗每帧同步(悬浮条 pass 调用,`platform::reanchor` 同址)。
+///
+/// PoC-7 定案:面板窗下挂同级窗承载 `NSVisualEffectView`(winit 视图即 contentView,
+/// 不可换容器/加兄弟层)。只在「frame 变化」与「显隐翻转」时调 AppKit——
+/// 静止期零原生调用。重入安全:AppKit 调用全程不持 PALETTE 借用。
+pub fn sync_blur(visible: bool, corner_radius: f64) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let (panel, has_blur) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.palette.clone(), st.blur.is_some())
+    });
+    let Some(panel) = panel else {
+        return; // 垫窗随面板;面板窗还没接上就不建
+    };
+    if visible && !has_blur {
+        create_blur(mtm, &panel, corner_radius);
+    }
+    let (blur, was_visible) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.blur.clone(), st.blur_visible)
+    });
+    let Some(blur) = blur else {
+        return;
+    };
+    if visible {
+        let f = panel.frame();
+        if blur.frame() != f {
+            let was = blur.frame();
+            blur.setFrame_display(f, true);
+            if let Some(vib) = PALETTE.with(|cell| cell.borrow().vib.clone()) {
+                vib.setMaskImage(Some(&rounded_mask(f.size, corner_radius)));
+            }
+            log::info!("垫窗跟随:blur {was:?} → {f:?}");
+        }
+        if !was_visible {
+            // 先于面板置前、再压到面板之下:顺序即层级
+            blur.orderFrontRegardless();
+            blur.orderWindow_relativeTo(NSWindowOrderingMode::Below, panel.windowNumber());
+            log::info!(
+                "毛玻璃垫窗显示:frame={:?} panel_window_number={} blur_window_number={}",
+                f,
+                panel.windowNumber(),
+                blur.windowNumber()
+            );
+        }
+    } else if was_visible {
+        blur.orderOut(None);
+    }
+    PALETTE.with(|cell| cell.borrow_mut().blur_visible = visible);
+}
+
+/// 建毛玻璃垫窗(borderless/无阴影/不接鼠标/级别与 collectionBehavior 同面板)。
+fn create_blur(mtm: MainThreadMarker, panel: &NSWindow, corner_radius: f64) {
+    // **普通 NSWindow（PoC-7 实证可见磨砂的形态）**。
+    // 2026-10-17 实机对照：垫窗改「NSPanel 构造」后，浅深两色下磨砂都不再出现
+    // （辉哥判读：「PoC 时有半透明，现在没了」）；换 maskImage 也不恢复。故回退到
+    // PoC 形态先保住磨砂。代价：**垫窗不进他人全屏 Space**（PoC-1：普通 NSWindow
+    // 的硬限制）——全屏下无磨砂，另行处置（见 plan 遗留）。
+    // SAFETY: 主线程持有 mtm；标准构造，返回对象由 Retained 保活。
+    let win = unsafe {
+        let alloc = NSWindow::alloc(mtm);
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            alloc,
+            panel.frame(),
+            NSWindowStyleMask::Borderless,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    win.setOpaque(false);
+    win.setBackgroundColor(Some(&NSColor::clearColor()));
+    win.setHasShadow(false);
+    win.setIgnoresMouseEvents(true);
+    win.setLevel(panel.level());
+    win.setCollectionBehavior(panel.collectionBehavior());
+    let vib = NSVisualEffectView::new(mtm);
+    // 材质选型（2026-10-17 实机迭代）：面板底 alpha 到 40% 仍「看不出变化」——
+    // 该观感由 material 自身的半透明层主导（Popover 偏亮偏实）。改窗口底色级材质
+    // `UnderWindowBackground`（最通透的一档），把「透明感」的杠杆交还材质。
+    vib.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
+    vib.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    vib.setState(NSVisualEffectState::Active);
+    let size = win.frame().size;
+    vib.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
+    vib.setMaskImage(Some(&rounded_mask(size, corner_radius)));
+    let vib_view: &NSView = &vib;
+    win.setContentView(Some(vib_view));
+    // 置前后必须立即压到面板之下（否则成"纱"——实机 2026-10-17）。
+    win.orderFrontRegardless();
+    win.orderWindow_relativeTo(NSWindowOrderingMode::Below, panel.windowNumber());
+    // **换类时机实验（2026-10-17）**：vibrancy 装好、排层完成**之后**再换类为 NSPanel
+    // 并补 NonactivatingPanel（跨他人全屏 Space 的硬条件）。此前两轮失败均为
+    // 「换类/构造在前、vibrancy 在后」，本组合是唯一未试的序；若成功则全屏也有磨砂。
+    {
+        let obj: *const AnyObject = (win.as_ref() as *const NSWindow).cast::<AnyObject>();
+        let before = obj_class(obj);
+        let target = NSPanel::class();
+        if before.instance_size() == target.instance_size() {
+            // SAFETY: 实例大小已断言一致；目标类为系统 NSPanel（无新增 ivars）。
+            unsafe {
+                objc2::ffi::object_setClass(obj.cast_mut(), target as *const AnyClass);
+            }
+            // SAFETY: 该对象已换为 NSPanel 类，按 NSPanel 解释成立。
+            let panel_ref: &NSPanel =
+                unsafe { &*(win.as_ref() as *const NSWindow).cast::<NSPanel>() };
+            panel_ref.setStyleMask(panel_ref.styleMask() | NSWindowStyleMask::NonactivatingPanel);
+            panel_ref.setFloatingPanel(true);
+            panel_ref.setBecomesKeyOnlyIfNeeded(false);
+            panel_ref.setHidesOnDeactivate(false);
+            log::info!("垫窗换类（vibrancy 之后）→ NSPanel + NonactivatingPanel");
+        } else {
+            log::warn!("垫窗换类被拒：实例大小不一致（全屏下将无磨砂）");
+        }
+    }
+    PALETTE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.blur = Some(win);
+        st.vib = Some(vib);
+        st.blur_visible = true;
+    });
+    log::info!(
+        "毛玻璃垫窗已建（普通 NSWindow/PoC-7 形态；material=Popover，面板之下；panel#{}）",
+        panel.windowNumber()
+    );
+}
+
+/// 生成圆角矩形遮罩图（黑填充 + 全透明底；`maskImage` 的形制）。
+///
+/// `lockFocus`/`unlockFocus` 为弃用 API 但仍受支持，是构造此图最短路径
+/// （替代：CG 位图上下文手绘，代码量约为其三倍）。
+#[allow(deprecated)]
+fn rounded_mask(size: NSSize, radius: f64) -> Retained<NSImage> {
+    // NSImage 为 AnyThread 类（objc2-app-kit 生成未标 MainThreadOnly），alloc 不带 mtm；
+    // 绘制调用本身仍在主线程（调用点均在 sync_blur/create_blur 内）。
+    let img = NSImage::initWithSize(NSImage::alloc(), size);
+    img.lockFocus();
+    NSColor::blackColor().set();
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius).fill();
+    img.unlockFocus();
+    img
 }
 
 /// 是否已接上悬浮条窗(诊断/首帧接线轮询用)。

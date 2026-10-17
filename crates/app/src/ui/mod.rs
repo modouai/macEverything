@@ -634,6 +634,8 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // 根窗走平台层原生(activate + 置前;单发 egui 命令不切 Space,实测):
             // 出锁再调(锁纪律——原生调用可被 winit 同步派发,持锁即自锁)。
             drop(s);
+            // 垫窗随面板收掉(本分支提前 return,末尾统一同步到不了这里)
+            platform::sync_blur(false, palette::PANEL_RADIUS_F64);
             show_root_window(&ctx);
             return; // 开窗后本 pass 结束(悬浮条已隐藏,下面不再排帧)
         }
@@ -644,4 +646,7 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     if s.palette_visible {
         ctx.request_repaint_after(theme::CHECK_INTERVAL);
     }
+    // 毛玻璃垫窗:显隐随面板(PoC-7 定案)。**放在动作处理之后**——隐藏当帧即
+    // orderOut,否则按 L4「隐藏后不排帧」可能长期残留一块磨砂矩形(review 2026-10-17)。
+    platform::sync_blur(s.palette_visible, palette::PANEL_RADIUS_F64);
 }

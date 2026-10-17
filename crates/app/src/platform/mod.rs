@@ -166,6 +166,15 @@ pub fn reanchor() {
     mac::reanchor();
 }
 
+/// 毛玻璃垫窗每帧同步(显隐随面板;悬浮条每次 pass 调用)。
+/// `corner_radius` 由 ui 层传入(垫窗圆角须与面板一致;平台层不反向引 ui 常量)。
+pub fn sync_blur(visible: bool, corner_radius: f64) {
+    #[cfg(target_os = "macos")]
+    mac::sync_blur(visible, corner_radius);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (visible, corner_radius);
+}
+
 /// 退出/销毁前还原窗口类(否则 winit drop → abort)。
 pub fn revert_class() {
     #[cfg(target_os = "macos")]

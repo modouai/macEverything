@@ -125,7 +125,7 @@ pub fn execute_sorted(
 | 根窗(完整窗口)唤起 | `NSApp.activate()` + `orderFrontRegardless`(常规 App 窗口语义,与悬浮条「不夺前台」相反);实测非激活 app 下 winit `makeKeyAndOrderFront` 不切 Space |
 | 根窗关闭 | 取消关闭(`CancelClose`)+ 隐藏窗口(关闭窗口不退出 App,product §2);真退出走托盘「退出」(Task 16) |
 | 无边框/透明/圆角 | `ViewportBuilder { decorations:false, transparent:true, ... }`(官方)+ egui 自绘圆角阴影 |
-| 毛玻璃(**PoC-7 定案 2026-10-17**) | 「面板窗 + **下挂同级毛玻璃窗**」:borderless + `ignoresMouseEvents` + collectionBehavior/level 与面板同源,`addChildWindow:ordered:Below`,frame 每帧同步、显隐随面板;`NSVisualEffectView`(blendingMode=BehindWindow,state=Active,material 取随外观自适应的 `Popover`)。**层级约束**:winit 视图即 contentView(winit 0.30.13 直接 `setContentView(WinitView)`,且 `WindowDelegate::view()` 恒按 WinitView 解释)——禁换容器/加兄弟层(UB)。取证见 poc-results.md「PoC-7」 |
+| 毛玻璃(**PoC-7 落地 2026-10-17**) | 「面板窗 + **下挂同级毛玻璃窗**」,构建顺序是硬约束:①建**普通 NSWindow**(borderless+`ignoresMouseEvents`+level/collectionBehavior 同面板);②装 `NSVisualEffectView`(blendingMode=BehindWindow,state=Active,material=`UnderWindowBackground`,圆角用官方 `maskImage`);③`orderFrontRegardless` + `orderWindow:relativeTo:Below`(面板之下);④**最后**换类为 NSPanel 并补 `NonactivatingPanel`(跨他人全屏 Space 的硬条件;裸 NSPanel 收不到键盘,垫窗正合适)。**顺序反了(先换类/直接 NSPanel 构造)会打死 vibrancy**——浅深两色磨砂全失,三轮实机对照。圆角禁用 `layer.masksToBounds`(离屏通道同理会打死 vibrancy)。frame 每帧同步、显隐随面板(隐藏/切完整窗口当帧 orderOut)。**层级约束**:winit 视图即 contentView,禁换容器/加兄弟层(UB)。取证见 poc-results.md「PoC-7」与 floatbar-visual/plan.md「Task 10」 |
 | 置顶 | `with_always_on_top`(官方) |
 | 右键菜单 | **原生 NSMenu**(objc2):egui 收到右键 → 构建 NSMenu(NSMenuItem + target/action 桥回 Rust)→ `popUpContextMenu` 于鼠标位置;菜单项语义见 product §2。非自绘:观感/键盘导航/异屏缩放均随系统 |
 

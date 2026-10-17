@@ -94,6 +94,8 @@ const ROWS_STEP: usize = 20;
 const LIST_MAX_H: f32 = tk::list_h(6) - 2.0 * tk::LIST_PAD_V;
 /// 排版区放开上限（px）：仅用于布局区（与窗高解耦），不作窗口高输出。
 const PANEL_MAX_H: f32 = 4096.0;
+/// 面板圆角（f64 形态；平台层垫窗签名用，避免调用点多处 `as`）。
+pub const PANEL_RADIUS_F64: f64 = tk::PANEL_RADIUS as f64;
 
 /// 工作线程回投的查询结果。
 pub struct QueryResult {
@@ -200,6 +202,10 @@ pub struct PaletteState {
     anim_trace: Option<(f32, u32, Instant)>,
     /// 会话内原生 resize 计数(证据与测试读它;每次高度变化应恰 +1)。
     h_resizes: u32,
+    /// 最近一帧实测的**自然内容高**（三段之和，未走 `INITIAL_H` 兜底）。
+    /// 测试用它钉住「内部版面精确等于设计推导」——只看窗口高会被兜底遮蔽
+    /// （空态块若少占高，窗口仍是 176，页脚却整体上移）。
+    natural_h: f32,
     /// 最近一次输入变更时刻(空态滞后判定 `EMPTY_HOLD` 起算;仅输入帧更新)。
     last_input_at: Option<Instant>,
     /// 空态待决:输入进行中的 0 命中已静默(仍显示上一轮结果);停手后复判,
@@ -258,6 +264,7 @@ impl PaletteState {
             h_anim: None,
             anim_trace: None,
             h_resizes: 0,
+            natural_h: INITIAL_H,
             last_input_at: None,
             pending_empty: false,
             pass_seq: 0,
@@ -311,6 +318,11 @@ impl PaletteState {
         );
         self.last_h = Some(h);
         self.h_resizes += 1;
+        // 尺寸命令异步落地:补排一帧让「落地之后」的帧再同步一次平台层——
+        // 垫窗按 `panel.frame()` 对齐、顶边重锚同理;否则过渡结束不再排帧(L4),
+        // 最后一次收缩落地的尺寸永远没人跟(实机:面板下方残留一条磨砂带)。
+        self.ctx
+            .request_repaint_after_for(Duration::from_millis(32), self.viewport);
     }
 
     /// 每帧驱动(悬浮条视口回调 `ui::draw_palette` 调用):防抖到期发查询;
@@ -533,6 +545,9 @@ impl PaletteState {
         let bg_idx = ui.painter().add(egui::Shape::Noop);
         // 设计 token（visual.md §四；本文件禁散落色值/字号）
         let t = tk::palette(ui.visuals().dark_mode);
+        // 面板底 = 设计 token 的 alpha（深 `#191C21CC` / 浅 `#FFFFFFD6`），叠在垫窗
+        // （平台层 NSVisualEffectView，PoC-7 定案）之上。若毛玻璃不可用（降级路径，
+        // 见 visual.md §6.1 路线①），此处改 `t.panel_fill.to_opaque()` 走实底。
         let panel_fill = t.panel_fill;
         let panel_stroke = egui::Stroke::new(1.0, t.panel_stroke);
 
@@ -605,6 +620,8 @@ impl PaletteState {
                                     .id_salt("palette-input")
                                     .font(font(FONT_INPUT))
                                     .text_color(t.query_text)
+                                    // 裸输入（设计稿：无框无底，只有文字与光标）
+                                    .frame(egui::Frame::NONE)
                                     // 文字垂直居中（同结果窗口；egui 0.37 主题的 TextEdit
                                     // align2 默认 LEFT_TOP，add_sized 拉高后贴顶）。
                                     .align(egui::Align2::LEFT_CENTER)
@@ -650,19 +667,24 @@ impl PaletteState {
                     } else {
                         ("输入关键词开始搜索", "可搜文件名，也可搜路径")
                     };
-                    ui.allocate_ui_with_layout(
+                    // 先按 EMPTY_H 精确占位，再在块内居中放两行——`allocate_ui_with_layout`
+                    // 只按内容实际用量推进游标（实测只占 51px），页脚会整体上移、下方留白。
+                    let (empty_rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), tk::EMPTY_H),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(tk::EMPTY_H / 2.0 - 19.0);
-                            ui.spacing_mut().item_spacing.y = tk::EMPTY_GAP;
-                            ui.label(egui::RichText::new(primary).size(14.0).color(t.file_name));
-                            ui.label(
-                                egui::RichText::new(secondary)
-                                    .size(FONT_DIR)
-                                    .color(t.dir_text),
-                            );
-                        },
+                        egui::Sense::hover(),
+                    );
+                    let mut empty_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(empty_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Center)),
+                    );
+                    empty_ui.add_space((tk::EMPTY_H - tk::EMPTY_TEXT_H) / 2.0);
+                    empty_ui.spacing_mut().item_spacing.y = tk::EMPTY_GAP;
+                    empty_ui.label(egui::RichText::new(primary).size(14.0).color(t.file_name));
+                    empty_ui.label(
+                        egui::RichText::new(secondary)
+                            .size(FONT_DIR)
+                            .color(t.dir_text),
                     );
                 } else {
                     ui.add_space(tk::LIST_PAD_V);
@@ -678,7 +700,7 @@ impl PaletteState {
                             ui.spacing_mut().item_spacing.y = tk::ROW_GAP;
                             for (i, e) in results.iter().take(rows).enumerate() {
                                 let is_sel = i == selected;
-                                let row = draw_result_row(ui, e, is_sel, &t);
+                                let row = draw_result_row(ui, e, is_sel, &t, panel_origin.x);
                                 if row.clicked() {
                                     clicked = Some(i);
                                 }
@@ -719,7 +741,8 @@ impl PaletteState {
         // 自然高 = 三段内容高之和（搜索行 64 + 结果区 + 页脚 38 + 两条分隔线）。
         // 描边画在面板矩形内侧 1px、叠在内容首尾像素上——与设计稿「面板高 466 =
         // 64+1+362+1+38」同口径，故不再另加描边宽。
-        let natural_h = frame.response.rect.height().max(INITIAL_H);
+        self.natural_h = frame.response.rect.height();
+        let natural_h = self.natural_h.max(INITIAL_H);
         // 目标变更(或首次)→ 从当前绘制高起一段新过渡(中途再变即在现值上重起,不叠段)。
         // 静止(未在过渡且已贴合)不起空过渡——否则每帧白走一段 54→54,日志刷屏。
         let target_changed = self
@@ -1291,10 +1314,18 @@ fn draw_result_row(
     e: &HitEntry,
     is_sel: bool,
     t: &tk::Palette,
+    panel_x: f32,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(
+    // 占位分配（只为拿滚动区的 y 与点击响应）。
+    let (slot, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), tk::ROW_H),
         egui::Sense::click(),
+    );
+    // 行矩形按**面板坐标系**显式定位：滚动区内容 ui 的原点会被 egui 左移、
+    // 宽度含滚动条余量（实测 min.x=-14 / 宽 712），不能拿它当行定位基准。
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(panel_x + tk::LIST_SIDE_PAD, slot.min.y),
+        egui::vec2(tk::ROW_W, tk::ROW_H),
     );
     let bg = if is_sel {
         t.row_selected
@@ -1326,25 +1357,26 @@ fn draw_result_row(
     } else {
         t.file_name
     };
+    // 文本列（左对齐；`Ui::put` 是居中布局，不能用——改用定宽子 Ui 顶部左排）
     let tx = icon.max.x + tk::ROW_INNER_GAP;
-    let hint_w = if is_sel { 40.0 } else { 0.0 };
+    let hint_w = if is_sel { tk::ACTION_HINT_W } else { 0.0 };
     let right = rect.max.x - tk::ROW_PAD_X - hint_w - 6.0;
-    let name_rect = egui::Rect::from_min_max(
-        egui::pos2(tx, rect.center().y - 19.0),
-        egui::pos2(right, rect.center().y - 1.0),
+    let col = egui::Rect::from_min_max(
+        egui::pos2(tx, rect.center().y - 18.0),
+        egui::pos2(right, rect.center().y + 18.0),
     );
-    let dir_rect = egui::Rect::from_min_max(
-        egui::pos2(tx, rect.center().y + 2.0),
-        egui::pos2(right, rect.center().y + 19.0),
+    let mut col_ui = row_ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(col)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
     );
-    let _ = row_ui.put(
-        name_rect,
+    col_ui.spacing_mut().item_spacing.y = tk::ROW_TEXT_GAP_Y;
+    col_ui.add(
         egui::Label::new(egui::RichText::new(&e.name).size(FONT_ROW).color(name_c))
             .truncate()
             .sense(egui::Sense::hover()),
     );
-    let _ = row_ui.put(
-        dir_rect,
+    col_ui.add(
         egui::Label::new(
             egui::RichText::new(dir_display(&e.path))
                 .size(FONT_DIR)
@@ -1395,7 +1427,7 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
         }
         let chip = egui::Rect::from_center_size(
             egui::pos2(cursor - kw / 2.0, rect.center().y),
-            egui::vec2(kw, 19.0),
+            egui::vec2(kw, tk::KEYCAP_H),
         );
         p.rect_filled(
             chip,
@@ -1885,6 +1917,11 @@ mod tests {
         for _ in 0..2 {
             probe_frame(&ctx, &mut st, vec![]);
         }
+        // 空态（空词）：三段 = 64 + 1 + 72 + 1 + 38 = 176，**精确**（非兜底值）
+        assert_eq!(
+            st.natural_h, 176.0,
+            "空态自然内容高应精确等于设计推导（页脚须贴底）"
+        );
         probe_phase(&ctx, &mut st, &mut seq, "打字", vec![probe_commit("湖")]);
         let mut got: Vec<(usize, f32)> = Vec::new();
         for rows in [1usize, 2, 3, 4, 5, 6, 8] {
@@ -1900,6 +1937,8 @@ mod tests {
             let expect = tk::panel_h(tk::list_h(rows.min(6)));
             assert_eq!(h, expect, "{rows} 行面板高不符 §2.2 推导（实测 {h}）");
         }
+        // 自然内容高 = 三段之和（最后一态：8 行封顶 466）
+        assert_eq!(st.natural_h, 466.0, "末态自然内容高应为封顶 466");
     }
 
     /// 窗口高策略(PoC-6 定案):增长 = 首帧即撑到目标(恰 1 次原生 resize);

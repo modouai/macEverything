@@ -39,7 +39,7 @@ pub struct Palette {
 
 pub fn dark() -> Palette {
     Palette {
-        panel_fill: c(0x191C21CC),
+        panel_fill: c(0x191C2166),
         panel_stroke: c(0xFFFFFF29),
         search_icon: c(0x8B929AFF),
         query_text: c(0xF2F4F7FF),
@@ -61,7 +61,7 @@ pub fn dark() -> Palette {
 
 pub fn light() -> Palette {
     Palette {
-        panel_fill: c(0xFFFFFFD6),
+        panel_fill: c(0xFFFFFF66),
         panel_stroke: c(0x0F172A1F),
         search_icon: c(0x6B7280FF),
         query_text: c(0x1A1D22FF),
@@ -108,6 +108,12 @@ pub const BTN_SIZE: f32 = 28.0; // 打开完整窗口按钮
 pub const BTN_RADIUS: u8 = 7;
 pub const DIVIDER_H: f32 = 1.0;
 pub const ROW_H: f32 = 56.0;
+/// 结果区左右内缩（行宽 = 面板宽 − 2×此值 = 684；§2.4 宽度分配）。
+pub const LIST_SIDE_PAD: f32 = 8.0;
+/// 结果行宽（§2.4「行宽 684」）。
+pub const ROW_W: f32 = PANEL_W - 2.0 * LIST_SIDE_PAD;
+/// 行内「文件名 ↔ 所在目录」纵向间距（§2.4「文本列纵向，间距 3」）。
+pub const ROW_TEXT_GAP_Y: f32 = 3.0;
 pub const ROW_GAP: f32 = 2.0;
 pub const ROW_RADIUS: u8 = 8;
 pub const ROW_PAD_X: f32 = 12.0;
@@ -122,6 +128,13 @@ pub const KEYCAP_PAD: (f32, f32) = (3.0, 6.0); // 上下 / 左右
 pub const KEYCAP_GAP: f32 = 6.0; // 提示组内部（标签与键帽）
 pub const EMPTY_H: f32 = 72.0; // 空态区（§2.7；纵向居中，主副间距 4）
 pub const EMPTY_GAP: f32 = 4.0;
+/// 空态两行文案块高（主 14pt + 间距 + 副 12pt 的行盒之和，实测 ≈38）——用于在
+/// `EMPTY_H` 内纵向居中。
+pub const EMPTY_TEXT_H: f32 = 38.0;
+/// 选中行动作提示预留宽（「打开」12pt 两字 + 与文件名列的余量，实测 ≈40）。
+pub const ACTION_HINT_W: f32 = 40.0;
+/// 键帽高（11pt 文本 + 上 3 下 3 内边距 + 描边余量 = §2.5 的 19）。
+pub const KEYCAP_H: f32 = 19.0;
 
 /// 面板高（含形象条 0；窗口高 = 本值 + `MASCOT_STRIP`，见 palette.rs 模块头）。
 pub const fn panel_h(list_h: f32) -> f32 {
@@ -145,7 +158,7 @@ mod tests {
     #[test]
     fn tokens_match_spec_table() {
         let rows: [(egui::Color32, u32, u32, &str); 17] = [
-            (dark().panel_fill, 0x191C21CC, 0xFFFFFFD6, "面板底"),
+            (dark().panel_fill, 0x191C2166, 0xFFFFFF66, "面板底"),
             (dark().panel_stroke, 0xFFFFFF29, 0x0F172A1F, "面板描边"),
             (dark().search_icon, 0x8B929AFF, 0x6B7280FF, "搜索图标"),
             (dark().query_text, 0xF2F4F7FF, 0x1A1D22FF, "查询文本"),

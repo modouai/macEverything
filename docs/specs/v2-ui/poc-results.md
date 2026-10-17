@@ -672,9 +672,15 @@ cargo run --release --manifest-path scripts/poc/poc7_vibrancy/Cargo.toml
 # V 开关毛玻璃 · M 材质 · 1/2/3 面板 alpha(0/60%/80%) · S 层级 · Q 退出
 ```
 
+### 落地回填（2026-10-17，实现期结论；覆盖上文探针初期取值）
+
+- **垫窗构建顺序是硬约束**：普通 NSWindow → 装 vibrancy（`maskImage` 圆角）→ 排序 → **再换类 NSPanel + NonactivatingPanel**。先换类/直接构造会打死 vibrancy（三轮实机对照）；该顺序同时保住「他人全屏 Space 可见」（PoC-1 硬条件）。
+- material 取 `UnderWindowBackground`（最通透档）；面板底 alpha 40%（深 `#191C2166` / 浅 `#FFFFFF66`）——初始的 Popover/80~84% 在实机上「几乎实底、看不出透明」。
+- `layer.masksToBounds` 圆角禁用（与 NSPanel 同类问题：离屏通道打死 vibrancy）。
+
 ### 落规格口径
 
-- `floatbar-visual` §6.1 走 ②：面板底 = token alpha（深 `#191C21CC` / 浅 `#FFFFFFD6`），毛玻璃由「下挂同级窗」提供。
+- `floatbar-visual` §6.1 走 ②：面板底 = token alpha（取值见上「落地回填」），毛玻璃由「下挂同级窗」提供。
 - `tech.md`「悬浮条窗口行为」新增「毛玻璃」行：vibrancy 窗（borderless / ignoresMouseEvents / collectionBehavior 与面板同源）挂面板窗下（ordered: Below），frame 每帧同步、显隐随面板。
 - 遗留（并入实现期实机验收）：多屏 / 切 Space 下毛玻璃窗跟随；深浅色切 material。
 
