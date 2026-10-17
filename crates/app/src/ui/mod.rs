@@ -613,9 +613,13 @@ impl eframe::App for App {
         }
 
         // 主视口:完整结果窗口(Task 17;product §2;右键菜单 Task 18 需 Frame 取窗)。
+        // 图标缓存与悬浮条共用一份(UTI 纹理跨视口复用;勿开第二个 worker)。
         {
             let mut s = self.shared();
-            s.results.draw(ui, frame);
+            let Shared {
+                palette, results, ..
+            } = &mut *s;
+            results.draw(ui, frame, palette.icons_mut());
         }
 
         // 悬浮条第二视口:常驻注册(deferred;隐藏不销毁,L1/L2 选路 A)。

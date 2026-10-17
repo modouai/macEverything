@@ -375,6 +375,59 @@ impl Drop for IconCache {
     }
 }
 
+/// 取图失败时的中性文档字形(visual.md §2.4 兜底,不留空槽)。
+///
+/// 按传入矩形等比缩放:悬浮条 32×32 与完整窗口 16×16 共用同一形状。
+pub(crate) fn draw_fallback(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let s = rect.width() / 32.0;
+    let c = rect.center();
+    let (half_w, half_h, fold) = (7.5 * s, 10.0 * s, 5.0 * s);
+    let (left, right) = (c.x - half_w, c.x + half_w);
+    let (top, bottom) = (c.y - half_h, c.y + half_h);
+    let stroke = egui::Stroke::new((1.4 * s).max(0.8), color);
+    painter.add(egui::Shape::closed_line(
+        vec![
+            egui::pos2(left, top),
+            egui::pos2(right - fold, top),
+            egui::pos2(right, top + fold),
+            egui::pos2(right, bottom),
+            egui::pos2(left, bottom),
+        ],
+        stroke,
+    ));
+    // 右上折角。
+    painter.line_segment(
+        [
+            egui::pos2(right - fold, top),
+            egui::pos2(right - fold, top + fold),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(right - fold, top + fold),
+            egui::pos2(right, top + fold),
+        ],
+        stroke,
+    );
+    // 两条内容线,强化「文档」字形。
+    let line = egui::Stroke::new((1.0 * s).max(0.6), color);
+    painter.line_segment(
+        [
+            egui::pos2(left + 3.0 * s, c.y + 1.0 * s),
+            egui::pos2(right - 3.0 * s, c.y + 1.0 * s),
+        ],
+        line,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(left + 3.0 * s, c.y + 4.5 * s),
+            egui::pos2(right - 5.0 * s, c.y + 4.5 * s),
+        ],
+        line,
+    );
+}
+
 /// 启动串行取图线程;线程只做 AppKit 取图 + 像素转换,不触碰视图/egui。
 fn spawn_worker(
     cancel: Arc<AtomicBool>,

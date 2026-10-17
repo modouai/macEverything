@@ -1178,9 +1178,12 @@ fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
     // SAFETY:`tiff` 在同步解码期间保持存活;`bytes` 返回其内部只读缓冲区指针,
     // 长度恰为 `length()`。切片只传给 `image::load_from_memory` 同步解码,期间
     // NSData 不被修改/释放,不越界。
+    // 返回类型须声明为 `*const c_void`(编码 `^v`):`NSData.bytes` 的 ABI 是
+    // `const void *`;写成 `*const u8`(objc2 编码 `*`,C 字符串)会在 debug 的
+    // 方法签名校验里 panic(2026-10-17 实机:图标 worker 整线程退出)。
     let bytes = unsafe {
-        let ptr: *const u8 = msg_send![&*tiff, bytes];
-        std::slice::from_raw_parts(ptr, len)
+        let ptr: *const std::ffi::c_void = msg_send![&*tiff, bytes];
+        std::slice::from_raw_parts(ptr.cast::<u8>(), len)
     };
     let decoded = image::load_from_memory(bytes).ok()?;
     let resized = decoded.resize_exact(ICON_PX, ICON_PX, image::imageops::FilterType::Lanczos3);

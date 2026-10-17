@@ -36,7 +36,6 @@
 //! - 「排序中…」= `sorting_inflight`(fire 置位、当代响应落地清除,见 `apply`)。
 
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
 use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -45,6 +44,7 @@ use crate::engine_launcher;
 use crate::platform;
 use crate::session::{Session, SortKey, State};
 use crate::tray;
+use crate::ui::icons::{self, IconCache};
 use crate::ui::menu_actions;
 use crate::ui::palette::{self, EngineStatus, Payload, QueryResult};
 use crate::ui::window_tokens::{self, FullWindowPalette};
@@ -53,24 +53,32 @@ use protocol::{Gap, HitEntry};
 
 /// 查询上限(与悬浮条同口径:协议上限一次取满;product §2「展示前 K 条」的 K)。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
-/// 数据行高(px;行间 item_spacing 置零,选中/斑马底连成整块)。
-/// 随全局字号基准(Body 15)定:行高小于文字高时,视觉行与点击命中区错位
-/// (「偏上/偏下才点得到」,2026-10-16 实机反馈)——字号基准上调须同步此值。
-const ROW_H: f32 = 28.0;
-/// 表头行高(px)。
-const HEADER_H: f32 = 28.0;
 /// 齿轮点击的 v2.1 提示(不放假入口;短驻留,避免长期占据状态栏)。
 const GEAR_PENDING_NOTE: &str = "设置将在 v2.1 提供";
 const GEAR_NOTE_TTL: Duration = Duration::from_secs(3);
 
-/// 表格列:(排序键, 标题, 初始宽, 最小宽);末列占余宽(不可拖)。
-/// 顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径。
-const COLUMNS: [(SortKey, &str, f32, f32); 4] = [
-    (SortKey::Name, "名称", 260.0, 100.0),
-    (SortKey::Size, "大小", 90.0, 60.0),
-    (SortKey::Mtime, "修改时间", 150.0, 110.0),
-    (SortKey::Path, "路径", 320.0, 120.0),
+/// 表头列:(排序键, 标题)。顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径。
+const COLUMNS: [(SortKey, &str); 4] = [
+    (SortKey::Name, "名称"),
+    (SortKey::Size, "大小"),
+    (SortKey::Mtime, "修改时间"),
+    (SortKey::Path, "路径"),
 ];
+
+/// 列索引(与 `COLUMNS` 同序;几何函数按此取位)。
+const COL_NAME: usize = 0;
+const COL_SIZE: usize = 1;
+const COL_MTIME: usize = 2;
+const COL_PATH: usize = 3;
+
+/// 名称列弹性宽下限(§3.4「名称弹性」;窄窗不得挤没名称)。
+const NAME_MIN_W: f32 = 84.0;
+/// 大小 / 修改时间 / 路径列最小宽(与旧表同口径;拖拽 clamp 用)。
+const SIZE_MIN_W: f32 = 60.0;
+const MTIME_MIN_W: f32 = 110.0;
+const PATH_MIN_W: f32 = 120.0;
+/// 列边界拖拽热区半宽(§3.4「边界 ±4」)。
+const DRAG_HOT_ZONE: f32 = 4.0;
 
 /// 完整窗口状态与查询会话(与悬浮条独立)。
 pub struct ResultsState {
@@ -84,6 +92,9 @@ pub struct ResultsState {
     /// 界面展示方向(true = 该列升序;列头箭头 ▲▼ 依据)。落序由引擎按 `desc`
     /// 完成(见 `request_desc`),本字段不参与结果加工——只作显示与请求换算。
     pub sort_asc: bool,
+    /// 大小 / 修改时间 / 路径三列固定宽(名称列吃余宽)。拖拽后跨帧保留,
+    /// **不持久化**(重启回落默认 [96, 160, 300],visual.md §3.4)。
+    col_fixed: [f32; 3],
     /// 选中行号集合(protocol 条目无 id,行号即选择;结果整体替换时清空)。
     pub selection: BTreeSet<usize>,
     /// shift 范围选锚点(范围选不移动锚点,概念如 Finder)。
@@ -147,6 +158,11 @@ impl ResultsState {
             stat_ms: 0.0,
             sort: SortKey::Relevance,
             sort_asc: true,
+            col_fixed: [
+                window_tokens::COL_SIZE_W,
+                window_tokens::COL_MTIME_W,
+                window_tokens::COL_PATH_W,
+            ],
             selection: BTreeSet::new(),
             anchor: None,
             sorting_inflight: false,
@@ -345,15 +361,23 @@ impl ResultsState {
         self.engine_known = true;
     }
 
-    /// 绘制完整窗口(主视口)。`frame` 供原生右键菜单取窗(调用方 = App::ui,根视口)。
+    /// 绘制完整窗口(主视口)。`frame` 供原生右键菜单取窗(调用方 = App::ui,根视口);
+    /// `icons` 与悬浮条共用的系统图标缓存(UTI 纹理跨视口复用)。
     /// 返回动作由上层不需要——打开/失败都就地落在状态栏。
-    pub fn draw(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        self.draw_impl(ui, Some(frame));
+    pub fn draw(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, icons: &mut IconCache) {
+        self.draw_impl(ui, Some(frame), icons);
     }
 
     /// 绘制主体(`frame` = None 时禁用原生右键菜单:实机走查测试无 eframe Frame)。
-    fn draw_impl(&mut self, ui: &mut egui::Ui, frame: Option<&eframe::Frame>) {
+    fn draw_impl(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: Option<&eframe::Frame>,
+        icons: &mut IconCache,
+    ) {
         let ctx = ui.ctx().clone();
+        // drain worker 响应 + 限量上传纹理(取图/解码在工作线程,不阻塞本帧)。
+        icons.begin_frame(&ctx);
         self.track_ime(ui);
 
         // ⌘A:输入框未聚焦时 = 表格全选行(聚焦时归输入框「全选文本」,平台惯例)。
@@ -540,101 +564,95 @@ impl ResultsState {
                 ui.add_space(3.0);
             });
 
-        // —— 中部:结果表格(虚拟化:只渲染可见行)——
+        // —— 中部:表头(32 + 1 分隔线)+ 自定义虚拟化表格(§3.4 / §3.5) ——
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).fill(palette.window_fill))
+            .frame(egui::Frame::NONE.fill(palette.window_fill))
             .show(ui, |ui| {
+                let area = ui.max_rect();
+                let cols = col_layout(area.width(), self.col_fixed);
+                let header_action =
+                    draw_header(ui, area, &cols, self.sort, self.sort_asc, &palette);
+                if let Some(key) = header_action.sort_click {
+                    sort_click = Some(key);
+                }
+                // 表头底 1px 分隔线(§3.1 分隔线 2)。
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(area.left(), area.top() + window_tokens::HEADER_H),
+                        egui::vec2(area.width(), window_tokens::DIVIDER_H),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    palette.divider,
+                );
+                // 拖拽结果下一帧生效(本帧行已按旧宽排;差一帧不可见)。
+                if let Some((boundary, delta)) = header_action.drag {
+                    self.col_fixed = drag_fixed(boundary, self.col_fixed, delta, area.width());
+                }
+                let table_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        area.left(),
+                        area.top() + window_tokens::HEADER_H + window_tokens::DIVIDER_H,
+                    ),
+                    area.max,
+                );
                 if self.results.is_empty() {
-                    ui.add_space(12.0);
+                    let mut empty_ui = ui.new_child(egui::UiBuilder::new().max_rect(table_rect));
+                    empty_ui.add_space(12.0);
                     if let Some(msg) = empty_hint(&self.session.state) {
-                        ui.label(egui::RichText::new(msg).weak());
+                        empty_ui.horizontal(|ui| {
+                            ui.add_space(window_tokens::CONTENT_PAD_X);
+                            ui.label(egui::RichText::new(msg).weak());
+                        });
                     }
                     return;
                 }
-                let cur_sort = self.sort;
-                let cur_asc = self.sort_asc;
                 let results: &[HitEntry] = &self.results;
                 let selection: &BTreeSet<usize> = &self.selection;
-
-                let mut table = TableBuilder::new(ui)
+                let home = std::env::var("HOME").ok();
+                let mut table_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(table_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                // 行间无缝(虚拟化按固定行高 30 计算);滚动条浮在内容上、不占内容宽,
+                // 表头与行因此同宽对齐(滚动条样式 Task 4 再收)。
+                table_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                table_ui.spacing_mut().scroll.floating = true;
+                egui::ScrollArea::vertical()
                     .id_salt("results-table")
-                    .sense(egui::Sense::click())
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-                for (i, (_, _, width, min_width)) in COLUMNS.iter().enumerate() {
-                    let column = if i == COLUMNS.len() - 1 {
-                        // 末列占余宽(TableBuilder 语义:remainder 末列不可拖)
-                        Column::remainder().at_least(*min_width).clip(true)
-                    } else {
-                        Column::initial(*width)
-                            .at_least(*min_width)
-                            .clip(true)
-                            .resizable(true)
-                    };
-                    table = table.column(column);
-                }
-                table
-                    .header(HEADER_H, |mut header| {
-                        for (key, label, _, _) in COLUMNS {
-                            header.col(|ui| {
-                                let arrow = if cur_sort == key {
-                                    if cur_asc {
-                                        " ▲"
-                                    } else {
-                                        " ▼"
-                                    }
-                                } else {
-                                    ""
-                                };
-                                let text = egui::RichText::new(format!("{label}{arrow}")).strong();
-                                let resp =
-                                    ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                                if resp.clicked() {
-                                    sort_click = Some(key);
-                                }
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(ROW_H, results.len(), |mut row| {
-                            let i = row.index();
-                            row.set_selected(selection.contains(&i));
-                            let e = &results[i];
-                            row.col(|ui| {
-                                ui.add(egui::Label::new(&e.name).truncate());
-                            });
-                            row.col(|ui| {
-                                // 数字右对齐(表格式读数习惯)
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(size_text(e.size));
-                                    },
+                    .auto_shrink([false, false])
+                    .max_height(table_rect.height())
+                    .show_rows(
+                        &mut table_ui,
+                        window_tokens::ROW_H,
+                        results.len(),
+                        |ui, range| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for i in range {
+                                let resp = draw_row(
+                                    ui,
+                                    &results[i],
+                                    &cols,
+                                    selection.contains(&i),
+                                    home.as_deref(),
+                                    &palette,
+                                    icons,
                                 );
-                            });
-                            row.col(|ui| {
-                                ui.label(mtime_text(e.mtime));
-                            });
-                            row.col(|ui| {
-                                let weak = egui::RichText::new(&e.path).weak();
-                                ui.add(egui::Label::new(weak).truncate());
-                            });
-                            let resp = row.response();
-                            if resp.double_clicked() {
-                                open_row = Some(i); // 双击 = 默认应用打开(product §2)
-                            } else if resp.secondary_clicked() {
-                                // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
-                                // 表格闭包外做(借用结束)
-                                match resp.interact_pointer_pos() {
-                                    Some(pos) => context_click = Some((i, pos)),
-                                    None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
+                                if resp.double_clicked() {
+                                    open_row = Some(i); // 双击 = 默认应用打开(product §2)
+                                } else if resp.secondary_clicked() {
+                                    // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
+                                    // 表格闭包外做(借用结束)
+                                    match resp.interact_pointer_pos() {
+                                        Some(pos) => context_click = Some((i, pos)),
+                                        None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
+                                    }
+                                } else if resp.clicked() {
+                                    row_click = Some((i, shift_down, cmd_down));
                                 }
-                            } else if resp.clicked() {
-                                row_click = Some((i, shift_down, cmd_down));
                             }
-                        });
-                    });
+                        },
+                    );
             });
 
         // —— 交互落地(表格闭包外:借用结束)——
@@ -896,6 +914,355 @@ fn search_row_layout(row_rect: egui::Rect) -> SearchRowLayout {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 表头 / 表格几何(§3.4 / §3.5;数值真源 = window_tokens + 本文件下限常量)
+
+/// 四列几何(纯函数):返回各列 `(x, 宽)`,坐标系原点 = 窗口左边。
+///
+/// 左右内边距 16、列间距 16;名称列吃余宽(下限 84),大小 / 修改时间 / 路径
+/// 取 `fixed`(下限 60 / 110 / 120)。名称不足下限时从右往左收缩固定列
+/// (路径 → 修改时间 → 大小),保证列不重叠、不越过右内边距。
+fn col_layout(total_w: f32, fixed: [f32; 3]) -> [(f32, f32); 4] {
+    let mut fixed = [
+        fixed[0].max(SIZE_MIN_W),
+        fixed[1].max(MTIME_MIN_W),
+        fixed[2].max(PATH_MIN_W),
+    ];
+    let inner =
+        (total_w - 2.0 * window_tokens::CONTENT_PAD_X - 3.0 * window_tokens::COLUMN_GAP).max(0.0);
+    let mut name_w = inner - fixed.iter().sum::<f32>();
+    if name_w < NAME_MIN_W {
+        // 名称吃最小宽后仍不足:路径 → 修改时间 → 大小依次让宽到各自下限。
+        let mut deficit = NAME_MIN_W - name_w;
+        for (i, min) in [(2usize, PATH_MIN_W), (1, MTIME_MIN_W), (0, SIZE_MIN_W)] {
+            let shrink = (fixed[i] - min).max(0.0).min(deficit);
+            fixed[i] -= shrink;
+            deficit -= shrink;
+            if deficit <= 0.0 {
+                break;
+            }
+        }
+        name_w = (inner - fixed.iter().sum::<f32>()).max(NAME_MIN_W);
+    }
+    let mut x = window_tokens::CONTENT_PAD_X;
+    let mut cols = [(0.0, 0.0); 4];
+    cols[COL_NAME] = (x, name_w);
+    x += name_w + window_tokens::COLUMN_GAP;
+    for (i, w) in fixed.into_iter().enumerate() {
+        cols[i + 1] = (x, w);
+        x += w + window_tokens::COLUMN_GAP;
+    }
+    cols
+}
+
+/// 表头列边界(从左到右;热区居中于两列之间的 16px 间隙)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColBoundary {
+    NameSize,
+    SizeMtime,
+    MtimePath,
+}
+
+/// 拖拽后的固定列宽(纯函数):`delta` = 本帧指针横向位移(右为正)。
+///
+/// 名称列吃余宽,故边界两侧必须一增一减才能让边界跟随指针:
+/// - 名称/大小边界调整大小列(右移 = 名称变宽、大小变窄);
+/// - 大小/修改时间边界调整大小列(右移变大),修改时间列反向补偿;
+/// - 修改时间/路径边界调整修改时间列(右移变大),路径列反向补偿。
+///
+/// 各列 clamp 最小宽;名称列不经这两条边界变化,始终保有下限。
+fn drag_fixed(boundary: ColBoundary, fixed: [f32; 3], delta: f32, total_w: f32) -> [f32; 3] {
+    let mut fixed = [
+        fixed[0].max(SIZE_MIN_W),
+        fixed[1].max(MTIME_MIN_W),
+        fixed[2].max(PATH_MIN_W),
+    ];
+    let inner =
+        (total_w - 2.0 * window_tokens::CONTENT_PAD_X - 3.0 * window_tokens::COLUMN_GAP).max(0.0);
+    // 固定列可占的最大宽 = 总内容宽 − 名称下限;窗口极窄时保底三列最小宽之和。
+    let budget = (inner - NAME_MIN_W).max(SIZE_MIN_W + MTIME_MIN_W + PATH_MIN_W);
+    match boundary {
+        ColBoundary::NameSize => {
+            let max = (budget - fixed[1] - fixed[2]).max(SIZE_MIN_W);
+            fixed[0] = (fixed[0] - delta).clamp(SIZE_MIN_W, max);
+        }
+        ColBoundary::SizeMtime => {
+            // 大小列吃 delta,修改时间列反向补偿;可用位移受两列最小宽共同约束。
+            let d = delta.min(fixed[1] - MTIME_MIN_W).max(SIZE_MIN_W - fixed[0]);
+            fixed[0] += d;
+            fixed[1] -= d;
+        }
+        ColBoundary::MtimePath => {
+            // 修改时间列吃 delta,路径列反向补偿。
+            let d = delta.min(fixed[2] - PATH_MIN_W).max(MTIME_MIN_W - fixed[1]);
+            fixed[1] += d;
+            fixed[2] -= d;
+        }
+    }
+    fixed
+}
+
+/// 单行各内容矩形(绝对坐标):名称图标 / 名称文本 / 大小 / 修改时间 / 路径。
+/// 名称文本起点 = 图标右缘 + 8(§3.5);四个 cell 共享行高、垂直居中绘制。
+#[derive(Clone, Copy, Debug)]
+struct RowCells {
+    rect: egui::Rect,
+    icon: egui::Rect,
+    name: egui::Rect,
+    size: egui::Rect,
+    mtime: egui::Rect,
+    path: egui::Rect,
+}
+
+fn row_cells(row: egui::Rect, cols: &[(f32, f32); 4]) -> RowCells {
+    let cell = |i: usize| {
+        egui::Rect::from_min_max(
+            egui::pos2(row.left() + cols[i].0, row.top()),
+            egui::pos2(row.left() + cols[i].0 + cols[i].1, row.bottom()),
+        )
+    };
+    let icon = egui::Rect::from_min_size(
+        egui::pos2(
+            row.left() + window_tokens::CONTENT_PAD_X,
+            row.center().y - window_tokens::ROW_ICON / 2.0,
+        ),
+        egui::Vec2::splat(window_tokens::ROW_ICON),
+    );
+    let name = egui::Rect::from_min_max(
+        egui::pos2(icon.right() + window_tokens::ICON_NAME_GAP, row.top()),
+        egui::pos2(cell(COL_NAME).right(), row.bottom()),
+    );
+    RowCells {
+        rect: row,
+        icon,
+        name,
+        size: cell(COL_SIZE),
+        mtime: cell(COL_MTIME),
+        path: cell(COL_PATH),
+    }
+}
+
+/// 表头交互产出(表头闭包外落地;避免 `draw_header` 参数过多)。
+#[derive(Default)]
+struct HeaderAction {
+    /// 列头点击的排序键(由调用方走 `on_header_click`)。
+    sort_click: Option<SortKey>,
+    /// 列边界拖拽:(边界, 本帧横向位移)。
+    drag: Option<(ColBoundary, f32)>,
+}
+
+/// 表头(§3.4):高 32、12pt、无竖分隔线;名称 / 大小 / 修改时间 / 路径四列,
+/// 大小右对齐、其余左对齐;当前排序列文字后 12×12 chevron(↑ 升 / ↓ 降)。
+/// 列边界 ±4 热区拖拽调宽(不占列头点击区;hover 显示横向缩放光标)。
+fn draw_header(
+    ui: &mut egui::Ui,
+    area: egui::Rect,
+    cols: &[(f32, f32); 4],
+    sort: SortKey,
+    sort_asc: bool,
+    palette: &FullWindowPalette,
+) -> HeaderAction {
+    let header =
+        egui::Rect::from_min_size(area.min, egui::vec2(area.width(), window_tokens::HEADER_H));
+    let header_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(header)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    let painter = header_ui.painter().clone();
+    let mut action = HeaderAction::default();
+    for (i, (key, label)) in COLUMNS.iter().enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(area.left() + cols[i].0, header.top()),
+            egui::vec2(cols[i].1, header.height()),
+        );
+        let resp = header_ui.interact(
+            cell,
+            header_ui.scope_id().with(("results-header", i)),
+            egui::Sense::click(),
+        );
+        if resp.clicked() {
+            action.sort_click = Some(*key);
+        }
+        // 默认 relevance 无箭头;仅当前排序列显示。
+        let arrow = (*key == sort && sort != SortKey::Relevance).then_some(sort_asc);
+        let arrow_w = if arrow.is_some() {
+            window_tokens::SORT_ARROW + window_tokens::SORT_ARROW_GAP
+        } else {
+            0.0
+        };
+        let galley = egui::WidgetText::from(
+            egui::RichText::new(*label)
+                .size(window_tokens::FONT_TABLE)
+                .color(palette.header_text),
+        )
+        .into_galley(
+            &header_ui,
+            Some(egui::TextWrapMode::Truncate),
+            (cell.width() - arrow_w).max(0.0),
+            egui::TextStyle::Body,
+        );
+        let text_area =
+            egui::Rect::from_min_max(cell.min, egui::pos2(cell.right() - arrow_w, cell.bottom()));
+        let align = if i == COL_SIZE {
+            egui::Align2::RIGHT_CENTER
+        } else {
+            egui::Align2::LEFT_CENTER
+        };
+        let text_rect = align.align_size_within_rect(galley.size(), text_area);
+        painter.galley(text_rect.min, galley, palette.header_text);
+        if let Some(up) = arrow {
+            let arrow_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    text_rect.right() + window_tokens::SORT_ARROW_GAP,
+                    cell.center().y - window_tokens::SORT_ARROW / 2.0,
+                ),
+                egui::Vec2::splat(window_tokens::SORT_ARROW),
+            );
+            draw_sort_arrow(&painter, arrow_rect, up, palette.sort_arrow);
+        }
+    }
+    // 拖拽热区:居中于列间 16px 空隙(与列头点击区不重叠,拖拽不会误触排序)。
+    let boundaries = [
+        ColBoundary::NameSize,
+        ColBoundary::SizeMtime,
+        ColBoundary::MtimePath,
+    ];
+    for (i, boundary) in boundaries.iter().enumerate() {
+        let x = area.left() + cols[i].0 + cols[i].1 + window_tokens::COLUMN_GAP / 2.0;
+        let zone = egui::Rect::from_center_size(
+            egui::pos2(x, header.center().y),
+            egui::vec2(2.0 * DRAG_HOT_ZONE, header.height()),
+        );
+        let resp = header_ui.interact(
+            zone,
+            header_ui.scope_id().with(("results-col-drag", i)),
+            egui::Sense::click_and_drag(),
+        );
+        if resp.drag_started() {
+            log::info!("列宽拖拽:{boundary:?}");
+        }
+        if resp.hovered() || resp.dragged() {
+            header_ui
+                .ctx()
+                .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if resp.dragged() {
+            let delta = resp.drag_delta().x;
+            if delta != 0.0 {
+                action.drag = Some((*boundary, delta));
+            }
+        }
+    }
+    action
+}
+
+/// Lucide `chevron-up` / `chevron-down`(§5.2;12×12,线条绘制)。
+fn draw_sort_arrow(painter: &egui::Painter, rect: egui::Rect, up: bool, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let c = rect.center();
+    let tip = egui::pos2(c.x, c.y + if up { -2.5 } else { 2.5 });
+    let wing_y = c.y + if up { 2.5 } else { -2.5 };
+    painter.line_segment([egui::pos2(c.x - 3.0, wing_y), tip], stroke);
+    painter.line_segment([tip, egui::pos2(c.x + 3.0, wing_y)], stroke);
+}
+
+/// 数据行(§3.5):高 30、左右内边距 16;行底全宽(选中 token / 悬停 50%),
+/// 名称 cell = 16×16 系统图标(兜底中性文档字形)+ 8 + 文件名 13pt;
+/// 大小右对齐(目录「—」)、修改时间 / 路径 12pt。鼠标移动不改选中集。
+fn draw_row(
+    ui: &mut egui::Ui,
+    entry: &HitEntry,
+    cols: &[(f32, f32); 4],
+    selected: bool,
+    home: Option<&str>,
+    palette: &FullWindowPalette,
+    icons: &mut IconCache,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), window_tokens::ROW_H),
+        egui::Sense::click(),
+    );
+    let cells = row_cells(rect, cols);
+    let bg = if selected {
+        palette.row_selected
+    } else if resp.hovered() {
+        palette.row_selected.gamma_multiply(0.5)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let painter = ui.painter();
+    painter.rect_filled(cells.rect, egui::CornerRadius::ZERO, bg);
+    match icons.icon(ui.ctx(), entry) {
+        Some(id) => {
+            painter.image(
+                id,
+                cells.icon,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        None => icons::draw_fallback(painter, cells.icon, palette.column_text),
+    }
+    draw_cell_text(
+        ui,
+        cells.name,
+        &entry.name,
+        window_tokens::FONT_FILENAME,
+        palette.file_name,
+        egui::Align2::LEFT_CENTER,
+    );
+    draw_cell_text(
+        ui,
+        cells.size,
+        &size_cell(entry),
+        window_tokens::FONT_TABLE,
+        palette.column_text,
+        egui::Align2::RIGHT_CENTER,
+    );
+    draw_cell_text(
+        ui,
+        cells.mtime,
+        &mtime_text(entry.mtime),
+        window_tokens::FONT_TABLE,
+        palette.column_text,
+        egui::Align2::LEFT_CENTER,
+    );
+    let path = display_path(&entry.path, home);
+    draw_cell_text(
+        ui,
+        cells.path,
+        &path,
+        window_tokens::FONT_TABLE,
+        palette.column_text,
+        egui::Align2::LEFT_CENTER,
+    );
+    resp
+}
+
+/// 单元格单行文本(超宽截断加省略号;垂直居中,水平按 `align`)。
+fn draw_cell_text(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    align: egui::Align2,
+) {
+    if rect.width() <= 0.0 || text.is_empty() {
+        return;
+    }
+    let galley = egui::WidgetText::from(egui::RichText::new(text).size(size).color(color))
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            rect.width(),
+            egui::TextStyle::Body,
+        );
+    let text_rect = align.align_size_within_rect(galley.size(), rect);
+    ui.painter().galley(text_rect.min, galley, color);
+}
+
 /// 搜索图标(§5.2 `search`,16×16):按 Lucide 24 网格比例画圆 + 手柄。
 fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let s = rect.width() / 24.0;
@@ -1139,6 +1506,34 @@ fn size_text(size: Option<u64>) -> String {
     }
 }
 
+/// 大小列文案(§3.5):目录恒显示「—」(目录大小无意义);文件走 `size_text`。
+fn size_cell(entry: &HitEntry) -> String {
+    if entry.is_dir {
+        "—".into()
+    } else {
+        size_text(entry.size)
+    }
+}
+
+/// 路径展示(纯函数):HOME 前缀替换为 `~`;无 HOME / 非整段前缀时原样返回。
+/// 按路径段匹配:`/Users/ab` 不会被 HOME=`/Users/a` 误改。
+fn display_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_owned();
+    };
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return path.to_owned();
+    }
+    if path == home {
+        return "~".into();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -1234,6 +1629,256 @@ mod tests {
         assert_eq!(l.box_rect.right() - l.text_rect.right(), 14.0);
         assert_eq!(l.text_rect.top(), l.box_rect.top());
         assert_eq!(l.text_rect.bottom(), l.box_rect.bottom());
+    }
+
+    /// 表头 / 行几何(§3.4 / §3.5):1080 下名称 444、四列间距 16、右内边距 16。
+    #[test]
+    fn col_layout_matches_spec_at_default_width() {
+        let cols = col_layout(1080.0, [96.0, 160.0, 300.0]);
+        assert_eq!(
+            cols,
+            [(16.0, 444.0), (476.0, 96.0), (588.0, 160.0), (764.0, 300.0)]
+        );
+        assert_eq!(cols[COL_PATH].0 + cols[COL_PATH].1, 1064.0, "右内边距 16");
+    }
+
+    /// 720 最小窗宽:名称恰好 84(设计下限),四列仍留足内边距。
+    #[test]
+    fn col_layout_at_min_window_keeps_name_minimum() {
+        let cols = col_layout(720.0, [96.0, 160.0, 300.0]);
+        assert_eq!(cols[COL_NAME].1, 84.0);
+        assert_eq!(cols[COL_PATH].0 + cols[COL_PATH].1, 704.0);
+    }
+
+    /// 窄宽与非法固定宽:固定列先 clamp 最小宽;名称不足时路径 → 修改时间 →
+    /// 大小依次让宽,直到四列最小宽之和(窗口最小 720 下远未触底)。
+    #[test]
+    fn col_layout_clamps_fixed_and_shrinks_right_to_left() {
+        let clamped = col_layout(720.0, [10.0, 10.0, 10.0]);
+        assert_eq!(
+            (
+                clamped[COL_NAME].1,
+                clamped[COL_SIZE].1,
+                clamped[COL_MTIME].1
+            ),
+            (350.0, 60.0, 110.0)
+        );
+        assert_eq!(clamped[COL_PATH].1, 120.0);
+        assert_eq!(clamped[COL_PATH].0 + clamped[COL_PATH].1, 704.0);
+
+        let narrow = col_layout(500.0, [96.0, 160.0, 300.0]);
+        assert_eq!(narrow[COL_NAME].1, 84.0, "名称保底");
+        assert_eq!(narrow[COL_MTIME].1, 120.0, "修改时间只让到够用为止");
+        assert_eq!(narrow[COL_PATH].1, 120.0, "路径先让到最小宽");
+        assert_eq!(narrow[COL_PATH].0 + narrow[COL_PATH].1, 484.0);
+
+        // 四列全部到达最小宽的总宽下限(32 + 48 + 84 + 60 + 110 + 120 = 454)。
+        let floor = col_layout(454.0, [96.0, 160.0, 300.0]);
+        assert_eq!(
+            (
+                floor[COL_NAME].1,
+                floor[COL_SIZE].1,
+                floor[COL_MTIME].1,
+                floor[COL_PATH].1
+            ),
+            (84.0, 60.0, 110.0, 120.0)
+        );
+        assert_eq!(floor[COL_PATH].0 + floor[COL_PATH].1, 438.0);
+    }
+
+    /// 任意窗口宽(≥四列最小宽):列不重叠、右缘恰在右内边距上。
+    #[test]
+    fn col_layout_never_overlaps_or_overflows() {
+        for total in [454.0, 500.0, 720.0, 1080.0, 1600.0] {
+            for fixed in [
+                [96.0, 160.0, 300.0],
+                [60.0, 110.0, 120.0],
+                [400.0, 400.0, 400.0],
+            ] {
+                let cols = col_layout(total, fixed);
+                assert_eq!(cols[COL_NAME].0, 16.0, "左内边距 16");
+                for i in 0..3 {
+                    assert_eq!(
+                        cols[i].0 + cols[i].1 + window_tokens::COLUMN_GAP,
+                        cols[i + 1].0,
+                        "列间距 16(total={total}, fixed={fixed:?})"
+                    );
+                }
+                assert_eq!(
+                    cols[COL_PATH].0 + cols[COL_PATH].1,
+                    total - 16.0,
+                    "右内边距 16(total={total})"
+                );
+                assert!(cols[COL_NAME].1 >= NAME_MIN_W);
+            }
+        }
+    }
+
+    /// 列宽拖拽:边界跟随指针,固定列一增一减(名称列吃余宽,只在名称/大小边界
+    /// 变化);clamp 最小宽且名称始终 ≥84。
+    #[test]
+    fn drag_fixed_adjusts_left_fixed_column_and_clamps() {
+        let base = [96.0, 160.0, 300.0];
+        assert_eq!(
+            drag_fixed(ColBoundary::NameSize, base, 10.0, 1080.0),
+            [86.0, 160.0, 300.0]
+        );
+        assert_eq!(
+            drag_fixed(ColBoundary::NameSize, base, -10.0, 1080.0),
+            [106.0, 160.0, 300.0]
+        );
+        // 大小/修改时间边界:大小 +10,修改时间 −10(边界右移 10)。
+        assert_eq!(
+            drag_fixed(ColBoundary::SizeMtime, base, 10.0, 1080.0),
+            [106.0, 150.0, 300.0]
+        );
+        // 修改时间/路径边界:修改时间 +10,路径 −10(边界右移 10)。
+        assert_eq!(
+            drag_fixed(ColBoundary::MtimePath, base, 10.0, 1080.0),
+            [96.0, 170.0, 290.0]
+        );
+        // 最小宽 clamp。
+        assert_eq!(
+            drag_fixed(ColBoundary::NameSize, base, 1000.0, 1080.0),
+            [60.0, 160.0, 300.0]
+        );
+        assert_eq!(
+            drag_fixed(ColBoundary::SizeMtime, base, 1000.0, 1080.0),
+            [146.0, 110.0, 300.0],
+            "修改时间到最小宽即停"
+        );
+        assert_eq!(
+            drag_fixed(ColBoundary::SizeMtime, base, -1000.0, 1080.0),
+            [60.0, 196.0, 300.0],
+            "大小到最小宽即停"
+        );
+        assert_eq!(
+            drag_fixed(ColBoundary::MtimePath, base, 1000.0, 1080.0),
+            [96.0, 340.0, 120.0],
+            "路径到最小宽即停"
+        );
+        assert_eq!(
+            drag_fixed(ColBoundary::MtimePath, base, -1000.0, 1080.0),
+            [96.0, 110.0, 350.0],
+            "修改时间到最小宽即停"
+        );
+        // 名称 ≥84:名称/大小边界左拖的上限受固定列预算约束(1080 下 916)。
+        assert_eq!(
+            drag_fixed(ColBoundary::NameSize, base, -1000.0, 1080.0),
+            [456.0, 160.0, 300.0]
+        );
+        // 入参低于最小宽先 clamp(防御旧持久化值/窄窗)。
+        assert_eq!(
+            drag_fixed(ColBoundary::MtimePath, [10.0, 10.0, 10.0], 0.0, 720.0),
+            [60.0, 110.0, 120.0]
+        );
+    }
+
+    /// 行几何:高 30、左内边距 16、图标 16×16 垂直居中、名称起点 = 图标右缘 + 8。
+    #[test]
+    fn row_cells_geometry_matches_spec() {
+        let row = egui::Rect::from_min_size(
+            egui::pos2(100.0, 200.0),
+            egui::vec2(1080.0, window_tokens::ROW_H),
+        );
+        let cols = col_layout(1080.0, [96.0, 160.0, 300.0]);
+        let c = row_cells(row, &cols);
+        assert_eq!(c.rect, row);
+        assert_eq!(row.height(), 30.0);
+        assert_eq!(c.icon.left() - row.left(), 16.0);
+        assert_eq!(c.icon.size(), egui::vec2(16.0, 16.0));
+        assert_eq!(c.icon.center().y, row.center().y);
+        assert_eq!(c.name.left() - c.icon.right(), 8.0);
+        assert_eq!(c.name.left() - row.left(), 40.0, "16 + 图标 16 + 间距 8");
+        assert_eq!(
+            c.name.right(),
+            row.left() + cols[COL_NAME].0 + cols[COL_NAME].1
+        );
+        assert_eq!(c.size.left() - row.left(), cols[COL_SIZE].0);
+        assert_eq!(c.size.width(), cols[COL_SIZE].1);
+        assert_eq!(c.mtime.left() - row.left(), cols[COL_MTIME].0);
+        assert_eq!(c.path.left() - row.left(), cols[COL_PATH].0);
+    }
+
+    #[test]
+    fn display_path_replaces_home_prefix() {
+        assert_eq!(
+            display_path("/Users/a/Documents/report.pdf", Some("/Users/a")),
+            "~/Documents/report.pdf"
+        );
+        assert_eq!(display_path("/Users/a", Some("/Users/a")), "~");
+        assert_eq!(display_path("/Users/a/", Some("/Users/a/")), "~/");
+        // 按路径段匹配:同前缀但不同目录不得替换。
+        assert_eq!(display_path("/Users/ab/x", Some("/Users/a")), "/Users/ab/x");
+        // 无 HOME / 不匹配 / HOME 为空:原样。
+        assert_eq!(display_path("/tmp/x", None), "/tmp/x");
+        assert_eq!(display_path("/tmp/x", Some("/Users/a")), "/tmp/x");
+        assert_eq!(display_path("/tmp/x", Some("")), "/tmp/x");
+        assert_eq!(display_path("/tmp/x", Some("/")), "/tmp/x");
+    }
+
+    #[test]
+    fn directory_size_cell_is_dash() {
+        let file = HitEntry {
+            name: "报告.pdf".into(),
+            path: "/tmp/报告.pdf".into(),
+            size: Some(2048),
+            mtime: None,
+            is_dir: false,
+        };
+        let dir = HitEntry {
+            is_dir: true,
+            size: Some(999),
+            ..file.clone()
+        };
+        assert_eq!(size_cell(&file), "2.0 KB");
+        assert_eq!(size_cell(&dir), "—", "目录大小恒为占位");
+    }
+
+    /// 自定义表头 + 虚拟化行出帧:选中行底可见;1000 行只绘可见行(文本形状
+    /// 数量不随总行数增长)。同时覆盖图标兜底路径(无 worker 缓存 → 中性字形)。
+    #[test]
+    fn custom_table_draws_selected_row_and_virtualizes() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..1000)
+            .map(|i| HitEntry {
+                name: format!("区域B报告-{i:04}.pdf"),
+                path: format!("/tmp/mce-test/区域B报告-{i:04}.pdf"),
+                size: Some(2048),
+                mtime: Some(1_700_000_000),
+                is_dir: i == 0,
+            })
+            .collect();
+        st.total = 1000;
+        st.selection = BTreeSet::from([0]);
+        let mut icons = IconCache::without_worker();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        let palette = window_tokens::dark();
+        let selected_bg = out
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == palette.row_selected))
+            .count();
+        assert_eq!(selected_bg, 1, "选中行底恰好一条");
+        let texts = out
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Text(_)))
+            .count();
+        assert!(
+            texts < 200,
+            "1000 行应只绘可见行(实际 {texts} 个文本形状;非虚拟化会 >4000)"
+        );
+        out.textures_delta.clear();
     }
 
     #[test]
@@ -1720,7 +2365,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None));
+        let mut icons = IconCache::without_worker();
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
         out.textures_delta.clear();
     }
 
@@ -1778,13 +2424,18 @@ mod tests {
     struct LiveHarness {
         ctx: egui::Context,
         st: ResultsState,
+        icons: IconCache,
     }
 
     impl LiveHarness {
         fn new(paths: DaemonPaths) -> Self {
             let ctx = egui::Context::default();
             let st = ResultsState::new(ctx.clone(), paths);
-            Self { ctx, st }
+            Self {
+                ctx,
+                st,
+                icons: IconCache::without_worker(),
+            }
         }
 
         fn frame(&mut self) {
@@ -1796,8 +2447,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let Self { ctx, st } = self;
-            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None));
+            let Self { ctx, st, icons } = self;
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, icons));
             out.textures_delta.clear(); // 无后端消费;epaint 要求:不处理须 clear
         }
 
@@ -1984,9 +2635,10 @@ mod tests {
         };
         let ctx = egui::Context::default();
         let mut st = ResultsState::new(ctx.clone(), paths);
+        let mut icons = IconCache::without_worker();
 
         // 一帧 = logic(tick) + ui(draw);raw 输入给足画布(模拟 1200×800 窗口)。
-        let frame = |st: &mut ResultsState| {
+        let mut frame = |st: &mut ResultsState| {
             st.tick(Instant::now());
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1995,7 +2647,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None));
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
             // 无真实后端消费纹理增量;显式清空(epaint 要求:不处理须 clear)
             out.textures_delta.clear();
         };
@@ -2003,7 +2655,7 @@ mod tests {
         // 防抖到期(60ms)+ 查询线程回投:排帧至在途结束。
         // 返回是否观测到「排序中…」段(sorting_inflight=true 至少一帧——
         // 发起帧即置位,响应线程不可能先于该帧回投,故正常路径恒 true)。
-        let settle = |st: &mut ResultsState| -> bool {
+        let mut settle = |st: &mut ResultsState| -> bool {
             std::thread::sleep(Duration::from_millis(90));
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut saw_inflight = false;
@@ -2107,7 +2759,7 @@ mod tests {
         // 虚拟化(core::TableBody::rows 只画可见行)两者每帧绘制量相同、耗时应接近;
         // 非虚拟化实现会随总行数线性放大(此处应 ~25 倍)。debug 构建,数值偏悲观,
         // 只打印不断言(避免机器负载抖动造成假红)。
-        let bench = |st: &mut ResultsState| -> f64 {
+        let mut bench = |st: &mut ResultsState| -> f64 {
             let t = Instant::now();
             for _ in 0..20 {
                 frame(st);

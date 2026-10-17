@@ -20,7 +20,6 @@ engine = { path = "../engine" }
 # 只在 clipboard_shortcuts 下把 ⌘V 译成 Event::Paste,而 Clipboard::get 无 arboard 时
 # 只读进程内兜底串(恒空,空串不再 push 事件),⌘V/⌘C/⌘X 三键全哑。
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts", "clipboard"] }
-egui_extras = "0.37"
 objc2 = "0.6"
 # NSResponder/NSAppearance:ui/theme.rs 经 NSApplication.effectiveAppearance 读系统外观
 # (sharedApplication 挂在 NSResponder feature 下、外观 API 挂在 NSAppearance 下;

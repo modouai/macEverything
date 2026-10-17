@@ -426,6 +426,12 @@ impl PaletteState {
         self.visible_panel_h
     }
 
+    /// 结果行图标缓存（完整窗口共用同一份：UTI 纹理键与悬浮条一致，
+    /// 勿为完整窗口再开第二个 worker）。
+    pub fn icons_mut(&mut self) -> &mut icons::IconCache {
+        &mut self.icons
+    }
+
     /// 唤起打点(首帧计时起点;`ui::palette_show` 调用)。
     pub fn on_shown(&mut self, now: Instant) {
         self.show_at = Some(now);
@@ -1585,57 +1591,6 @@ fn draw_open_full_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32
     p.line_segment([c + egui::vec2(-5.0, 1.0), c + egui::vec2(-5.0, 5.0)], s);
 }
 
-/// 结果行图标兜底（visual.md §2.4「取图失败回落中性文档字形」）：32×32 内画
-/// 文档轮廓，**无块底**——系统图标本身有形状，块底会变成两层形状打架。
-fn draw_file_icon_fallback(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let c = rect.center();
-    let (half_w, half_h, fold) = (7.5, 10.0, 5.0);
-    let (left, right) = (c.x - half_w, c.x + half_w);
-    let (top, bottom) = (c.y - half_h, c.y + half_h);
-    let stroke = egui::Stroke::new(1.4, color);
-    p.add(egui::Shape::closed_line(
-        vec![
-            egui::pos2(left, top),
-            egui::pos2(right - fold, top),
-            egui::pos2(right, top + fold),
-            egui::pos2(right, bottom),
-            egui::pos2(left, bottom),
-        ],
-        stroke,
-    ));
-    // 右上折角。
-    p.line_segment(
-        [
-            egui::pos2(right - fold, top),
-            egui::pos2(right - fold, top + fold),
-        ],
-        stroke,
-    );
-    p.line_segment(
-        [
-            egui::pos2(right - fold, top + fold),
-            egui::pos2(right, top + fold),
-        ],
-        stroke,
-    );
-    // 两条内容线，强化「文档」字形。
-    let line = egui::Stroke::new(1.0, color);
-    p.line_segment(
-        [
-            egui::pos2(left + 3.0, c.y + 1.0),
-            egui::pos2(right - 3.0, c.y + 1.0),
-        ],
-        line,
-    );
-    p.line_segment(
-        [
-            egui::pos2(left + 3.0, c.y + 4.5),
-            egui::pos2(right - 5.0, c.y + 4.5),
-        ],
-        line,
-    );
-}
-
 /// 选中行动作提示（§2.4）：文件「打开」、目录「进入」。
 fn action_hint(is_dir: bool) -> &'static str {
     if is_dir {
@@ -1700,7 +1655,8 @@ fn draw_result_row(
             egui::Color32::WHITE,
         );
     } else {
-        draw_file_icon_fallback(row_ui.painter(), icon_rect, t.dir_text);
+        // 兜底字形两形态共用（16 / 32 按矩形缩放；visual.md §2.4）。
+        icons::draw_fallback(row_ui.painter(), icon_rect, t.dir_text);
     }
     let name_c = if is_sel {
         t.file_name_selected

@@ -152,6 +152,10 @@ pub const COL_SIZE_W: f32 = 96.0;
 pub const COL_MTIME_W: f32 = 160.0;
 pub const COL_PATH_W: f32 = 300.0;
 pub const DIVIDER_H: f32 = 1.0;
+/// 表头排序箭头（§3.4 / §5.2 `chevron-up` / `chevron-down`）。
+pub const SORT_ARROW: f32 = 12.0;
+/// 表头文字与排序箭头的间距（§4.5：6）。
+pub const SORT_ARROW_GAP: f32 = 6.0;
 
 // —— 状态栏（§3.6）——
 pub const STATUS_H: f32 = 28.0;
@@ -348,6 +352,7 @@ mod tests {
         assert_eq!((CONTENT_PAD_X, COLUMN_GAP), (16.0, 16.0));
         assert_eq!((ROW_ICON, ICON_NAME_GAP), (16.0, 8.0));
         assert_eq!((COL_SIZE_W, COL_MTIME_W, COL_PATH_W), (96.0, 160.0, 300.0));
+        assert_eq!((SORT_ARROW, SORT_ARROW_GAP), (12.0, 6.0));
 
         assert_eq!(STATUS_H, 28.0);
         assert_eq!(STATUS_GAP, 16.0);
