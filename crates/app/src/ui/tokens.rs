@@ -154,7 +154,7 @@ pub const ACTION_HINT_W: f32 = 40.0;
 /// 键帽高（11pt 文本 + 上 3 下 3 内边距 + 描边余量 = §2.5 的 19）。
 pub const KEYCAP_H: f32 = 19.0;
 
-// —— 形象几何（§2.9；Task 8 只预留净空，绘制与窗口高在 Task 9）——
+// —— 形象几何（§2.9；Task 9 已落地：窗口高 = 面板高 + `MASCOT_STRIP`）——
 /// 形象画布宽（§2.9）。
 pub const MASCOT_W: f32 = 118.0;
 /// 形象画布高（§2.9）。
@@ -165,8 +165,13 @@ pub const MASCOT_OVERLAP: f32 = 34.0;
 pub const MASCOT_RIGHT_GAP: f32 = 60.0;
 /// 角标（或输入框）与形象左缘的最小净空（§2.9「避让」）。
 pub const MASCOT_BADGE_GAP: f32 = 12.0;
-/// 形象露出面板顶边的高度（Task 9 窗口预留 = 本值）。
-pub const MASCOT_STRIP: f32 = MASCOT_H - MASCOT_OVERLAP;
+/// 画布顶部到窗口顶的余量（旋转/呼吸时头顶不碰窗口边）。
+///
+/// 旋转支点在画布底边中点：±3° 摇摆时顶角相对画布顶最多上探
+/// `59·sin3° − 100·(1−cos3°) ≈ 2.95px`；呼吸最高再上抬 1.5px，4px 留量足够。
+pub const MASCOT_HEADROOM: f32 = 4.0;
+/// 形象露出面板顶边的条高 = 画布高 − 压顶量 + 头顶余量（窗口高 = 面板高 + 本值）。
+pub const MASCOT_STRIP: f32 = MASCOT_H - MASCOT_OVERLAP + MASCOT_HEADROOM;
 /// 搜索行右端「按钮后游标 → 角标右缘」的预留宽（不含 item_spacing 14）；
 /// 按钮左缘到角标右缘的实际距离 = `SEARCH_GAP + 本值` = 142。
 ///
@@ -176,10 +181,10 @@ pub const MASCOT_STRIP: f32 = MASCOT_H - MASCOT_OVERLAP;
 pub const MASCOT_CLEAR_W: f32 =
     MASCOT_RIGHT_GAP + MASCOT_W + MASCOT_BADGE_GAP - (SEARCH_PAD_X + BTN_SIZE) - SEARCH_GAP;
 
-/// 编译期钉住形象露出条高（Task 9 窗口预留直接读 `MASCOT_STRIP`；本任务不启用）。
-const _: () = assert!(MASCOT_STRIP == 66.0);
+/// 编译期钉住形象露出条高（窗口预留直接读 `MASCOT_STRIP`）。
+const _: () = assert!(MASCOT_STRIP == 70.0);
 
-/// 面板高（不含形象条；窗口高 = 本值 + `MASCOT_STRIP`，Task 9 启用）。
+/// 面板高（不含形象条；窗口高 = 本值 + `MASCOT_STRIP`，Task 9）。
 pub const fn panel_h(list_h: f32) -> f32 {
     SEARCH_H + DIVIDER_H + list_h + DIVIDER_H + FOOTER_H
 }
@@ -332,7 +337,9 @@ mod tests {
             "内容宽 = 面板宽时净空应为 12"
         );
         assert!(badge_right < mascot_left, "角标不得进入形象区域");
-        // 形象露出顶边的高度（Task 9 窗口预留用）。
-        assert_eq!(MASCOT_STRIP, 66.0);
+        // 形象条 = 画布 100 − 压顶 34 + 头顶余量 4。
+        assert_eq!(MASCOT_HEADROOM, 4.0);
+        assert_eq!(MASCOT_STRIP, 70.0);
+        assert_eq!(MASCOT_STRIP, MASCOT_H - MASCOT_OVERLAP + MASCOT_HEADROOM);
     }
 }

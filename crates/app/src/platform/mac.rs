@@ -56,9 +56,13 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
 use super::{monotonic_ms, palette_width, SpaceChange, ICON_PX, PALETTE_TITLE};
 
-/// 顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
+/// 面板顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
 /// 视觉稿 y=110 是含 28px 菜单栏的画布坐标,故物理位置比画布低 28;
 /// 2026-10-17 定案,替代旧「可见区顶部向下 1/4」。
+///
+/// Task 9 起窗口高 = 面板高 + 形象条:屏幕坐标(y 向下)窗口顶 = 面板顶 − 形象条,
+/// AppKit 坐标(y 向上)窗口顶 y = 面板顶 y + 形象条(`show_palette` 的 `top_inset`
+/// 参数)。本常量仍只约束**面板**口径。
 const TOP_INSET: f64 = 110.0;
 /// 与屏/可见区边缘的最小留白(定位 clamp 用)。
 const EDGE_MARGIN: f64 = 8.0;
@@ -318,10 +322,13 @@ pub fn ensure_patched() -> Result<()> {
     Ok(())
 }
 
-/// 唤起悬浮条:补丁 → 多屏定位(鼠标所在屏,顶边固定 110、宽度按屏回填)→
+/// 唤起悬浮条:补丁 → 多屏定位(鼠标所在屏,面板顶边固定 110、宽度按屏回填)→
 /// 补 first responder → `orderFrontRegardless`(不激活 app、不切 Space)→
 /// `makeKeyWindow`(成 key 不夺前台,PoC-1b 结论 #6)。
 ///
+/// `top_inset` = 窗口顶部形象条高(Task 9):窗口顶在面板顶之上。屏幕坐标(y 向下)
+/// 口径为「窗口顶 = 面板顶 − top_inset」;AppKit 坐标(y 向上)口径为
+/// 「窗口顶 y = 面板顶 y + top_inset」。面板顶边仍距可见区顶 110。
 /// 返回实际面板宽(ui 层据此同步布局宽;Task 11)。
 ///
 /// 重入安全(硬要求):本函数会从**主队列直调块**(hotkey.rs 的直显路径)调用。
@@ -331,7 +338,7 @@ pub fn ensure_patched() -> Result<()> {
 /// draw_palette)。故:
 /// ① 全程不持 PALETTE 借用(帧内 `reanchor`/`ensure_patched` 会 borrow_mut);
 /// ② 窗口句柄经短借用取出(Retained 保活),后续原生调用全在借用外。
-pub fn show_palette() -> Result<f64> {
+pub fn show_palette(top_inset: f64) -> Result<f64> {
     ensure_patched()?;
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("show_palette 非主线程调用"));
@@ -339,7 +346,7 @@ pub fn show_palette() -> Result<f64> {
     let win = PALETTE
         .with(|cell| cell.borrow().palette.clone())
         .ok_or_else(|| anyhow!("悬浮条窗口未就绪(视口尚未创建)"))?;
-    let (anchor, panel_w) = position_palette(&win, mtm);
+    let (anchor, panel_w) = position_palette(&win, mtm, top_inset);
     // 顺序照 PoC-1b `show_and_make_key`:先补 first responder,再 orderFrontRegardless,
     // 最后 makeKeyWindow(定位先于显示,避免可见后跳位)。
     let responder_ok = restore_first_responder(&win);
@@ -347,10 +354,11 @@ pub fn show_palette() -> Result<f64> {
     win.makeKeyWindow();
     PALETTE.with(|cell| cell.borrow_mut().anchor = Some(anchor)); // 短借用回写(重锚用)
     log::info!(
-        "悬浮条唤起:origin=({:.0}, {:.0}) 顶边 y={:.0} 高 {:.0} 宽 {panel_w:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        "悬浮条唤起:origin=({:.0}, {:.0}) 窗口顶 y={:.0} 面板顶 y={:.0} 窗高 {:.0}(形象条 {top_inset:.0}) 宽 {panel_w:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
         anchor.x,
         anchor.top_y - anchor.h,
         anchor.top_y,
+        anchor.top_y - top_inset,
         anchor.h,
         win.isKeyWindow(),
         win.isVisible()
@@ -670,12 +678,36 @@ pub fn revert_class() {
     });
 }
 
+/// 垫窗 frame:面板窗 frame 去掉**顶部形象条**,并跟随本帧**可见面板高**。
+///
+/// AppKit origin 在左下:面板顶 = 窗口顶 − `top_inset` = `origin.y + height − top_inset`。
+/// 垫窗顶边钉在面板顶,向下延伸 `visible_h`:
+/// `origin.y = 面板顶 − visible_h`、`height = visible_h`。
+/// - 静止(`visible_h` = 面板区高):底边与窗口底一致;
+/// - 收缩/增长动画期(`visible_h` < 面板区高):顶边不动、底边随可见面板移动,
+///   不会在可见面板下方留磨砂带,也不会先铺出整块目标高磨砂。
+///
+/// `visible_h` clamp 到 [0, 窗口高 − top_inset];为 0 时调用方 orderOut。
+/// 垫窗若盖住形象条,那块会变成磨砂矩形(§2.9 形象须透出桌面背景)。
+fn blur_frame(panel: NSRect, top_inset: f64, visible_h: f64) -> NSRect {
+    let panel_h = (panel.size.height - top_inset).max(0.0);
+    let h = visible_h.clamp(0.0, panel_h);
+    let panel_top = panel.origin.y + panel.size.height - top_inset;
+    NSRect::new(
+        NSPoint::new(panel.origin.x, panel_top - h),
+        NSSize::new(panel.size.width, h),
+    )
+}
+
 /// 毛玻璃垫窗每帧同步(悬浮条 pass 调用,`platform::reanchor` 同址)。
 ///
 /// PoC-7 定案:面板窗下挂同级窗承载 `NSVisualEffectView`(winit 视图即 contentView,
 /// 不可换容器/加兄弟层)。只在「frame 变化」与「显隐翻转」时调 AppKit——
-/// 静止期零原生调用。重入安全:AppKit 调用全程不持 PALETTE 借用。
-pub fn sync_blur(visible: bool, corner_radius: f64) {
+/// 静止期零原生调用;高度动画期每帧 resize + mask 重建(≤120ms,可接受)。
+/// 重入安全:AppKit 调用全程不持 PALETTE 借用。
+///
+/// `top_inset` = 窗口顶形象条高;`visible_panel_h` = 本帧可见面板高(Task 9)。
+pub fn sync_blur(visible: bool, corner_radius: f64, top_inset: f64, visible_panel_h: f64) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
@@ -686,8 +718,11 @@ pub fn sync_blur(visible: bool, corner_radius: f64) {
     let Some(panel) = panel else {
         return; // 垫窗随面板;面板窗还没接上就不建
     };
-    if visible && !has_blur {
-        create_blur(mtm, &panel, corner_radius);
+    // 可见面板高为 0(隐藏/空裁剪)时不显示垫窗:零面积磨砂无意义,
+    // 且避免动画起点先铺一块目标高磨砂。
+    let show = visible && visible_panel_h > 0.5;
+    if show && !has_blur {
+        create_blur(mtm, &panel, corner_radius, top_inset, visible_panel_h);
     }
     let (blur, was_visible) = PALETTE.with(|cell| {
         let st = cell.borrow();
@@ -696,8 +731,8 @@ pub fn sync_blur(visible: bool, corner_radius: f64) {
     let Some(blur) = blur else {
         return;
     };
-    if visible {
-        let f = panel.frame();
+    if show {
+        let f = blur_frame(panel.frame(), top_inset, visible_panel_h);
         if blur.frame() != f {
             let was = blur.frame();
             blur.setFrame_display(f, true);
@@ -720,22 +755,30 @@ pub fn sync_blur(visible: bool, corner_radius: f64) {
     } else if was_visible {
         blur.orderOut(None);
     }
-    PALETTE.with(|cell| cell.borrow_mut().blur_visible = visible);
+    PALETTE.with(|cell| cell.borrow_mut().blur_visible = show);
 }
 
 /// 建毛玻璃垫窗(borderless/无阴影/不接鼠标/级别与 collectionBehavior 同面板)。
-fn create_blur(mtm: MainThreadMarker, panel: &NSWindow, corner_radius: f64) {
+/// 初始 frame 只覆盖本帧可见面板(去掉顶部形象条,Task 9)。
+fn create_blur(
+    mtm: MainThreadMarker,
+    panel: &NSWindow,
+    corner_radius: f64,
+    top_inset: f64,
+    visible_panel_h: f64,
+) {
     // **普通 NSWindow（PoC-7 实证可见磨砂的形态）**。
     // 2026-10-17 实机对照：垫窗改「NSPanel 构造」后，浅深两色下磨砂都不再出现
     // （辉哥判读：「PoC 时有半透明，现在没了」）；换 maskImage 也不恢复。故回退到
     // PoC 形态先保住磨砂。代价：**垫窗不进他人全屏 Space**（PoC-1：普通 NSWindow
     // 的硬限制）——全屏下无磨砂，另行处置（见 plan 遗留）。
     // SAFETY: 主线程持有 mtm；标准构造，返回对象由 Retained 保活。
+    let frame = blur_frame(panel.frame(), top_inset, visible_panel_h);
     let win = unsafe {
         let alloc = NSWindow::alloc(mtm);
         NSWindow::initWithContentRect_styleMask_backing_defer(
             alloc,
-            panel.frame(),
+            frame,
             NSWindowStyleMask::Borderless,
             NSBackingStoreType::Buffered,
             false,
@@ -793,7 +836,7 @@ fn create_blur(mtm: MainThreadMarker, panel: &NSWindow, corner_radius: f64) {
         st.blur_visible = true;
     });
     log::info!(
-        "毛玻璃垫窗已建（普通 NSWindow/PoC-7 形态；material=Popover，面板之下；panel#{}）",
+        "毛玻璃垫窗已建（普通 NSWindow/PoC-7 形态；material=UnderWindowBackground，面板之下；panel#{}）",
         panel.windowNumber()
     );
 }
@@ -1007,14 +1050,16 @@ fn screen_with_point(mtm: MainThreadMarker, p: NSPoint) -> Option<Retained<NSScr
     NSScreen::mainScreen(mtm).or_else(|| screens.iter().next())
 }
 
-/// 定位(Task 11 定案):鼠标所在屏可见区内水平居中、顶边固定 `TOP_INSET`;
+/// 定位(Task 11 定案):鼠标所在屏可见区内水平居中、面板顶边固定 `TOP_INSET`;
 /// 宽度按可见区回填(`palette_width`);越界 clamp 回可见区。返回 (锚点, 实际面板宽)。
 ///
-/// 宽度变化走 `setContentSize`(borderless 下 content = frame),随后重读 frame——
-/// AppKit/窗口约束可能调整目标宽,以实际落地 frame 为准。`Anchor.top_y` 取
-/// **实际窗口顶**(origin.y + h):底边 clamp 时顶边不再是 110 线,该位置保持到
-/// 下次 show(正常屏不触发底部 clamp)。
-fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> (Anchor, f64) {
+/// Task 9 起窗口高 = 面板高 + `top_inset`(形象条)。口径：
+/// - 屏幕坐标(y 向下):窗口顶 = 面板顶 − top_inset；
+/// - AppKit 坐标(y 向上,本函数):窗口顶 y = 面板顶 y + top_inset，再减窗高得 origin。
+///
+/// `Anchor.top_y` 取**实际窗口顶**(origin.y + h)：底边 clamp 时窗口顶不再是
+/// 110+strip 线，该位置保持到下次 show（正常屏不触发）。
+fn position_palette(win: &NSWindow, mtm: MainThreadMarker, top_inset: f64) -> (Anchor, f64) {
     let mouse = NSEvent::mouseLocation();
     let visible = screen_with_point(mtm, mouse)
         .map(|s| s.visibleFrame())
@@ -1036,7 +1081,7 @@ fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> (Anchor, f64) {
         );
     }
     let (w, h) = (frame.size.width, frame.size.height);
-    let origin = palette_origin(visible, w, h);
+    let origin = palette_origin(visible, w, h, top_inset);
     win.setFrameOrigin(origin);
     (
         Anchor {
@@ -1049,17 +1094,20 @@ fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> (Anchor, f64) {
 }
 
 /// 悬浮条左上角(纯函数,单测钉住):可见区水平居中并 clamp(两侧留 `EDGE_MARGIN`);
-/// 顶边 = 可见区顶 − `TOP_INSET`;底边越界时上移 clamp(Cocoa 原点在左下),顶边
-/// 随之低于 110 线并保持到下次 show(正常屏不触发)。
+/// **窗口顶** = 可见区顶 − `TOP_INSET` + `top_inset`(AppKit y 向上;`top_inset` 为
+/// 窗口顶部形象条,Task 9)。换算到屏幕坐标(y 向下)即窗口顶 = 面板顶 − `top_inset`；
+/// 面板顶 = 可见区顶 − `TOP_INSET`(两种坐标口径一致)。
+/// 底边越界时上移 clamp(Cocoa 原点在左下),窗口顶随之低于目标线并保持到下次 show
+/// (正常屏不触发)。
 ///
 /// 水平 clamp 语义:**宽度下限 480 优先**——可见宽 < 496(480 + 2×`EDGE_MARGIN`)
 /// 时无法同时保留两侧留白,允许横向溢出(典型 700 宽窗放进 700 可见区,右缘越出 8)。
-fn palette_origin(visible: NSRect, w: f64, h: f64) -> NSPoint {
+fn palette_origin(visible: NSRect, w: f64, h: f64, top_inset: f64) -> NSPoint {
     let min_x = visible.origin.x + EDGE_MARGIN;
     let max_x = (visible.origin.x + visible.size.width - w - EDGE_MARGIN).max(min_x);
     let x = (visible.origin.x + (visible.size.width - w) / 2.0).clamp(min_x, max_x);
-    let top_y = visible.origin.y + visible.size.height - TOP_INSET;
-    let y = (top_y - h).max(visible.origin.y + EDGE_MARGIN);
+    let window_top = visible.origin.y + visible.size.height - TOP_INSET + top_inset;
+    let y = (window_top - h).max(visible.origin.y + EDGE_MARGIN);
     NSPoint::new(x, y)
 }
 
@@ -1150,15 +1198,17 @@ mod tests {
         NSRect::new(NSPoint::new(1470.0, -65.0), NSSize::new(1920.0, 1080.0))
     }
 
-    /// 顶边口径(Task 11):窗口顶边恰为 fixture 的可见区顶(1015)− 110;水平居中。
+    /// 顶边口径(Task 11):面板顶边恰为 fixture 的可见区顶(1015)− 110;水平居中。
     /// 注意基准是 `visibleFrame` 顶,不是含 28px 菜单栏的屏幕顶。
+    /// Task 9:带形象条时窗口顶 = 面板顶 + strip,面板顶口径不变。
     #[test]
     fn palette_origin_pins_top_110_and_centers() {
         let visible = vis();
         let (w, h) = (700.0, 176.0);
-        let p = palette_origin(visible, w, h);
         let visible_top = visible.origin.y + visible.size.height;
         assert_eq!(TOP_INSET, 110.0, "顶边口径固定 110");
+        // 无形象条(top_inset = 0):窗口顶 = 可见区顶 − 110。
+        let p = palette_origin(visible, w, h, 0.0);
         assert_eq!(
             p.y + h,
             visible_top - TOP_INSET,
@@ -1173,6 +1223,18 @@ mod tests {
             p.x + w <= visible.origin.x + visible.size.width - EDGE_MARGIN,
             "右缘保留 EDGE_MARGIN"
         );
+        // 带形象条(Task 9,strip = 70):AppKit 窗口顶 = 可见区顶 − 110 + 70 = −40;
+        // 屏幕坐标(面板顶 = 窗口顶 − 70)仍 = 可见区顶 − 110。
+        let strip = 70.0;
+        let p = palette_origin(visible, w, h + strip, strip);
+        let window_top = p.y + h + strip;
+        assert_eq!(window_top, visible_top - TOP_INSET + strip);
+        assert_eq!(window_top, visible_top - 40.0);
+        assert_eq!(
+            window_top - strip,
+            visible_top - TOP_INSET,
+            "面板顶边仍为可见区顶 − 110"
+        );
     }
 
     /// 水平 clamp 语义:宽度下限 480 优先——可见宽 < 496(480+2×EDGE_MARGIN)时
@@ -1182,7 +1244,7 @@ mod tests {
     fn palette_origin_clamps_horizontally() {
         // 整宽/近整宽:居中位越过左留白 → 贴左内边距,右缘按既定语义越出。
         let narrow = NSRect::new(vis().origin, NSSize::new(700.0, vis().size.height));
-        let p = palette_origin(narrow, 700.0, 176.0);
+        let p = palette_origin(narrow, 700.0, 176.0, 0.0);
         assert_eq!(p.x, narrow.origin.x + EDGE_MARGIN, "整宽时贴左留白");
         assert_eq!(
             p.x + 700.0,
@@ -1191,11 +1253,11 @@ mod tests {
         );
         // 可见宽 < 496 的下限场景:480 窗放进 480 可见区,同样允许右缘越出。
         let tiny = NSRect::new(vis().origin, NSSize::new(480.0, vis().size.height));
-        let p = palette_origin(tiny, 480.0, 176.0);
+        let p = palette_origin(tiny, 480.0, 176.0, 0.0);
         assert_eq!(p.x, tiny.origin.x + EDGE_MARGIN);
         assert_eq!(p.x + 480.0, tiny.origin.x + 480.0 + EDGE_MARGIN);
         // 正常窄宽(可见宽 − 48)仍居中且左右留白。
-        let fit = palette_origin(narrow, 652.0, 176.0);
+        let fit = palette_origin(narrow, 652.0, 176.0, 0.0);
         assert_eq!(fit.x, narrow.origin.x + (700.0 - 652.0) / 2.0);
         assert!(fit.x >= narrow.origin.x + EDGE_MARGIN);
         assert!(fit.x + 652.0 <= narrow.origin.x + 700.0 - EDGE_MARGIN);
@@ -1207,12 +1269,60 @@ mod tests {
     fn palette_origin_clamps_bottom() {
         let visible = vis();
         let h = 1080.0; // 恰为可见区高:按 110 顶边摆放会露出底边
-        let p = palette_origin(visible, 700.0, h);
+        let p = palette_origin(visible, 700.0, h, 0.0);
         assert_eq!(p.y, visible.origin.y + EDGE_MARGIN, "底边贴可见区底留白");
         assert!(
             p.y + h > visible.origin.y + visible.size.height - TOP_INSET,
             "顶边随底边 clamp 下移"
         );
+    }
+
+    /// 垫窗 frame 跟随**可见面板高**(Task 9 集成审查修复):
+    /// - 静态(visible = 面板区高):底边与窗口底一致;
+    /// - 收缩/增长中(visible < 面板区高):顶边恒 = 面板顶,底边随 visible 移动;
+    /// - 顶部形象条永远排除;visible clamp 到 [0, 窗口高 − strip];宽度不变。
+    #[test]
+    fn blur_frame_follows_visible_panel_height() {
+        // 空态窗口 = 面板区 176 + 形象条 70 = 246。
+        let win = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(700.0, 246.0));
+        let panel_top = win.origin.y + win.size.height - 70.0; // 196
+
+        // 静态:可见高 = 面板区高 → 底边与窗口底一致、顶边 = 面板顶。
+        let still = blur_frame(win, 70.0, 176.0);
+        assert_eq!(still.origin.x, win.origin.x);
+        assert_eq!(still.size.width, win.size.width, "宽度不变");
+        assert_eq!(still.origin.y, win.origin.y, "静态底边 = 窗口底");
+        assert_eq!(still.size.height, 176.0);
+        assert_eq!(still.origin.y + still.size.height, panel_top);
+
+        // 收缩中:可见 100 → 顶边仍 = 面板顶,底边上移 76(不在下方留磨砂带)。
+        let shrink = blur_frame(win, 70.0, 100.0);
+        assert_eq!(shrink.size.height, 100.0);
+        assert_eq!(
+            shrink.origin.y + shrink.size.height,
+            panel_top,
+            "顶边钉面板顶"
+        );
+        assert_eq!(shrink.origin.y, win.origin.y + 76.0, "底边随可见面板上移");
+
+        // 增长中:窗口已撑到新高(面板区 266 + strip 70 = 336),可见仅 150 →
+        // 顶边钉面板顶,底边高于窗口底(不先铺整块目标高磨砂)。
+        let tall = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(700.0, 336.0));
+        let grow = blur_frame(tall, 70.0, 150.0);
+        let tall_panel_top = tall.origin.y + tall.size.height - 70.0;
+        assert_eq!(grow.size.height, 150.0);
+        assert_eq!(grow.origin.y + grow.size.height, tall_panel_top);
+        assert!(grow.origin.y > tall.origin.y, "增长中底边高于窗口底");
+
+        // 顶部 strip 永远排除:任何可见高下 frame 顶 ≤ 面板顶。
+        for h in [0.0, 1.0, 100.0, 176.0, 500.0] {
+            let f = blur_frame(win, 70.0, h);
+            assert!(f.origin.y + f.size.height <= panel_top + 1e-9);
+        }
+        // clamp:超面板区高按面板区高;负值按 0;条高超过窗高也不得为负。
+        assert_eq!(blur_frame(win, 70.0, 500.0).size.height, 176.0);
+        assert_eq!(blur_frame(win, 70.0, -5.0).size.height, 0.0);
+        assert_eq!(blur_frame(win, 500.0, 100.0).size.height, 0.0);
     }
 
     /// 常规:锚点 = 光标 x、可见区顶边(可见区已扣菜单栏 → 栏底,传 0)。

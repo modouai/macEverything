@@ -204,13 +204,17 @@ pub fn ensure_patched() -> anyhow::Result<()> {
 
 /// 唤起悬浮条:原生定位 + `orderFrontRegardless` + `makeKeyWindow`(不激活 app)。
 /// 返回实际面板宽(按鼠标所在屏回填;调用方据此同步 UI 布局宽)。
-pub fn show_palette() -> anyhow::Result<f64> {
+///
+/// `top_inset` = 窗口顶预留的形象条高(Task 9):窗口顶 = 面板顶 − top_inset,
+/// 面板顶边仍距可见区顶 110。
+pub fn show_palette(top_inset: f64) -> anyhow::Result<f64> {
     #[cfg(target_os = "macos")]
     {
-        mac::show_palette()
+        mac::show_palette(top_inset)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = top_inset;
         Err(anyhow::anyhow!("非 macOS:悬浮条原生唤起不可用"))
     }
 }
@@ -235,11 +239,14 @@ pub fn reanchor() {
 
 /// 毛玻璃垫窗每帧同步(显隐随面板;悬浮条每次 pass 调用)。
 /// `corner_radius` 由 ui 层传入(垫窗圆角须与面板一致;平台层不反向引 ui 常量)。
-pub fn sync_blur(visible: bool, corner_radius: f64) {
+/// `top_inset` = 窗口顶部的形象条高;垫窗只覆盖面板,不含形象条(Task 9)。
+/// `visible_panel_h` = 本帧可见面板高(动画期为 `clip_h`):垫窗顶边钉面板顶、
+/// 高度随可见面板走,避免过渡期磨砂带伸出可见面板底。
+pub fn sync_blur(visible: bool, corner_radius: f64, top_inset: f64, visible_panel_h: f64) {
     #[cfg(target_os = "macos")]
-    mac::sync_blur(visible, corner_radius);
+    mac::sync_blur(visible, corner_radius, top_inset, visible_panel_h);
     #[cfg(not(target_os = "macos"))]
-    let _ = (visible, corner_radius);
+    let _ = (visible, corner_radius, top_inset, visible_panel_h);
 }
 
 /// 退出/销毁前还原窗口类(否则 winit drop → abort)。

@@ -61,6 +61,7 @@
 //! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
 
 pub mod icons;
+pub mod mascot;
 pub mod menu_actions;
 pub mod palette;
 pub mod results;
@@ -190,7 +191,10 @@ fn palette_hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str) 
 /// 顺序(与 PoC-4 native 路径同构):先让窗口在屏(内容为上一帧),再复位状态并
 /// 请求重绘——上屏延迟与内容刷新解耦。
 fn palette_show(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> bool {
-    match platform::show_palette() {
+    // 屏幕坐标 y 向下：窗口顶 = 面板顶 − 形象条；AppKit y 向上：窗口顶 y =
+    // 面板顶 y + 形象条。平台层按 top_inset 上移窗口，面板顶边仍距可见区顶 110
+    // （§2.9 / Task 9）。
+    match platform::show_palette(palette::MASCOT_STRIP as f64) {
         Ok(w) => {
             {
                 let mut s = lock_shared(shared);
@@ -239,7 +243,8 @@ fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
 fn palette_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_title(platform::PALETTE_TITLE)
-        .with_inner_size([palette::PANEL_W, palette::INITIAL_H])
+        // 窗口高 = 面板高 + 形象条 70（Task 9；面板顶边仍距可见区顶 110）。
+        .with_inner_size([palette::PANEL_W, palette::INITIAL_H + palette::MASCOT_STRIP])
         .with_decorations(false)
         .with_transparent(true)
         .with_has_shadow(false)
@@ -642,7 +647,12 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // 出锁再调(锁纪律——原生调用可被 winit 同步派发,持锁即自锁)。
             drop(s);
             // 垫窗随面板收掉(本分支提前 return,末尾统一同步到不了这里)
-            platform::sync_blur(false, palette::PANEL_RADIUS_F64);
+            platform::sync_blur(
+                false,
+                palette::PANEL_RADIUS_F64,
+                palette::MASCOT_STRIP as f64,
+                0.0,
+            );
             show_root_window(&ctx);
             return; // 开窗后本 pass 结束(悬浮条已隐藏,下面不再排帧)
         }
@@ -652,8 +662,18 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 可见期排下一帧(主题跟随节流上限);隐藏后不再排帧(L4 隐藏零帧)。
     if s.palette_visible {
         ctx.request_repaint_after(theme::CHECK_INTERVAL);
+        // 吉祥物动作排帧(≈30fps;Task 9)。只在可见期排,隐藏后随 L4 归零。
+        ctx.request_repaint_after_for(mascot::FRAME_INTERVAL, palette_viewport_id());
     }
     // 毛玻璃垫窗:显隐随面板(PoC-7 定案)。**放在动作处理之后**——隐藏当帧即
     // orderOut,否则按 L4「隐藏后不排帧」可能长期残留一块磨砂矩形(review 2026-10-17)。
-    platform::sync_blur(s.palette_visible, palette::PANEL_RADIUS_F64);
+    // 垫窗只覆盖**面板**(窗口去顶部形象条),否则形象条会变成一块磨砂矩形。
+    // 高度跟本帧**可见面板高**走:过渡期窗口先停在旧高,整窗垫窗会在可见面板
+    // 下方露磨砂带 / 增长时先铺整块目标高磨砂。
+    platform::sync_blur(
+        s.palette_visible,
+        palette::PANEL_RADIUS_F64,
+        palette::MASCOT_STRIP as f64,
+        s.palette.visible_panel_h() as f64,
+    );
 }

@@ -16,7 +16,8 @@
 //! **窗内平滑**(PoC-6 定案,2026-10-17,取证见 poc-results.md「PoC-6」):目标高变更即
 //! 从当前绘制高起一段 `H_ANIM_MS`(120ms)smoothstep 动画(`h_ease`),动画全部在 egui
 //! 窗内绘制,排帧节流到 ~120Hz。**窗口先在目标一侧就位**:增长立即撑到目标(1 次原生
-//! resize),收缩等动画收敛再收(1 次)——静止时窗口=面板,过渡期窗口瞬时大于面板(透明区)。
+//! resize),收缩等动画收敛再收(1 次)——静止时窗口 = 面板 + 形象条 70(Task 9),
+//! 过渡期窗口瞬时大于面板(透明区)。
 //! 配套平台层 `layerContentsPlacement=TopLeft`(mac.rs;resize 时旧帧钉左上、裁切而非拉伸)。
 //! 对照实测:旧「每帧发 InnerSize」= 134–175 次 resize/次变化,即抖动的来源。
 //!
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 use crate::platform;
 use crate::session::{Fire, Session, SortKey, State};
 use crate::ui::icons;
+use crate::ui::mascot;
 use crate::ui::tokens as tk;
 use client::{DaemonPaths, StatusOutcome};
 use protocol::HitEntry;
@@ -68,9 +70,12 @@ pub const PANEL_W: f32 = tk::PANEL_W;
 pub const PANEL_MIN_W: f32 = crate::platform::PALETTE_MIN_W as f32;
 /// 宽度策略单源：平台层上限 = UI 面板最大宽（防 700 两处漂移；Task 11）。
 const _: () = assert!(crate::platform::PALETTE_MAX_W as f32 == tk::PANEL_W);
-/// 初始/复位窗口高 = 空态面板高（搜索行 + 空态区 + 页脚；visual.md §2.7 = 176）。
-/// 也是面板高过渡的起点（唤起首帧不缩放）。
+/// 初始/复位面板高 = 空态面板高（搜索行 + 空态区 + 页脚；visual.md §2.7 = 176）。
+/// 也是面板高过渡的起点（唤起首帧不缩放）。窗口高另加 `MASCOT_STRIP`。
 pub const INITIAL_H: f32 = tk::panel_h(tk::list_h(0));
+/// 形象露出面板顶边的条高（窗口高 = 面板高 + 本值；§2.9 / Task 9）。
+/// 单源 = token 层；`ui/mod.rs` 的平台调用与 `tokens` 编译期钉住同一值。
+pub const MASCOT_STRIP: f32 = tk::MASCOT_STRIP;
 
 // ---------------------------------------------------------------------------
 // 字号（visual.md §4.3；数值真源 = token 层，本文件禁散落色值/字号）
@@ -212,14 +217,21 @@ pub enum Action {
     FullWindow,
 }
 
-/// headless 测试探针:搜索行关键矩形(输入/图标左缘、角标 chip 宽、面板左缘)。
+/// headless 测试探针:搜索行关键矩形(输入/图标左缘、角标 chip 宽、面板左缘/顶边)。
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct SearchRowProbe {
     panel_left: f32,
+    /// 面板顶边(窗口内 y;恒 = `MASCOT_STRIP`,形象锚点不随面板高度变化)。
+    panel_top: f32,
     input_left: f32,
+    input_right: f32,
     icon_left: f32,
     badge_w: f32,
+    /// 「打开完整窗口」按钮整矩形(与形象/旋转包围盒的避让断言用)。
+    button_rect: egui::Rect,
+    /// 搜索行内容(角标或输入框)最右缘(避让断言用)。
+    content_right: f32,
 }
 
 /// 悬浮条状态与查询会话。
@@ -242,6 +254,8 @@ pub struct PaletteState {
     /// 结果行系统图标缓存(UTI 纹理 + 路径自定义图标;`reset` 清路径无自定义/
     /// 失败条目,类型纹理与类型失败记录保留)。
     icons: icons::IconCache,
+    /// 吉祥物纹理与姿态(跨帧持有;`reset` 不清纹理)。
+    mascot: mascot::Mascot,
 
     paths: DaemonPaths,
     ctx: egui::Context,
@@ -272,9 +286,9 @@ pub struct PaletteState {
     /// 测试探针:最近一帧搜索行关键矩形(headless 越界断言用;生产不编译)。
     #[cfg(test)]
     search_probe: Option<SearchRowProbe>,
-    /// 已下发的窗口高度(`send_h` 记账;探针与测试读它)。
+    /// 已下发的**窗口**高度(`send_h` 记账 = 面板高 + `MASCOT_STRIP`;探针与测试读它)。
     last_h: Option<f32>,
-    /// 面板高过渡:当前绘制高(窗高单位,含内边距与描边)。
+    /// 面板高过渡:当前绘制高(面板高单位,含内边距与描边;窗口另加形象条)。
     /// `reset` 复位到 `INITIAL_H`(唤起首帧不缩放)。
     anim_h: f32,
     /// 进行中的高度过渡:(起点高, 目标高, 起始时刻);None = 已收敛。
@@ -288,6 +302,9 @@ pub struct PaletteState {
     /// 测试用它钉住「内部版面精确等于设计推导」——只看窗口高会被兜底遮蔽
     /// （空态块若少占高，窗口仍是 176，页脚却整体上移）。
     natural_h: f32,
+    /// 本帧**可见面板高**（draw 的 `clip_h`；平台垫窗按它裁磨砂，避免动画期
+    /// 磨砂带伸出可见面板底）。`reset` 复位到 `INITIAL_H`。
+    visible_panel_h: f32,
     /// 最近一次输入变更时刻(空态滞后判定 `EMPTY_HOLD` 起算;仅输入帧更新)。
     last_input_at: Option<Instant>,
     /// 空态待决:输入进行中的 0 命中已静默(仍显示上一轮结果);停手后复判,
@@ -315,13 +332,18 @@ impl PaletteState {
         viewport: egui::ViewportId,
         hotkey_note: Option<String>,
     ) -> Self {
-        Self::with_icons(
-            egui_ctx,
+        let mut st = Self::with_icons(
+            egui_ctx.clone(),
             paths,
             viewport,
             hotkey_note,
             icons::IconCache::new(),
-        )
+            mascot::Mascot::new(),
+        );
+        // 启动期预热（仅生产构造路径）：窗口此时隐藏，避开首次唤起首帧的 PNG
+        // 解码 + Lanczos 缩放。测试构造 `new_for_test` 传入不加载纹理的 Mascot。
+        st.mascot.ensure_texture(&egui_ctx);
+        st
     }
 
     /// 测试构造:注入无 worker 的图标缓存,避免测试向 NSWorkspace 发假路径。
@@ -338,6 +360,8 @@ impl PaletteState {
             viewport,
             hotkey_note,
             icons::IconCache::without_worker(),
+            // 单测不加载纹理：构造与绘制都不解码 PNG（姿态/几何由纯函数测试覆盖）。
+            mascot::Mascot::without_texture(),
         )
     }
 
@@ -347,6 +371,7 @@ impl PaletteState {
         viewport: egui::ViewportId,
         hotkey_note: Option<String>,
         icons: icons::IconCache,
+        mascot: mascot::Mascot,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
@@ -362,6 +387,7 @@ impl PaletteState {
             visible_rows: ROWS_INITIAL,
             full_window_request: None,
             icons,
+            mascot,
             paths,
             ctx: egui_ctx,
             viewport,
@@ -384,6 +410,7 @@ impl PaletteState {
             anim_trace: None,
             h_resizes: 0,
             natural_h: INITIAL_H,
+            visible_panel_h: INITIAL_H,
             last_input_at: None,
             pending_empty: false,
             pass_seq: 0,
@@ -392,6 +419,11 @@ impl PaletteState {
             query_sent: None,
             pending_empty_clear: false,
         }
+    }
+
+    /// 本帧可见面板高（draw 的 `clip_h` 快照；平台垫窗按它裁磨砂）。
+    pub fn visible_panel_h(&self) -> f32 {
+        self.visible_panel_h
     }
 
     /// 唤起打点(首帧计时起点;`ui::palette_show` 调用)。
@@ -429,9 +461,11 @@ impl PaletteState {
         self.last_focused = None;
         // 高度复位到初始高并**立即下发**:视口窗常驻(隐藏不销毁),高度可能停在上次的
         // 自然高;唤起首帧不缩放(拉平期窗外区域全透明,不可见)。
+        // 纹理不清(形象跨帧缓存;素材不变)。
         self.anim_h = INITIAL_H;
         self.h_anim = None;
         self.anim_trace = None;
+        self.visible_panel_h = INITIAL_H;
         self.send_h(INITIAL_H);
         self.last_input_at = None;
         self.pending_empty = false;
@@ -439,12 +473,15 @@ impl PaletteState {
     }
 
     /// 下发窗口高并记账(去重由调用点按策略判边沿;`h_resizes` 供证据与测试)。
+    /// 入参 `h` = **面板高**；窗口高 = `h + MASCOT_STRIP`（形象条在面板上方），
+    /// `last_h` 记窗口高（探针的 `screen_rect` 与平台窗高同口径）。
     fn send_h(&mut self, h: f32) {
+        let win_h = h + MASCOT_STRIP;
         self.ctx.send_viewport_cmd_to(
             self.viewport,
-            egui::ViewportCommand::InnerSize(egui::vec2(self.panel_w, h)),
+            egui::ViewportCommand::InnerSize(egui::vec2(self.panel_w, win_h)),
         );
-        self.last_h = Some(h);
+        self.last_h = Some(win_h);
         self.h_resizes += 1;
         // 尺寸命令异步落地:补排一帧让「落地之后」的帧再同步一次平台层——
         // 垫窗按 `panel.frame()` 对齐、顶边重锚同理;否则过渡结束不再排帧(L4),
@@ -648,28 +685,36 @@ impl PaletteState {
 
         let now = Instant::now();
 
-        // —— 面板背景占位(自绘;填实见帧尾)——
-        // 背景矩形 = 本帧**可见高**矩形,而非自然内容高矩形:egui `Frame` 的背景
-        // 恒等于内容高,动画期窗/内容两高不一致会出现「底边直角裁切」或「背景瞬贴
-        // 内容(动画不可见)」两种伪影(模块头注「面板高度」)。占位先落笔、内容后画,
-        // 遮挡关系正确(egui `Frame` 内部同法:先 add(Shape::Noop),末尾 set)。
-        let panel_origin = ui.min_rect().left_top();
-        // 真实窗高(可见高/裁剪用;须在放开布局区之前读)。
-        let win_h = ui.max_rect().height();
+        // —— 窗口 = 形象条 + 面板(Task 9;§2.9)——
+        // 窗口顶部预留 70 给形象条;面板从形象条下缘起画。先读**窗矩形**(可见高/
+        // 裁剪基准,须在放开布局区之前),再推进游标给形象条留位。平台层把窗口顶
+        // 上移 strip,故面板顶边距可见区顶仍是 110(舞台口径不变)。
+        let window_rect = ui.max_rect();
+        let win_h = window_rect.height();
         // 布局区与窗高解耦(先读窗高再放开):内容自然高必须只由内容决定——根 ui
         // 的布局区默认为窗矩形,而窗高又由内容高驱动(动画输出),不放即形成
         // 「窗高 → 内容高 → 窗高」反馈环:结果区被窗高钳住,面板只能一帧长几 px
         // 慢慢「爬」向目标(前一版实机高度大幅摆动/慢爬的根因之一)。取富余上限
         // 让排版一次到位;可见性仍由下面的裁剪矩形(窗 ∩ 动画矩形)决定。
         ui.set_max_height(PANEL_MAX_H);
-        // 可见高 = min(动画高, 真实窗高):窗尺寸命令下一帧才落地(扩张期窗还矮),
-        // 不取小则背景伸到窗外被裁 → 底边直角(圆角丢失)。窗高取不到(创建首帧)时
-        // 以动画高为准。
+        ui.add_space(MASCOT_STRIP);
+        let panel_origin = ui.cursor().min;
+        // —— 面板背景占位(自绘;填实见帧尾)——
+        // 背景矩形 = 本帧**可见高**矩形,而非自然内容高矩形:egui `Frame` 的背景
+        // 恒等于内容高,动画期窗/内容两高不一致会出现「底边直角裁切」或「背景瞬贴
+        // 内容(动画不可见)」两种伪影(模块头注「面板高度」)。占位先落笔、内容后画,
+        // 遮挡关系正确(egui `Frame` 内部同法:先 add(Shape::Noop),末尾 set)。
+        // 面板可见高 = min(动画高, 真实窗高 − 形象条):窗尺寸命令下一帧才落地
+        // (扩张期窗还矮),不取小则背景伸到窗外被裁 → 底边直角(圆角丢失)。
+        // 窗高取不到(创建首帧)时以动画高为准。
         let clip_h = if win_h > 1.0 {
-            self.anim_h.min(win_h)
+            self.anim_h.min(win_h - MASCOT_STRIP)
         } else {
             self.anim_h
         };
+        // 平台垫窗按本帧可见面板高裁磨砂（动画期窗口先停在旧高，整窗垫窗会
+        // 在可见面板下方露磨砂带）。
+        self.visible_panel_h = clip_h;
         ui.set_clip_rect(egui::Rect::from_min_size(
             panel_origin,
             egui::vec2(panel_w, clip_h),
@@ -747,6 +792,8 @@ impl PaletteState {
                             // 实测宽截断，不挤掉输入框下限（见 `search_row_badge_max_w`）。
                             #[cfg(test)]
                             let mut badge_w = 0.0_f32;
+                            #[cfg(test)]
+                            let mut badge_right = 0.0_f32;
                             if let Some(badge) = &note {
                                 let chip_max_w = search_row_badge_max_w(panel_w);
                                 let text_max_w = (chip_max_w - 2.0 * tk::KEYCAP_PAD.1).max(0.0);
@@ -761,6 +808,10 @@ impl PaletteState {
                                     egui::vec2(w, tk::KEYCAP_H),
                                     egui::Sense::hover(),
                                 );
+                                #[cfg(test)]
+                                {
+                                    badge_right = rect.right();
+                                }
                                 let (fill, text_color) = badge_colors(badge.tone, &t);
                                 let p = ui.painter();
                                 p.rect_filled(
@@ -805,9 +856,13 @@ impl PaletteState {
                             {
                                 search_probe = Some(SearchRowProbe {
                                     panel_left: panel_origin.x,
+                                    panel_top: panel_origin.y,
                                     input_left: input_resp.rect.left(),
+                                    input_right: input_resp.rect.right(),
                                     icon_left: icon_rect.left(),
                                     badge_w,
+                                    button_rect: btn_rect,
+                                    content_right: badge_right.max(input_resp.rect.right()),
                                 });
                             }
                             ui.add_space(tk::SEARCH_PAD_X); // 左端内边距
@@ -965,10 +1020,13 @@ impl PaletteState {
             }
         }
         // 窗口高策略(PoC-6 定案):增长**立即撑到目标**(1 次原生 resize);收缩等动画
-        // 收敛再收(1 次)。静止时窗口 = 面板;过渡期窗口瞬时大于面板(透明区,不可见)。
-        // `last_h` 为 None(创建首帧)视作 0:走增长分支直接对齐自然高。
-        let win_h = self.last_h.unwrap_or(0.0);
-        if natural_h > win_h + 0.5 || (self.h_anim.is_none() && natural_h < win_h - 0.5) {
+        // 收敛再收(1 次)。静止时窗口 = 面板 + 形象条;过渡期窗口瞬时大于面板
+        // (透明区,不可见)。`last_h` 为 None(创建首帧)视作 0:走增长分支直接对齐。
+        let window_target = natural_h + MASCOT_STRIP;
+        let cur_win_h = self.last_h.unwrap_or(0.0);
+        if window_target > cur_win_h + 0.5
+            || (self.h_anim.is_none() && window_target < cur_win_h - 0.5)
+        {
             self.send_h(natural_h);
         }
         if self.h_anim.is_some() {
@@ -987,6 +1045,18 @@ impl PaletteState {
                 egui::StrokeKind::Inside,
             )),
         );
+
+        // —— 形象(Task 9;§2.9 层级硬约束)——
+        // 面板子树在 Frame 内且带面板 clip;此处先把裁剪恢复为**整个窗矩形**,
+        // 形象才不被面板 clip 裁掉,且语义上是面板的兄弟节点。绘制顺序在面板
+        // 背景之后(压住面板顶边);`Image::paint_at` 不占布局、不可交互。
+        ui.set_clip_rect(window_rect);
+        let typing = self
+            .last_input_at
+            .is_some_and(|t| now.saturating_duration_since(t) < mascot::TYPING_WINDOW);
+        let t = ui.input(|i| i.time) as f32;
+        self.mascot
+            .draw(ui, &self.session.state, typing, panel_origin, panel_w, t);
 
         let input_resp = frame.inner;
         // 组合中的预编辑文本不触发查询(IME 未上屏;提交/取消帧 composing 已复位,
@@ -1458,7 +1528,7 @@ fn badge_colors(tone: BadgeTone, t: &tk::Palette) -> (egui::Color32, egui::Color
     }
 }
 
-/// 所在目录(展示用):去掉文件名后中间省略(宽窗 720 下容 64 字符)。
+/// 所在目录(展示用):去掉文件名后中间省略(最大宽 700 下容 64 字符)。
 fn dir_display(path: &str) -> String {
     let dir = match path.rsplit_once('/') {
         Some((d, _)) => d,
@@ -1832,6 +1902,11 @@ mod tests {
     /// 探针帧长(模拟 60fps;动画是时间基插值,headless 逐帧 run 之间没有真实时长)。
     const PROBE_DT: Duration = Duration::from_millis(16);
 
+    /// 面板高 → 窗口高（探针 `last_h` 口径 = 面板 + 形象条 70）。
+    fn win_h(panel_h: f32) -> f32 {
+        panel_h + MASCOT_STRIP
+    }
+
     /// 造 N 条命中(只用于行数/高度,内容不参与布局高度)。
     fn hits(n: usize) -> Vec<HitEntry> {
         (0..n)
@@ -1857,7 +1932,11 @@ mod tests {
         }
         // 窗高模拟为「上一帧请求的高」(尺寸命令下一帧落地):可见高取 min 的路径
         // 与实机一致;窗高只影响裁剪,不影响本帧请求的高(测量值)。
-        let win_h = st.last_h.unwrap_or(900.0).max(INITIAL_H);
+        // `last_h` 是**窗口高**(面板 + 形象条 70);创建首帧回落到初始窗高。
+        let win_h = st
+            .last_h
+            .unwrap_or(INITIAL_H + MASCOT_STRIP)
+            .max(INITIAL_H + MASCOT_STRIP);
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -2018,7 +2097,11 @@ mod tests {
             let h = probe_frame(&ctx, &mut st, vec![]);
             seq.push(("warm".into(), st.input.clone(), st.results.len(), h));
         }
-        assert_eq!(st.last_h, Some(INITIAL_H), "唤起/复位后停在输入行高");
+        assert_eq!(
+            st.last_h,
+            Some(win_h(INITIAL_H)),
+            "唤起/复位后停在输入行窗高（面板 + 形象条）"
+        );
 
         let backspace = || {
             vec![egui::Event::Key {
@@ -2048,8 +2131,9 @@ mod tests {
         assert_smooth(&first, true); // 无旧结果:空态立即落定(平滑塌到 79)
         assert_eq!(
             *first.last().unwrap(),
-            176.0,
-            "S1 首字落空态 176px:{first:?}"
+            win_h(176.0),
+            "S1 首字落空态面板 176px（窗高 {} = 176 + 70）:{first:?}",
+            win_h(176.0)
         );
         for ch in ["z", "q", "q", "x", "x"] {
             let (framed, resp) = type_char(&mut st, &mut seq, ch);
@@ -2057,7 +2141,7 @@ mod tests {
                 framed
                     .iter()
                     .chain(resp.iter())
-                    .all(|h| (h - 176.0).abs() < 0.5),
+                    .all(|h| (h - win_h(176.0)).abs() < 0.5),
                 "S1 空态持续期零抽动({ch}):{framed:?}/{resp:?}"
             );
         }
@@ -2069,8 +2153,8 @@ mod tests {
         assert_smooth(&clear, false);
         assert_eq!(
             *clear.last().unwrap(),
-            INITIAL_H,
-            "清空回输入行高:{clear:?}"
+            win_h(INITIAL_H),
+            "清空回输入行窗高:{clear:?}"
         );
 
         // ================= S2 状态往返穿越(加字链,含 0 命中坠点)=================
@@ -2079,7 +2163,11 @@ mod tests {
         let (_, f) = type_char(&mut st, &mut seq, "湖"); // 28 行
         assert_smooth(&f, true);
         let h_cap = *f.last().unwrap();
-        assert_eq!(h_cap, 466.0, "28 行封顶自然高:{f:?}");
+        assert_eq!(
+            h_cap,
+            win_h(466.0),
+            "28 行封顶面板高 466（窗高 + 70）:{f:?}"
+        );
         let (_, f) = type_char(&mut st, &mut seq, "北"); // 区域B 27 行
         assert!(
             f.iter().all(|h| (h - h_cap).abs() < 0.5),
@@ -2111,13 +2199,17 @@ mod tests {
         let down = probe_phase(&ctx, &mut st, &mut seq, "停手落定", vec![]);
         assert_smooth(&down, false);
         assert!(st.results.is_empty(), "停手后切空态");
-        assert_eq!(*down.last().unwrap(), 176.0, "空态贴合:{down:?}");
+        assert_eq!(*down.last().unwrap(), win_h(176.0), "空态贴合窗高:{down:?}");
         for _ in 0..4 {
             probe_phase(&ctx, &mut st, &mut seq, "退格", backspace());
         }
         assert!(st.input.is_empty());
         let clear = probe_phase(&ctx, &mut st, &mut seq, "清空", vec![]);
-        assert_eq!(*clear.last().unwrap(), INITIAL_H, "清空回 54:{clear:?}");
+        assert_eq!(
+            *clear.last().unwrap(),
+            win_h(INITIAL_H),
+            "清空回初始窗高:{clear:?}"
+        );
 
         // ================= S3 行数大波动(28 行封顶 ↔ 3 行)=================
         // 预期:28 → 410;降到 3 行即时平滑收拢(不推迟到停手)。
@@ -2127,7 +2219,7 @@ mod tests {
         let (_, f) = type_char(&mut st, &mut seq, "省"); // 区域B省 3 行:大波动实时跟
         assert_smooth(&f, false);
         let h3b = *f.last().unwrap();
-        assert_eq!(h3b, 292.0, "28→3 行即时平滑收拢到 3 行自然高:{f:?}");
+        assert_eq!(h3b, win_h(292.0), "28→3 行即时平滑收拢到 3 行窗高:{f:?}");
         // 停手后零高度变化事件(验收口径「输入完成后无额外动作」)
         probe_settle_input(&mut st);
         let idle = probe_phase(&ctx, &mut st, &mut seq, "停手静置", vec![]);
@@ -2183,17 +2275,32 @@ mod tests {
         assert!(st.input.is_empty());
         let clear = probe_phase(&ctx, &mut st, &mut seq, "空输入", vec![]);
         assert_smooth(&clear, false);
-        assert_eq!(*clear.last().unwrap(), INITIAL_H, "清空回 54:{clear:?}");
+        assert_eq!(
+            *clear.last().unwrap(),
+            win_h(INITIAL_H),
+            "清空回初始窗高:{clear:?}"
+        );
 
-        println!("—— 验收矩阵小结(预期 vs 实测;命中数取自隔离索引实测)——");
-        println!("S1 zzqqxx(0 命中,冷启动)      预期 空态立即落定 176px       实测 176px");
+        println!("—— 验收矩阵小结(预期 vs 实测;命中数取自隔离索引实测;窗高 = 面板 + 70)——");
+        println!(
+            "S1 zzqqxx(0 命中,冷启动)      预期 空态立即落定 面板176/窗高{:.0} 实测 {:.0}",
+            win_h(176.0),
+            win_h(176.0)
+        );
         println!("S2 湖28→区域B27→区域B报24→区域B省3 预期 封顶段零变化/3 行即时收拢   实测 {h_cap:.0}/{h_cap:.0}/{h_cap:.0}/{h_3:.0}");
-        println!("S2 区域B省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 176 实测 176px");
+        println!(
+            "S2 区域B省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 面板176 实测 {:.0}",
+            win_h(176.0)
+        );
         println!("S3 湖28→区域B省3(大波动)     预期 即时平滑收拢(120ms)         实测 {h_3:.1}px");
         println!(
             "S4 区域B省3→(删)区域B27→湖28    预期 实时平滑扩张回封顶           实测 {h_cap:.0}px"
         );
-        println!("S4 全删(空输入)             预期 落空态面板高 176             实测 176px");
+        println!(
+            "S4 全删(空输入)             预期 落空态面板高 176/窗高{:.0}   实测 {:.0}",
+            win_h(INITIAL_H),
+            win_h(INITIAL_H)
+        );
         println!("—— 逐帧高度序列(输入=当前词 · 结果=行数 · 窗高) ——");
         for (tag, input, rows, h) in &seq {
             println!("{tag:<26} 输入={input:<10} 结果={rows:<3} 窗高={h:.0}px");
@@ -2234,11 +2341,42 @@ mod tests {
             println!("rows={rows} → 面板高 {h}");
         }
         for (rows, h) in got {
-            let expect = tk::panel_h(tk::list_h(rows.min(6)));
-            assert_eq!(h, expect, "{rows} 行面板高不符 §2.2 推导（实测 {h}）");
+            let expect = win_h(tk::panel_h(tk::list_h(rows.min(6))));
+            assert_eq!(
+                h, expect,
+                "{rows} 行窗高（面板 + 形象条）不符 §2.2 推导（实测 {h}）"
+            );
         }
         // 自然内容高 = 三段之和（最后一态：8 行封顶 466）
         assert_eq!(st.natural_h, 466.0, "末态自然内容高应为封顶 466");
+    }
+
+    /// 形象锚点(Task 9):面板顶边恒在窗口内 `MASCOT_STRIP`(70)处——形象条固定
+    /// 在窗口顶部;面板高度变化(空态 176 → 5 行 350)不改变该锚点。
+    /// 突变验证:去掉 `ui.add_space(MASCOT_STRIP)`,顶边变 0 即红。
+    #[test]
+    fn panel_top_stays_at_strip_across_height_changes() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new_for_test(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        let mut seq: Vec<(String, String, usize, f32)> = Vec::new();
+        for _ in 0..2 {
+            probe_frame(&ctx, &mut st, vec![]);
+        }
+        let empty_top = st.search_probe.expect("搜索行探针已记录").panel_top;
+        assert_eq!(empty_top, MASCOT_STRIP, "空态面板顶边 = 形象条高");
+        probe_phase(&ctx, &mut st, &mut seq, "打字", vec![probe_commit("湖")]);
+        probe_respond(&mut st, 5);
+        probe_phase(&ctx, &mut st, &mut seq, "响应 5 行", vec![]);
+        assert!(st.natural_h > 176.0, "面板已增高");
+        let tall_top = st.search_probe.expect("搜索行探针已记录").panel_top;
+        assert_eq!(tall_top, MASCOT_STRIP, "面板增高后顶边不动（形象锚点不动）");
     }
 
     /// 宽度回填 clamp(平台层已按屏计算;UI 侧防御到 [480, PANEL_W])。
@@ -2282,7 +2420,11 @@ mod tests {
         }
         assert_eq!(st.panel_w, PANEL_MIN_W);
         assert_eq!(st.natural_h, 176.0, "窄宽空态自然高仍为设计推导 176");
-        assert_eq!(st.last_h, Some(INITIAL_H), "高度下发不变");
+        assert_eq!(
+            st.last_h,
+            Some(win_h(INITIAL_H)),
+            "窗高下发不变（面板 + 形象条）"
+        );
     }
 
     /// 角标可用宽随面板宽收窄:480 下 142,700 下取 240 上限,极窄不为负。
@@ -2337,6 +2479,73 @@ mod tests {
         );
     }
 
+    /// 真实布局避让（700 / 480，长错误角标 = 最紧场景）：用探针实测的按钮矩形与
+    /// 角标/输入右缘，断言形象矩形净空 ≥12；四动作极值的旋转包围盒不与两者相交。
+    /// 突变验证：把 `MASCOT_CLEAR_W` 或形象右缘距改小，本测试即红。
+    #[test]
+    fn mascot_clears_real_layout_and_rotated_bounds_at_700_and_480() {
+        for panel_w in [PANEL_W, PANEL_MIN_W] {
+            let ctx = egui::Context::default();
+            let mut st = PaletteState::new_for_test(
+                ctx.clone(),
+                DaemonPaths {
+                    data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+                },
+                egui::ViewportId::ROOT,
+                None,
+            );
+            st.set_panel_width(panel_w);
+            for _ in 0..2 {
+                probe_frame(&ctx, &mut st, vec![]);
+            }
+            // 超长错误文案：角标占满可用宽（搜索行最紧）。
+            st.status_note = Some(Badge::error(format!(
+                "打开失败:{}",
+                "文件路径不存在或已被移动".repeat(8)
+            )));
+            probe_frame(&ctx, &mut st, vec![]);
+            let p = st.search_probe.expect("搜索行探针应已记录");
+            assert!(p.content_right >= p.input_right - 0.01);
+            let origin = egui::pos2(p.panel_left, p.panel_top);
+            let r = mascot::mascot_rect(origin, st.panel_w, 0.0);
+            assert!(
+                r.left() - p.content_right >= tk::MASCOT_BADGE_GAP - 0.01,
+                "宽 {panel_w}:形象左缘 {} 与内容右缘 {} 净空不足 12",
+                r.left(),
+                p.content_right
+            );
+            assert!(
+                p.button_rect.left() - r.right() >= tk::MASCOT_BADGE_GAP - 0.01,
+                "宽 {panel_w}:形象右缘 {} 与按钮左缘 {} 净空不足 12",
+                r.right(),
+                p.button_rect.left()
+            );
+            for pose in [
+                mascot::pose_for(&State::Idle, false, 1.8),     // 呼吸最高
+                mascot::pose_for(&State::Searching, true, 0.0), // 前倾 2.5°
+                mascot::pose_for(&State::EngineStarting, false, 0.4), // +3°
+                mascot::pose_for(&State::EngineStarting, false, 1.2), // -3°
+            ] {
+                let bbox = mascot::rotated_bounds(
+                    mascot::mascot_rect(origin, st.panel_w, pose.dy),
+                    pose.angle_deg,
+                );
+                assert!(
+                    !bbox.intersects(p.button_rect),
+                    "宽 {panel_w}:姿态 {pose:?} 的旋转包围盒 {} 与按钮 {} 相交",
+                    bbox,
+                    p.button_rect
+                );
+                assert!(
+                    bbox.left() > p.content_right,
+                    "宽 {panel_w}:姿态 {pose:?} 的旋转包围盒左缘 {} 压住内容右缘 {}",
+                    bbox.left(),
+                    p.content_right
+                );
+            }
+        }
+    }
+
     /// 宽度回归网:set_panel_width(480) 后 reset 与高度变化下发的视口命令都是
     /// InnerSize(480, …)。突变复核:把 `send_h` 宽度改回 `PANEL_W` 即红。
     #[test]
@@ -2358,7 +2567,8 @@ mod tests {
         let (_, commands) = probe_frame_with_commands(&ctx, &mut st, vec![]);
         assert!(
             commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(
-                480.0, INITIAL_H
+                480.0,
+                win_h(INITIAL_H)
             ))),
             "reset 后首帧须按 480 宽下发:{commands:?}"
         );
@@ -2366,7 +2576,7 @@ mod tests {
         probe_frame(&ctx, &mut st, vec![probe_commit("湖")]);
         probe_respond(&mut st, 5);
         let (h, commands) = probe_frame_with_commands(&ctx, &mut st, vec![]);
-        let expect_h = tk::panel_h(tk::list_h(5));
+        let expect_h = win_h(tk::panel_h(tk::list_h(5)));
         assert_eq!(h, expect_h, "5 行自然高");
         assert!(
             commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(
@@ -2394,7 +2604,11 @@ mod tests {
         for _ in 0..2 {
             probe_frame(&ctx, &mut st, vec![]);
         }
-        assert_eq!(st.last_h, Some(INITIAL_H), "唤起/复位后停在输入行高");
+        assert_eq!(
+            st.last_h,
+            Some(win_h(INITIAL_H)),
+            "唤起/复位后停在输入行窗高（面板 + 形象条）"
+        );
 
         // —— 增长:打字 → 注入 5 行响应 ——
         probe_phase(&ctx, &mut st, &mut seq, "打字", vec![probe_commit("湖")]);
@@ -2402,11 +2616,28 @@ mod tests {
         probe_respond(&mut st, 5);
         let grow = probe_phase(&ctx, &mut st, &mut seq, "响应 5 行", vec![]);
         let h5 = *grow.last().unwrap();
-        assert!(h5 > INITIAL_H + 1.0, "5 行自然高应高于输入行:{grow:?}");
+        assert!(
+            h5 > win_h(INITIAL_H) + 1.0,
+            "5 行窗高应高于输入行窗高:{grow:?}"
+        );
         assert_eq!(st.h_resizes - r0, 1, "增长恰 1 次原生 resize:{grow:?}");
         assert!(
             grow.iter().all(|h| (h - h5).abs() < 0.5),
             "增长首帧即撑到目标(窗口先撑,不逐帧爬):{grow:?}"
+        );
+        assert!(
+            (h5 - st.natural_h - MASCOT_STRIP).abs() < 0.5,
+            "窗口高恒为面板 + 形象条（面板高度变化时形象锚点不动）:h5={h5} natural={}",
+            st.natural_h
+        );
+        // 收敛帧的绘制高是「步进前」的 anim_h（动画步进在布局之后），补一帧让
+        // anim_h 吸附目标；垫窗输入应等于该帧实际可见面板高。
+        probe_frame(&ctx, &mut st, vec![]);
+        assert!(
+            (st.visible_panel_h() - st.natural_h).abs() < 0.5,
+            "收敛后垫窗输入 = 可见面板高（自然高）:visible={} natural={}",
+            st.visible_panel_h(),
+            st.natural_h
         );
 
         // —— 收缩:退格清空(清空即清结果,product §1)→ 过渡期窗高不动、收敛帧收拢 ——
@@ -2423,7 +2654,18 @@ mod tests {
         let shrink = probe_phase(&ctx, &mut st, &mut seq, "退格清空", backspace());
         assert!(st.input.is_empty(), "退格清空");
         assert_eq!(st.h_resizes - r1, 1, "收缩恰 1 次原生 resize:{shrink:?}");
-        assert_eq!(*shrink.last().unwrap(), INITIAL_H, "收拢回输入行高");
+        assert_eq!(
+            *shrink.last().unwrap(),
+            win_h(INITIAL_H),
+            "收拢回输入行窗高"
+        );
+        probe_frame(&ctx, &mut st, vec![]);
+        assert!(
+            (st.visible_panel_h() - st.natural_h).abs() < 0.5,
+            "收缩收敛后垫窗输入 = 可见面板高（自然高）:visible={} natural={}",
+            st.visible_panel_h(),
+            st.natural_h
+        );
         let changes = shrink
             .windows(2)
             .filter(|w| (w[0] - w[1]).abs() > 0.5)
