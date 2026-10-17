@@ -77,9 +77,9 @@ pub fn menu_items(files: usize, dirs: usize) -> Vec<(&'static str, MenuAction)> 
 
 /// 选中路径分类计数(文件数, 目录数)。
 ///
-/// 索引条目无类型字段(protocol::HitEntry),按元数据现查。取不到元数据
-/// (已删/无权限)按文件计——保守:不出现目录专属语义项,执行时统一做存在性
-/// 前置校验并把失败落状态栏,不静默。
+/// `HitEntry.is_dir` 是索引快照,右键动作要求当前文件系统状态,故仍现查元数据;
+/// 取不到(已删/无权限)按文件计——保守:不出现目录专属语义项,执行时统一做
+/// 存在性前置校验并把失败落状态栏,不静默。
 pub fn count_types(paths: &[String]) -> (usize, usize) {
     let mut files = 0;
     let mut dirs = 0;

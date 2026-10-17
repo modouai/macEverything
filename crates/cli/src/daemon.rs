@@ -215,7 +215,9 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc:
         };
         let out =
             engine::query::execute_sorted(v, &plan, limit.min(1000) as usize, key, desc, &meta_fn);
-        let rows: Vec<(u32, String, String)> = out
+        // 第四列 is_dir 取自索引条目:缓存命中与补 stat 两条组装路径都据此填值,
+        // 不依赖 stat 是否发生(Relevance/Name/Path 排序下缓存为空)。
+        let rows: Vec<(u32, String, String, bool)> = out
             .hits
             .iter()
             .map(|h| {
@@ -223,6 +225,7 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc:
                     *h,
                     String::from_utf8_lossy(v.display_name(*h)).into_owned(),
                     v.full_path_dyn(*h),
+                    v.entries()[*h as usize].is_dir(),
                 )
             })
             .collect();
@@ -249,7 +252,7 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc:
 /// 已全量 stat,零重查;Relevance/Name/Path 排序下缓存为空,与 v1 行为一致。
 /// 返回 (条目, 补全轮读取耗时毫秒);响应 stat_ms = 排序轮 + 补全轮。
 fn stat_with_cache(
-    rows: Vec<(u32, String, String)>,
+    rows: Vec<(u32, String, String, bool)>,
     cache: &Mutex<HashMap<u32, MetaRow>>,
 ) -> (Vec<HitEntry>, f64) {
     let t = Instant::now();
@@ -281,11 +284,12 @@ fn stat_with_cache(
     let entries = rows
         .into_iter()
         .zip(meta)
-        .map(|((_, name, path), (size, mtime))| HitEntry {
+        .map(|((_, name, path, is_dir), (size, mtime))| HitEntry {
             name,
             path,
             size,
             mtime,
+            is_dir,
         })
         .collect();
     (entries, t.elapsed().as_secs_f64() * 1000.0)
@@ -1184,6 +1188,51 @@ mod tests {
         assert!(state.applied_event_id.load(Ordering::Relaxed) >= floor);
         assert_eq!(*state.state_name.lock().unwrap(), state::READY);
         assert!(paths.index_file().exists(), "重扫后落盘");
+    }
+
+    /// is_dir 组装路径钉:relevance 排序下排序轮 stat 缓存为空,两行都走锁外
+    /// 补 stat(miss)路径;size 排序下两行在排序轮已 stat,走缓存命中路径。
+    /// 两条路径的响应都必须保留索引条目的目录真值。
+    #[test]
+    fn query_response_keeps_is_dir_on_cache_hit_and_miss_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("hit_dir")).unwrap();
+        std::fs::write(dir.path().join("hit_file.txt"), b"x").unwrap();
+        let state = mounted_state(dir.path());
+        {
+            let mut h = state.holder.write().unwrap();
+            let IndexHolder::Mutable(idx) = &mut *h else {
+                panic!("应为可变索引")
+            };
+            let root = idx
+                .entries()
+                .iter()
+                .position(|e| e.parent == NO_PARENT && e.is_dir())
+                .expect("mounted_state 应含根目录条目") as u32;
+            idx.insert("hit_dir", root, true);
+            idx.insert("hit_file.txt", root, false);
+        }
+
+        for (sort, label) in [
+            (None, "relevance(补 stat miss)"),
+            (Some("size"), "size(缓存命中)"),
+        ] {
+            let resp = run_query(&state, "hit", 10, sort, false);
+            let Response::Query { entries, .. } = resp else {
+                panic!("{label} 应返回查询响应: {resp:?}");
+            };
+            assert_eq!(entries.len(), 2, "{label} 应命中目录与文件");
+            let dir_hit = entries
+                .iter()
+                .find(|e| e.name == "hit_dir")
+                .unwrap_or_else(|| panic!("{label} 缺目录命中"));
+            assert!(dir_hit.is_dir, "{label}: 目录命中 is_dir 应为 true");
+            let file_hit = entries
+                .iter()
+                .find(|e| e.name == "hit_file.txt")
+                .unwrap_or_else(|| panic!("{label} 缺文件命中"));
+            assert!(!file_hit.is_dir, "{label}: 文件命中 is_dir 应为 false");
+        }
     }
 
     /// 排除路径校验钉(tech.md 契约:必须为扫描根内绝对路径,否则拒绝)。

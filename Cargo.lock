@@ -248,6 +248,7 @@ dependencies = [
  "engine",
  "protocol",
  "rayon",
+ "tempfile",
 ]
 
 [[package]]

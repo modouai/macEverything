@@ -1307,6 +1307,15 @@ fn draw_file_icon_placeholder(p: &egui::Painter, rect: egui::Rect, name: &str, t
     );
 }
 
+/// 选中行动作提示（§2.4）：文件「打开」、目录「进入」。
+fn action_hint(is_dir: bool) -> &'static str {
+    if is_dir {
+        "进入"
+    } else {
+        "打开"
+    }
+}
+
 /// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
 /// 动作提示 12pt 仅选中行。悬停 = 选中态约 50% 强度；鼠标移动不改键盘选中。
 fn draw_result_row(
@@ -1386,12 +1395,11 @@ fn draw_result_row(
         .sense(egui::Sense::hover()),
     );
     if is_sel {
-        // 动作提示：文件「打开」/ 目录「进入」——协议无 `is_dir`，暂统一「打开」
-        // （见 plan 遗留：协议加 `is_dir` 后分流）。
+        // 动作提示：文件「打开」/ 目录「进入」（协议 HitEntry.is_dir 分流）。
         row_ui.painter().text(
             egui::pos2(rect.max.x - tk::ROW_PAD_X, rect.center().y),
             egui::Align2::RIGHT_CENTER,
-            "打开",
+            action_hint(e.is_dir),
             font(FONT_META),
             t.action_hint,
         );
@@ -1490,6 +1498,12 @@ mod tests {
     }
 
     #[test]
+    fn action_hint_dir_enters_file_opens() {
+        assert_eq!(action_hint(true), "进入", "目录动作提示应为「进入」");
+        assert_eq!(action_hint(false), "打开", "文件动作提示应为「打开」");
+    }
+
+    #[test]
     fn dir_display_strips_file_name() {
         assert_eq!(
             dir_display("/tmp/mce/Documents/季度报告.md"),
@@ -1555,6 +1569,7 @@ mod tests {
                 path: format!("/tmp/mce-probe/Documents/子目录/命中{i}.md"),
                 size: None,
                 mtime: None,
+                is_dir: false,
             })
             .collect()
     }

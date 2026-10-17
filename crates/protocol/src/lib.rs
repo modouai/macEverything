@@ -110,6 +110,10 @@ pub struct HitEntry {
     pub path: String,
     pub size: Option<u64>,
     pub mtime: Option<u64>,
+    /// 是否目录(动作提示「进入」/「打开」分流)。纯新增可选字段不 bump 协议
+    /// 版本:旧响应缺该键时缺省 false,按文件处理。
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -174,6 +178,7 @@ mod tests {
                 path: "/x/a.txt".into(),
                 size: Some(12),
                 mtime: None,
+                is_dir: false,
             }],
             total: 1,
             elapsed_ms: 0.8,
@@ -194,6 +199,36 @@ mod tests {
         let old_resp = br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0}"#;
         let p: Response = serde_json::from_slice(old_resp).unwrap();
         assert!(matches!(p, Response::Query { sort_echo, .. } if sort_echo.is_empty()));
+    }
+
+    /// is_dir 向后兼容钉:旧响应(无该键)必须可解码且缺省为文件(false);
+    /// 新响应经线上编码往返保留目录真值(true)。
+    #[test]
+    fn is_dir_field_backward_compatible() {
+        let old_resp = br#"{"msg":"query","entries":[{"name":"a.txt","path":"/x/a.txt","size":12,"mtime":null}],"total":1,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"relevance"}"#;
+        match serde_json::from_slice::<Response>(old_resp).unwrap() {
+            Response::Query { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert!(!entries[0].is_dir, "旧 JSON 缺 is_dir 应缺省为文件");
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+
+        let new_resp = Response::Query {
+            entries: vec![HitEntry {
+                name: "Documents".into(),
+                path: "/x/Documents".into(),
+                size: None,
+                mtime: None,
+                is_dir: true,
+            }],
+            total: 1,
+            elapsed_ms: 0.0,
+            stat_ms: 0.0,
+            sort_echo: "relevance".into(),
+        };
+        let bytes = encode(&new_resp).unwrap();
+        assert_eq!(decode_response(&bytes[4..]).unwrap(), new_resp);
     }
 
     /// desc 向后兼容钉:旧 JSON(无 desc;v1 形态与 8b 的 sort-only 形态)必须可

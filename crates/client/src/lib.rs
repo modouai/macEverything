@@ -78,8 +78,9 @@ pub fn expect_ok(resp: Response) -> Result<Response> {
 
 // —— 按需 stat 读取(daemon 在线查询与离线查询共用同一实现) ——
 
-/// 读单个路径的 (size, mtime);不存在或不可读返回 (None, None)。
-pub fn stat_of(path: &str) -> (Option<u64>, Option<u64>) {
+/// 读单个路径的 (size, mtime, is_dir);不存在或不可读返回 (None, None, false)。
+/// 一次 `metadata` 同时取三项,供 stat_rows 复用(不重复读文件系统)。
+fn stat_meta(path: &str) -> (Option<u64>, Option<u64>, bool) {
     match std::fs::metadata(path) {
         Ok(m) => (
             Some(m.len()),
@@ -87,12 +88,19 @@ pub fn stat_of(path: &str) -> (Option<u64>, Option<u64>) {
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs()),
+            m.is_dir(),
         ),
-        Err(_) => (None, None),
+        Err(_) => (None, None, false),
     }
 }
 
-/// 结果行的 size/mtime 并行读取;返回 (条目, 读取耗时毫秒)。
+/// 读单个路径的 (size, mtime);不存在或不可读返回 (None, None)。
+pub fn stat_of(path: &str) -> (Option<u64>, Option<u64>) {
+    let (size, mtime, _) = stat_meta(path);
+    (size, mtime)
+}
+
+/// 结果行的 size/mtime/is_dir 并行读取;返回 (条目, 读取耗时毫秒)。
 /// daemon 在线查询与离线查询共用(product 契约口径一致)。
 pub fn stat_rows(rows: Vec<(String, String)>) -> (Vec<HitEntry>, f64) {
     use rayon::prelude::*;
@@ -100,12 +108,13 @@ pub fn stat_rows(rows: Vec<(String, String)>) -> (Vec<HitEntry>, f64) {
     let entries: Vec<HitEntry> = rows
         .into_par_iter()
         .map(|(name, path)| {
-            let (size, mtime) = stat_of(&path);
+            let (size, mtime, is_dir) = stat_meta(&path);
             HitEntry {
                 name,
                 path,
                 size,
                 mtime,
+                is_dir,
             }
         })
         .collect();
@@ -376,5 +385,44 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
             message,
         }),
         other => bail!("意外响应: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// stat_rows 必须从同一次 metadata 同时填 size/mtime/is_dir:
+    /// 目录 true、文件 false、不存在路径缺省 false(size/mtime 为 None)。
+    #[test]
+    fn stat_rows_fills_is_dir_with_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let missing = dir.path().join("missing.txt");
+
+        let rows = vec![
+            ("sub".to_string(), sub.to_string_lossy().into_owned()),
+            ("file.txt".to_string(), file.to_string_lossy().into_owned()),
+            (
+                "missing.txt".to_string(),
+                missing.to_string_lossy().into_owned(),
+            ),
+        ];
+        let (entries, _) = stat_rows(rows);
+
+        let sub = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert!(sub.is_dir, "目录应标为 is_dir=true");
+
+        let file = entries.iter().find(|e| e.name == "file.txt").unwrap();
+        assert!(!file.is_dir, "文件应标为 is_dir=false");
+        assert_eq!(file.size, Some(5));
+        assert!(file.mtime.is_some(), "文件应取到 mtime");
+
+        let missing = entries.iter().find(|e| e.name == "missing.txt").unwrap();
+        assert!(!missing.is_dir, "不存在路径缺省按文件");
+        assert_eq!((missing.size, missing.mtime), (None, None));
     }
 }

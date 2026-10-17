@@ -103,6 +103,7 @@ pub fn execute_sorted(
 | Request::Query | 新增 `sort: Option<String>`(serde default) | 旧客户端缺省 → relevance;旧 daemon 忽略未知字段 |
 | Request::Query | 新增 `desc: Option<bool>`(serde default;**语义 = 反转自然方向**,非绝对升/降) | 缺省/false = 引擎自然方向(名升/大小升/mtime 降/路径升);旧 daemon 忽略 → 方向失效(Task 19 的 sort_echo 提示兜底) |
 | Response::Query | 新增 `sort_echo: String`(serde default 空串) | 旧客户端忽略;空串 = 旧 daemon(实际按 relevance) |
+| Response::Query | `HitEntry` 新增 `is_dir: bool`(serde default false) | 纯新增可选字段,不 bump v;旧客户端忽略该字段;旧 daemon 缺省 false(目录提示降级为「打开」,`open` 仍能进入);在线取索引真值、离线取当前 stat |
 
 (`stat_ms` 为 v1 已在协议中的字段,本版不含变更。)
 
