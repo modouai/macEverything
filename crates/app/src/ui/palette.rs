@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use crate::platform;
 use crate::session::{Fire, Session, SortKey, State};
+use crate::ui::tokens as tk;
 use client::{DaemonPaths, StatusOutcome};
 use protocol::HitEntry;
 
@@ -59,55 +60,40 @@ pub const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(800);
 /// ghost 态(可见但未聚焦)探帧间隔:该态下点击面板外不产生聚焦事件,
 /// 靠全局鼠标键状态识别,须低延迟轮询;该态通常只在豁免后的常驻期短暂存在。
 pub const GHOST_POLL: Duration = Duration::from_millis(150);
-/// 悬浮条窗口宽度(与中央视口创建处的 ViewportBuilder 一致)。
-/// 2026-10-16 辉哥实机反馈「窗口偏小」:600 → 720。
-pub const PANEL_W: f32 = 720.0;
-/// 初始/复位窗口高(空态:仅输入行;也是面板高动画的起点)。
-/// = 2×`PANEL_PAD_Y`(10) + `INPUT_H`(32) + 描边 2(描边画在面板矩形内侧,
-/// 与自然高算式同一个 2,见 `draw` 自绘背景)= 54。2026-10-16:44 → 54(上下留白)。
-pub const INITIAL_H: f32 = 54.0;
+/// 悬浮条窗口宽度（与中央视口创建处的 ViewportBuilder 一致；visual.md §2.2 = 700）。
+pub const PANEL_W: f32 = tk::PANEL_W;
+/// 初始/复位窗口高 = 空态面板高（搜索行 + 空态区 + 页脚；visual.md §2.7 = 176）。
+/// 也是面板高过渡的起点（唤起首帧不缩放）。
+pub const INITIAL_H: f32 = tk::panel_h(tk::list_h(0));
 
 // ---------------------------------------------------------------------------
-// 字号档(悬浮条用;全局基准 +2 号在 ui/mod.rs::install_base_text_styles)
-//
-// 单点定义:未来「自定义字号」设置项(v2.1 候选)改这几处常量即可。输入框与
-// 结果行用比全局 Body(15)更大的放大档(辉哥 2026-10-16 定:输入框 17、
-// 结果行 16、目录灰字 13、计数/角标 12)。
-/// 输入框字号。
-pub const FONT_INPUT: f32 = 17.0;
-/// 结果行文件名。
-pub const FONT_ROW: f32 = 16.0;
-/// 结果行目录灰字。
-pub const FONT_DIR: f32 = 13.0;
-/// 计数行 / 状态角标 / 空态。
-pub const FONT_META: f32 = 12.0;
+// 字号（visual.md §4.3；数值真源 = token 层，本文件禁散落色值/字号）
+/// 查询文本（21pt）。
+const FONT_INPUT: f32 = tk::FONT_QUERY;
+/// 结果行文件名（15pt）。
+const FONT_ROW: f32 = tk::FONT_FILENAME;
+/// 结果行所在目录（12pt）。
+const FONT_DIR: f32 = tk::FONT_DIR;
+/// 页脚标签 / 结果计数 / 动作提示（12pt）。
+const FONT_META: f32 = tk::FONT_HINT;
+/// 键帽 / 状态角标（11pt）。
+const FONT_KEYCAP: f32 = tk::FONT_KEYCAP;
 
-/// 结果行/输入框字号(proportional;供 RichText/TextEdit 直接引用)。
+/// 结果行/输入框字号（proportional；供 RichText/TextEdit 直接引用）。
 fn font(size: f32) -> egui::FontId {
     egui::FontId::proportional(size)
 }
 
-/// 首查按协议上限请求一次(product §1 分页语义:不重查、不翻页请求)。
+/// 首查按协议上限请求一次（product §1 分页语义：不重查、不翻页请求）。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
-/// 列表初始渲染行数与滚到底增量(product §1:初始 20 行,滚到底 +20)。
+/// 列表初始渲染行数与滚到底增量（product §1：初始 20 行，滚到底 +20）。
 const ROWS_INITIAL: usize = 20;
 const ROWS_STEP: usize = 20;
-/// 列表区最大高度(行数少时收缩到内容高;超出滚动)。
-const LIST_MAX_H: f32 = 322.0;
-/// 排版区放开上限(px):面板内容最大高 ≈ 内外边距 + 输入行 + 间距 + `LIST_MAX_H`
-/// + 计数行 ≈ 410,取富余值。仅用于布局区(与窗高解耦),不作窗口高输出。
+/// 滚动区行区最大高 = 6 行（不含结果区上下内边距；超出滚动；visual.md §2.2
+/// 「结果区高 = 行数×56 + (行数−1)×2 + 16」——16 即上下内边距，单独加）。
+const LIST_MAX_H: f32 = tk::list_h(6) - 2.0 * tk::LIST_PAD_V;
+/// 排版区放开上限（px）：仅用于布局区（与窗高解耦），不作窗口高输出。
 const PANEL_MAX_H: f32 = 4096.0;
-/// 面板四周内边距(左右, 上下);`INITIAL_H` = 2×上下内边距 + 输入行高。
-const PANEL_PAD_X: i8 = 14;
-const PANEL_PAD_Y: i8 = 10;
-/// 输入行(输入框)高度:17pt 文字 + 上下留白(文本内垂直居中)。
-const INPUT_H: f32 = 32.0;
-/// 面板圆角。
-const PANEL_RADIUS: u8 = 12;
-/// 结果行圆角(选中高亮块的柔和圆角)与行内边距(左右, 上下)。
-const ROW_RADIUS: u8 = 6;
-const ROW_PAD_X: i8 = 8;
-const ROW_PAD_Y: i8 = 3;
 
 /// 工作线程回投的查询结果。
 pub struct QueryResult {
@@ -545,48 +531,104 @@ impl PaletteState {
             egui::vec2(PANEL_W, clip_h),
         ));
         let bg_idx = ui.painter().add(egui::Shape::Noop);
-        let panel_fill = ui.visuals().window_fill;
-        let panel_stroke = ui.visuals().window_stroke;
+        // 设计 token（visual.md §四；本文件禁散落色值/字号）
+        let t = tk::palette(ui.visuals().dark_mode);
+        let panel_fill = t.panel_fill;
+        let panel_stroke = egui::Stroke::new(1.0, t.panel_stroke);
 
         let note = self.status_note.clone();
         let hotkey_note = self.hotkey_note.clone();
+        // 页脚所需（借 `self.input` 可变之前取值，避免与闭包内的 `self` 借用冲突）
+        let has_query = !self.input.is_empty();
+        let total = self.total;
         let input = &mut self.input;
         let mut at_bottom = false;
-        // 布局壳(内边距/宽度);填色描边归自绘背景,故 Frame 本体不带背景。
+        // 本帧「打开完整窗口」按钮被点击（画完在动作段消费）。
+        let mut btn_full = false;
+        // 布局壳（三段：搜索行 / 结果区 / 页脚；各段自带内边距，壳本身不加）。
+        // 填色描边归自绘背景，故 Frame 本体不带背景。
         let frame = egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(PANEL_PAD_X, PANEL_PAD_Y))
+            .inner_margin(egui::Margin::ZERO)
             .show(ui, |ui| {
-                // 内容宽 = 窗宽 - 左右边距 - 描边(内容所在位置与自绘背景一致:
-                // 背景矩形 0..PANEL_W,描边画在其内侧 1px)。
-                ui.set_width(PANEL_W - 2.0 * PANEL_PAD_X as f32 - 2.0);
-                // —— 输入行:输入框占满余宽,角标贴右 ——
-                // 定高子区(不可用 with_layout:其子区吃满剩余高度,行被垂直居中
-                // → 面板高度翻倍空半屏)。
+                // 内容宽 = 窗宽 − 描边 2（与自绘背景一致：描边画在内侧 1px）。
+                ui.set_width(PANEL_W - 2.0);
+                // 三段高按 token 精确拼装：段间不留 item_spacing（否则整段多垫 N×4px）。
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // —— 搜索行（高 64；右端为「打开完整窗口」按钮，右→左：按钮/角标/输入/图标）——
                 let row_w = ui.available_width();
                 let input_resp = ui
                     .allocate_ui_with_layout(
-                        egui::vec2(row_w, INPUT_H),
+                        egui::vec2(row_w, tk::SEARCH_H),
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if let Some(note) = &note {
-                                ui.label(egui::RichText::new(note).size(FONT_META).weak());
-                                ui.add_space(6.0);
+                            ui.spacing_mut().item_spacing.x = tk::SEARCH_GAP;
+                            ui.add_space(tk::SEARCH_PAD_X); // 右端内边距（右→左，先右后左）
+                                                            // 「打开完整窗口」按钮（28×28 圆角 7；静止态须一眼可见，§2.3）
+                            let (btn_rect, btn_resp) = ui.allocate_exact_size(
+                                egui::vec2(tk::BTN_SIZE, tk::BTN_SIZE),
+                                egui::Sense::click(),
+                            );
+                            let fill = if btn_resp.is_pointer_button_down_on() {
+                                t.btn_fill_hover.gamma_multiply(0.85)
+                            } else if btn_resp.hovered() {
+                                t.btn_fill_hover
+                            } else {
+                                t.btn_fill
+                            };
+                            ui.painter().rect_filled(
+                                btn_rect,
+                                egui::CornerRadius::same(tk::BTN_RADIUS),
+                                fill,
+                            );
+                            draw_open_full_icon(ui.painter(), btn_rect, t.btn_icon);
+                            if btn_resp.on_hover_text("在完整窗口中打开（⌥↵）").clicked()
+                            {
+                                btn_full = true;
                             }
-                            let w = ui.available_width();
-                            ui.add_sized(
-                                [w, INPUT_H],
+                            // 状态角标（非 ready 才有；落在按钮左侧，§2.6）
+                            if let Some(note) = &note {
+                                ui.label(
+                                    egui::RichText::new(note)
+                                        .size(FONT_KEYCAP)
+                                        .color(t.footer_label),
+                                );
+                            }
+                            // 查询区（占满余宽 − 图标 − 间距 − 左端内边距；空词只有光标）
+                            let w = (ui.available_width()
+                                - tk::SEARCH_ICON
+                                - tk::SEARCH_GAP
+                                - tk::SEARCH_PAD_X)
+                                .max(80.0);
+                            let input_resp = ui.add_sized(
+                                [w, tk::SEARCH_H],
                                 egui::TextEdit::singleline(input)
                                     .id_salt("palette-input")
                                     .font(font(FONT_INPUT))
-                                    // 文字垂直居中(同结果窗口;egui 0.37 主题的
-                                    // TextEdit align2 默认 LEFT_TOP,add_sized 拉高后贴顶
-                                    // —— 2026-10-16 实测两窗同病,一并显式居中)。
+                                    .text_color(t.query_text)
+                                    // 文字垂直居中（同结果窗口；egui 0.37 主题的 TextEdit
+                                    // align2 默认 LEFT_TOP，add_sized 拉高后贴顶）。
                                     .align(egui::Align2::LEFT_CENTER)
-                                    .hint_text("搜索文件…"),
-                            )
+                                    .hint_text(""),
+                            );
+                            // 搜索图标（20×20；自绘，§5.2 `search`）
+                            let (icon_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(tk::SEARCH_ICON, tk::SEARCH_ICON),
+                                egui::Sense::hover(),
+                            );
+                            draw_search_icon(ui.painter(), icon_rect, t.search_icon);
+                            ui.add_space(tk::SEARCH_PAD_X); // 左端内边距
+                            input_resp
                         },
                     )
                     .inner;
+                // 搜索行底分隔线（1px，§2.1）
+                let sep = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(sep.min, egui::vec2(PANEL_W - 2.0, tk::DIVIDER_H)),
+                    0,
+                    t.divider,
+                );
+                ui.add_space(tk::DIVIDER_H);
 
                 // —— 热键提示(Task 15;降级「已改用 X」/不可用;常驻不随唤起复位)——
                 if let Some(note) = &hotkey_note {
@@ -598,81 +640,72 @@ impl PaletteState {
                     );
                 }
 
-                // —— 结果列表 / 空态 / 计数行 ——
-                // 结果只在响应落地时整体替换(上一轮结果保留到新响应,减少高度动画
-                // 的目标变化次数);行数变化不再直接缩放窗口——高度由帧尾动画过渡
-                // (模块头注「面板高度」)。
+                // —— 结果区 / 空态（中段）——
+                // 结果只在响应落地时整体替换（上一轮结果保留到新响应，减少高度过渡的
+                // 目标变化次数）；行数变化由窗内平滑过渡（模块头注「面板高度」）。
                 if self.results.is_empty() {
-                    if matches!(self.session.state, State::Empty) {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("无匹配项").size(FONT_META).weak());
-                    }
+                    // 空态两屏（§2.7）：空词 / 无匹配项；区高 72、纵向居中、主副间距 4
+                    let (primary, secondary) = if matches!(self.session.state, State::Empty) {
+                        ("无匹配项", "换个关键词试试")
+                    } else {
+                        ("输入关键词开始搜索", "可搜文件名，也可搜路径")
+                    };
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), tk::EMPTY_H),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(tk::EMPTY_H / 2.0 - 19.0);
+                            ui.spacing_mut().item_spacing.y = tk::EMPTY_GAP;
+                            ui.label(egui::RichText::new(primary).size(14.0).color(t.file_name));
+                            ui.label(
+                                egui::RichText::new(secondary)
+                                    .size(FONT_DIR)
+                                    .color(t.dir_text),
+                            );
+                        },
+                    );
                 } else {
-                    ui.add_space(8.0);
+                    ui.add_space(tk::LIST_PAD_V);
                     let rows = self.results.len().min(self.visible_rows);
                     let results = &self.results;
                     let selected = self.selected;
                     let scroll_sel = self.scroll_to_selected;
                     let mut clicked: Option<usize> = None;
                     let out = egui::ScrollArea::vertical()
-                        .max_height(LIST_MAX_H) // 行数少时 auto_shrink 收缩到内容高
+                        .max_height(LIST_MAX_H) // 行数少时收缩到内容高
                         .id_salt("palette-list")
                         .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = tk::ROW_GAP;
                             for (i, e) in results.iter().take(rows).enumerate() {
                                 let is_sel = i == selected;
-                                let bg = if is_sel {
-                                    selection_fill(ui.visuals())
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                let row = egui::Frame::new()
-                                    .fill(bg)
-                                    .corner_radius(egui::CornerRadius::same(ROW_RADIUS))
-                                    .inner_margin(egui::Margin::symmetric(ROW_PAD_X, ROW_PAD_Y))
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 10.0;
-                                            ui.label(
-                                                egui::RichText::new(&e.name)
-                                                    .strong()
-                                                    .size(FONT_ROW),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(dir_display(&e.path))
-                                                        .size(FONT_DIR)
-                                                        .color(dir_text_color(ui.visuals())),
-                                                )
-                                                .truncate(),
-                                            );
-                                        });
-                                    });
-                                if row.response.interact(egui::Sense::click()).clicked() {
+                                let row = draw_result_row(ui, e, is_sel, &t);
+                                if row.clicked() {
                                     clicked = Some(i);
                                 }
                                 if is_sel && scroll_sel {
-                                    ui.scroll_to_rect(row.response.rect, None);
+                                    ui.scroll_to_rect(row.rect, None);
                                 }
                             }
                         });
                     if let Some(i) = clicked {
                         self.selected = i;
                     }
-                    // 滚到底 → 本地增量渲染(+20,至 K;不重查)
+                    // 滚到底 → 本地增量渲染（+20，至 K；不重查）
                     at_bottom = rows < self.results.len()
                         && out.state.clamped_offset().y + out.inner_rect.height()
                             >= out.content_size.y - 4.0;
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "共 {} 项 · 匹配 {:.1} ms · 读取 {:.1} ms",
-                            self.total, self.elapsed_ms, self.stat_ms
-                        ))
-                        .size(FONT_META)
-                        .weak(),
-                    );
+                    ui.add_space(tk::LIST_PAD_V);
                 }
+                // 结果区底分隔线（1px）
+                let sep = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(sep.min, egui::vec2(PANEL_W - 2.0, tk::DIVIDER_H)),
+                    0,
+                    t.divider,
+                );
+                ui.add_space(tk::DIVIDER_H);
+                // —— 页脚（高 38）——
+                draw_footer(ui, has_query, total, &t);
                 input_resp
             });
 
@@ -683,9 +716,10 @@ impl PaletteState {
         self.scroll_to_selected = false;
 
         // —— 高度:目标 = 自然高(贴合内容;过渡为窗内平滑,PoC-6 定案)——
-        // 自然高 = 内容高 + 上下内边距 + 描边 2(描边画在面板矩形内侧,与窗口几何
-        // 一致:窗高 = 自然高时面板恰好铺满窗)。
-        let natural_h = (frame.response.rect.height() + 2.0 * panel_stroke.width).max(INPUT_H);
+        // 自然高 = 三段内容高之和（搜索行 64 + 结果区 + 页脚 38 + 两条分隔线）。
+        // 描边画在面板矩形内侧 1px、叠在内容首尾像素上——与设计稿「面板高 466 =
+        // 64+1+362+1+38」同口径，故不再另加描边宽。
+        let natural_h = frame.response.rect.height().max(INITIAL_H);
         // 目标变更(或首次)→ 从当前绘制高起一段新过渡(中途再变即在现值上重起,不叠段)。
         // 静止(未在过渡且已贴合)不起空过渡——否则每帧白走一段 54→54,日志刷屏。
         let target_changed = self
@@ -732,7 +766,7 @@ impl PaletteState {
             bg_idx,
             egui::Shape::Rect(egui::epaint::RectShape::new(
                 egui::Rect::from_min_size(panel_origin, egui::vec2(PANEL_W, clip_h)),
-                egui::CornerRadius::same(PANEL_RADIUS),
+                egui::CornerRadius::same(tk::PANEL_RADIUS),
                 panel_fill,
                 panel_stroke,
                 egui::StrokeKind::Inside,
@@ -827,7 +861,11 @@ impl PaletteState {
 
         // —— 键位动作(在 TextEdit 处理完本帧事件之后:⌥↵ 取到最新输入词)——
         let mut action = None;
-        if keys.enter {
+        if btn_full {
+            // 搜索行右端按钮 ≡ ⌥↵（§2.3/§2.8）：打开完整窗口并带入当前查询词
+            self.full_window_request = Some(self.input.clone());
+            action = Some(Action::FullWindow);
+        } else if keys.enter {
             action = self.open_selected(false);
         } else if keys.cmd_enter {
             action = self.open_selected(true);
@@ -1201,18 +1239,195 @@ fn dir_display(path: &str) -> String {
     elide_middle(dir, 64)
 }
 
-/// 选中行高亮:主题 selection 色的柔和版(降不透明度),深浅主题通用——
-/// 直接铺 `selection.bg_fill` 是饱和蓝块,抢结果文字(2026-10-16 实机反馈)。
-fn selection_fill(visuals: &egui::Visuals) -> egui::Color32 {
-    let c = visuals.selection.bg_fill;
-    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 60)
+/// 文本宽度（页脚键帽/标签排版用）。
+fn text_w(ui: &egui::Ui, s: &str, size: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(s.to_owned(), font(size), egui::Color32::WHITE)
+        .size()
+        .x
 }
 
-/// 结果行目录灰字:`text_color` 降不透明度到「可读但不抢」。
-/// 不用 `weak()`:egui 默认 weak 档位过淡,叠加小字号后不可读(实机反馈)。
-fn dir_text_color(visuals: &egui::Visuals) -> egui::Color32 {
-    let c = visuals.text_color();
-    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150)
+/// 搜索图标（§5.2 `search`；圆 + 手柄）。
+fn draw_search_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6, color);
+    let c = rect.center() - egui::vec2(1.5, 1.5);
+    p.circle_stroke(c, 5.5, stroke);
+    p.line_segment([c + egui::vec2(4.0, 4.0), c + egui::vec2(8.0, 8.0)], stroke);
+}
+
+/// 「打开完整窗口」按钮图标（§5.2 `maximize-2`；对角双箭头）。
+fn draw_open_full_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let s = egui::Stroke::new(1.5, color);
+    let c = rect.center();
+    p.line_segment([c + egui::vec2(-1.0, 1.0), c + egui::vec2(5.0, -5.0)], s);
+    p.line_segment([c + egui::vec2(1.0, -5.0), c + egui::vec2(5.0, -5.0)], s);
+    p.line_segment([c + egui::vec2(5.0, -1.0), c + egui::vec2(5.0, -5.0)], s);
+    p.line_segment([c + egui::vec2(1.0, -1.0), c + egui::vec2(-5.0, 5.0)], s);
+    p.line_segment([c + egui::vec2(-1.0, 5.0), c + egui::vec2(-5.0, 5.0)], s);
+    p.line_segment([c + egui::vec2(-5.0, 1.0), c + egui::vec2(-5.0, 5.0)], s);
+}
+
+/// 结果行图标位（32×32 裸放）。**占位**：Task 5 换 `NSWorkspace` 系统真实图标
+/// （§2.4「文件图标走系统真实图标」）；此处仅取扩展名示意，避免空槽。
+fn draw_file_icon_placeholder(p: &egui::Painter, rect: egui::Rect, name: &str, t: &tk::Palette) {
+    p.rect_filled(rect, egui::CornerRadius::same(6), t.divider);
+    let ext = match name.rsplit_once('.') {
+        Some((_, e)) if !e.is_empty() => e.to_uppercase(),
+        _ => "·".to_string(),
+    };
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ext,
+        font(FONT_KEYCAP),
+        t.dir_text,
+    );
+}
+
+/// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
+/// 动作提示 12pt 仅选中行。悬停 = 选中态约 50% 强度；鼠标移动不改键盘选中。
+fn draw_result_row(
+    ui: &mut egui::Ui,
+    e: &HitEntry,
+    is_sel: bool,
+    t: &tk::Palette,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), tk::ROW_H),
+        egui::Sense::click(),
+    );
+    let bg = if is_sel {
+        t.row_selected
+    } else if resp.hovered() {
+        t.row_selected.gamma_multiply(0.5)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    // 行内绘制放子 Ui：`Ui::put` 会把**父**游标回退到放置矩形（实测每行被吃 6px，
+    // 直接吃穿 §2.2 的行高推导）。子 Ui 的游标独立，父游标停在 `allocate_exact_size`。
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    row_ui
+        .painter()
+        .rect_filled(rect, egui::CornerRadius::same(tk::ROW_RADIUS), bg);
+    let icon = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.min.x + tk::ROW_PAD_X,
+            rect.center().y - tk::ROW_ICON / 2.0,
+        ),
+        egui::vec2(tk::ROW_ICON, tk::ROW_ICON),
+    );
+    draw_file_icon_placeholder(row_ui.painter(), icon, &e.name, t);
+    let name_c = if is_sel {
+        t.file_name_selected
+    } else {
+        t.file_name
+    };
+    let tx = icon.max.x + tk::ROW_INNER_GAP;
+    let hint_w = if is_sel { 40.0 } else { 0.0 };
+    let right = rect.max.x - tk::ROW_PAD_X - hint_w - 6.0;
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(tx, rect.center().y - 19.0),
+        egui::pos2(right, rect.center().y - 1.0),
+    );
+    let dir_rect = egui::Rect::from_min_max(
+        egui::pos2(tx, rect.center().y + 2.0),
+        egui::pos2(right, rect.center().y + 19.0),
+    );
+    let _ = row_ui.put(
+        name_rect,
+        egui::Label::new(egui::RichText::new(&e.name).size(FONT_ROW).color(name_c))
+            .truncate()
+            .sense(egui::Sense::hover()),
+    );
+    let _ = row_ui.put(
+        dir_rect,
+        egui::Label::new(
+            egui::RichText::new(dir_display(&e.path))
+                .size(FONT_DIR)
+                .color(t.dir_text),
+        )
+        .truncate()
+        .sense(egui::Sense::hover()),
+    );
+    if is_sel {
+        // 动作提示：文件「打开」/ 目录「进入」——协议无 `is_dir`，暂统一「打开」
+        // （见 plan 遗留：协议加 `is_dir` 后分流）。
+        row_ui.painter().text(
+            egui::pos2(rect.max.x - tk::ROW_PAD_X, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "打开",
+            font(FONT_META),
+            t.action_hint,
+        );
+    }
+    resp
+}
+
+/// 页脚（§2.5）：高 38 / 内边距 16；左结果计数（空词隐藏），右四组键位提示
+/// （右→左：隐藏 / 完整窗口 / 访达 / 打开；窄屏按「隐藏 > 完整窗口 > 访达」裁减，
+/// 至少保留「打开」）。
+fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), tk::FOOTER_H),
+        egui::Sense::hover(),
+    );
+    let p = ui.painter();
+    p.rect_filled(rect, 0, t.footer_fill);
+    let groups: [(&str, &str); 4] = [
+        ("隐藏", "esc"),
+        ("完整窗口", "⌥↵"),
+        ("访达", "⌘↵"),
+        ("打开", "↵"),
+    ];
+    let mut cursor = rect.max.x - tk::FOOTER_PAD_X;
+    for (gi, (label, key)) in groups.iter().enumerate() {
+        let kw = text_w(ui, key, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
+        let lw = text_w(ui, label, FONT_META);
+        let gw = lw + tk::KEYCAP_GAP + kw;
+        let last = gi == groups.len() - 1;
+        // 窄屏裁减：为左端计数预留 120px；「打开」无论如何保留
+        if !last && cursor - gw < rect.min.x + 120.0 {
+            break;
+        }
+        let chip = egui::Rect::from_center_size(
+            egui::pos2(cursor - kw / 2.0, rect.center().y),
+            egui::vec2(kw, 19.0),
+        );
+        p.rect_filled(
+            chip,
+            egui::CornerRadius::same(tk::KEYCAP_RADIUS),
+            t.keycap_fill,
+        );
+        p.text(
+            chip.center(),
+            egui::Align2::CENTER_CENTER,
+            *key,
+            font(FONT_KEYCAP),
+            t.keycap_text,
+        );
+        p.text(
+            egui::pos2(cursor - kw - tk::KEYCAP_GAP, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            *label,
+            font(FONT_META),
+            t.footer_label,
+        );
+        cursor -= gw + tk::FOOTER_GAP;
+    }
+    // 左：结果计数（空词隐藏；无匹配项显示「共 0 项」）
+    if has_query {
+        p.text(
+            egui::pos2(rect.min.x + tk::FOOTER_PAD_X, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("共 {total} 项"),
+            font(FONT_META),
+            t.footer_label,
+        );
+    }
 }
 
 /// 中间省略:超长取「前一半…后一半」(保留首尾信息)。
@@ -1452,7 +1667,7 @@ mod tests {
     /// (**行数取隔离索引实测命中数**),以 16ms 模拟帧间隔推进高度过渡,记录每帧
     /// 请求的窗口高 `last_h`。四个场景(0 命中冷启动 / 状态往返穿越 / 行数大波动 /
     /// 删字往返)逐段断言:整段单调、帧数在 120ms 内、同目标段零抽动、
-    /// 收敛精确贴合自然高(54 空输入 / 79 空态 / 317 八行 / 410 封顶)。
+    /// 收敛精确贴合自然高(176 空态 / 292 三行 / 350 四行 / 408 五行 / 466 封顶)。
     /// 突变验证:把 `h_ease` 改回逐帧原生 resize、或去掉空态滞后,本测试即红。
     #[test]
     fn typing_height_sequence_is_smooth_and_fits_content() {
@@ -1499,14 +1714,18 @@ mod tests {
         // 预期:无旧结果 → 空态立即落定,平滑塌到「无匹配项」行高(79);后续键零变化。
         let (_, first) = type_char(&mut st, &mut seq, "z");
         assert_smooth(&first, true); // 无旧结果:空态立即落定(平滑塌到 79)
-        assert_eq!(*first.last().unwrap(), 79.0, "S1 首字落空态 79px:{first:?}");
+        assert_eq!(
+            *first.last().unwrap(),
+            176.0,
+            "S1 首字落空态 176px:{first:?}"
+        );
         for ch in ["z", "q", "q", "x", "x"] {
             let (framed, resp) = type_char(&mut st, &mut seq, ch);
             assert!(
                 framed
                     .iter()
                     .chain(resp.iter())
-                    .all(|h| (h - 79.0).abs() < 0.5),
+                    .all(|h| (h - 176.0).abs() < 0.5),
                 "S1 空态持续期零抽动({ch}):{framed:?}/{resp:?}"
             );
         }
@@ -1528,7 +1747,7 @@ mod tests {
         let (_, f) = type_char(&mut st, &mut seq, "湖"); // 28 行
         assert_smooth(&f, true);
         let h_cap = *f.last().unwrap();
-        assert_eq!(h_cap, 410.0, "28 行封顶自然高:{f:?}");
+        assert_eq!(h_cap, 466.0, "28 行封顶自然高:{f:?}");
         let (_, f) = type_char(&mut st, &mut seq, "北"); // 区域B 27 行
         assert!(
             f.iter().all(|h| (h - h_cap).abs() < 0.5),
@@ -1560,7 +1779,7 @@ mod tests {
         let down = probe_phase(&ctx, &mut st, &mut seq, "停手落定", vec![]);
         assert_smooth(&down, false);
         assert!(st.results.is_empty(), "停手后切空态");
-        assert_eq!(*down.last().unwrap(), 79.0, "空态贴合:{down:?}");
+        assert_eq!(*down.last().unwrap(), 176.0, "空态贴合:{down:?}");
         for _ in 0..4 {
             probe_phase(&ctx, &mut st, &mut seq, "退格", backspace());
         }
@@ -1576,7 +1795,7 @@ mod tests {
         let (_, f) = type_char(&mut st, &mut seq, "省"); // 区域B省 3 行:大波动实时跟
         assert_smooth(&f, false);
         let h3b = *f.last().unwrap();
-        assert!(h3b < 200.0 && h3b > 79.0, "28→3 行大波动实时平滑收拢:{f:?}");
+        assert_eq!(h3b, 292.0, "28→3 行即时平滑收拢到 3 行自然高:{f:?}");
         // 停手后零高度变化事件(验收口径「输入完成后无额外动作」)
         probe_settle_input(&mut st);
         let idle = probe_phase(&ctx, &mut st, &mut seq, "停手静置", vec![]);
@@ -1586,12 +1805,13 @@ mod tests {
         );
 
         // ================= S3b 行数小波动(无死区:每档同样走 120ms 平滑)=================
-        // 预期:8→7→6→4 行每档都平滑跟随到各自自然高,且**每档恰 1 次原生 resize**。
+        // 预期:6→5→4→3 行每档都平滑跟随到各自自然高,且**每档恰 1 次原生 resize**
+        // (8/7/6 行同封顶 466,无高度变化,不入本段)。
         probe_refire(&mut st);
-        probe_respond(&mut st, 8);
-        let base = probe_phase(&ctx, &mut st, &mut seq, "合 8 行", vec![]);
+        probe_respond(&mut st, 6);
+        let base = probe_phase(&ctx, &mut st, &mut seq, "合 6 行", vec![]);
         let h8 = *base.last().unwrap();
-        for rows in [7usize, 6, 4] {
+        for rows in [5usize, 4, 3] {
             probe_refire(&mut st);
             probe_respond(&mut st, rows);
             let r0 = st.h_resizes;
@@ -1634,17 +1854,51 @@ mod tests {
         assert_eq!(*clear.last().unwrap(), INITIAL_H, "清空回 54:{clear:?}");
 
         println!("—— 验收矩阵小结(预期 vs 实测;命中数取自隔离索引实测)——");
-        println!("S1 zzqqxx(0 命中,冷启动)      预期 空态立即落定 79px        实测 79px");
+        println!("S1 zzqqxx(0 命中,冷启动)      预期 空态立即落定 176px       实测 176px");
         println!("S2 湖28→区域B27→区域B报24→区域B省3 预期 封顶段零变化/3 行即时收拢   实测 {h_cap:.0}/{h_cap:.0}/{h_cap:.0}/{h_3:.0}");
-        println!("S2 区域B省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 79  实测 79px");
+        println!("S2 区域B省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 176 实测 176px");
         println!("S3 湖28→区域B省3(大波动)     预期 即时平滑收拢(120ms)         实测 {h_3:.1}px");
         println!(
             "S4 区域B省3→(删)区域B27→湖28    预期 实时平滑扩张回封顶           实测 {h_cap:.0}px"
         );
-        println!("S4 全删(空输入)             预期 立即回输入行高 54            实测 54px");
+        println!("S4 全删(空输入)             预期 落空态面板高 176             实测 176px");
         println!("—— 逐帧高度序列(输入=当前词 · 结果=行数 · 窗高) ——");
         for (tag, input, rows, h) in &seq {
             println!("{tag:<26} 输入={input:<10} 结果={rows:<3} 窗高={h:.0}px");
+        }
+    }
+
+    /// 钉住：行数 → 面板高映射（visual.md §2.2 高度推导：0/1 行 176（72 空态区），
+    /// 2 行起每多一行 +58，6 行封顶 466）。
+    #[test]
+    fn panel_height_per_row_count() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        let mut seq: Vec<(String, String, usize, f32)> = Vec::new();
+        for _ in 0..2 {
+            probe_frame(&ctx, &mut st, vec![]);
+        }
+        probe_phase(&ctx, &mut st, &mut seq, "打字", vec![probe_commit("湖")]);
+        let mut got: Vec<(usize, f32)> = Vec::new();
+        for rows in [1usize, 2, 3, 4, 5, 6, 8] {
+            probe_refire(&mut st);
+            probe_respond(&mut st, rows);
+            let f = probe_phase(&ctx, &mut st, &mut seq, &format!("合 {rows} 行"), vec![]);
+            got.push((rows, *f.last().unwrap()));
+        }
+        for (rows, h) in &got {
+            println!("rows={rows} → 面板高 {h}");
+        }
+        for (rows, h) in got {
+            let expect = tk::panel_h(tk::list_h(rows.min(6)));
+            assert_eq!(h, expect, "{rows} 行面板高不符 §2.2 推导（实测 {h}）");
         }
     }
 

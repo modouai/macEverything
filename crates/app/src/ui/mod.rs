@@ -64,6 +64,7 @@ pub mod menu_actions;
 pub mod palette;
 pub mod results;
 pub mod theme;
+pub mod tokens;
 
 use eframe::egui;
 use std::sync::mpsc::Receiver;
