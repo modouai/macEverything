@@ -54,9 +54,9 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 
 ## Task 2: 搜索行
 
-- [ ] **Step 1:** 高 52、左右 16；搜索框占满（宽 −32）、高 36、圆角 8、底/字/图标取 token、内边距 [0,14]、子间距 10；搜索图标 16×16；查询文本 14pt；原生光标。
-- [ ] **Step 2:** 聚焦/悬停不引入设计稿外的粗描边；IME 与现有 query 流程不动。
-- [ ] **Step 3:** `<check>`。
+- [x] **Step 1:** 高 52、左右 16；搜索框占满（宽 −32）、高 36、圆角 8、底/字/图标取 token、内边距 [0,14]、子间距 10；搜索图标 16×16；查询文本 14pt；原生光标。
+- [x] **Step 2:** 聚焦/悬停不引入设计稿外的粗描边；IME 与现有 query 流程不动。空词保留 hint「搜索文件…」（egui 0.37 hint 色不可 token 化，自绘）；§2.7 的「空词只有光标」属悬浮条口径，完整窗口不适用。
+- [x] **Step 3:** `<check>`。
 
 ## Task 3: 表头 + 表格（自定义虚拟化）
 
@@ -71,7 +71,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 ## Task 4: 状态栏 + 空态
 
 - [ ] **Step 1:** 状态栏高 28、左右 16、子间距 16、11pt；左状态文本（N 项 · 匹配 X ms · 读取 Y ms · 索引状态；离线生成时刻；截断「展示前 K 条」）；右侧缺口徽标圆角 6、内边距 [3,10]、警示图标 12 + 文本 11；点击展开缺口面板（保留现有行为）。
-- [ ] **Step 2:** 空态：Idle / EngineStarting / Offline / Empty / Warming 按 §3.7 与 §2.7 文案，表格区居中主/副文案，结构不塌陷；搜索框空词只有光标。
+- [ ] **Step 2:** 空态：Idle / EngineStarting / Offline / Empty / Warming 按 §3.7 与 §2.7 文案，表格区居中主/副文案，结构不塌陷；搜索框空词保留 hint（见 Task 2）。
 - [ ] **Step 3:** `<check>`。
 
 ## Task 5: 验收
