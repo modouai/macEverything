@@ -61,8 +61,13 @@ pub const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(800);
 /// ghost 态(可见但未聚焦)探帧间隔:该态下点击面板外不产生聚焦事件,
 /// 靠全局鼠标键状态识别,须低延迟轮询;该态通常只在豁免后的常驻期短暂存在。
 pub const GHOST_POLL: Duration = Duration::from_millis(150);
-/// 悬浮条窗口宽度（与中央视口创建处的 ViewportBuilder 一致；visual.md §2.2 = 700）。
+/// 悬浮条窗口**最大**宽度（视口创建处的 ViewportBuilder 用；visual.md §2.2 = 700）。
+/// 实际面板宽由 `PaletteState::panel_w` 决定（唤起时按屏回填，窄屏收窄）。
 pub const PANEL_W: f32 = tk::PANEL_W;
+/// 窄屏宽度下限（visual.md §1.1：`min(700, 可见宽−48)`，下限 480）。
+pub const PANEL_MIN_W: f32 = crate::platform::PALETTE_MIN_W as f32;
+/// 宽度策略单源：平台层上限 = UI 面板最大宽（防 700 两处漂移；Task 11）。
+const _: () = assert!(crate::platform::PALETTE_MAX_W as f32 == tk::PANEL_W);
 /// 初始/复位窗口高 = 空态面板高（搜索行 + 空态区 + 页脚；visual.md §2.7 = 176）。
 /// 也是面板高过渡的起点（唤起首帧不缩放）。
 pub const INITIAL_H: f32 = tk::panel_h(tk::list_h(0));
@@ -81,8 +86,23 @@ const FONT_META: f32 = tk::FONT_HINT;
 const FONT_KEYCAP: f32 = tk::FONT_KEYCAP;
 /// 状态角标 chip 最大宽（px）：超长错误文案不得挤爆搜索行。
 const BADGE_MAX_W: f32 = 240.0;
-/// 状态角标文本最大宽（chip 宽 − 左右内边距）；宽度按 `text_w` 实测截断。
-const BADGE_TEXT_MAX_W: f32 = BADGE_MAX_W - 2.0 * tk::KEYCAP_PAD.1;
+/// 搜索行输入框下限（px）：角标挤压时的底线（与布局 `.max` 同源）。
+const SEARCH_INPUT_MIN_W: f32 = 80.0;
+/// 搜索行除角标外的固定占用（px；按右→左布局实际推进核算）：
+/// 左右内边距 40 + 按钮 28 + 形象净空 128 + 三处 item_spacing 42
+/// + 搜索图标 20 + 输入框下限 80 = 338。
+const SEARCH_ROW_FIXED_W: f32 = 2.0 * tk::SEARCH_PAD_X
+    + tk::BTN_SIZE
+    + tk::MASCOT_CLEAR_W
+    + 3.0 * tk::SEARCH_GAP
+    + tk::SEARCH_ICON
+    + SEARCH_INPUT_MIN_W;
+
+/// 搜索行角标 chip 可用宽：面板宽 − 固定占用（clamp 到 [0, `BADGE_MAX_W`]）。
+/// 窄屏（480）下为 142；超长错误文案按此收窄，不挤掉输入框下限。
+fn search_row_badge_max_w(panel_w: f32) -> f32 {
+    (panel_w - SEARCH_ROW_FIXED_W).clamp(0.0, BADGE_MAX_W)
+}
 
 /// 结果行/输入框字号（proportional；供 RichText/TextEdit 直接引用）。
 fn font(size: f32) -> egui::FontId {
@@ -192,6 +212,16 @@ pub enum Action {
     FullWindow,
 }
 
+/// headless 测试探针:搜索行关键矩形(输入/图标左缘、角标 chip 宽、面板左缘)。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct SearchRowProbe {
+    panel_left: f32,
+    input_left: f32,
+    icon_left: f32,
+    badge_w: f32,
+}
+
 /// 悬浮条状态与查询会话。
 pub struct PaletteState {
     pub session: Session,
@@ -237,6 +267,11 @@ pub struct PaletteState {
     last_focused: Option<bool>,
     /// selected 变更后把该行滚入可见区。
     scroll_to_selected: bool,
+    /// 当前面板宽(唤起时按屏幕回填;`PANEL_W` = 最大宽/非窄屏)。
+    panel_w: f32,
+    /// 测试探针:最近一帧搜索行关键矩形(headless 越界断言用;生产不编译)。
+    #[cfg(test)]
+    search_probe: Option<SearchRowProbe>,
     /// 已下发的窗口高度(`send_h` 记账;探针与测试读它)。
     last_h: Option<f32>,
     /// 面板高过渡:当前绘制高(窗高单位,含内边距与描边)。
@@ -340,6 +375,9 @@ impl PaletteState {
             focus_pending_since: None,
             last_focused: None,
             scroll_to_selected: false,
+            panel_w: PANEL_W,
+            #[cfg(test)]
+            search_probe: None,
             last_h: None,
             anim_h: INITIAL_H,
             h_anim: None,
@@ -359,6 +397,12 @@ impl PaletteState {
     /// 唤起打点(首帧计时起点;`ui::palette_show` 调用)。
     pub fn on_shown(&mut self, now: Instant) {
         self.show_at = Some(now);
+    }
+
+    /// 唤起时按屏幕回填面板宽(平台层实际落地宽;防御 clamp 到 [480, PANEL_W])。
+    /// 须在 `reset` 前调用——reset 内的 `send_h(INITIAL_H)` 以本宽下发。
+    pub fn set_panel_width(&mut self, w: f32) {
+        self.panel_w = w.clamp(PANEL_MIN_W, PANEL_W);
     }
 
     /// 每次唤起/隐藏后复位(product §1:重复唤起居输入清空,每次都是全新查询)。
@@ -398,7 +442,7 @@ impl PaletteState {
     fn send_h(&mut self, h: f32) {
         self.ctx.send_viewport_cmd_to(
             self.viewport,
-            egui::ViewportCommand::InnerSize(egui::vec2(PANEL_W, h)),
+            egui::ViewportCommand::InnerSize(egui::vec2(self.panel_w, h)),
         );
         self.last_h = Some(h);
         self.h_resizes += 1;
@@ -515,6 +559,8 @@ impl PaletteState {
     /// 绘制悬浮条;返回交上层的动作。
     pub fn draw(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let ctx = ui.ctx().clone();
+        // 当前面板宽(唤起时按屏回填;窄屏收窄,最大 PANEL_W)。
+        let panel_w = self.panel_w;
         // 图标:drain 工作线程响应 + 限量上传纹理(取图/解码在工作线程,不阻塞本帧)。
         self.icons.begin_frame(&ctx);
         // 首程诊断打点(唤起后 1.5s 内逐帧留痕,之后停;常态零开销):
@@ -626,7 +672,7 @@ impl PaletteState {
         };
         ui.set_clip_rect(egui::Rect::from_min_size(
             panel_origin,
-            egui::vec2(PANEL_W, clip_h),
+            egui::vec2(panel_w, clip_h),
         ));
         let bg_idx = ui.painter().add(egui::Shape::Noop);
         // 设计 token（visual.md §四；本文件禁散落色值/字号）
@@ -646,13 +692,17 @@ impl PaletteState {
         let mut at_bottom = false;
         // 本帧「打开完整窗口」按钮被点击（画完在动作段消费）。
         let mut btn_full = false;
+        // 测试探针：搜索行关键矩形（生产构建不编译）。
+        #[cfg(test)]
+        let mut search_probe: Option<SearchRowProbe> = None;
         // 布局壳（三段：搜索行 / 结果区 / 页脚；各段自带内边距，壳本身不加）。
         // 填色描边归自绘背景，故 Frame 本体不带背景。
         let frame = egui::Frame::new()
             .inner_margin(egui::Margin::ZERO)
             .show(ui, |ui| {
-                // 内容宽 = 窗宽 − 描边 2（与自绘背景一致：描边画在内侧 1px）。
-                ui.set_width(PANEL_W - 2.0);
+                // 内容宽 = 面板宽（Task 11：描边画在内侧 1px，不再从内容宽里扣 2；
+                // 右侧 20 内边距与按钮位置按设计稿落在面板右缘内侧）。
+                ui.set_width(panel_w);
                 // 三段高按 token 精确拼装：段间不留 item_spacing（否则整段多垫 N×4px）。
                 ui.spacing_mut().item_spacing.y = 0.0;
                 // —— 搜索行（高 64；右端为「打开完整窗口」按钮，右→左：
@@ -693,9 +743,20 @@ impl PaletteState {
                             // 状态角标（非 ready 才有；落在按钮左侧，§2.6）：
                             // 形制与键帽同族（圆角 4 / 上下 3 左右 6 / 11pt，
                             // 高 = KEYCAP_H），底色与文字色按强调度取 token。
+                            // 可用宽随面板宽收窄（窄屏 480 下 142）：超长文案先按
+                            // 实测宽截断，不挤掉输入框下限（见 `search_row_badge_max_w`）。
+                            #[cfg(test)]
+                            let mut badge_w = 0.0_f32;
                             if let Some(badge) = &note {
-                                let text = badge_text_fit(ui, &badge.text, BADGE_TEXT_MAX_W);
-                                let w = text_w(ui, &text, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
+                                let chip_max_w = search_row_badge_max_w(panel_w);
+                                let text_max_w = (chip_max_w - 2.0 * tk::KEYCAP_PAD.1).max(0.0);
+                                let text = badge_text_fit(ui, &badge.text, text_max_w);
+                                let w = (text_w(ui, &text, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1)
+                                    .min(chip_max_w);
+                                #[cfg(test)]
+                                {
+                                    badge_w = w;
+                                }
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(w, tk::KEYCAP_H),
                                     egui::Sense::hover(),
@@ -720,7 +781,7 @@ impl PaletteState {
                                 - tk::SEARCH_ICON
                                 - tk::SEARCH_GAP
                                 - tk::SEARCH_PAD_X)
-                                .max(80.0);
+                                .max(SEARCH_INPUT_MIN_W);
                             let input_resp = ui.add_sized(
                                 [w, tk::SEARCH_H],
                                 egui::TextEdit::singleline(input)
@@ -740,6 +801,15 @@ impl PaletteState {
                                 egui::Sense::hover(),
                             );
                             draw_search_icon(ui.painter(), icon_rect, t.search_icon);
+                            #[cfg(test)]
+                            {
+                                search_probe = Some(SearchRowProbe {
+                                    panel_left: panel_origin.x,
+                                    input_left: input_resp.rect.left(),
+                                    icon_left: icon_rect.left(),
+                                    badge_w,
+                                });
+                            }
                             ui.add_space(tk::SEARCH_PAD_X); // 左端内边距
                             input_resp
                         },
@@ -748,7 +818,7 @@ impl PaletteState {
                 // 搜索行底分隔线（1px，§2.1）
                 let sep = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(
-                    egui::Rect::from_min_size(sep.min, egui::vec2(PANEL_W - 2.0, tk::DIVIDER_H)),
+                    egui::Rect::from_min_size(sep.min, egui::vec2(panel_w - 2.0, tk::DIVIDER_H)),
                     0,
                     t.divider,
                 );
@@ -810,8 +880,15 @@ impl PaletteState {
                             for (i, e) in results.iter().take(rows).enumerate() {
                                 let is_sel = i == selected;
                                 let texture = icons.icon(ui.ctx(), e);
-                                let row =
-                                    draw_result_row(ui, e, is_sel, &t, panel_origin.x, texture);
+                                let row = draw_result_row(
+                                    ui,
+                                    e,
+                                    is_sel,
+                                    &t,
+                                    panel_origin.x,
+                                    panel_w,
+                                    texture,
+                                );
                                 if row.clicked() {
                                     clicked = Some(i);
                                 }
@@ -832,7 +909,7 @@ impl PaletteState {
                 // 结果区底分隔线（1px）
                 let sep = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(
-                    egui::Rect::from_min_size(sep.min, egui::vec2(PANEL_W - 2.0, tk::DIVIDER_H)),
+                    egui::Rect::from_min_size(sep.min, egui::vec2(panel_w - 2.0, tk::DIVIDER_H)),
                     0,
                     t.divider,
                 );
@@ -841,6 +918,10 @@ impl PaletteState {
                 draw_footer(ui, has_query, total, &t);
                 input_resp
             });
+        #[cfg(test)]
+        {
+            self.search_probe = search_probe;
+        }
 
         if at_bottom {
             self.visible_rows += ROWS_STEP;
@@ -899,7 +980,7 @@ impl PaletteState {
         ui.painter().set(
             bg_idx,
             egui::Shape::Rect(egui::epaint::RectShape::new(
-                egui::Rect::from_min_size(panel_origin, egui::vec2(PANEL_W, clip_h)),
+                egui::Rect::from_min_size(panel_origin, egui::vec2(panel_w, clip_h)),
                 egui::CornerRadius::same(tk::PANEL_RADIUS),
                 panel_fill,
                 panel_stroke,
@@ -1502,6 +1583,7 @@ fn draw_result_row(
     is_sel: bool,
     t: &tk::Palette,
     panel_x: f32,
+    panel_w: f32,
     texture: Option<egui::TextureId>,
 ) -> egui::Response {
     // 占位分配（只为拿滚动区的 y 与点击响应）。
@@ -1511,9 +1593,10 @@ fn draw_result_row(
     );
     // 行矩形按**面板坐标系**显式定位：滚动区内容 ui 的原点会被 egui 左移、
     // 宽度含滚动条余量（实测 min.x=-14 / 宽 712），不能拿它当行定位基准。
+    // 行宽随面板宽收窄（`panel_w − 2×LIST_SIDE_PAD`；最大宽即设计稿 684）。
     let rect = egui::Rect::from_min_size(
         egui::pos2(panel_x + tk::LIST_SIDE_PAD, slot.min.y),
-        egui::vec2(tk::ROW_W, tk::ROW_H),
+        egui::vec2(panel_w - 2.0 * tk::LIST_SIDE_PAD, tk::ROW_H),
     );
     let bg = if is_sel {
         t.row_selected
@@ -1762,8 +1845,12 @@ mod tests {
             .collect()
     }
 
-    /// 跑一帧(注入事件 → draw),返回本帧请求的窗口高度。
-    fn probe_frame(ctx: &egui::Context, st: &mut PaletteState, events: Vec<egui::Event>) -> f32 {
+    /// 跑一帧(注入事件 → draw),返回本帧请求的窗口高度与本帧视口命令。
+    fn probe_frame_with_commands(
+        ctx: &egui::Context,
+        st: &mut PaletteState,
+        events: Vec<egui::Event>,
+    ) -> (f32, Vec<egui::ViewportCommand>) {
         // 模拟 16ms 帧间隔:把进行中的过渡起点回拨一帧(时间基插值 → 一帧推进一步)。
         if let Some((from, to, t0)) = st.h_anim {
             st.h_anim = Some((from, to, t0 - PROBE_DT));
@@ -1774,7 +1861,7 @@ mod tests {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(PANEL_W, win_h),
+                egui::vec2(st.panel_w, win_h),
             )),
             events,
             ..Default::default()
@@ -1784,7 +1871,17 @@ mod tests {
             let _ = st.draw(ui);
         });
         out.textures_delta.clear(); // headless:不做纹理上传,清掉免得 Drop 告警
-        st.last_h.unwrap_or_default()
+        let commands = out
+            .viewport_output
+            .get(&st.viewport)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default();
+        (st.last_h.unwrap_or_default(), commands)
+    }
+
+    /// 跑一帧,只取窗口高(多数探针用)。
+    fn probe_frame(ctx: &egui::Context, st: &mut PaletteState, events: Vec<egui::Event>) -> f32 {
+        probe_frame_with_commands(ctx, st, events).0
     }
 
     /// 连续走帧到高度收敛(过渡完成 + 窗高两帧一致;上限防死循环),逐帧记入 seq。
@@ -2144,6 +2241,141 @@ mod tests {
         assert_eq!(st.natural_h, 466.0, "末态自然内容高应为封顶 466");
     }
 
+    /// 宽度回填 clamp(平台层已按屏计算;UI 侧防御到 [480, PANEL_W])。
+    #[test]
+    fn set_panel_width_clamps_to_bounds() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new_for_test(
+            ctx,
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        assert_eq!(st.panel_w, PANEL_W, "默认取最大宽");
+        st.set_panel_width(480.0);
+        assert_eq!(st.panel_w, 480.0);
+        st.set_panel_width(700.0);
+        assert_eq!(st.panel_w, 700.0);
+        st.set_panel_width(300.0);
+        assert_eq!(st.panel_w, 480.0, "低于下限按 480");
+        st.set_panel_width(900.0);
+        assert_eq!(st.panel_w, 700.0, "高于上限按 700");
+    }
+
+    /// 窄宽(480)headless 绘制:不 panic,自然高与最大宽一致(高度链与宽度解耦)。
+    #[test]
+    fn narrow_panel_width_keeps_natural_height() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new_for_test(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        st.set_panel_width(480.0);
+        for _ in 0..2 {
+            probe_frame(&ctx, &mut st, vec![]);
+        }
+        assert_eq!(st.panel_w, PANEL_MIN_W);
+        assert_eq!(st.natural_h, 176.0, "窄宽空态自然高仍为设计推导 176");
+        assert_eq!(st.last_h, Some(INITIAL_H), "高度下发不变");
+    }
+
+    /// 角标可用宽随面板宽收窄:480 下 142,700 下取 240 上限,极窄不为负。
+    #[test]
+    fn search_row_badge_max_w_follows_panel_width() {
+        assert_eq!(SEARCH_ROW_FIXED_W, 338.0, "固定占用须按布局实算");
+        assert_eq!(search_row_badge_max_w(480.0), 142.0);
+        assert_eq!(search_row_badge_max_w(700.0), BADGE_MAX_W);
+        assert_eq!(search_row_badge_max_w(SEARCH_ROW_FIXED_W), 0.0);
+        assert_eq!(search_row_badge_max_w(300.0), 0.0, "余量不足不为负");
+    }
+
+    /// 480 窄宽 + 长错误文案:角标按可用宽截断,输入框与搜索图标左缘不越界。
+    #[test]
+    fn narrow_panel_long_badge_keeps_search_row_inside() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new_for_test(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        st.set_panel_width(480.0);
+        for _ in 0..2 {
+            probe_frame(&ctx, &mut st, vec![]);
+        }
+        st.status_note = Some(Badge::error(format!(
+            "打开失败:{}",
+            "文件路径不存在或已被移动".repeat(8)
+        )));
+        probe_frame(&ctx, &mut st, vec![]);
+        let probe = st.search_probe.expect("搜索行布局探针应已记录");
+        let max_chip_w = search_row_badge_max_w(PANEL_MIN_W);
+        assert!(
+            probe.badge_w > 0.0 && probe.badge_w <= max_chip_w + 0.01,
+            "chip 宽 {} 超出可用宽 {max_chip_w}",
+            probe.badge_w
+        );
+        let left_pad = probe.panel_left + tk::SEARCH_PAD_X;
+        assert!(
+            probe.icon_left >= left_pad - 0.01,
+            "搜索图标左缘 {} 越出左内边距 {left_pad}",
+            probe.icon_left
+        );
+        assert!(
+            probe.input_left >= probe.icon_left + tk::SEARCH_ICON + tk::SEARCH_GAP - 0.01,
+            "输入框左缘 {} 压住搜索图标(左缘 {})",
+            probe.input_left,
+            probe.icon_left
+        );
+    }
+
+    /// 宽度回归网:set_panel_width(480) 后 reset 与高度变化下发的视口命令都是
+    /// InnerSize(480, …)。突变复核:把 `send_h` 宽度改回 `PANEL_W` 即红。
+    #[test]
+    fn narrow_width_survives_reset_and_height_change_commands() {
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new_for_test(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        for _ in 0..2 {
+            probe_frame(&ctx, &mut st, vec![]);
+        }
+        st.set_panel_width(480.0);
+        st.reset();
+        let (_, commands) = probe_frame_with_commands(&ctx, &mut st, vec![]);
+        assert!(
+            commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(
+                480.0, INITIAL_H
+            ))),
+            "reset 后首帧须按 480 宽下发:{commands:?}"
+        );
+        // 打字 → 注入 5 行响应 → 高度变化帧。
+        probe_frame(&ctx, &mut st, vec![probe_commit("湖")]);
+        probe_respond(&mut st, 5);
+        let (h, commands) = probe_frame_with_commands(&ctx, &mut st, vec![]);
+        let expect_h = tk::panel_h(tk::list_h(5));
+        assert_eq!(h, expect_h, "5 行自然高");
+        assert!(
+            commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(
+                480.0, expect_h
+            ))),
+            "高度变化后仍须以 480 宽下发:{commands:?}"
+        );
+    }
+
     /// 窗口高策略(PoC-6 定案):增长 = 首帧即撑到目标(恰 1 次原生 resize);
     /// 收缩 = 过渡期窗高不动、收敛帧收拢(恰 1 次)——过渡期零逐帧尺寸命令。
     /// 突变验证:把窗口高改回逐帧发(旧实现),本测试即红。
@@ -2316,17 +2548,19 @@ mod tests {
             )),
             ..Default::default()
         };
+        let max_chip_w = search_row_badge_max_w(PANEL_W);
+        let text_max_w = max_chip_w - 2.0 * tk::KEYCAP_PAD.1;
         let mut out = ctx.run_ui(raw, |ui| {
             let long = format!("打开失败:{}", "文件路径不存在或已被移动".repeat(8));
-            let fitted = badge_text_fit(ui, &long, BADGE_TEXT_MAX_W);
+            let fitted = badge_text_fit(ui, &long, text_max_w);
             assert!(fitted.ends_with('…'), "超长文本应截断并补省略号:{fitted}");
             let chip_w = text_w(ui, &fitted, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
             assert!(
-                chip_w <= BADGE_MAX_W,
-                "chip 宽 {chip_w} 超过上限 {BADGE_MAX_W}"
+                chip_w <= max_chip_w,
+                "chip 宽 {chip_w} 超过上限 {max_chip_w}"
             );
             // 短文本不截断。
-            assert_eq!(badge_text_fit(ui, "补齐中", BADGE_TEXT_MAX_W), "补齐中");
+            assert_eq!(badge_text_fit(ui, "补齐中", text_max_w), "补齐中");
         });
         out.textures_delta.clear(); // headless：不做纹理上传，清掉免得 Drop 告警
     }

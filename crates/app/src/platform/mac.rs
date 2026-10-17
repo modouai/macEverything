@@ -54,10 +54,12 @@ use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
-use super::{monotonic_ms, SpaceChange, ICON_PX, PALETTE_TITLE};
+use super::{monotonic_ms, palette_width, SpaceChange, ICON_PX, PALETTE_TITLE};
 
-/// 顶边位置:可见区顶部向下 1/4(Spotlight 式「居中偏上」,product §1)。
-const TOP_INSET_FRACTION: f64 = 0.25;
+/// 顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
+/// 视觉稿 y=110 是含 28px 菜单栏的画布坐标,故物理位置比画布低 28;
+/// 2026-10-17 定案,替代旧「可见区顶部向下 1/4」。
+const TOP_INSET: f64 = 110.0;
 /// 与屏/可见区边缘的最小留白(定位 clamp 用)。
 const EDGE_MARGIN: f64 = 8.0;
 
@@ -316,17 +318,20 @@ pub fn ensure_patched() -> Result<()> {
     Ok(())
 }
 
-/// 唤起悬浮条:补丁 → 多屏定位(鼠标所在屏,居中偏上)→ 补 first responder →
-/// `orderFrontRegardless`(不激活 app、不切 Space)→ `makeKeyWindow`(成 key 不夺前台,
-/// PoC-1b 结论 #6)。
+/// 唤起悬浮条:补丁 → 多屏定位(鼠标所在屏,顶边固定 110、宽度按屏回填)→
+/// 补 first responder → `orderFrontRegardless`(不激活 app、不切 Space)→
+/// `makeKeyWindow`(成 key 不夺前台,PoC-1b 结论 #6)。
+///
+/// 返回实际面板宽(ui 层据此同步布局宽;Task 11)。
 ///
 /// 重入安全(硬要求):本函数会从**主队列直调块**(hotkey.rs 的直显路径)调用。
-/// `setFrameOrigin` 会触发 `windowDidMove` 通知,而 winit 的 `maybe_queue_event` 在
-/// 「不在事件处理中」时**同步派发** → 重入一帧(实测栈:setFrameOrigin →
-/// window_did_move → eframe run_ui_and_paint → draw_palette)。故:
+/// `setFrameOrigin`/`setContentSize` 会触发 `windowDidMove`/`windowDidResize` 通知,
+/// 而 winit 的 `maybe_queue_event` 在「不在事件处理中」时**同步派发** → 重入一帧
+/// (实测栈:setFrameOrigin → window_did_move → eframe run_ui_and_paint →
+/// draw_palette)。故:
 /// ① 全程不持 PALETTE 借用(帧内 `reanchor`/`ensure_patched` 会 borrow_mut);
 /// ② 窗口句柄经短借用取出(Retained 保活),后续原生调用全在借用外。
-pub fn show_palette() -> Result<()> {
+pub fn show_palette() -> Result<f64> {
     ensure_patched()?;
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("show_palette 非主线程调用"));
@@ -334,7 +339,7 @@ pub fn show_palette() -> Result<()> {
     let win = PALETTE
         .with(|cell| cell.borrow().palette.clone())
         .ok_or_else(|| anyhow!("悬浮条窗口未就绪(视口尚未创建)"))?;
-    let anchor = position_palette(&win, mtm);
+    let (anchor, panel_w) = position_palette(&win, mtm);
     // 顺序照 PoC-1b `show_and_make_key`:先补 first responder,再 orderFrontRegardless,
     // 最后 makeKeyWindow(定位先于显示,避免可见后跳位)。
     let responder_ok = restore_first_responder(&win);
@@ -342,7 +347,7 @@ pub fn show_palette() -> Result<()> {
     win.makeKeyWindow();
     PALETTE.with(|cell| cell.borrow_mut().anchor = Some(anchor)); // 短借用回写(重锚用)
     log::info!(
-        "悬浮条唤起:origin=({:.0}, {:.0}) 顶边 y={:.0} 高 {:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        "悬浮条唤起:origin=({:.0}, {:.0}) 顶边 y={:.0} 高 {:.0} 宽 {panel_w:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
         anchor.x,
         anchor.top_y - anchor.h,
         anchor.top_y,
@@ -350,7 +355,7 @@ pub fn show_palette() -> Result<()> {
         win.isKeyWindow(),
         win.isVisible()
     );
-    Ok(())
+    Ok(panel_w)
 }
 
 /// 显示完整窗口(根窗):激活 app + 置前 + 成 key/main。
@@ -602,6 +607,9 @@ fn build_context_menu(mtm: MainThreadMarker, items: &[(&str, i64)]) -> Retained<
 /// 依据:宽度/位置由平台层摆了脚(原生 `setFrameOrigin`),而 egui 的
 /// `InnerSize` 走 winit `setContentSize`,其保持的角在 AppKit 侧不作保证——
 /// 每次悬浮条 pass 在高度变化时重摆一次,顶边恒定(实测定:内容向下扩)。
+///
+/// 底部 clamp 回退:show 时若可见高不足,`Anchor.top_y` 记为实际窗口顶(低于 110
+/// 线);重锚保持该顶边直到下次唤起。正常屏不触发。
 pub fn reanchor() {
     let Some(_mtm) = MainThreadMarker::new() else {
         return; // 非主线程:no-op(不该发生)
@@ -999,8 +1007,14 @@ fn screen_with_point(mtm: MainThreadMarker, p: NSPoint) -> Option<Retained<NSScr
     NSScreen::mainScreen(mtm).or_else(|| screens.iter().next())
 }
 
-/// 定位:鼠标所在屏可见区内水平居中、顶边在上 1/4 处;越界 clamp 回可见区。
-fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> Anchor {
+/// 定位(Task 11 定案):鼠标所在屏可见区内水平居中、顶边固定 `TOP_INSET`;
+/// 宽度按可见区回填(`palette_width`);越界 clamp 回可见区。返回 (锚点, 实际面板宽)。
+///
+/// 宽度变化走 `setContentSize`(borderless 下 content = frame),随后重读 frame——
+/// AppKit/窗口约束可能调整目标宽,以实际落地 frame 为准。`Anchor.top_y` 取
+/// **实际窗口顶**(origin.y + h):底边 clamp 时顶边不再是 110 线,该位置保持到
+/// 下次 show(正常屏不触发底部 clamp)。
+fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> (Anchor, f64) {
     let mouse = NSEvent::mouseLocation();
     let visible = screen_with_point(mtm, mouse)
         .map(|s| s.visibleFrame())
@@ -1009,15 +1023,44 @@ fn position_palette(win: &NSWindow, mtm: MainThreadMarker) -> Anchor {
             log::warn!("鼠标所在屏查不到:退化使用零原点可见区");
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0))
         });
-    let frame = win.frame();
+    let target_w = palette_width(visible.size.width);
+    let mut frame = win.frame();
+    let old_w = frame.size.width;
+    if (old_w - target_w).abs() > 0.5 {
+        win.setContentSize(NSSize::new(target_w, frame.size.height));
+        frame = win.frame(); // 重读:以实际落地尺寸为准
+        log::info!(
+            "悬浮条宽度回填:{old_w:.0} → {:.0}(可见区宽 {:.0})",
+            frame.size.width,
+            visible.size.width
+        );
+    }
     let (w, h) = (frame.size.width, frame.size.height);
+    let origin = palette_origin(visible, w, h);
+    win.setFrameOrigin(origin);
+    (
+        Anchor {
+            x: origin.x,
+            top_y: origin.y + h,
+            h,
+        },
+        w,
+    )
+}
+
+/// 悬浮条左上角(纯函数,单测钉住):可见区水平居中并 clamp(两侧留 `EDGE_MARGIN`);
+/// 顶边 = 可见区顶 − `TOP_INSET`;底边越界时上移 clamp(Cocoa 原点在左下),顶边
+/// 随之低于 110 线并保持到下次 show(正常屏不触发)。
+///
+/// 水平 clamp 语义:**宽度下限 480 优先**——可见宽 < 496(480 + 2×`EDGE_MARGIN`)
+/// 时无法同时保留两侧留白,允许横向溢出(典型 700 宽窗放进 700 可见区,右缘越出 8)。
+fn palette_origin(visible: NSRect, w: f64, h: f64) -> NSPoint {
     let min_x = visible.origin.x + EDGE_MARGIN;
     let max_x = (visible.origin.x + visible.size.width - w - EDGE_MARGIN).max(min_x);
     let x = (visible.origin.x + (visible.size.width - w) / 2.0).clamp(min_x, max_x);
-    let top_y = visible.origin.y + visible.size.height * (1.0 - TOP_INSET_FRACTION);
+    let top_y = visible.origin.y + visible.size.height - TOP_INSET;
     let y = (top_y - h).max(visible.origin.y + EDGE_MARGIN);
-    win.setFrameOrigin(NSPoint::new(x, y));
-    Anchor { x, top_y, h }
+    NSPoint::new(x, y)
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,8 +1144,75 @@ mod tests {
     use super::*;
 
     /// 副屏可见区(与本机实机同形:Redmi 1920x1080 @ (1470,-65);AppKit 坐标)。
+    /// **可见区顶 = origin.y + height = 1015**,即顶边 110 的基准(`visibleFrame`
+    /// 已扣菜单栏,不是含菜单栏的屏幕顶)。
     fn vis() -> NSRect {
         NSRect::new(NSPoint::new(1470.0, -65.0), NSSize::new(1920.0, 1080.0))
+    }
+
+    /// 顶边口径(Task 11):窗口顶边恰为 fixture 的可见区顶(1015)− 110;水平居中。
+    /// 注意基准是 `visibleFrame` 顶,不是含 28px 菜单栏的屏幕顶。
+    #[test]
+    fn palette_origin_pins_top_110_and_centers() {
+        let visible = vis();
+        let (w, h) = (700.0, 176.0);
+        let p = palette_origin(visible, w, h);
+        let visible_top = visible.origin.y + visible.size.height;
+        assert_eq!(TOP_INSET, 110.0, "顶边口径固定 110");
+        assert_eq!(
+            p.y + h,
+            visible_top - TOP_INSET,
+            "窗口顶边须为可见区顶 − 110"
+        );
+        assert_eq!(
+            p.x,
+            visible.origin.x + (visible.size.width - w) / 2.0,
+            "常规宽度水平居中"
+        );
+        assert!(
+            p.x + w <= visible.origin.x + visible.size.width - EDGE_MARGIN,
+            "右缘保留 EDGE_MARGIN"
+        );
+    }
+
+    /// 水平 clamp 语义:宽度下限 480 优先——可见宽 < 496(480+2×EDGE_MARGIN)时
+    /// 无法同时保留两侧留白,**允许横向溢出**(右缘越出 EDGE_MARGIN);
+    /// 正常窄宽(≤ 可见宽−48)恒在两侧留白内。
+    #[test]
+    fn palette_origin_clamps_horizontally() {
+        // 整宽/近整宽:居中位越过左留白 → 贴左内边距,右缘按既定语义越出。
+        let narrow = NSRect::new(vis().origin, NSSize::new(700.0, vis().size.height));
+        let p = palette_origin(narrow, 700.0, 176.0);
+        assert_eq!(p.x, narrow.origin.x + EDGE_MARGIN, "整宽时贴左留白");
+        assert_eq!(
+            p.x + 700.0,
+            narrow.origin.x + 700.0 + EDGE_MARGIN,
+            "整宽时右缘越出 EDGE_MARGIN(下限/整宽优先)"
+        );
+        // 可见宽 < 496 的下限场景:480 窗放进 480 可见区,同样允许右缘越出。
+        let tiny = NSRect::new(vis().origin, NSSize::new(480.0, vis().size.height));
+        let p = palette_origin(tiny, 480.0, 176.0);
+        assert_eq!(p.x, tiny.origin.x + EDGE_MARGIN);
+        assert_eq!(p.x + 480.0, tiny.origin.x + 480.0 + EDGE_MARGIN);
+        // 正常窄宽(可见宽 − 48)仍居中且左右留白。
+        let fit = palette_origin(narrow, 652.0, 176.0);
+        assert_eq!(fit.x, narrow.origin.x + (700.0 - 652.0) / 2.0);
+        assert!(fit.x >= narrow.origin.x + EDGE_MARGIN);
+        assert!(fit.x + 652.0 <= narrow.origin.x + 700.0 - EDGE_MARGIN);
+    }
+
+    /// 底边 clamp:窗口高超过可用高度时,底边不低于可见区底 + EDGE_MARGIN;
+    /// 此时实际顶边随之下移(Anchor 取实际窗口顶,不再等于 110 线)。
+    #[test]
+    fn palette_origin_clamps_bottom() {
+        let visible = vis();
+        let h = 1080.0; // 恰为可见区高:按 110 顶边摆放会露出底边
+        let p = palette_origin(visible, 700.0, h);
+        assert_eq!(p.y, visible.origin.y + EDGE_MARGIN, "底边贴可见区底留白");
+        assert!(
+            p.y + h > visible.origin.y + visible.size.height - TOP_INSET,
+            "顶边随底边 clamp 下移"
+        );
     }
 
     /// 常规:锚点 = 光标 x、可见区顶边(可见区已扣菜单栏 → 栏底,传 0)。

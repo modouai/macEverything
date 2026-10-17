@@ -191,9 +191,13 @@ fn palette_hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str) 
 /// 请求重绘——上屏延迟与内容刷新解耦。
 fn palette_show(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> bool {
     match platform::show_palette() {
-        Ok(()) => {
+        Ok(w) => {
             {
                 let mut s = lock_shared(shared);
+                // 先按屏幕回填宽(窄屏收窄),再 reset——reset 内的 send_h 须带新宽。
+                // 已知一帧观感:平台 resize 与 UI 宽度跨帧收敛,唤起首帧可能先画
+                // 上一会话宽度的旧内容,下一帧即收敛;不做平台拆分(2026-10-17 review)。
+                s.palette.set_panel_width(w as f32);
                 s.palette.reset(); // 每次唤起都是全新查询(product §1)
                 s.palette.on_shown(std::time::Instant::now()); // 首帧计时起点(诊断)
                 s.palette_visible = true;
@@ -229,6 +233,8 @@ fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
 }
 
 /// 悬浮条视口 builder(常量;每 pass 传同一份——`patch` 无差异则无命令/无重建)。
+/// 宽取**最大宽** `PANEL_W`:首次唤起时平台层按鼠标所在屏收窄,UI 随 `show_palette`
+/// 返回的实际宽同步布局(窄屏走 `set_panel_width`;builder 不逐 pass 变,免重建)。
 /// `visible(false)`:启动隐藏(唤起走平台层原生路径,不用 winit `Visible(true)`)。
 fn palette_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()

@@ -704,7 +704,7 @@ cargo run --release --manifest-path scripts/poc/poc7_vibrancy/Cargo.toml
 | 显示路径 | winit 视口重建 | 平台层原生 `orderFrontRegardless` + `makeKeyWindow`（主线程） | tech 表「显示路径（定案）」 |
 | 补丁时机 | 每次创建 | 视口窗创建后首见即施（`NSApp.windows()` 按标题定位 → 换类 + 五要素 + 补丁 a）；可见期每帧漂移核对 | 本文件「必须的属性组合」 |
 | 还原类时机 | 关窗前 | 进程退出（`App::on_exit` → `revert_class`；常驻形态下唯一销毁点） | 补丁 b |
-| 位置 | ViewportBuilder position | 平台层原生 `setFrameOrigin`（鼠标屏可见区，顶边在上 1/4）；高度变化「顶边钉住」重锚 | tech 表「多屏定位」 |
+| 位置 | ViewportBuilder position | 平台层原生 `setFrameOrigin`（鼠标屏可见区，顶边在上 1/4；已被 Task 11 取代：顶边固定 110）；高度变化「顶边钉住」重锚 | tech 表「多屏定位」 |
 | 排帧 | 根视口 logic 每 2s 常排 | 仅悬浮条可见期（悬浮条 pass 自排；根视口隐藏即停） | L4 |
 | 根窗关闭 | 退出 App | 取消关闭 + 隐藏窗口（product §2「关闭窗口不退出」；悬浮条 ⌥↵ 原生唤回） | 本次顺带（托盘退出 Task 16） |
 

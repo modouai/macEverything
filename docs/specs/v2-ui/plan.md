@@ -946,7 +946,7 @@ git commit -m "feat(app): 中文字体加载 + 深浅色跟随主题"
 // platform/mod.rs
 pub fn patch_palette_window(eframe_window: &eframe::Frame) -> anyhow::Result<()>;  // 跨 Space+浮动级别+activate 策略
 pub fn mouse_screen_position() -> Option<(f64, f64)>;      // 鼠标所在屏 + 位置(NSEvent.mouseLocation)
-pub fn screen_center_top(size: (f32, f32)) -> (f32, f32);  // 计算悬浮条坐标(屏可见区上 1/4)
+pub fn screen_center_top(size: (f32, f32)) -> (f32, f32);  // 计算悬浮条坐标(屏可见区上 1/4)（已被 Task 11 取代：顶边固定 110）
 pub fn activate_app();                                     // LSUIElement 键盘焦点(点击/唤起时)
 ```
 

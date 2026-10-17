@@ -20,6 +20,20 @@ pub mod mac;
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
 
+/// 悬浮条最大宽(视觉稿 §1.1/§2.2 = 700;ui 侧 `tokens::PANEL_W` 编译期互钉)。
+pub const PALETTE_MAX_W: f64 = 700.0;
+
+/// 悬浮条宽度下限(窄屏收窄后的最小可用宽;visual.md §1.1 = 480)。
+pub const PALETTE_MIN_W: f64 = 480.0;
+
+/// 窄屏宽度公式的两侧总留白(每侧 24;visual.md §1.1「可见宽 − 48」)。
+pub const SCREEN_SIDE_MARGIN: f64 = 48.0;
+
+/// 由可见区宽计算面板宽(纯函数;Task 11 定案):`min(700, 可见宽 − 48)`,下限 480。
+pub fn palette_width(visible_w: f64) -> f64 {
+    (visible_w - SCREEN_SIDE_MARGIN).clamp(PALETTE_MIN_W, PALETTE_MAX_W)
+}
+
 /// 进程内单调时钟基准(懒初始化;日志打点与 Space 变更判定共用,跨进程不可比)。
 static MONO_EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
@@ -189,7 +203,8 @@ pub fn ensure_patched() -> anyhow::Result<()> {
 }
 
 /// 唤起悬浮条:原生定位 + `orderFrontRegardless` + `makeKeyWindow`(不激活 app)。
-pub fn show_palette() -> anyhow::Result<()> {
+/// 返回实际面板宽(按鼠标所在屏回填;调用方据此同步 UI 布局宽)。
+pub fn show_palette() -> anyhow::Result<f64> {
     #[cfg(target_os = "macos")]
     {
         mac::show_palette()
@@ -310,6 +325,17 @@ mod tests {
 
     fn change(seq: u64, at: Instant) -> Option<SpaceChange> {
         Some(SpaceChange { seq, at })
+    }
+
+    /// 宽度策略边界(Task 11;visual.md §1.1):`min(700, 可见宽 − 48)`,下限 480。
+    #[test]
+    fn palette_width_boundaries() {
+        assert_eq!(palette_width(1920.0), 700.0, "常规屏取设计宽");
+        assert_eq!(palette_width(748.0), 700.0, "恰 700 的临界可见宽");
+        assert_eq!(palette_width(747.0), 699.0, "临界下 1 点即收窄");
+        assert_eq!(palette_width(529.0), 481.0);
+        assert_eq!(palette_width(528.0), 480.0, "恰到底限");
+        assert_eq!(palette_width(500.0), 480.0, "低于底限取 480");
     }
 
     /// 无变更通知 → 永不豁免(含非 macOS 恒 None 路径)。钉:None 短路。

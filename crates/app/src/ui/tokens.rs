@@ -128,10 +128,8 @@ pub const BTN_SIZE: f32 = 28.0; // 打开完整窗口按钮
 pub const BTN_RADIUS: u8 = 7;
 pub const DIVIDER_H: f32 = 1.0;
 pub const ROW_H: f32 = 56.0;
-/// 结果区左右内缩（行宽 = 面板宽 − 2×此值 = 684；§2.4 宽度分配）。
+/// 结果区左右内缩（行宽 = 面板宽 − 2×此值；最大宽下即 §2.4 的 684）。
 pub const LIST_SIDE_PAD: f32 = 8.0;
-/// 结果行宽（§2.4「行宽 684」）。
-pub const ROW_W: f32 = PANEL_W - 2.0 * LIST_SIDE_PAD;
 /// 行内「文件名 ↔ 所在目录」纵向间距（§2.4「文本列纵向，间距 3」）。
 pub const ROW_TEXT_GAP_Y: f32 = 3.0;
 pub const ROW_GAP: f32 = 2.0;
@@ -316,35 +314,24 @@ mod tests {
         assert_eq!(panel_h(list_h(6)), 466.0);
     }
 
-    /// 钉住：形象净空推导（§2.9）——理想内容宽下角标右缘与形象左缘恰 12；
-    /// 实际内容宽（`PANEL_W − 2`）下净空 ≥ 12。
+    /// 钉住：形象净空推导（§2.9）——内容宽 = 面板宽时，角标右缘与形象左缘恰 12。
     #[test]
     fn mascot_clear_w_leaves_twelve_px_gap() {
         let mascot_left = PANEL_W - MASCOT_RIGHT_GAP - MASCOT_W;
-        // 理想推导（内容宽 = 面板宽）：角标右缘 = 形象左缘 − 12。
         assert_eq!(MASCOT_CLEAR_W, 128.0, "净空宽应等于 §2.9 推导值");
-        let ideal_badge_right = PANEL_W - SEARCH_PAD_X - BTN_SIZE - SEARCH_GAP - MASCOT_CLEAR_W;
+        // Task 11 起搜索行内容宽 = panel_w（描边画在内侧，不再从内容宽里扣 2）。
+        let badge_right = PANEL_W - SEARCH_PAD_X - BTN_SIZE - SEARCH_GAP - MASCOT_CLEAR_W;
         assert_eq!(
-            ideal_badge_right,
+            badge_right,
             PANEL_W - (MASCOT_RIGHT_GAP + MASCOT_W + MASCOT_BADGE_GAP),
             "角标右缘须按「面板右缘 − 形象占位 − 净空」定位"
         );
         assert_eq!(
-            mascot_left - ideal_badge_right,
+            mascot_left - badge_right,
             MASCOT_BADGE_GAP,
-            "理想内容宽下净空应为 12"
+            "内容宽 = 面板宽时净空应为 12"
         );
-        // 实际布局：搜索行内容宽 = PANEL_W − 2（既有描边内缩），净空 14 ≥ 12；
-        // Task 11 统一内容宽后收敛为 12。
-        let content_right = PANEL_W - 2.0;
-        let actual_badge_right =
-            content_right - SEARCH_PAD_X - BTN_SIZE - SEARCH_GAP - MASCOT_CLEAR_W;
-        assert!(actual_badge_right < mascot_left, "角标不得进入形象区域");
-        assert!(
-            mascot_left - actual_badge_right >= MASCOT_BADGE_GAP,
-            "实际净空须 ≥ 12（当前 {}）",
-            mascot_left - actual_badge_right
-        );
+        assert!(badge_right < mascot_left, "角标不得进入形象区域");
         // 形象露出顶边的高度（Task 9 窗口预留用）。
         assert_eq!(MASCOT_STRIP, 66.0);
     }
