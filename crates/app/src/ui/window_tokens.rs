@@ -33,6 +33,8 @@ pub struct FullWindowPalette {
     pub divider: egui::Color32,
     pub search_fill: egui::Color32,
     pub search_icon: egui::Color32,
+    /// 搜索框空词 hint（§4.2 表外补充：查询文本色的弱化值）。
+    pub search_hint: egui::Color32,
     pub query_text: egui::Color32,
     pub header_text: egui::Color32,
     pub sort_arrow: egui::Color32,
@@ -59,6 +61,7 @@ pub fn dark() -> FullWindowPalette {
         divider: c(0xFFFFFF14),
         search_fill: c(0xFFFFFF14),
         search_icon: c(0x8B929AFF),
+        search_hint: c(0x8B929AFF),
         query_text: c(0xF2F4F7FF),
         header_text: c(0x8B929AFF),
         sort_arrow: c(0xC6CBD1FF),
@@ -82,6 +85,7 @@ pub fn light() -> FullWindowPalette {
         divider: c(0x00000012),
         search_fill: c(0x0000000A),
         search_icon: c(0x6B7280FF),
+        search_hint: c(0x6B7280FF),
         query_text: c(0x1A1D22FF),
         header_text: c(0x6B7280FF),
         sort_arrow: c(0x4B5563FF),
@@ -297,6 +301,14 @@ mod tests {
                 "{name} 浅色值不符 §4.2"
             );
         }
+    }
+
+    /// 钉住：搜索框空词 hint 色（§4.2 表外补充：查询文本的弱化值，
+    /// 深/浅两主题均与搜索图标同灰度）。
+    #[test]
+    fn search_hint_is_weakened_query_text() {
+        assert_eq!(dark().search_hint.to_array(), c(0x8B929AFF).to_array());
+        assert_eq!(light().search_hint.to_array(), c(0x6B7280FF).to_array());
     }
 
     /// 钉住：标题栏齿轮两枚颜色（settings-visual.md §3.1）。

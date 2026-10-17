@@ -59,8 +59,6 @@ const QUERY_LIMIT: u32 = client::RESULT_CAP;
 const ROW_H: f32 = 28.0;
 /// 表头行高(px)。
 const HEADER_H: f32 = 28.0;
-/// 搜索行高(px;与悬浮条输入行一并放大)。
-const INPUT_H: f32 = 30.0;
 /// 齿轮点击的 v2.1 提示(不放假入口;短驻留,避免长期占据状态栏)。
 const GEAR_PENDING_NOTE: &str = "设置将在 v2.1 提供";
 const GEAR_NOTE_TTL: Duration = Duration::from_secs(3);
@@ -402,28 +400,76 @@ impl ResultsState {
             log::info!("标题栏齿轮点击:设置窗口未实现(v2.1 提示已落状态栏)");
         }
 
-        // —— 顶部:搜索框(Task 2 重绘;本轮沿用现有 UI) ——
+        // —— 顶部:搜索行(52 + 1 分隔线,§3.1/§3.3) ——
+        //
+        // 搜索框底由本层绘制(整宽圆角矩形),TextEdit 只承担文字与原生光标:
+        // egui 0.37 的 TextEdit 主题自带描边与聚焦变化,而视觉规格要求「无描边、
+        // 无聚焦粗环」,故 frame 置 NONE、底/字/图标全取 window_tokens。
         let input_resp = egui::Panel::top("results-search")
-            .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.window_fill))
+            .exact_size(window_tokens::SEARCH_ROW_H + window_tokens::DIVIDER_H)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(palette.window_fill))
             .show(ui, |ui| {
-                ui.add_space(6.0);
-                let resp = ui
-                    .horizontal(|ui| {
-                        ui.add_sized(
-                            [ui.available_width(), INPUT_H],
-                            egui::TextEdit::singleline(&mut self.input)
-                                .id_salt("results-input")
-                                // 文字垂直居中(2026-10-16 实机反馈「整体偏上」):
-                                // egui 0.37 的 TextEdit 主题默认 align2 = LEFT_TOP
-                                // (theme/default_style.rs 的 TextEditStyle),而 add_sized
-                                // 的 centered_and_justified 会把输入框拉到 INPUT_H 高——
-                                // 文字就贴顶。显式 LEFT_CENTER = 行盒在框内居中,横向仍左对齐。
-                                .align(egui::Align2::LEFT_CENTER)
-                                .hint_text("搜索文件…"),
-                        )
-                    })
-                    .inner;
-                ui.add_space(6.0);
+                let panel = ui.max_rect();
+                let row = egui::Rect::from_min_max(
+                    panel.min,
+                    egui::pos2(panel.right(), panel.top() + window_tokens::SEARCH_ROW_H),
+                );
+                let layout = search_row_layout(row);
+                let painter = ui.painter().clone();
+
+                // 浅灰圆角底,无描边、无聚焦粗环(§3.3)。
+                painter.rect_filled(
+                    layout.box_rect,
+                    egui::CornerRadius::same(window_tokens::SEARCH_BOX_RADIUS),
+                    palette.search_fill,
+                );
+                draw_search_icon(&painter, layout.icon_rect, palette.search_icon);
+
+                // 空词 hint:自绘以取 token 色(TextEdit 的 hint_text 会被主题
+                // `hint_text_color` 覆盖,无法走 token)。先于 TextEdit 绘制,
+                // 光标随后叠在其上。
+                if self.input.is_empty() {
+                    painter.text(
+                        egui::pos2(layout.text_rect.left(), layout.text_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "搜索文件…",
+                        egui::FontId::proportional(window_tokens::FONT_QUERY),
+                        palette.search_hint,
+                    );
+                }
+
+                // 点击框内空白/图标 → 聚焦输入框。TextEdit 在本交互之后注册:
+                // 同层命中测试后注册者优先,框内文字区域的点击仍归 TextEdit(定光标)。
+                let box_resp = ui.interact(
+                    layout.box_rect,
+                    ui.scope_id().with("results-search-box"),
+                    egui::Sense::click(),
+                );
+                let input_id = ui.make_persistent_id("results-input");
+                // 原生闪烁光标用查询文本色(§4.2「查询文本 / 光标」同一 token)。
+                ui.visuals_mut().text_cursor.stroke.color = palette.query_text;
+                let resp = ui.place(
+                    layout.text_rect,
+                    egui::TextEdit::singleline(&mut self.input)
+                        .id(input_id)
+                        .font(egui::FontId::proportional(window_tokens::FONT_QUERY))
+                        .text_color(palette.query_text)
+                        .frame(egui::Frame::NONE)
+                        .min_size(layout.text_rect.size())
+                        // 文字垂直居中、左对齐(egui 0.37 TextEdit 主题默认贴顶)。
+                        .align(egui::Align2::LEFT_CENTER),
+                );
+                if box_resp.clicked() && !resp.has_focus() {
+                    resp.request_focus();
+                }
+
+                // 搜索行底 1px 分隔线(§3.1 分隔线 1);标题栏与搜索行之间不加线。
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(panel.left(), row.bottom()), panel.max),
+                    egui::CornerRadius::ZERO,
+                    palette.divider,
+                );
                 resp
             })
             .inner;
@@ -805,6 +851,66 @@ impl ResultsState {
     }
 }
 
+/// 搜索行几何(§3.3,纯函数):行内左右各 16 得到整宽搜索框;框高 36 在 52 行内
+/// 垂直居中;框内左右各 14、图标 16×16、图标与文本间距 10。坐标均为绝对坐标。
+struct SearchRowLayout {
+    /// 搜索框:窗口宽 − 32。
+    box_rect: egui::Rect,
+    /// 搜索图标:16×16,框内左内边距 14、垂直居中。
+    icon_rect: egui::Rect,
+    /// 查询文本区:图标右缘 + 10 到框右缘 − 14,纵向取满框高(文字居中)。
+    text_rect: egui::Rect,
+}
+
+/// 搜索行几何(规格数值见 `window_tokens`,单测逐项钉住)。
+fn search_row_layout(row_rect: egui::Rect) -> SearchRowLayout {
+    let (_, pad_x) = window_tokens::SEARCH_BOX_PAD;
+    let box_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            row_rect.left() + window_tokens::CONTENT_PAD_X,
+            row_rect.center().y - window_tokens::SEARCH_BOX_H / 2.0,
+        ),
+        egui::vec2(
+            (row_rect.width() - 2.0 * window_tokens::CONTENT_PAD_X).max(0.0),
+            window_tokens::SEARCH_BOX_H,
+        ),
+    );
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            box_rect.left() + pad_x,
+            box_rect.center().y - window_tokens::SEARCH_ICON / 2.0,
+        ),
+        egui::Vec2::splat(window_tokens::SEARCH_ICON),
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            icon_rect.right() + window_tokens::SEARCH_BOX_GAP,
+            box_rect.top(),
+        ),
+        egui::pos2(box_rect.right() - pad_x, box_rect.bottom()),
+    );
+    SearchRowLayout {
+        box_rect,
+        icon_rect,
+        text_rect,
+    }
+}
+
+/// 搜索图标(§5.2 `search`,16×16):按 Lucide 24 网格比例画圆 + 手柄。
+fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let s = rect.width() / 24.0;
+    let stroke = egui::Stroke::new(2.0 * s, color);
+    let center = rect.min + egui::vec2(11.0, 11.0) * s;
+    painter.circle_stroke(center, 7.0 * s, stroke);
+    painter.line_segment(
+        [
+            rect.min + egui::vec2(16.65, 16.65) * s,
+            rect.min + egui::vec2(21.0, 21.0) * s,
+        ],
+        stroke,
+    );
+}
+
 /// 标题栏(§3.1/§3.3):左侧 80px 留给原生交通灯(不绘制内容),右端齿轮按钮,
 /// 其余区域为窗口拖拽区。返回齿轮是否被点击(调用方落 v2.1 提示)。
 ///
@@ -1099,6 +1205,35 @@ mod tests {
         assert_eq!(size_text(None), "—", "读取失败不留空");
         assert_eq!(mtime_text(None), "—");
         assert_eq!(mtime_text(Some(0)), "—", "0 = 未取(与 cli fmt_time 同约定)");
+    }
+
+    /// 搜索行几何(§3.3):钉住 52 / 36 / 16 / 14 / 10 / 图标 16×16 的落位。
+    #[test]
+    fn search_row_geometry_matches_spec() {
+        let row = egui::Rect::from_min_size(
+            egui::pos2(100.0, 200.0),
+            egui::vec2(1080.0, window_tokens::SEARCH_ROW_H),
+        );
+        let l = search_row_layout(row);
+
+        // 搜索框:窗口宽 − 32,高 36,在 52 行内垂直居中。
+        assert_eq!(l.box_rect.width(), 1048.0, "左右内边距各 16");
+        assert_eq!(l.box_rect.height(), 36.0);
+        assert_eq!(l.box_rect.left() - row.left(), 16.0);
+        assert_eq!(row.right() - l.box_rect.right(), 16.0);
+        assert_eq!(l.box_rect.top() - row.top(), 8.0, "行内垂直居中");
+        assert_eq!(row.bottom() - l.box_rect.bottom(), 8.0);
+
+        // 图标:16×16,框内左内边距 14,垂直居中。
+        assert_eq!(l.icon_rect.left() - l.box_rect.left(), 14.0);
+        assert_eq!((l.icon_rect.width(), l.icon_rect.height()), (16.0, 16.0));
+        assert_eq!(l.icon_rect.center().y, l.box_rect.center().y);
+
+        // 文本区:图标右缘 + 10,右端内边距 14,纵向取满框高。
+        assert_eq!(l.text_rect.left() - l.icon_rect.right(), 10.0);
+        assert_eq!(l.box_rect.right() - l.text_rect.right(), 14.0);
+        assert_eq!(l.text_rect.top(), l.box_rect.top());
+        assert_eq!(l.text_rect.bottom(), l.box_rect.bottom());
     }
 
     #[test]
