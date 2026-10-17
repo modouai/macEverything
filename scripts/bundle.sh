@@ -4,6 +4,7 @@
 # 结构:release/macEverything.app/Contents/
 #   MacOS/macEverything-app   App 本体(CFBundleExecutable;LSUIElement 菜单栏应用)
 #   MacOS/macEverything       引擎 CLI(随包;App 定位三档①「同目录」即命中它)
+#   Resources/AppIcon.icns    应用图标(吉祥物);Info.plist 的 CFBundleIconFile 指向它
 #   Info.plist                bundle 标识 = 自启条目身份键(PoC-5 坑②)
 #
 # 必须 ad-hoc 签名(PoC-5 硬门槛:未签名 arm64 进程直接 SIGKILL;签名无效时
@@ -37,10 +38,11 @@ cargo build --release -p "$EXE" -p "$CLI"
 # 3) 组装 bundle
 echo "== 3/4 组装 $APP =="
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/release/$EXE" "$APP/Contents/MacOS/$EXE"
 cp "target/release/$CLI" "$APP/Contents/MacOS/$CLI"
 chmod +x "$APP/Contents/MacOS/$EXE" "$APP/Contents/MacOS/$CLI"
+cp "assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -51,6 +53,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleName</key><string>macEverything</string>
 	<key>CFBundleDisplayName</key><string>macEverything</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleIconFile</key><string>AppIcon.icns</string>
 	<key>CFBundleShortVersionString</key><string>${VERSION}</string>
 	<key>CFBundleVersion</key><string>${VERSION}</string>
 	<key>LSMinimumSystemVersion</key><string>13.0</string>

@@ -65,7 +65,10 @@ pub const NO_ENGINE: &str = "no-engine";
 
 /// 图标边长(px;菜单栏显示时按 22pt 上限等比缩放——tray-icon macOS 实现)。
 const ICON_SIZE: u32 = 64;
-/// 圆角方块底色(中蓝:深浅两色菜单栏上都可辨)与放大镜前景(白)。
+/// 菜单栏图标资源(应用图标 64px 版,与 `assets/AppIcon.png` 同源)。
+/// 解码失败时回落下方代码生成的占位图标(保底显示,不静默无图标)。
+const TRAY_ICON_PNG: &[u8] = include_bytes!("../../../assets/TrayIcon.png");
+/// 占位图标:圆角方块底色(中蓝:深浅两色菜单栏上都可辨)与放大镜前景(白)。
 const ICON_BG: [u8; 3] = [58, 124, 188];
 const ICON_FG: [u8; 3] = [255, 255, 255];
 
@@ -424,10 +427,26 @@ fn spawn_state_refresher(
     }
 }
 
-/// 托盘图标(代码生成 RGBA,免 asset 文件)。
+/// 托盘图标:优先用内置资源(`assets/TrayIcon.png`,与应用图标同源);
+/// 资源解码失败时回落到代码生成的占位图标,保底可见。
 fn icon(size: u32) -> anyhow::Result<Icon> {
+    if let Some(icon) = asset_icon(size) {
+        return Ok(icon);
+    }
+    log::warn!("托盘图标资源解码失败,回落内置占位图标");
     Icon::from_rgba(icon_rgba(size), size, size)
         .map_err(|e| anyhow::anyhow!("托盘图标数据非法(内部构造,不应发生): {e}"))
+}
+
+/// 解码内置菜单栏图标并缩放到 `size`;失败返回 None(调用方回落占位图标)。
+fn asset_icon(size: u32) -> Option<Icon> {
+    let decoded = image::load_from_memory(TRAY_ICON_PNG).ok()?.to_rgba8();
+    let rgba = if decoded.width() == size && decoded.height() == size {
+        decoded
+    } else {
+        image::imageops::resize(&decoded, size, size, image::imageops::FilterType::Lanczos3)
+    };
+    Icon::from_rgba(rgba.into_raw(), size, size).ok()
 }
 
 /// 生成 RGBA 位图:圆角方块底 + 白色放大镜(镜圈 + 手柄)。
@@ -561,6 +580,17 @@ mod tests {
     }
 
     /// 图标位图:尺寸、圆角透明、底色与放大镜(镜圈/手柄)各自命中。
+    /// 菜单栏图标资源必须可解码且为 ICON_SIZE 见方(改素材/尺寸即红)。
+    #[test]
+    fn tray_icon_asset_decodes_at_expected_size() {
+        let img = image::load_from_memory(super::TRAY_ICON_PNG).expect("内置托盘图标应可解码");
+        assert_eq!(
+            (img.width(), img.height()),
+            (super::ICON_SIZE, super::ICON_SIZE),
+            "托盘图标资源尺寸须与 ICON_SIZE 一致"
+        );
+    }
+
     #[test]
     fn icon_bitmap_shape_and_colors() {
         const S: u32 = 64;
