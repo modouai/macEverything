@@ -7,7 +7,7 @@
 
 ## 已定决策（2026-10-17，辉哥）
 
-- **标题栏**：保留**原生交通灯**（系统行为：拖拽/关闭/最小化/缩放/阴影）；`with_titlebar_shown(false)` 透明标题栏 + `with_fullsize_content_view(true)` + `with_title_shown(false)`，内容绘制到标题栏下方；视觉与原型一致（只有三个圆点 + 右侧齿轮）。
+- **标题栏**：保留**原生交通灯**（系统行为：拖拽/关闭/最小化/缩放/阴影/双击 zoom）；`with_titlebar_shown(false)` 透明标题栏 + `with_fullsize_content_view(true)` + `with_title_shown(false)`，内容绘制到标题栏下方；视觉与原型一致（只有三个圆点 + 右侧齿轮）。双击与绿灯缩放均归原生（Task 1 实测第二次 release 不进 egui）。
 - **图标列**：本次进入——名称列 16×16 系统图标（复用悬浮条图标 worker 的 UTI 缓存）。
 - **窗口尺寸**：首次 1080×627；记住用户调整后的尺寸（写 App 数据目录，跨启动生效）；最小 720×480。
 - **齿轮**：标题栏右端 28×28（图标 16，tooltip「设置」）；设置窗口 v2.1 未实现，点击先显示「设置将在 v2.1 提供」提示，不放假入口。
@@ -31,13 +31,26 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 
 ## Task 1: 完整窗口 token + 窗口壳
 
-**Files:** `crates/app/src/ui/tokens.rs`（或新增 `ui/window_tokens.rs`）；`crates/app/src/ui/window_state.rs`（新，尺寸持久化）；`crates/app/src/main.rs`（root viewport builder）；`crates/app/src/ui/results.rs`（标题栏/整体壳）。
+**Files:** `crates/app/src/ui/window_tokens.rs`（新）；`crates/app/src/window_state.rs`（新，尺寸持久化）；`crates/app/src/main.rs`（root viewport builder）；`crates/app/src/ui/results.rs`（标题栏/整体壳）；`crates/app/src/ui/mod.rs`（尺寸跟踪接线）。
 
-- [ ] **Step 1:** `FullWindowPalette`（§4.2 全部色值，深/浅）+ §4.3 字号 + §4.4/4.5 几何常量；单测逐项钉住 §4.2 表。
-- [ ] **Step 2:** root viewport builder：1080×627、min 720×480、resizable、`with_titlebar_shown(false)`、`with_title_shown(false)`、`with_fullsize_content_view(true)`、`with_transparent(false)`（窗口不透明）、`with_has_shadow(true)`；原生交通灯保留。
-- [ ] **Step 3:** 尺寸持久化：`window_state.rs` 读写数据目录下 `window-state.toml`（纯逻辑解析/序列化 + 单测）；启动读取并应用，运行期 debounce 保存；离屏/超屏时 clamp。
-- [ ] **Step 4:** 结果窗口壳：顶部 32 标题栏（拖动区 `ViewportCommand::StartDrag`，双击 `Maximized` 切换；齿轮 28×28 右端，点击提示 v2.1），下方搜索行/表头/表格/状态栏的分段结构；标题栏区域留空给原生交通灯，不绘制任何遮挡。
-- [ ] **Step 5:** `<check>` + 实机看壳：原生交通灯位置、透明标题栏、窗口阴影/圆角、拖拽、缩放、三键。
+- [x] **Step 1:** `FullWindowPalette`（§4.2 全部色值，深/浅）+ §4.3 字号 + §4.4/4.5 几何常量；单测逐项钉住 §4.2 表。
+- [x] **Step 2:** root viewport builder：1080×627、min 720×480、resizable、`with_titlebar_shown(false)`、`with_title_shown(false)`、`with_fullsize_content_view(true)`、`with_has_shadow(true)`、`with_clamp_size_to_monitor_size(true)`；原生交通灯保留。
+  - **`with_transparent(true)` 保留（2026-10-17 定案）**：eframe 0.37 glow 后端只有一个全局 GL config，透明位取自根视口 builder（`glow_integration.rs:1212`）；`glutin-winit` 在 config 不支持透明时会把所有窗口属性强制改回不透明（`glutin-winit-0.5.0/src/lib.rs:199-202`），实测后果是悬浮条圆角外近黑。完整窗口的「不透明」由内容层每帧整窗铺底色保证，不依赖该窗口属性；改 false 会连带打死悬浮条透明。
+- [x] **Step 3:** 尺寸持久化：`window_state.rs` 读写数据目录下 `window-state.toml`（纯逻辑解析/序列化 + 单测）；启动读取并应用，超屏用 `with_clamp_size_to_monitor_size(true)` 收口；运行期为 **400ms 限频（合并写，非 trailing debounce）**，隐藏期用原生 `isVisible` 跳过。
+- [x] **Step 4:** 结果窗口壳：顶部 32 标题栏（拖拽区从交通灯预留 80px 之后到齿轮左缘，`ViewportCommand::StartDrag`；齿轮 28×28 右端，点击提示 v2.1 且 3s 后自动消失），下方搜索行/表头/表格/状态栏的分段结构；标题栏区域留空给原生交通灯，不绘制任何遮挡。
+  - **双击归属（2026-10-17 临时日志实测）**：双击标题栏的第一次 press/release 进入 egui，第二次 press 进入 egui、但第二次 release 被原生标题栏接管并触发系统 zoom——egui 收不到完整 double-click。故**双击与原生绿灯缩放都走系统原生行为**，不保留自定义 `ViewportCommand::Maximized` 分支（保留即死代码）；`viewport.maximized` 在 macOS 运行期不刷新，代码不读它。
+- [x] **Step 5:** `<check>` + 实机看壳：原生交通灯位置、透明标题栏、窗口底色、拖拽、缩放、三键已看；双击/绿灯为原生 zoom。详见下方实机记录。
+
+**Task 1 实机记录（2026-10-17，隔离 HOME，debug 构建）**
+
+- 默认窗口 1080×627（CGWindowList 实测）；AX 压 600×400 → 系统钳到最小 720×480。
+- 原生交通灯可见、可点；红色关闭 → 日志「取消关闭,改为隐藏窗口」，窗口隐藏、进程存活；标题栏区域为窗口底色，无透明/黑条。
+- 齿轮：hover 底 + tooltip「设置」；点击状态栏「设置将在 v2.1 提供」，3s 后自动消失（到期线程 `request_repaint_of(ROOT)` 唤醒空闲根窗；只用 `request_repaint_after_for` 实测不唤醒）。
+- 双击/绿灯：原生绿灯点击 → 1470×846 zoom；在正确标题栏位置双击 → 还原 1080×627。临时日志显示双击第二次 release 被原生标题栏接管（egui 收不到完整 double-click），故自定义 `Maximized` 分支删除，双击与绿灯均走系统原生。
+- 隐藏期：临时日志确认 `platform::root_visible()==Some(false)` 且 `inner_rect` 有值时直接跳过；启动隐藏期与悬浮条帧期间状态文件 mtime 不变。
+- 全屏期间：`ViewportInfo.fullscreen == Some(true)` 跳过写盘（该字段每帧刷新）。实机经原生 `AXFullScreen` 进入全屏（inner_rect 变为 1470×956），临时日志确认每帧走 fullscreen 跳过、状态文件不产生；退出全屏后普通窗口尺寸不误写。
+- 超屏：写入 3840×2160 → 启动窗口被 `with_clamp_size_to_monitor_size(true)` 收口到 1470×844（当前显示器工作区）。
+- 持久化：900×600 / 720×480 落盘并在重启后恢复；400ms 限频的连续变化写入次数由单测钉住（1s 内 3 次）。
 
 ## Task 2: 搜索行
 

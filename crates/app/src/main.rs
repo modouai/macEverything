@@ -13,6 +13,7 @@ mod session;
 mod single_instance;
 mod tray;
 mod ui;
+mod window_state;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -45,10 +46,33 @@ fn main() -> anyhow::Result<()> {
         log::warn!("开机自启默认注册未完成: {err:#}");
     }
 
+    // 完整窗口尺寸(visual.md §1.2):默认 1080×627,记住用户调整后的尺寸。
+    // 读取失败/无文件回落默认;越界由 window_state::load 内的 clamp 收口。
+    let window_size = window_state::load(&paths.data_dir).unwrap_or_default();
+    log::info!(
+        "完整窗口尺寸:{:.0}×{:.0}(最小 {:.0}×{:.0})",
+        window_size.w,
+        window_size.h,
+        window_state::MIN_W,
+        window_state::MIN_H
+    );
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
-            .with_inner_size([900.0, 600.0])
+            .with_inner_size([window_size.w, window_size.h])
+            .with_min_inner_size([window_state::MIN_W, window_state::MIN_H])
+            .with_resizable(true)
+            // 记忆尺寸可能来自更大/更小的屏幕:交给 winit 按当前显示器收口,
+            // 防 3840×2160 的历史值在小屏上开出屏幕外/超出工作区。
+            .with_clamp_size_to_monitor_size(true)
+            // 标题栏透明化(完整窗口视觉重构;visual.md §3.1/§3.3):保留原生交通灯,
+            // 内容绘制到标题栏下方 —— 标题不显示、标题栏透明、内容全尺寸。
+            // 窗口本身仍是不透明观感:结果窗口每帧先铺整窗底色(ui/results.rs)。
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_fullsize_content_view(true)
+            .with_has_shadow(true)
             // 透明根窗(硬要求,勿删):eframe 0.37 的 glow 后端只有一个全局 GL config
             // (glow_integration.rs:76「one painter shared by all viewports」),
             // 其透明位取自**根视口** builder(`with_transparency(native_options.viewport
@@ -61,6 +85,8 @@ fn main() -> anyhow::Result<()> {
             // macOS CGL 的 config.transparency 只是回显模板位(cgl/config.rs:123),
             // 像素格式本身恒带 8 位 alpha——故此位对根窗只是「允许透明」,根窗自绘不透明
             // 底,观感不变;PoC-1b 单视口实测即此路径(透明像素取证 alpha 220)。
+            // 完整窗口的「不透明」由内容层每帧铺整窗底色保证(ui/results.rs);
+            // 此处**不可**改 false——会连带打死悬浮条透明(GL config 全局单份)。
             .with_transparent(true)
             // 产品形态(Task 21):两窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
             // 待命。eframe 0.37 在首帧 post_rendering 里**无条件** set_visible(true)

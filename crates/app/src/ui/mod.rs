@@ -67,6 +67,7 @@ pub mod palette;
 pub mod results;
 pub mod theme;
 pub mod tokens;
+pub mod window_tokens;
 
 use eframe::egui;
 use std::sync::mpsc::Receiver;
@@ -79,6 +80,7 @@ use crate::hotkey;
 use crate::platform;
 use crate::single_instance::Incoming;
 use crate::tray::{self, TrayMsg};
+use crate::window_state::{self, SizeUpdate, WindowSize, WindowSizeTracker};
 
 /// 系统 CJK 字体候选路径(探测用;结论见模块注释「中文字体」)。
 const CJK_FONT_CANDIDATES: [&str; 2] = [
@@ -274,6 +276,8 @@ pub struct App {
     tray: Option<tray::TrayRuntime>,
     /// 引擎路径(托盘「拉起引擎」用;PaletteState 内另持一份同源克隆)。
     paths: client::DaemonPaths,
+    /// 完整窗口尺寸变化跟踪(400ms 限频合并写盘;见 `window_state`)。
+    window_size: WindowSizeTracker,
 }
 
 /// 两视口共享的运行时状态。
@@ -355,6 +359,7 @@ impl App {
             hotkey,
             tray,
             paths,
+            window_size: WindowSizeTracker::new(),
         }
     }
 
@@ -363,6 +368,42 @@ impl App {
         match self.shared.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// 窗口尺寸变化 → 400ms 限频合并写盘(`window-state.toml`)。
+    ///
+    /// 隐藏门禁用**原生** `isVisible`(`platform::root_visible`):egui-winit 0.37
+    /// 的 `ViewportInfo.visible` / `minimized` 在 macOS 不刷新,不能作为判断依据
+    /// (实测恒 `None`)——两者仅作已知平台限制留档,真正兜底是 `inner_rect == None`
+    /// (窗口隐藏/未创建时平台不提供内容矩形)。最小化由 `isVisible == false` 覆盖。
+    ///
+    /// 全屏跳过:`ViewportInfo.fullscreen` 每帧刷新;全屏尺寸不是用户对普通窗口的
+    /// 调整意图,退出全屏后系统恢复原尺寸,记成全屏尺寸会在下次启动开出超屏窗口。
+    fn persist_window_size(&mut self, ctx: &egui::Context, now: Instant) {
+        if platform::root_visible() == Some(false) {
+            return; // 根窗隐藏/最小化:不落盘
+        }
+        let (inner_rect, fullscreen) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.inner_rect, viewport.fullscreen)
+        });
+        if fullscreen == Some(true) {
+            return; // 全屏期间不写盘
+        }
+        let Some(rect) = inner_rect else {
+            return; // 平台不提供窗口尺寸(隐藏期/未创建):本帧不观察
+        };
+        if rect.width() < window_state::MIN_W || rect.height() < window_state::MIN_H {
+            return; // 最小尺寸生效前的过渡帧不落盘
+        }
+        match self
+            .window_size
+            .observe(WindowSize::new(rect.width(), rect.height()), now)
+        {
+            SizeUpdate::Idle => {}
+            SizeUpdate::Defer(delay) => ctx.request_repaint_after(delay),
+            SizeUpdate::Save(size) => window_state::save(&self.paths.data_dir, size),
         }
     }
 
@@ -496,6 +537,9 @@ impl eframe::App for App {
         // 状态不落后到下次显示;空闲无 pending 时不产生任何帧,不破隐藏零帧。
         self.shared().results.tick(Instant::now());
 
+        // 完整窗口尺寸持久化(visual.md §1.2):可见期跟踪,400ms 限频合并写盘。
+        self.persist_window_size(ctx, Instant::now());
+
         // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/
         // 文本更新要求主线程——muda 约束;快照由刷新线程写、悬停/点击/拉起后触发)。
         self.drain_tray(ctx);
@@ -588,8 +632,9 @@ impl eframe::App for App {
     ///
     /// 悬浮条圆角外区域靠这一层透出桌面:eframe 默认色会把整圈染成暗色
     /// (实测圆角外 (20,21,24) = 默认色叠桌面 (41,44,53) 的合成——透明已生效但
-    /// 仍显"黑角"的另一半)。根视口不受影响:完整窗口内容被 `CentralPanel`
-    /// 不透明底铺满(ui/results.rs:443),清屏色不可见。
+    /// 仍显"黑角"的另一半)。根视口不受影响:`ui/results.rs::draw_impl` 每帧
+    /// 最先铺整窗窗口底色(`window_tokens::FullWindowPalette::window_fill`,
+    /// 含透明标题栏下方区域),清屏色不可见。
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }

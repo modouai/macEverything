@@ -39,7 +39,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::BTreeSet;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::engine_launcher;
 use crate::platform;
@@ -47,6 +47,7 @@ use crate::session::{Session, SortKey, State};
 use crate::tray;
 use crate::ui::menu_actions;
 use crate::ui::palette::{self, EngineStatus, Payload, QueryResult};
+use crate::ui::window_tokens::{self, FullWindowPalette};
 use client::DaemonPaths;
 use protocol::{Gap, HitEntry};
 
@@ -60,6 +61,9 @@ const ROW_H: f32 = 28.0;
 const HEADER_H: f32 = 28.0;
 /// 搜索行高(px;与悬浮条输入行一并放大)。
 const INPUT_H: f32 = 30.0;
+/// 齿轮点击的 v2.1 提示(不放假入口;短驻留,避免长期占据状态栏)。
+const GEAR_PENDING_NOTE: &str = "设置将在 v2.1 提供";
+const GEAR_NOTE_TTL: Duration = Duration::from_secs(3);
 
 /// 表格列:(排序键, 标题, 初始宽, 最小宽);末列占余宽(不可拖)。
 /// 顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径。
@@ -98,6 +102,8 @@ pub struct ResultsState {
     pub input: String,
     /// 瞬时提示(打开失败/查询失败;显示于状态栏)。
     pub status_note: Option<String>,
+    /// 齿轮 v2.1 提示的到期时刻(只对 `GEAR_PENDING_NOTE` 生效,其他提示不设 TTL)。
+    status_note_until: Option<Instant>,
     /// 引擎状态快照(status 面;状态栏「索引状态」段)。
     engine: Option<EngineStatus>,
     /// 是否已取过一次引擎状态(区分「未检查」与「引擎未运行」)。
@@ -151,6 +157,7 @@ impl ResultsState {
             gaps_open: false,
             input: String::new(),
             status_note: None,
+            status_note_until: None,
             engine: None,
             engine_known: false,
             // 启动即显示窗口(dev 形态):首帧补查状态 + 聚焦搜索框。
@@ -174,6 +181,9 @@ impl ResultsState {
     pub fn on_window_shown(&mut self) {
         self.focus_input_pending = true;
         self.status_refresh_pending = true;
+        // 每次唤起从干净状态开始:上次会话的齿轮提示不得跨唤起驻留。
+        self.status_note = None;
+        self.status_note_until = None;
     }
 
     /// 托盘缺口项(product §3):唤起完整窗口并展开缺口面板。
@@ -206,6 +216,15 @@ impl ResultsState {
     /// 每帧驱动(App::logic 调用;根窗隐藏期也经 run_logic 收取响应,状态不落后):
     /// 补查状态 → 防抖到期发查询 → 收三路回投(结果/状态/重启)。
     pub fn tick(&mut self, now: Instant) {
+        // 齿轮提示到期清除(其他状态提示不设 TTL;被新提示替换时丢弃到期点)。
+        if self.status_note.as_deref() == Some(GEAR_PENDING_NOTE) {
+            if self.status_note_until.is_some_and(|until| now >= until) {
+                self.status_note = None;
+                self.status_note_until = None;
+            }
+        } else {
+            self.status_note_until = None;
+        }
         // 在途防抖逐帧补排(与悬浮条同款;根因见 `Session::pending_delay`:
         // 同一 pass 里 0ms 立即重绘请求会吞掉 60ms 防抖请求)。
         if let Some(delay) = self.session.pending_delay(now) {
@@ -358,8 +377,34 @@ impl ResultsState {
         // 行间无缝(item_spacing.y = 0):选中/斑马底连成整块(表格式观感)。
         ui.spacing_mut().item_spacing.y = 0.0;
 
-        // —— 顶部:搜索框 ——
+        // 整窗底色(先于所有分段):根窗标题栏透明化后,原生交通灯浮在内容之上,
+        // 该区域必须是窗口底色而非清屏透明(否则交通灯后是一条黑带)。
+        let palette = window_tokens::palette(ui.visuals().dark_mode);
+        ui.painter()
+            .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, palette.window_fill);
+
+        // —— 标题栏(32):左侧留原生交通灯,右侧齿轮;中间为拖拽区 ——
+        let titlebar = egui::Panel::top("results-titlebar")
+            .exact_size(window_tokens::TITLEBAR_H)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(palette.window_fill))
+            .show(ui, |ui| draw_titlebar(ui, &palette));
+        if titlebar.inner {
+            self.show_gear_note(Instant::now());
+            // 提示 TTL 到期需一帧来清除。实测 `request_repaint_after_for` 在根窗
+            // 空闲期不保证唤醒(悬浮条 pass 不会驱动根窗 logic),用短命线程在
+            // 到期点主动 request_repaint(与查询 worker 同一唤醒路径)。
+            let ctx = self.ctx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(GEAR_NOTE_TTL);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            });
+            log::info!("标题栏齿轮点击:设置窗口未实现(v2.1 提示已落状态栏)");
+        }
+
+        // —— 顶部:搜索框(Task 2 重绘;本轮沿用现有 UI) ——
         let input_resp = egui::Panel::top("results-search")
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.window_fill))
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 let resp = ui
@@ -385,161 +430,166 @@ impl ResultsState {
 
         // —— 底部:状态栏(N 项 · 匹配/读取 ms | 索引状态 | 排序中 | 排序未生效
         //    (红字 + 重启按钮)| 缺口徽标 | 提示)+ 缺口面板(展开时在上,状态行恒驻底)——
-        egui::Panel::bottom("results-status").show(ui, |ui| {
-            let gaps = self.gaps();
-            if self.gaps_open && !gaps.is_empty() {
-                draw_gaps_panel(ui, gaps);
-            }
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(
-                    egui::RichText::new(counts_text(
-                        self.total,
-                        self.results.len(),
-                        self.elapsed_ms,
-                        self.stat_ms,
-                    ))
-                    .small()
-                    .weak(),
-                );
-                ui.separator();
-                if let Some(note) =
-                    index_note(self.engine.as_ref(), &self.session.state, self.engine_known)
-                {
-                    ui.label(egui::RichText::new(note).small().weak());
+        egui::Panel::bottom("results-status")
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.status_fill))
+            .show(ui, |ui| {
+                let gaps = self.gaps();
+                if self.gaps_open && !gaps.is_empty() {
+                    draw_gaps_panel(ui, gaps);
                 }
-                if self.sorting_inflight {
-                    ui.label(egui::RichText::new("排序中…").small().weak());
-                }
-                // 排序未生效(tech 定案:请求键与回显不符):红字 + 重启引擎动作
-                if self.sort_stale {
-                    let warn = ui.visuals().warn_fg_color;
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(
-                        egui::RichText::new("引擎版本过旧,排序未生效")
-                            .small()
-                            .color(warn),
+                        egui::RichText::new(counts_text(
+                            self.total,
+                            self.results.len(),
+                            self.elapsed_ms,
+                            self.stat_ms,
+                        ))
+                        .small()
+                        .weak(),
                     );
-                    if self.engine_restarting {
-                        ui.label(egui::RichText::new("重启中…").small().weak());
-                    } else if ui.button(egui::RichText::new("重启引擎").small()).clicked() {
-                        restart_clicked = true;
+                    ui.separator();
+                    if let Some(note) =
+                        index_note(self.engine.as_ref(), &self.session.state, self.engine_known)
+                    {
+                        ui.label(egui::RichText::new(note).small().weak());
                     }
-                }
-                if !gaps.is_empty() {
-                    let warn = ui.visuals().warn_fg_color;
-                    // 文案与托盘缺口项同源(tray::gaps_label,product §2/§3 逐字)
-                    let badge = egui::Label::new(
-                        egui::RichText::new(tray::gaps_label(gaps.len() as u32))
-                            .small()
-                            .color(warn),
-                    )
-                    .sense(egui::Sense::click());
-                    if ui.add(badge).clicked() {
-                        gaps_clicked = true;
+                    if self.sorting_inflight {
+                        ui.label(egui::RichText::new("排序中…").small().weak());
                     }
-                }
-                if let Some(note) = &self.status_note {
-                    let warn = ui.visuals().warn_fg_color;
-                    ui.label(egui::RichText::new(note).small().color(warn));
-                }
+                    // 排序未生效(tech 定案:请求键与回显不符):红字 + 重启引擎动作
+                    if self.sort_stale {
+                        let warn = ui.visuals().warn_fg_color;
+                        ui.label(
+                            egui::RichText::new("引擎版本过旧,排序未生效")
+                                .small()
+                                .color(warn),
+                        );
+                        if self.engine_restarting {
+                            ui.label(egui::RichText::new("重启中…").small().weak());
+                        } else if ui.button(egui::RichText::new("重启引擎").small()).clicked() {
+                            restart_clicked = true;
+                        }
+                    }
+                    if !gaps.is_empty() {
+                        let warn = ui.visuals().warn_fg_color;
+                        // 文案与托盘缺口项同源(tray::gaps_label,product §2/§3 逐字)
+                        let badge = egui::Label::new(
+                            egui::RichText::new(tray::gaps_label(gaps.len() as u32))
+                                .small()
+                                .color(warn),
+                        )
+                        .sense(egui::Sense::click());
+                        if ui.add(badge).clicked() {
+                            gaps_clicked = true;
+                        }
+                    }
+                    if let Some(note) = &self.status_note {
+                        let warn = ui.visuals().warn_fg_color;
+                        ui.label(egui::RichText::new(note).small().color(warn));
+                    }
+                });
+                ui.add_space(3.0);
             });
-            ui.add_space(3.0);
-        });
 
         // —— 中部:结果表格(虚拟化:只渲染可见行)——
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.results.is_empty() {
-                ui.add_space(12.0);
-                if let Some(msg) = empty_hint(&self.session.state) {
-                    ui.label(egui::RichText::new(msg).weak());
-                }
-                return;
-            }
-            let cur_sort = self.sort;
-            let cur_asc = self.sort_asc;
-            let results: &[HitEntry] = &self.results;
-            let selection: &BTreeSet<usize> = &self.selection;
-
-            let mut table = TableBuilder::new(ui)
-                .id_salt("results-table")
-                .sense(egui::Sense::click())
-                .striped(true)
-                .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-            for (i, (_, _, width, min_width)) in COLUMNS.iter().enumerate() {
-                let column = if i == COLUMNS.len() - 1 {
-                    // 末列占余宽(TableBuilder 语义:remainder 末列不可拖)
-                    Column::remainder().at_least(*min_width).clip(true)
-                } else {
-                    Column::initial(*width)
-                        .at_least(*min_width)
-                        .clip(true)
-                        .resizable(true)
-                };
-                table = table.column(column);
-            }
-            table
-                .header(HEADER_H, |mut header| {
-                    for (key, label, _, _) in COLUMNS {
-                        header.col(|ui| {
-                            let arrow = if cur_sort == key {
-                                if cur_asc {
-                                    " ▲"
-                                } else {
-                                    " ▼"
-                                }
-                            } else {
-                                ""
-                            };
-                            let text = egui::RichText::new(format!("{label}{arrow}")).strong();
-                            let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                            if resp.clicked() {
-                                sort_click = Some(key);
-                            }
-                        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).fill(palette.window_fill))
+            .show(ui, |ui| {
+                if self.results.is_empty() {
+                    ui.add_space(12.0);
+                    if let Some(msg) = empty_hint(&self.session.state) {
+                        ui.label(egui::RichText::new(msg).weak());
                     }
-                })
-                .body(|body| {
-                    body.rows(ROW_H, results.len(), |mut row| {
-                        let i = row.index();
-                        row.set_selected(selection.contains(&i));
-                        let e = &results[i];
-                        row.col(|ui| {
-                            ui.add(egui::Label::new(&e.name).truncate());
-                        });
-                        row.col(|ui| {
-                            // 数字右对齐(表格式读数习惯)
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(size_text(e.size));
-                                },
-                            );
-                        });
-                        row.col(|ui| {
-                            ui.label(mtime_text(e.mtime));
-                        });
-                        row.col(|ui| {
-                            let weak = egui::RichText::new(&e.path).weak();
-                            ui.add(egui::Label::new(weak).truncate());
-                        });
-                        let resp = row.response();
-                        if resp.double_clicked() {
-                            open_row = Some(i); // 双击 = 默认应用打开(product §2)
-                        } else if resp.secondary_clicked() {
-                            // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
-                            // 表格闭包外做(借用结束)
-                            match resp.interact_pointer_pos() {
-                                Some(pos) => context_click = Some((i, pos)),
-                                None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
-                            }
-                        } else if resp.clicked() {
-                            row_click = Some((i, shift_down, cmd_down));
+                    return;
+                }
+                let cur_sort = self.sort;
+                let cur_asc = self.sort_asc;
+                let results: &[HitEntry] = &self.results;
+                let selection: &BTreeSet<usize> = &self.selection;
+
+                let mut table = TableBuilder::new(ui)
+                    .id_salt("results-table")
+                    .sense(egui::Sense::click())
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                for (i, (_, _, width, min_width)) in COLUMNS.iter().enumerate() {
+                    let column = if i == COLUMNS.len() - 1 {
+                        // 末列占余宽(TableBuilder 语义:remainder 末列不可拖)
+                        Column::remainder().at_least(*min_width).clip(true)
+                    } else {
+                        Column::initial(*width)
+                            .at_least(*min_width)
+                            .clip(true)
+                            .resizable(true)
+                    };
+                    table = table.column(column);
+                }
+                table
+                    .header(HEADER_H, |mut header| {
+                        for (key, label, _, _) in COLUMNS {
+                            header.col(|ui| {
+                                let arrow = if cur_sort == key {
+                                    if cur_asc {
+                                        " ▲"
+                                    } else {
+                                        " ▼"
+                                    }
+                                } else {
+                                    ""
+                                };
+                                let text = egui::RichText::new(format!("{label}{arrow}")).strong();
+                                let resp =
+                                    ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                                if resp.clicked() {
+                                    sort_click = Some(key);
+                                }
+                            });
                         }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_H, results.len(), |mut row| {
+                            let i = row.index();
+                            row.set_selected(selection.contains(&i));
+                            let e = &results[i];
+                            row.col(|ui| {
+                                ui.add(egui::Label::new(&e.name).truncate());
+                            });
+                            row.col(|ui| {
+                                // 数字右对齐(表格式读数习惯)
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(size_text(e.size));
+                                    },
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.label(mtime_text(e.mtime));
+                            });
+                            row.col(|ui| {
+                                let weak = egui::RichText::new(&e.path).weak();
+                                ui.add(egui::Label::new(weak).truncate());
+                            });
+                            let resp = row.response();
+                            if resp.double_clicked() {
+                                open_row = Some(i); // 双击 = 默认应用打开(product §2)
+                            } else if resp.secondary_clicked() {
+                                // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
+                                // 表格闭包外做(借用结束)
+                                match resp.interact_pointer_pos() {
+                                    Some(pos) => context_click = Some((i, pos)),
+                                    None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
+                                }
+                            } else if resp.clicked() {
+                                row_click = Some((i, shift_down, cmd_down));
+                            }
+                        });
                     });
-                });
-        });
+            });
 
         // —— 交互落地(表格闭包外:借用结束)——
         if let Some(key) = sort_click {
@@ -589,6 +639,12 @@ impl ResultsState {
             self.focus_input_pending = false;
         }
         self.input_focused = input_resp.has_focus();
+    }
+
+    /// 齿轮点击的 v2.1 提示:`status_note` + 到期时刻(由 tick 清除)。
+    fn show_gear_note(&mut self, now: Instant) {
+        self.status_note = Some(GEAR_PENDING_NOTE.into());
+        self.status_note_until = Some(now + GEAR_NOTE_TTL);
     }
 
     /// 列头点击:同列翻转方向;异列切键并按该键默认方向;两者都触发同串重查
@@ -746,6 +802,72 @@ impl ResultsState {
             composing
         });
         self.ime_composing = composing;
+    }
+}
+
+/// 标题栏(§3.1/§3.3):左侧 80px 留给原生交通灯(不绘制内容),右端齿轮按钮,
+/// 其余区域为窗口拖拽区。返回齿轮是否被点击(调用方落 v2.1 提示)。
+///
+/// 交通灯是原生 NSWindow 按钮,浮在内容之上;此处只负责不遮挡它们的视觉。
+fn draw_titlebar(ui: &mut egui::Ui, palette: &FullWindowPalette) -> bool {
+    let bar = ui.max_rect();
+    let gear = egui::Rect::from_min_size(
+        egui::pos2(
+            bar.right() - window_tokens::TITLEBAR_PAD_X - window_tokens::GEAR_SIZE,
+            bar.top() + (window_tokens::TITLEBAR_H - window_tokens::GEAR_SIZE) / 2.0,
+        ),
+        egui::Vec2::splat(window_tokens::GEAR_SIZE),
+    );
+
+    // 拖拽区 = 交通灯预留区之后到齿轮左缘。左侧 80px 不接管:原生交通灯自带
+    // 命中,自定义交互不覆盖其附近;双击与绿灯缩放走系统原生 zoom(见下)。
+    let drag_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            bar.left() + window_tokens::TRAFFIC_LIGHTS_RESERVE,
+            bar.top(),
+        ),
+        egui::pos2(gear.left(), bar.bottom()),
+    );
+    let drag = ui.interact(
+        drag_rect,
+        ui.scope_id().with("results-titlebar-drag"),
+        egui::Sense::click_and_drag(),
+    );
+    if drag.drag_started() {
+        log::info!("标题栏拖拽:StartDrag");
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    // 双击标题栏与原生绿灯缩放都交给系统:实测双击的第二次 release 不进入 egui
+    // (原生标题栏先接管并 zoom),egui 侧收不到完整 double-click,保留自定义
+    // `ViewportCommand::Maximized` 分支只会是死代码(2026-10-17 临时日志实测)。
+
+    let gear = ui.interact(
+        gear,
+        ui.scope_id().with("results-titlebar-settings"),
+        egui::Sense::click(),
+    );
+    if gear.hovered() {
+        ui.painter().rect_filled(
+            gear.rect,
+            egui::CornerRadius::same(window_tokens::GEAR_RADIUS),
+            palette.title_hover_fill,
+        );
+    }
+    let inset = (window_tokens::GEAR_SIZE - window_tokens::GEAR_ICON) / 2.0;
+    draw_settings_icon(ui.painter(), gear.rect.shrink(inset), palette.title_icon);
+    gear.on_hover_text("设置").clicked()
+}
+
+/// Lucide `settings` 近似(16×16):外圈 + 内圈 + 8 个齿(visual.md §5.2 图标族)。
+fn draw_settings_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.4, color);
+    let center = rect.center();
+    painter.circle_stroke(center, 4.6, stroke);
+    painter.circle_stroke(center, 1.8, stroke);
+    for i in 0..8 {
+        let angle = std::f32::consts::TAU * i as f32 / 8.0;
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment([center + dir * 5.4, center + dir * 7.0], stroke);
     }
 }
 
@@ -1305,6 +1427,39 @@ mod tests {
         assert!(st.sort_stale, "失败不清红字(排序仍未生效)");
         assert!(!st.engine_restarting);
         assert_eq!(st.status_note.as_deref(), Some("引擎重启失败:x"));
+    }
+
+    /// 齿轮 v2.1 提示:3s 到期由 tick 清除;窗口重新唤起立即清除;其他提示不被 TTL 误清。
+    #[test]
+    fn gear_note_expires_and_window_shown_clears() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx, daemon_paths_for_test());
+        let t0 = Instant::now();
+        st.show_gear_note(t0);
+        assert_eq!(st.status_note.as_deref(), Some(GEAR_PENDING_NOTE));
+        assert_eq!(st.status_note_until, Some(t0 + GEAR_NOTE_TTL));
+
+        // 未到期:保留
+        st.tick(t0 + GEAR_NOTE_TTL - Duration::from_millis(1));
+        assert_eq!(st.status_note.as_deref(), Some(GEAR_PENDING_NOTE));
+
+        // 到期:tick 清除
+        st.tick(t0 + GEAR_NOTE_TTL);
+        assert_eq!(st.status_note, None);
+        assert_eq!(st.status_note_until, None);
+
+        // 重新唤起:立即清除,不等 TTL
+        st.show_gear_note(t0);
+        st.on_window_shown();
+        assert_eq!(st.status_note, None);
+        assert_eq!(st.status_note_until, None);
+
+        // 其他状态提示(非齿轮文案)不受 TTL 影响:到期点被丢弃,文案保留到业务清除
+        st.status_note = Some("查询失败".into());
+        st.status_note_until = Some(t0); // 模拟遗留到期点
+        st.tick(t0 + GEAR_NOTE_TTL * 2);
+        assert_eq!(st.status_note.as_deref(), Some("查询失败"));
+        assert_eq!(st.status_note_until, None);
     }
 
     /// 缺口面板:展开态随缺口归零自动收起;徽标/面板/红字/按钮出帧不 panic。
