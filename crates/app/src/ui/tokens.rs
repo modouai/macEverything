@@ -35,6 +35,14 @@ pub struct Palette {
     pub footer_label: egui::Color32,
     pub keycap_fill: egui::Color32,
     pub keycap_text: egui::Color32,
+    /// 状态角标（§2.6）：中性 / 警示 / 错误三档强调度的底与字。
+    /// 中性档与键帽同值，但有意分列（可独立调整，当前同值）。
+    pub badge_neutral_fill: egui::Color32,
+    pub badge_neutral_text: egui::Color32,
+    pub badge_warning_fill: egui::Color32,
+    pub badge_warning_text: egui::Color32,
+    pub badge_error_fill: egui::Color32,
+    pub badge_error_text: egui::Color32,
 }
 
 pub fn dark() -> Palette {
@@ -56,6 +64,12 @@ pub fn dark() -> Palette {
         footer_label: c(0x8B929AFF),
         keycap_fill: c(0xFFFFFF1A),
         keycap_text: c(0xC6CBD1FF),
+        badge_neutral_fill: c(0xFFFFFF1A),
+        badge_neutral_text: c(0xC6CBD1FF),
+        badge_warning_fill: c(0xF59E0B29),
+        badge_warning_text: c(0xF0B357FF),
+        badge_error_fill: c(0xEF444429),
+        badge_error_text: c(0xF87171FF),
     }
 }
 
@@ -78,6 +92,12 @@ pub fn light() -> Palette {
         footer_label: c(0x5F6774FF),
         keycap_fill: c(0x0000000D),
         keycap_text: c(0x4B5563FF),
+        badge_neutral_fill: c(0x0000000D),
+        badge_neutral_text: c(0x4B5563FF),
+        badge_warning_fill: c(0xF59E0B1F),
+        badge_warning_text: c(0xB45309FF),
+        badge_error_fill: c(0xEF44441F),
+        badge_error_text: c(0xB91C1CFF),
     }
 }
 
@@ -136,7 +156,32 @@ pub const ACTION_HINT_W: f32 = 40.0;
 /// 键帽高（11pt 文本 + 上 3 下 3 内边距 + 描边余量 = §2.5 的 19）。
 pub const KEYCAP_H: f32 = 19.0;
 
-/// 面板高（含形象条 0；窗口高 = 本值 + `MASCOT_STRIP`，见 palette.rs 模块头）。
+// —— 形象几何（§2.9；Task 8 只预留净空，绘制与窗口高在 Task 9）——
+/// 形象画布宽（§2.9）。
+pub const MASCOT_W: f32 = 118.0;
+/// 形象画布高（§2.9）。
+pub const MASCOT_H: f32 = 100.0;
+/// 形象下缘压过面板顶边的深度（§2.9）。
+pub const MASCOT_OVERLAP: f32 = 34.0;
+/// 形象右缘距面板右缘（§2.9）。
+pub const MASCOT_RIGHT_GAP: f32 = 60.0;
+/// 角标（或输入框）与形象左缘的最小净空（§2.9「避让」）。
+pub const MASCOT_BADGE_GAP: f32 = 12.0;
+/// 形象露出面板顶边的高度（Task 9 窗口预留 = 本值）。
+pub const MASCOT_STRIP: f32 = MASCOT_H - MASCOT_OVERLAP;
+/// 搜索行右端「按钮后游标 → 角标右缘」的预留宽（不含 item_spacing 14）；
+/// 按钮左缘到角标右缘的实际距离 = `SEARCH_GAP + 本值` = 142。
+///
+/// 推导（§2.9）：`面板右缘 − SEARCH_PAD_X − BTN_SIZE − SEARCH_GAP − 本值`
+/// 必须等于 `形象左缘 − MASCOT_BADGE_GAP`。无角标时该净空同样保留，
+/// 输入框右缘不进入形象区域。
+pub const MASCOT_CLEAR_W: f32 =
+    MASCOT_RIGHT_GAP + MASCOT_W + MASCOT_BADGE_GAP - (SEARCH_PAD_X + BTN_SIZE) - SEARCH_GAP;
+
+/// 编译期钉住形象露出条高（Task 9 窗口预留直接读 `MASCOT_STRIP`；本任务不启用）。
+const _: () = assert!(MASCOT_STRIP == 66.0);
+
+/// 面板高（不含形象条；窗口高 = 本值 + `MASCOT_STRIP`，Task 9 启用）。
 pub const fn panel_h(list_h: f32) -> f32 {
     SEARCH_H + DIVIDER_H + list_h + DIVIDER_H + FOOTER_H
 }
@@ -157,7 +202,7 @@ mod tests {
     /// 钉住：深/浅两套 token 与 `visual.md` §4.1 表逐项相等（防手滑改错色值）。
     #[test]
     fn tokens_match_spec_table() {
-        let rows: [(egui::Color32, u32, u32, &str); 17] = [
+        let rows: [(egui::Color32, u32, u32, &str); 23] = [
             (dark().panel_fill, 0x191C2166, 0xFFFFFF66, "面板底"),
             (dark().panel_stroke, 0xFFFFFF29, 0x0F172A1F, "面板描边"),
             (dark().search_icon, 0x8B929AFF, 0x6B7280FF, "搜索图标"),
@@ -185,8 +230,44 @@ mod tests {
             (dark().footer_label, 0x8B929AFF, 0x5F6774FF, "页脚标签"),
             (dark().keycap_fill, 0xFFFFFF1A, 0x0000000D, "键帽底"),
             (dark().keycap_text, 0xC6CBD1FF, 0x4B5563FF, "键帽文字"),
+            (
+                dark().badge_neutral_fill,
+                0xFFFFFF1A,
+                0x0000000D,
+                "角标底(中性)",
+            ),
+            (
+                dark().badge_neutral_text,
+                0xC6CBD1FF,
+                0x4B5563FF,
+                "角标文字(中性)",
+            ),
+            (
+                dark().badge_warning_fill,
+                0xF59E0B29,
+                0xF59E0B1F,
+                "角标底(警示)",
+            ),
+            (
+                dark().badge_warning_text,
+                0xF0B357FF,
+                0xB45309FF,
+                "角标文字(警示)",
+            ),
+            (
+                dark().badge_error_fill,
+                0xEF444429,
+                0xEF44441F,
+                "角标底(错误)",
+            ),
+            (
+                dark().badge_error_text,
+                0xF87171FF,
+                0xB91C1CFF,
+                "角标文字(错误)",
+            ),
         ];
-        let light: [egui::Color32; 17] = [
+        let light: [egui::Color32; 23] = [
             light().panel_fill,
             light().panel_stroke,
             light().search_icon,
@@ -204,6 +285,12 @@ mod tests {
             light().footer_label,
             light().keycap_fill,
             light().keycap_text,
+            light().badge_neutral_fill,
+            light().badge_neutral_text,
+            light().badge_warning_fill,
+            light().badge_warning_text,
+            light().badge_error_fill,
+            light().badge_error_text,
         ];
         for (i, (dark_val, dark_hex, light_hex, name)) in rows.iter().enumerate() {
             assert_eq!(
@@ -227,5 +314,38 @@ mod tests {
         assert_eq!(list_h(6), 6.0 * ROW_H + 5.0 * ROW_GAP + LIST_PAD_V * 2.0);
         assert_eq!(panel_h(list_h(0)), 176.0);
         assert_eq!(panel_h(list_h(6)), 466.0);
+    }
+
+    /// 钉住：形象净空推导（§2.9）——理想内容宽下角标右缘与形象左缘恰 12；
+    /// 实际内容宽（`PANEL_W − 2`）下净空 ≥ 12。
+    #[test]
+    fn mascot_clear_w_leaves_twelve_px_gap() {
+        let mascot_left = PANEL_W - MASCOT_RIGHT_GAP - MASCOT_W;
+        // 理想推导（内容宽 = 面板宽）：角标右缘 = 形象左缘 − 12。
+        assert_eq!(MASCOT_CLEAR_W, 128.0, "净空宽应等于 §2.9 推导值");
+        let ideal_badge_right = PANEL_W - SEARCH_PAD_X - BTN_SIZE - SEARCH_GAP - MASCOT_CLEAR_W;
+        assert_eq!(
+            ideal_badge_right,
+            PANEL_W - (MASCOT_RIGHT_GAP + MASCOT_W + MASCOT_BADGE_GAP),
+            "角标右缘须按「面板右缘 − 形象占位 − 净空」定位"
+        );
+        assert_eq!(
+            mascot_left - ideal_badge_right,
+            MASCOT_BADGE_GAP,
+            "理想内容宽下净空应为 12"
+        );
+        // 实际布局：搜索行内容宽 = PANEL_W − 2（既有描边内缩），净空 14 ≥ 12；
+        // Task 11 统一内容宽后收敛为 12。
+        let content_right = PANEL_W - 2.0;
+        let actual_badge_right =
+            content_right - SEARCH_PAD_X - BTN_SIZE - SEARCH_GAP - MASCOT_CLEAR_W;
+        assert!(actual_badge_right < mascot_left, "角标不得进入形象区域");
+        assert!(
+            mascot_left - actual_badge_right >= MASCOT_BADGE_GAP,
+            "实际净空须 ≥ 12（当前 {}）",
+            mascot_left - actual_badge_right
+        );
+        // 形象露出顶边的高度（Task 9 窗口预留用）。
+        assert_eq!(MASCOT_STRIP, 66.0);
     }
 }

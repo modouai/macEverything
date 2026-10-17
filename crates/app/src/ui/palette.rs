@@ -79,6 +79,10 @@ const FONT_DIR: f32 = tk::FONT_DIR;
 const FONT_META: f32 = tk::FONT_HINT;
 /// 键帽 / 状态角标（11pt）。
 const FONT_KEYCAP: f32 = tk::FONT_KEYCAP;
+/// 状态角标 chip 最大宽（px）：超长错误文案不得挤爆搜索行。
+const BADGE_MAX_W: f32 = 240.0;
+/// 状态角标文本最大宽（chip 宽 − 左右内边距）；宽度按 `text_w` 实测截断。
+const BADGE_TEXT_MAX_W: f32 = BADGE_MAX_W - 2.0 * tk::KEYCAP_PAD.1;
 
 /// 结果行/输入框字号（proportional；供 RichText/TextEdit 直接引用）。
 fn font(size: f32) -> egui::FontId {
@@ -141,6 +145,45 @@ pub struct EngineStatus {
     pub built_at: u64,
 }
 
+/// 状态角标（visual.md §2.6）：文案 + 强调度（决定底色与文字色）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Badge {
+    pub text: String,
+    pub tone: BadgeTone,
+}
+
+impl Badge {
+    fn neutral(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: BadgeTone::Neutral,
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: BadgeTone::Warning,
+        }
+    }
+
+    /// 瞬时错误（打开失败等；非索引态映射）。
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: BadgeTone::Error,
+        }
+    }
+}
+
+/// 角标强调度（visual.md §2.6 / §4.1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeTone {
+    Neutral,
+    Warning,
+    Error,
+}
+
 /// 绘制产出的动作,交上层(`ui::App`)执行。
 pub enum Action {
     /// 隐藏悬浮条(打开成功 / Esc / 失焦)。
@@ -158,8 +201,8 @@ pub struct PaletteState {
     pub total: u32,
     pub elapsed_ms: f64,
     pub stat_ms: f64,
-    /// 角标文案(§7 六态映射:建索引中/补齐中/重扫中/离线索引/引擎启动中/索引构建中)。
-    pub status_note: Option<String>,
+    /// 状态角标（§2.6 六态映射 + 强调度；打开失败等瞬时提示用 `Badge::error`）。
+    pub status_note: Option<Badge>,
     /// 热键提示(降级/不可用;Task 15)。常驻:不随唤起复位、不被查询结果覆盖。
     pub hotkey_note: Option<String>,
     /// 列表渲染行数(初始 20,滚到底 +20,至 `results.len()`)。
@@ -612,7 +655,8 @@ impl PaletteState {
                 ui.set_width(PANEL_W - 2.0);
                 // 三段高按 token 精确拼装：段间不留 item_spacing（否则整段多垫 N×4px）。
                 ui.spacing_mut().item_spacing.y = 0.0;
-                // —— 搜索行（高 64；右端为「打开完整窗口」按钮，右→左：按钮/角标/输入/图标）——
+                // —— 搜索行（高 64；右端为「打开完整窗口」按钮，右→左：
+                //    按钮/形象净空/角标/输入/图标）——
                 let row_w = ui.available_width();
                 let input_resp = ui
                     .allocate_ui_with_layout(
@@ -643,12 +687,32 @@ impl PaletteState {
                             {
                                 btn_full = true;
                             }
-                            // 状态角标（非 ready 才有；落在按钮左侧，§2.6）
-                            if let Some(note) = &note {
-                                ui.label(
-                                    egui::RichText::new(note)
-                                        .size(FONT_KEYCAP)
-                                        .color(t.footer_label),
+                            // 形象净空（§2.9）：无角标也保留，保证输入框右缘
+                            // 不进入形象区域（角标右缘距形象左缘 12）。
+                            ui.add_space(tk::MASCOT_CLEAR_W);
+                            // 状态角标（非 ready 才有；落在按钮左侧，§2.6）：
+                            // 形制与键帽同族（圆角 4 / 上下 3 左右 6 / 11pt，
+                            // 高 = KEYCAP_H），底色与文字色按强调度取 token。
+                            if let Some(badge) = &note {
+                                let text = badge_text_fit(ui, &badge.text, BADGE_TEXT_MAX_W);
+                                let w = text_w(ui, &text, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(w, tk::KEYCAP_H),
+                                    egui::Sense::hover(),
+                                );
+                                let (fill, text_color) = badge_colors(badge.tone, &t);
+                                let p = ui.painter();
+                                p.rect_filled(
+                                    rect,
+                                    egui::CornerRadius::same(tk::KEYCAP_RADIUS),
+                                    fill,
+                                );
+                                p.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &text,
+                                    font(FONT_KEYCAP),
+                                    text_color,
                                 );
                             }
                             // 查询区（占满余宽 − 图标 − 间距 − 左端内边距；空词只有光标）
@@ -1065,7 +1129,7 @@ impl PaletteState {
             Ok(()) => Some(Action::Hide),
             Err(msg) => {
                 // 边界(product §边界):文件已删/打开失败 → 提示,不隐藏、不静默
-                self.status_note = Some(msg);
+                self.status_note = Some(Badge::error(msg));
                 None
             }
         }
@@ -1280,23 +1344,36 @@ pub(crate) fn sort_str(key: SortKey) -> Option<&'static str> {
     }
 }
 
-/// 角标文案(product §7 映射,悬浮条列)。引擎状态优先(更新鲜);会话态兜底。
-fn badge_note(state: &State, engine: Option<&EngineStatus>) -> Option<String> {
+/// 状态角标（visual.md §2.6 六态映射）。引擎状态优先（更新鲜）；会话态兜底。
+fn badge_note(state: &State, engine: Option<&EngineStatus>) -> Option<Badge> {
     if let Some(eng) = engine {
         match eng.state.as_str() {
-            client::state::BUILDING => return Some(format!("建索引中 {}", eng.entry_count)),
-            client::state::RECONCILING => return Some("补齐中".into()),
-            client::state::DEGRADED => return Some("重扫中".into()),
-            client::state::OFFLINE => return Some("离线索引".into()),
-            _ => {} // ready:无角标;其余看会话态
+            client::state::BUILDING => {
+                return Some(Badge::neutral(format!("建索引中 {}", eng.entry_count)));
+            }
+            // 就绪不占位；但查询级错误不得被 ready 吞掉（落到会话态 → 「查询失败」）。
+            client::state::READY if !matches!(state, State::Error(_)) => return None,
+            client::state::RECONCILING => return Some(Badge::warning("补齐中")),
+            client::state::DEGRADED => return Some(Badge::warning("重扫中")),
+            client::state::OFFLINE => return Some(Badge::warning("离线索引")),
+            _ => {} // 未知引擎态：落到会话态
         }
     }
     match state {
-        State::EngineStarting => Some("引擎启动中".into()),
-        State::Warming => Some("索引构建中".into()),
-        State::Offline => Some("离线索引".into()),
-        State::Error(_) => Some("查询失败".into()),
+        State::EngineStarting => Some(Badge::error("引擎未运行")),
+        State::Warming => Some(Badge::neutral("索引构建中")),
+        State::Offline => Some(Badge::warning("离线索引")),
+        State::Error(_) => Some(Badge::error("查询失败")),
         State::Idle | State::Searching | State::Empty => None,
+    }
+}
+
+/// 角标强调度 → (底, 字)（visual.md §2.6 / §4.1）。
+fn badge_colors(tone: BadgeTone, t: &tk::Palette) -> (egui::Color32, egui::Color32) {
+    match tone {
+        BadgeTone::Neutral => (t.badge_neutral_fill, t.badge_neutral_text),
+        BadgeTone::Warning => (t.badge_warning_fill, t.badge_warning_text),
+        BadgeTone::Error => (t.badge_error_fill, t.badge_error_text),
     }
 }
 
@@ -1309,12 +1386,32 @@ fn dir_display(path: &str) -> String {
     elide_middle(dir, 64)
 }
 
-/// 文本宽度（页脚键帽/标签排版用）。
+/// 文本宽（页脚键帽/标签排版与状态角标宽度测量共用）。
 fn text_w(ui: &egui::Ui, s: &str, size: f32) -> f32 {
     ui.painter()
         .layout_no_wrap(s.to_owned(), font(size), egui::Color32::WHITE)
         .size()
         .x
+}
+
+/// 角标文本按实测宽度截断：超 `max_w` 时逐字符回退并补「…」。
+/// 不按字符数硬编码——中文/数字/标点宽度不同。
+fn badge_text_fit(ui: &egui::Ui, text: &str, max_w: f32) -> String {
+    if text_w(ui, text, FONT_KEYCAP) <= max_w {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        out.push(ch);
+        let mut probe = out.clone();
+        probe.push('…');
+        if text_w(ui, &probe, FONT_KEYCAP) > max_w {
+            out.pop();
+            break;
+        }
+    }
+    out.push('…');
+    out
 }
 
 /// 搜索图标（§5.2 `search`；圆 + 手柄）。
@@ -2143,44 +2240,94 @@ mod tests {
             gaps: Vec::new(),
             built_at: 0,
         };
+        // 角标形态 = (文案, 强调度)；ready / 空态无角标。
+        let note = |state: &State, engine: Option<&EngineStatus>| {
+            badge_note(state, engine).map(|b| (b.text, b.tone))
+        };
+        let some = |text: &str, tone: BadgeTone| Some((text.to_string(), tone));
+        // —— 引擎六态（引擎优先，会话态无关）——
         assert_eq!(
-            badge_note(&State::Searching, Some(&eng("building"))).as_deref(),
-            Some("建索引中 12")
+            note(&State::Searching, Some(&eng("building"))),
+            some("建索引中 12", BadgeTone::Neutral)
         );
         assert_eq!(
-            badge_note(&State::Searching, Some(&eng("reconciling"))).as_deref(),
-            Some("补齐中")
-        );
-        assert_eq!(
-            badge_note(&State::Searching, Some(&eng("degraded"))).as_deref(),
-            Some("重扫中")
-        );
-        assert_eq!(
-            badge_note(&State::Searching, Some(&eng("offline"))).as_deref(),
-            Some("离线索引")
-        );
-        assert_eq!(
-            badge_note(&State::Searching, Some(&eng("ready"))),
+            note(&State::Searching, Some(&eng("ready"))),
             None,
-            "就绪无角标"
+            "就绪不占位"
         );
-        // 引擎状态取不到 → 会话态兜底
+        // 就绪时非错误的会话态角标照样被抑制（证明 ready 分支起效）。
         assert_eq!(
-            badge_note(&State::EngineStarting, None).as_deref(),
-            Some("引擎启动中")
+            note(&State::EngineStarting, Some(&eng("ready"))),
+            None,
+            "就绪时不得显示会话态角标"
         );
+        // 就绪但查询报错：错误不得被 ready 吞掉。
         assert_eq!(
-            badge_note(&State::Warming, None).as_deref(),
-            Some("索引构建中")
-        );
-        assert_eq!(
-            badge_note(&State::Offline, None).as_deref(),
-            Some("离线索引")
+            note(&State::Error("query".into()), Some(&eng("ready"))),
+            some("查询失败", BadgeTone::Error)
         );
         assert_eq!(
-            badge_note(&State::Error("query".into()), None).as_deref(),
-            Some("查询失败")
+            note(&State::Searching, Some(&eng("reconciling"))),
+            some("补齐中", BadgeTone::Warning)
         );
-        assert_eq!(badge_note(&State::Idle, None), None);
+        assert_eq!(
+            note(&State::Searching, Some(&eng("degraded"))),
+            some("重扫中", BadgeTone::Warning)
+        );
+        assert_eq!(
+            note(&State::Searching, Some(&eng("offline"))),
+            some("离线索引", BadgeTone::Warning)
+        );
+        // —— 引擎态取不到（或未知）→ 会话态兜底 ——
+        assert_eq!(
+            note(&State::EngineStarting, None),
+            some("引擎未运行", BadgeTone::Error)
+        );
+        assert_eq!(
+            note(&State::Warming, None),
+            some("索引构建中", BadgeTone::Neutral)
+        );
+        assert_eq!(
+            note(&State::Offline, None),
+            some("离线索引", BadgeTone::Warning)
+        );
+        assert_eq!(
+            note(&State::Error("query".into()), None),
+            some("查询失败", BadgeTone::Error)
+        );
+        assert_eq!(note(&State::Idle, None), None);
+        assert_eq!(note(&State::Searching, None), None);
+        assert_eq!(note(&State::Empty, None), None);
+        // 未知引擎态落到会话态（不误报 ready）。
+        assert_eq!(
+            note(&State::Warming, Some(&eng("unknown"))),
+            some("索引构建中", BadgeTone::Neutral)
+        );
+    }
+
+    /// 超长角标文案按实测宽截断：chip 宽 ≤ 上限且以「…」结尾；短文本原样。
+    #[test]
+    fn badge_text_fit_caps_chip_width() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(PANEL_W, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            let long = format!("打开失败:{}", "文件路径不存在或已被移动".repeat(8));
+            let fitted = badge_text_fit(ui, &long, BADGE_TEXT_MAX_W);
+            assert!(fitted.ends_with('…'), "超长文本应截断并补省略号:{fitted}");
+            let chip_w = text_w(ui, &fitted, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
+            assert!(
+                chip_w <= BADGE_MAX_W,
+                "chip 宽 {chip_w} 超过上限 {BADGE_MAX_W}"
+            );
+            // 短文本不截断。
+            assert_eq!(badge_text_fit(ui, "补齐中", BADGE_TEXT_MAX_W), "补齐中");
+        });
+        out.textures_delta.clear(); // headless：不做纹理上传，清掉免得 Drop 告警
     }
 }
