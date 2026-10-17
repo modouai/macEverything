@@ -65,7 +65,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 - [x] **Step 1:** 表头高 32、左右 16、子间距 16、12pt；列宽 名称弹性 ｜ 96 ｜ 160 ｜ 300；排序箭头 12×12（chevron up/down，仅当前排序列）；列宽拖拽热区边界 ±4，名称最小 84（720 最小窗仍能容纳四列）。
 - [x] **Step 2:** 行高 30、左右 16、子间距 16、文件名 13pt、其余 12pt；名称 cell = 16×16 图标（UTI 缓存）+ 间距 8 + 文件名；目录大小列「—」。
 - [x] **Step 3:** 行状态：选中行底 token、悬停 = 选中 50% 强度、鼠标移动不改选中；多选/双击/右键语义沿用 product §2，零功能丢失。
-- [x] **Step 4:** 虚拟化 `ScrollArea::show_rows`/等价；滚动条默认隐藏、滚动时出现（当前为 egui floating 近似：悬停/滚动出现，已知偏差交 Task 5 验收）。
+- [x] **Step 4:** 虚拟化 `ScrollArea::show_rows`/等价；滚动条为 egui floating：悬停出现，滚动不改变可见性（已知偏差，Task 5 验收）。
 - [x] **Step 5:** `<check>` + 实机大结果集滚动。
 
 ## Task 4: 状态栏 + 空态

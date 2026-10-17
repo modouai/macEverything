@@ -95,6 +95,8 @@ pub struct ResultsState {
     /// 大小 / 修改时间 / 路径三列固定宽(名称列吃余宽)。拖拽后跨帧保留,
     /// **不持久化**(重启回落默认 [96, 160, 300],visual.md §3.4)。
     col_fixed: [f32; 3],
+    /// 列宽拖拽会话(按下点与起拖时显示宽;总位移从按下点起算,见 `draw_header`)。
+    col_drag: Option<ColDragState>,
     /// 选中行号集合(protocol 条目无 id,行号即选择;结果整体替换时清空)。
     pub selection: BTreeSet<usize>,
     /// shift 范围选锚点(范围选不移动锚点,概念如 Finder)。
@@ -163,6 +165,7 @@ impl ResultsState {
                 window_tokens::COL_MTIME_W,
                 window_tokens::COL_PATH_W,
             ],
+            col_drag: None,
             selection: BTreeSet::new(),
             anchor: None,
             sorting_inflight: false,
@@ -532,8 +535,15 @@ impl ResultsState {
             .show(ui, |ui| {
                 let area = ui.max_rect();
                 let cols = col_layout(area.width(), self.col_fixed);
-                let header_action =
-                    draw_header(ui, area, &cols, self.sort, self.sort_asc, &palette);
+                let header_action = draw_header(
+                    ui,
+                    area,
+                    &cols,
+                    self.sort,
+                    self.sort_asc,
+                    &palette,
+                    &mut self.col_drag,
+                );
                 if let Some(key) = header_action.sort_click {
                     sort_click = Some(key);
                 }
@@ -546,11 +556,12 @@ impl ResultsState {
                     egui::CornerRadius::ZERO,
                     palette.divider,
                 );
-                // 拖拽结果下一帧生效(本帧行已按旧宽排;差一帧不可见)。起点宽取
-                // 本帧投影后的显示宽(不是 stored),否则窄窗首帧会跳变(见
-                // `drag_from_layout`)。
-                if let Some((boundary, delta)) = header_action.drag {
-                    self.col_fixed = drag_from_layout(boundary, &cols, delta, area.width());
+                // 拖拽结果下一帧生效(本帧行已按旧宽排;差一帧不可见)。总位移从
+                // 按下点起算、起点宽取按下帧投影后的显示宽(不是 stored),否则窄窗
+                // 首帧会跳变;释放帧同样按最终指针位置应用一次(见 `draw_header`)。
+                if let Some((drag, delta)) = header_action.drag {
+                    self.col_fixed =
+                        drag_fixed(drag.boundary, drag.start_fixed, delta, area.width());
                 }
                 let table_rect = egui::Rect::from_min_max(
                     egui::pos2(
@@ -935,6 +946,19 @@ enum ColBoundary {
     MtimePath,
 }
 
+/// 列宽拖拽会话:按下点 + 按下时实际显示的三列固定宽。
+///
+/// 位移从**按下点**起算(不是逐帧 `drag_delta`):快速拖动同帧释放时
+/// `drag_delta` 归零/起拖阈值前位移会丢,边界落后指针。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ColDragState {
+    boundary: ColBoundary,
+    /// 按下点 x(视口坐标)。
+    start_x: f32,
+    /// 按下时 `col_layout` 投影后的实际显示宽(窄窗不跳回 stored)。
+    start_fixed: [f32; 3],
+}
+
 /// 拖拽后的固定列宽(纯函数):`delta` = 本帧指针横向位移(右为正)。
 ///
 /// 名称列吃余宽,故边界两侧必须一增一减才能让边界跟随指针:
@@ -972,21 +996,6 @@ fn drag_fixed(boundary: ColBoundary, fixed: [f32; 3], delta: f32, total_w: f32) 
         }
     }
     fixed
-}
-
-/// 拖拽起算宽 = `col_layout` 投影后的实际显示宽(纯函数)。
-///
-/// 窄窗下 `col_layout` 会把超预算的 stored 固定列收缩到当前窗口预算;若拖拽仍按
-/// stored 起算,首帧增量会一次性抹掉隐藏的超额宽度,边界跳变。以投影宽为起点,
-/// 拖拽即把 stored 归一化到当前可见布局,边界始终跟手。
-fn drag_from_layout(
-    boundary: ColBoundary,
-    cols: &[(f32, f32); 4],
-    delta: f32,
-    total_w: f32,
-) -> [f32; 3] {
-    let effective = [cols[COL_SIZE].1, cols[COL_MTIME].1, cols[COL_PATH].1];
-    drag_fixed(boundary, effective, delta, total_w)
 }
 
 /// 单行各内容矩形(绝对坐标):名称图标 / 名称文本 / 大小 / 修改时间 / 路径。
@@ -1034,8 +1043,8 @@ fn row_cells(row: egui::Rect, cols: &[(f32, f32); 4]) -> RowCells {
 struct HeaderAction {
     /// 列头点击的排序键(由调用方走 `on_header_click`)。
     sort_click: Option<SortKey>,
-    /// 列边界拖拽:(边界, 本帧横向位移)。
-    drag: Option<(ColBoundary, f32)>,
+    /// 列边界拖拽:(拖拽会话, 自按下点起算的总横向位移)。
+    drag: Option<(ColDragState, f32)>,
 }
 
 /// 表头(§3.4):高 32、12pt、无竖分隔线;名称 / 大小 / 修改时间 / 路径四列,
@@ -1048,6 +1057,7 @@ fn draw_header(
     sort: SortKey,
     sort_asc: bool,
     palette: &FullWindowPalette,
+    drag: &mut Option<ColDragState>,
 ) -> HeaderAction {
     let header =
         egui::Rect::from_min_size(area.min, egui::vec2(area.width(), window_tokens::HEADER_H));
@@ -1058,6 +1068,8 @@ fn draw_header(
     );
     let painter = header_ui.painter().clone();
     let mut action = HeaderAction::default();
+    // 按下帧的实际显示宽:窄窗下 stored 超预算时以投影宽起算,拖拽不跳变。
+    let effective = [cols[COL_SIZE].1, cols[COL_MTIME].1, cols[COL_PATH].1];
     for (i, (key, label)) in COLUMNS.iter().enumerate() {
         let cell = egui::Rect::from_min_size(
             egui::pos2(area.left() + cols[i].0, header.top()),
@@ -1126,18 +1138,37 @@ fn draw_header(
             header_ui.scope_id().with(("results-col-drag", i)),
             egui::Sense::click_and_drag(),
         );
-        if resp.drag_started() {
-            log::info!("列宽拖拽:{boundary:?}");
+        // 按下即记住起点(不等 drag_started 的 6px 阈值):快速拖动同帧释放
+        // 时也能按最终指针位置应用,阈值前的位移不丢。
+        if drag.is_none() && resp.is_pointer_button_down_on() {
+            if let Some(start) = header_ui.input(|i| i.pointer.press_origin()) {
+                *drag = Some(ColDragState {
+                    boundary: *boundary,
+                    start_x: start.x,
+                    start_fixed: effective,
+                });
+                log::info!("列宽拖拽按下:{boundary:?} x={:.1}", start.x);
+            }
         }
         if resp.hovered() || resp.dragged() {
             header_ui
                 .ctx()
                 .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
-        if resp.dragged() {
-            let delta = resp.drag_delta().x;
-            if delta != 0.0 {
-                action.drag = Some((*boundary, delta));
+        if let Some(state) = *drag {
+            if state.boundary == *boundary {
+                // 总位移 = 当前指针 x − 按下点 x(drag_delta 不是总位移)。
+                let pos = resp
+                    .interact_pointer_pos()
+                    .or_else(|| header_ui.input(|i| i.pointer.latest_pos()));
+                if let Some(pos) = pos {
+                    action.drag = Some((state, pos.x - state.start_x));
+                }
+                let (released, down) =
+                    header_ui.input(|i| (i.pointer.any_released(), i.pointer.any_down()));
+                if released || !down {
+                    *drag = None; // 释放帧已按最终位置应用;会话结束
+                }
             }
         }
     }
@@ -1387,9 +1418,24 @@ fn natural_asc(key: SortKey) -> bool {
     !matches!(key, SortKey::Mtime | SortKey::Relevance)
 }
 
+/// 数值文案(原型口径):保留一位小数,整数值去掉 `.0`
+/// (18 KB / 2.4 MB / 12 MB / 匹配 3 ms / 读取 12 ms)。
+fn format_metric(value: f64) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
 /// 状态栏计数段:N 项 = 命中总数(total);返回条数 < total 时注「展示前 K 条」。
 fn counts_text(total: u32, shown: usize, elapsed_ms: f64, stat_ms: f64) -> String {
-    let mut s = format!("{total} 项 · 匹配 {elapsed_ms:.1} ms · 读取 {stat_ms:.1} ms");
+    let mut s = format!(
+        "{total} 项 · 匹配 {} ms · 读取 {} ms",
+        format_metric(elapsed_ms),
+        format_metric(stat_ms)
+    );
     if (shown as u32) < total {
         s.push_str(&format!(" · 展示前 {shown} 条"));
     }
@@ -1438,9 +1484,139 @@ struct StatusAction {
     restart_clicked: bool,
 }
 
+/// 状态栏左区各段自然宽(0 = 不显示;由绘制侧量出的像素宽)。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StatusWidths {
+    status: f32,
+    stale: f32,
+    restart: f32,
+    note: f32,
+}
+
+/// 状态栏各段矩形(纯几何;绝对坐标)。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StatusRowLayout {
+    status: Option<egui::Rect>,
+    stale: Option<egui::Rect>,
+    restart: Option<egui::Rect>,
+    note: Option<egui::Rect>,
+    badge: Option<egui::Rect>,
+}
+
+/// 状态栏几何(§3.6,纯函数):先算右侧缺口徽标占位,左侧状态区取剩余宽,
+/// 两者之间留 `STATUS_GAP`(16)。
+///
+/// 左区内容放不下时依次压缩「状态文本 → 瞬时提示 → 警示文本」;重启按钮不压缩,
+/// 因此其右缘恒不超过徽标左缘 − 16(长状态不得伸进徽标区)。
+fn status_row_layout(
+    row: egui::Rect,
+    badge_w: f32,
+    badge_h: f32,
+    widths: StatusWidths,
+) -> StatusRowLayout {
+    let pad = window_tokens::CONTENT_PAD_X;
+    let badge = (badge_w > 0.0).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(row.right() - pad - badge_w, row.center().y - badge_h / 2.0),
+            egui::pos2(row.right() - pad, row.center().y + badge_h / 2.0),
+        )
+    });
+    // 左区右界:有徽标 = 徽标左缘 − 16;无徽标 = 右内边距。
+    let left_right = badge.map_or(row.right() - pad, |b| b.left() - window_tokens::STATUS_GAP);
+    let left = egui::Rect::from_min_max(
+        egui::pos2(row.left() + pad, row.top()),
+        egui::pos2(left_right.max(row.left() + pad), row.bottom()),
+    );
+
+    let present = [
+        widths.status > 0.0,
+        widths.stale > 0.0,
+        widths.restart > 0.0,
+        widths.note > 0.0,
+    ];
+    let gap_count = present.iter().filter(|p| **p).count().saturating_sub(1) as f32;
+    let mut fitted = [widths.status, widths.stale, widths.restart, widths.note];
+    let mut overflow = (fitted.iter().sum::<f32>() + gap_count * window_tokens::STATUS_GAP
+        - left.width())
+    .max(0.0);
+    for index in [0usize, 3, 1] {
+        let take = fitted[index].min(overflow);
+        fitted[index] -= take;
+        overflow -= take;
+        if overflow <= 0.0 {
+            break;
+        }
+    }
+
+    let mut cursor = left.left();
+    let mut first = true;
+    let mut rects: [Option<egui::Rect>; 4] = [None; 4];
+    for (index, width) in fitted.into_iter().enumerate() {
+        if width <= 0.0 {
+            continue;
+        }
+        if !first {
+            cursor += window_tokens::STATUS_GAP;
+        }
+        let right = (cursor + width).min(left.right());
+        if right <= cursor {
+            break;
+        }
+        rects[index] = Some(egui::Rect::from_min_max(
+            egui::pos2(cursor, left.top()),
+            egui::pos2(right, left.bottom()),
+        ));
+        cursor = right;
+        first = false;
+    }
+
+    StatusRowLayout {
+        status: rects[0],
+        stale: rects[1],
+        restart: rects[2],
+        note: rects[3],
+        badge,
+    }
+}
+
+/// 状态栏单段文本的自然宽(不换行;空串 = 0)。
+fn status_text_width(ui: &egui::Ui, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(window_tokens::FONT_STATUS),
+            egui::Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+}
+
+/// 状态栏单段文本(按 rect 宽截断;垂直居中)。
+fn draw_status_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32) {
+    if rect.width() <= 0.0 || text.is_empty() {
+        return;
+    }
+    let galley = egui::WidgetText::from(
+        egui::RichText::new(text)
+            .size(window_tokens::FONT_STATUS)
+            .color(color),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        rect.width(),
+        egui::TextStyle::Body,
+    );
+    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, color);
+}
+
 /// 状态栏内容行(高 28,§3.6):左 = 状态文本(11pt status_text)+ 排序未生效
-/// 红字/重启动作 + 瞬时提示;右 = 缺口徽标(仅 gaps>0)。左右内边距 16、
-/// 子元素间距 16。
+/// 错误色文字/重启动作 + 瞬时提示;右 = 缺口徽标(仅 gaps>0,绝对定位)。
+/// 左右内边距 16、子元素间距 16。
 fn draw_status_row(
     ui: &mut egui::Ui,
     row: egui::Rect,
@@ -1449,7 +1625,7 @@ fn draw_status_row(
 ) -> StatusAction {
     let gaps = st.gaps();
     let mut action = StatusAction::default();
-    let warn = ui.visuals().warn_fg_color;
+    let error = palette.error_text;
     let index = index_note(st.engine.as_ref(), &st.session.state, st.engine_known);
     let text = status_text(
         st.input.is_empty(),
@@ -1460,9 +1636,16 @@ fn draw_status_row(
         index.as_deref(),
         st.sorting_inflight,
     );
+    let stale_text = st.sort_stale.then_some("引擎版本过旧,排序未生效");
+    let restart_text = st.sort_stale.then_some(if st.engine_restarting {
+        "重启中…"
+    } else {
+        "重启引擎"
+    });
+    let note = st.status_note.as_deref();
 
-    // 缺口徽标几何(右侧):文本 + 自绘警示三角。左侧文本的截断预算扣除它,
-    // 避免长状态文本压到徽标。
+    // 缺口徽标(右侧,绝对定位):文本 + 自绘警示三角。先量宽,左侧状态区
+    // 只使用剩余宽,保证长状态不会伸进徽标区。
     let badge_text = (!gaps.is_empty()).then(|| gap_badge_text(gaps.len() as u32));
     let badge_galley = badge_text.as_deref().map(|text| {
         ui.painter().layout_no_wrap(
@@ -1477,84 +1660,55 @@ fn draw_status_row(
             + galley.size().x
             + 2.0 * window_tokens::GAP_BADGE_PAD.1
     });
-    let reserve = if badge_w > 0.0 {
-        badge_w + window_tokens::STATUS_GAP
-    } else {
-        0.0
-    };
-
-    let mut row_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(row)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    let badge_h = badge_galley.as_ref().map_or(0.0, |galley| {
+        (galley.size().y + 2.0 * window_tokens::GAP_BADGE_PAD.0)
+            .max(window_tokens::GAP_ICON + 2.0 * window_tokens::GAP_BADGE_PAD.0)
+    });
+    let stale_w = stale_text.map_or(0.0, |t| status_text_width(ui, t));
+    let restart_w = restart_text.map_or(0.0, |t| status_text_width(ui, t));
+    let note_w = note.map_or(0.0, |t| status_text_width(ui, t));
+    let layout = status_row_layout(
+        row,
+        badge_w,
+        badge_h,
+        StatusWidths {
+            status: status_text_width(ui, &text),
+            stale: stale_w,
+            restart: restart_w,
+            note: note_w,
+        },
     );
-    // 可用宽 = 行宽 − 左内边距(由 add_space 消费) − 右内边距 − 徽标预留。
-    row_ui.set_max_width((row.width() - window_tokens::CONTENT_PAD_X - reserve).max(0.0));
-    row_ui.spacing_mut().item_spacing.x = window_tokens::STATUS_GAP;
-    row_ui.add_space(window_tokens::CONTENT_PAD_X);
 
-    if !text.is_empty() {
-        row_ui.add(
-            egui::Label::new(
-                egui::RichText::new(text)
-                    .size(window_tokens::FONT_STATUS)
-                    .color(palette.status_text),
-            )
-            .truncate(),
-        );
+    if let Some(rect) = layout.status {
+        draw_status_text(ui, rect, &text, palette.status_text);
     }
-    // 排序未生效(tech 定案:请求键与回显不符):红字 + 文字按钮(11pt)。
-    if st.sort_stale {
-        row_ui.add(egui::Label::new(
-            egui::RichText::new("引擎版本过旧,排序未生效")
-                .size(window_tokens::FONT_STATUS)
-                .color(warn),
-        ));
+    // 排序未生效(tech 定案:请求键与回显不符):错误色文字 + 重启动作(11pt)。
+    if let (Some(rect), Some(label)) = (layout.stale, stale_text) {
+        draw_status_text(ui, rect, label, error);
+    }
+    if let (Some(rect), Some(label)) = (layout.restart, restart_text) {
         if st.engine_restarting {
-            row_ui.add(egui::Label::new(
-                egui::RichText::new("重启中…")
-                    .size(window_tokens::FONT_STATUS)
-                    .color(palette.status_text),
-            ));
-        } else if row_ui
-            .add(
-                egui::Button::new(
-                    egui::RichText::new("重启引擎")
-                        .size(window_tokens::FONT_STATUS)
-                        .color(warn),
-                )
-                .frame(false),
-            )
-            .clicked()
-        {
-            action.restart_clicked = true;
+            draw_status_text(ui, rect, label, palette.status_text);
+        } else {
+            draw_status_text(ui, rect, label, error);
+            let resp = ui.interact(
+                rect,
+                ui.scope_id().with("results-restart"),
+                egui::Sense::click(),
+            );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            action.restart_clicked = resp.clicked();
         }
     }
-    // 瞬时提示(打开失败/查询失败/齿轮 v2.1):warn 色,11pt。
-    if let Some(note) = &st.status_note {
-        row_ui.add(
-            egui::Label::new(
-                egui::RichText::new(note)
-                    .size(window_tokens::FONT_STATUS)
-                    .color(warn),
-            )
-            .truncate(),
-        );
+    // 瞬时提示(打开失败/查询失败/齿轮 v2.1):错误色,11pt,按左区剩余宽截断。
+    if let (Some(rect), Some(note)) = (layout.note, note) {
+        draw_status_text(ui, rect, note, error);
     }
 
-    if let Some(galley) = badge_galley {
-        let badge_h = (galley.size().y + 2.0 * window_tokens::GAP_BADGE_PAD.0)
-            .max(window_tokens::GAP_ICON + 2.0 * window_tokens::GAP_BADGE_PAD.0);
-        let badge = egui::Rect::from_min_max(
-            egui::pos2(
-                row.right() - window_tokens::CONTENT_PAD_X - badge_w,
-                row.center().y - badge_h / 2.0,
-            ),
-            egui::pos2(
-                row.right() - window_tokens::CONTENT_PAD_X,
-                row.center().y + badge_h / 2.0,
-            ),
-        );
+    // 徽标绝对定位后注册(命中优先于左侧内容;几何上两者已不重叠)。
+    if let (Some(badge), Some(galley)) = (layout.badge, badge_galley) {
         let resp = ui.interact(
             badge,
             ui.scope_id().with("results-gap-badge"),
@@ -1805,11 +1959,11 @@ fn human_size(bytes: u64) -> String {
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
     if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
+        format!("{} GB", format_metric(bytes as f64 / GB as f64))
     } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
+        format!("{} MB", format_metric(bytes as f64 / MB as f64))
     } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
+        format!("{} KB", format_metric(bytes as f64 / KB as f64))
     } else {
         format!("{bytes} B")
     }
@@ -1854,12 +2008,31 @@ fn format_ymd_hm(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> Str
 mod tests {
     use super::*;
 
+    /// 原型口径:整数去 `.0`(18 KB / 12 MB),非整数保留一位(2.4 MB);
+    /// 字节 `B` 恒整数。
     #[test]
     fn human_size_bounds() {
         assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2048), "2.0 KB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
-        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+        assert_eq!(human_size(18 * 1024), "18 KB");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(12 * 1024 * 1024), "12 MB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5 MB");
+        assert_eq!(human_size((2.4 * (1024 * 1024) as f64) as u64), "2.4 MB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3 GB");
+        assert_eq!(
+            human_size((2.4 * (1024 * 1024 * 1024) as f64) as u64),
+            "2.4 GB"
+        );
+    }
+
+    /// ms 与大小共用同一数值策略:整数去 `.0`,非整数一位。
+    #[test]
+    fn format_metric_trims_integer_fraction() {
+        assert_eq!(format_metric(18.0), "18");
+        assert_eq!(format_metric(2.4), "2.4");
+        assert_eq!(format_metric(2.04), "2");
+        assert_eq!(format_metric(2.05), "2.1");
+        assert_eq!(format_metric(0.0), "0");
     }
 
     #[test]
@@ -2056,7 +2229,8 @@ mod tests {
             "窄窗投影:超预算固定列按 路径 → 修改时间 → 大小 让宽"
         );
 
-        let new_fixed = drag_from_layout(ColBoundary::NameSize, &before, 10.0, 720.0);
+        let start_fixed = [before[COL_SIZE].1, before[COL_MTIME].1, before[COL_PATH].1];
+        let new_fixed = drag_fixed(ColBoundary::NameSize, start_fixed, 10.0, 720.0);
         let after = col_layout(720.0, new_fixed);
         assert_eq!(
             after[COL_NAME].1,
@@ -2126,7 +2300,7 @@ mod tests {
             size: Some(999),
             ..file.clone()
         };
-        assert_eq!(size_cell(&file), "2.0 KB");
+        assert_eq!(size_cell(&file), "2 KB");
         assert_eq!(size_cell(&dir), "—", "目录大小恒为占位");
         let no_size = HitEntry {
             size: None,
@@ -2259,6 +2433,133 @@ mod tests {
         );
     }
 
+    /// 快速拖拽:移动与释放落在同一帧时,按「按下点 → 释放点」总位移应用一次,
+    /// 不得因 `drag_delta` 归零而丢位移(边界跟手)。
+    #[test]
+    fn header_drag_release_in_same_frame_keeps_total_displacement() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = vec![HitEntry {
+            name: "报告.pdf".into(),
+            path: "/tmp/报告.pdf".into(),
+            size: Some(2048),
+            mtime: Some(1_700_000_000),
+            is_dir: false,
+        }];
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(720.0, 600.0);
+        // 默认固定宽在 720 下名称恰好 84;名称/大小间隙中心 x = 16 + 84 + 8 = 108。
+        let from = egui::pos2(108.0, 101.0);
+        let to = from + egui::vec2(10.0, 0.0);
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![]);
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        // 同帧:移动到目标 + 释放。
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![
+                egui::Event::PointerMoved(to),
+                egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            st.col_fixed,
+            [86.0, 160.0, 300.0],
+            "释放帧按最终位置应用 10px:大小 96→86;不得丢位移"
+        );
+        assert!(st.col_drag.is_none(), "释放后拖拽会话结束");
+    }
+
+    /// 起拖阈值前的位移不丢:3px + 3px 两帧后释放(未达 egui 6px 拖拽阈值),
+    /// 仍按按下点起算的 6px 应用(旧 `drag_delta` 实现会丢前段)。
+    #[test]
+    fn header_drag_counts_movement_before_threshold() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = vec![HitEntry {
+            name: "报告.pdf".into(),
+            path: "/tmp/报告.pdf".into(),
+            size: Some(2048),
+            mtime: Some(1_700_000_000),
+            is_dir: false,
+        }];
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(720.0, 600.0);
+        let from = egui::pos2(108.0, 101.0);
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![]);
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let mid = from + egui::vec2(3.0, 0.0);
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![egui::Event::PointerMoved(mid)],
+        );
+        let end = from + egui::vec2(6.0, 0.0);
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            st.col_fixed,
+            [90.0, 160.0, 300.0],
+            "按下点起算总位移 6px:大小 96→90"
+        );
+    }
+
     /// 带原始输入事件的一帧(拖拽等指针交互测试)。
     fn run_frame_with_events(
         ctx: &egui::Context,
@@ -2372,9 +2673,14 @@ mod tests {
             "未截断不加注"
         );
         assert_eq!(
+            counts_text(18, 18, 3.0, 12.0),
+            "18 项 · 匹配 3 ms · 读取 12 ms",
+            "整数值去 .0(原型口径)"
+        );
+        assert_eq!(
             counts_text(8000, 1000, 12.5, 40.0),
-            "8000 项 · 匹配 12.5 ms · 读取 40.0 ms · 展示前 1000 条",
-            "K < total 注展示条数"
+            "8000 项 · 匹配 12.5 ms · 读取 40 ms · 展示前 1000 条",
+            "K < total 注展示条数;非整数保留一位"
         );
     }
 
@@ -2739,6 +3045,142 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// 720 宽 + 长状态 + 缺口徽标:徽标先占右侧宽,左区在其左侧 16 处截止;
+    /// 重启按钮右缘不得越过徽标左缘 − 16。
+    #[test]
+    fn status_layout_at_720_keeps_restart_clear_of_badge() {
+        let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 28.0));
+        let widths = StatusWidths {
+            status: 520.0,
+            stale: 140.0,
+            restart: 52.0,
+            note: 240.0,
+        };
+        let layout = status_row_layout(row, 116.0, 20.0, widths);
+        let badge = layout.badge.expect("有缺口:徽标");
+        assert_eq!(badge.right(), 720.0 - window_tokens::CONTENT_PAD_X);
+        assert_eq!(badge.left(), 720.0 - 16.0 - 116.0);
+        let restart = layout.restart.expect("排序未生效:重启按钮");
+        assert!(
+            restart.right() <= badge.left() - window_tokens::STATUS_GAP + 0.01,
+            "重启按钮右缘 {} 须 ≤ 徽标左缘 − 16 ({})",
+            restart.right(),
+            badge.left() - window_tokens::STATUS_GAP
+        );
+        for rect in [layout.status, layout.stale, layout.restart, layout.note]
+            .into_iter()
+            .flatten()
+        {
+            assert!(rect.left() >= window_tokens::CONTENT_PAD_X - 0.01);
+            assert!(
+                rect.right() <= badge.left() - window_tokens::STATUS_GAP + 0.01,
+                "左区内容 {rect:?} 不得伸进徽标区"
+            );
+        }
+        // 长状态文本先被压缩(不得把重启按钮挤出去)。
+        assert!(layout.status.expect("状态文本").width() < widths.status);
+    }
+
+    /// 无徽标:左区右界 = 右内边距(16),内容仍不越界。
+    #[test]
+    fn status_layout_without_badge_uses_right_padding() {
+        let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 28.0));
+        let widths = StatusWidths {
+            status: 900.0,
+            stale: 0.0,
+            restart: 0.0,
+            note: 0.0,
+        };
+        let layout = status_row_layout(row, 0.0, 0.0, widths);
+        assert!(layout.badge.is_none());
+        let status = layout.status.expect("状态文本");
+        assert_eq!(status.left(), window_tokens::CONTENT_PAD_X);
+        assert_eq!(status.right(), 720.0 - window_tokens::CONTENT_PAD_X);
+    }
+
+    /// 720 宽实机形态出帧:长状态 + 排序未生效 + 重启按钮 + 长提示 + 缺口徽标,
+    /// 重启文案（完整未截断）右缘在徽标左缘 − 16 之内;徽标保持右内边距 16。
+    #[test]
+    fn status_row_at_720_long_state_does_not_reach_badge() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.input = "报告".into();
+        st.total = 18;
+        st.elapsed_ms = 3.0;
+        st.stat_ms = 12.0;
+        st.sort_stale = true;
+        st.status_note = Some("查询失败:无法连接引擎,请稍后重试并检查索引状态是否正常".into());
+        st.engine = Some(EngineStatus {
+            state: client::state::READY.into(),
+            entry_count: 3,
+            gaps: vec![
+                Gap {
+                    path: "/private/a".into(),
+                    reason: "Permission denied".into(),
+                },
+                Gap {
+                    path: "/private/b".into(),
+                    reason: "Permission denied".into(),
+                },
+            ],
+            built_at: 0,
+        });
+        st.engine_known = true;
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(720.0, 600.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        out.textures_delta.clear();
+        let palette = window_tokens::dark();
+
+        let chip = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.fill == palette.gap_badge_fill => Some(r.rect),
+                _ => None,
+            })
+            .expect("720 宽仍显示缺口徽标");
+        assert_eq!(chip.right(), screen.x - window_tokens::CONTENT_PAD_X);
+
+        let restart = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "重启引擎" => {
+                    Some(t.pos.x + t.galley.size().x)
+                }
+                _ => None,
+            })
+            .expect("排序未生效:重启按钮文案");
+        assert!(
+            restart <= chip.left() - window_tokens::STATUS_GAP + 0.01,
+            "重启按钮右缘 {restart} 须 ≤ 徽标左缘 − 16 ({})",
+            chip.left() - window_tokens::STATUS_GAP
+        );
+
+        // 左侧状态文本(被截断)同样止于徽标左侧 16。
+        let status_right = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text().starts_with("18") => {
+                    Some(t.pos.x + t.galley.size().x)
+                }
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(status_right > 0.0, "状态文本上屏");
+        assert!(
+            status_right <= chip.left() - window_tokens::STATUS_GAP + 0.01,
+            "长状态文本不得伸进徽标区"
+        );
+    }
+
     /// 空态(§2.7):表头保留,主/副文案在表格区整块居中、间距 4。
     #[test]
     fn empty_state_is_centered_with_header_kept() {
@@ -3008,7 +3450,7 @@ mod tests {
         assert!(!normal.contains('|'), "不用「|」分隔条");
         assert_eq!(
             status_text(false, 8000, 1000, 12.5, 40.0, Some("就绪"), true),
-            "8000 项 · 匹配 12.5 ms · 读取 40.0 ms · 展示前 1000 条 · 排序中… · 就绪"
+            "8000 项 · 匹配 12.5 ms · 读取 40 ms · 展示前 1000 条 · 排序中… · 就绪"
         );
         assert_eq!(
             status_text(
@@ -3020,7 +3462,7 @@ mod tests {
                 Some("离线索引 · 生成于 2026-10-16 09:03"),
                 false
             ),
-            "5 项 · 匹配 1.0 ms · 读取 2.0 ms · 离线索引 · 生成于 2026-10-16 09:03",
+            "5 项 · 匹配 1 ms · 读取 2 ms · 离线索引 · 生成于 2026-10-16 09:03",
             "离线生成时刻并入索引段"
         );
     }

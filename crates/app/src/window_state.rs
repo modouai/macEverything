@@ -162,10 +162,15 @@ pub enum SizeUpdate {
 /// 也避免「用户从未调整过」时产生写入。之后以**上次写盘尺寸**为比较基准：
 /// 首个变化立即写（leading），之后 400ms 内的变化合并，窗口到期由调用方
 /// 排帧补写最终值。不是 trailing debounce（后续变化不重置计时）。
+///
+/// 隐藏/退出前调用 [`WindowSizeTracker::flush`]：保留最近一次观察值，限频窗
+/// 内未写盘的尺寸立即落盘（否则「调整后 400ms 内点红点」丢最后一次调整）。
 #[derive(Debug, Default)]
 pub struct WindowSizeTracker {
     last_saved: Option<WindowSize>,
     last_save_at: Option<Instant>,
+    /// 最近一次观察到的尺寸(可能是限频窗内尚未落盘的值)。
+    pending: Option<WindowSize>,
 }
 
 impl WindowSizeTracker {
@@ -175,12 +180,17 @@ impl WindowSizeTracker {
 
     /// 喂入当前尺寸与时刻（已通过可见性/最小值过滤）。
     pub fn observe(&mut self, current: WindowSize, now: Instant) -> SizeUpdate {
+        self.pending = Some(current);
         match self.last_saved {
             None => {
                 self.last_saved = Some(current);
+                self.pending = None; // 基线尚未写盘,与 last_saved 相同,无需 flush
                 SizeUpdate::Idle
             }
-            Some(last) if last == current => SizeUpdate::Idle,
+            Some(last) if last == current => {
+                self.pending = None;
+                SizeUpdate::Idle
+            }
             Some(_) => {
                 let elapsed = self.last_save_at.map(|t| now.saturating_duration_since(t));
                 match elapsed {
@@ -190,11 +200,29 @@ impl WindowSizeTracker {
                     _ => {
                         self.last_saved = Some(current);
                         self.last_save_at = Some(now);
+                        self.pending = None;
                         SizeUpdate::Save(current)
                     }
                 }
             }
         }
+    }
+
+    /// 立即写出最近观察到的尺寸(幂等)。
+    ///
+    /// 用于「尺寸已变但限频窗未到」时窗口即将隐藏/退出的路径:隐藏后不再有帧
+    /// 观察,不补写会丢掉最后一次调整。无待写值(未观察/已写盘/与已写值相同)
+    /// 时不写文件。
+    pub fn flush(&mut self, data_dir: &Path) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if self.last_saved == Some(pending) {
+            return;
+        }
+        save(data_dir, pending);
+        self.last_saved = Some(pending);
+        self.last_save_at = Some(Instant::now());
     }
 }
 
@@ -436,6 +464,52 @@ mod tests {
             vec![(1, 1001.0), (9, 1009.0), (17, 1017.0)],
             "400ms 限频窗口"
         );
+    }
+
+    /// flush:隐藏/退出前补写限频窗内最后一次观察值;基线不写盘(不产生空文件),
+    /// 写盘后再 flush 幂等。
+    #[test]
+    fn tracker_flush_writes_pending_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "mce-window-state-flush-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let t0 = Instant::now();
+        let mut tracker = WindowSizeTracker::new();
+        let a = WindowSize {
+            w: 1080.0,
+            h: 627.0,
+        };
+        assert_eq!(tracker.observe(a, t0), SizeUpdate::Idle);
+        tracker.flush(&dir);
+        assert_eq!(load(&dir), None, "仅基线、未调整过:flush 不写文件");
+
+        let b = WindowSize {
+            w: 1200.0,
+            h: 700.0,
+        };
+        assert_eq!(
+            tracker.observe(b, t0 + Duration::from_millis(10)),
+            SizeUpdate::Save(b)
+        );
+        save(&dir, b); // 调用方按 SizeUpdate::Save 落盘
+        let c = WindowSize {
+            w: 1300.0,
+            h: 750.0,
+        };
+        assert!(matches!(
+            tracker.observe(c, t0 + Duration::from_millis(200)),
+            SizeUpdate::Defer(_)
+        ));
+        assert_eq!(load(&dir), Some(b), "限频窗内不写盘");
+        tracker.flush(&dir);
+        assert_eq!(load(&dir), Some(c), "flush 补写最终观察值");
+
+        tracker.flush(&dir);
+        assert_eq!(load(&dir), Some(c), "重复 flush 幂等");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

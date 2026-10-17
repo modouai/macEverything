@@ -63,8 +63,9 @@ impl ThemeThrottle {
 /// 主题跟随状态(节流 + 已应用值;两视口共享,Task 14 起挂在共享状态里)。
 ///
 /// 排帧纪律(L4,tech 平台行为表):探帧只在「有窗可见」期进行——悬浮条 callback
-/// 与根视口 `logic` 各自检查本状态并给自己的视口排下一帧(`CHECK_INTERVAL` 上限);
-/// 全隐藏期不排帧,隐藏态 CPU 0% 红线不被破坏。唤起时 `check_now` 立即补查,
+/// 与根视口 `logic`(根窗可见时)各自检查本状态并给自己的视口排下一帧
+/// (`CHECK_INTERVAL` 上限);全隐藏期不排帧,隐藏态 CPU 0% 红线不被破坏。
+/// 唤起时 `check_now_with` 立即应用锁外探测到的外观,
 /// 免「隐藏期切了外观、亮起首帧仍是旧主题」。
 pub struct ThemeFollow {
     throttle: ThemeThrottle,
@@ -84,7 +85,20 @@ impl ThemeFollow {
         if !self.throttle.should_check(now) {
             return false;
         }
-        let detected = current_theme();
+        self.apply_detected(ctx, current_theme())
+    }
+
+    /// 立即补查(外观已由调用方在锁外探测;每次唤起调用)。
+    ///
+    /// 锁纪律:共享状态持锁期间不得做平台原生调用;`current_theme()` 由调用方
+    /// 在锁外完成,本方法只写共享状态与 egui 主题队列。
+    pub fn check_now_with(&mut self, ctx: &egui::Context, detected: Theme) {
+        self.throttle.reset();
+        self.apply_detected(ctx, detected);
+    }
+
+    /// 应用一次已探测的外观;变化才应用(返回是否发生了应用)。
+    fn apply_detected(&mut self, ctx: &egui::Context, detected: Theme) -> bool {
         if self.theme != Some(detected) {
             self.theme = Some(detected);
             apply(ctx, detected);
@@ -92,12 +106,6 @@ impl ThemeFollow {
             return true;
         }
         false
-    }
-
-    /// 立即补查一次(节流复位 + 当帧探测;每次唤起调用)。
-    pub fn check_now(&mut self, ctx: &egui::Context) {
-        self.throttle.reset();
-        self.maybe_apply(ctx, Instant::now());
     }
 
     /// 当前已应用主题(测试断言用;产品侧无消费者,不做公开面)。
@@ -211,7 +219,22 @@ mod tests {
         assert_eq!(ctx.theme(), egui::Theme::Light);
     }
 
-    /// 跟随状态三态:节流内不探测;到期探测;`check_now` 复位后当帧放行。
+    /// 已探测外观立即应用(锁外探测 → 锁内只应用;不依赖测试宿主的真实外观)。
+    #[test]
+    fn check_now_with_applies_detected_theme() {
+        let ctx = egui::Context::default();
+        let mut f = ThemeFollow::new(Theme::Light, Duration::from_secs(2));
+        f.check_now_with(&ctx, Theme::Dark);
+        assert_eq!(f.current(), Some(Theme::Dark));
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        // 节流已复位:随后再传同值不重复应用,但状态保持一致。
+        f.check_now_with(&ctx, Theme::Dark);
+        assert_eq!(f.current(), Some(Theme::Dark));
+        f.check_now_with(&ctx, Theme::Light);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+    }
+
+    /// 跟随状态三态:节流内不探测;到期探测;`check_now_with` 复位后当帧放行。
     #[test]
     fn follow_throttle_and_check_now() {
         let ctx = egui::Context::default();
@@ -221,9 +244,9 @@ mod tests {
         assert!(!f.maybe_apply(&ctx, t0), "interval 内不探测");
         // 到期:探测一次(系统外观在测试宿主不可控,断言只钉「不静态跳过」)。
         let _ = f.maybe_apply(&ctx, t0 + Duration::from_secs(2));
-        // check_now 复位节流:紧接着再调即重新探测。
-        f.check_now(&ctx);
-        assert!(f.current().is_some(), "已应用主题恒有值");
+        // check_now_with 复位节流:紧接着再调即直接应用已探测外观。
+        f.check_now_with(&ctx, Theme::Dark);
+        assert_eq!(f.current(), Some(Theme::Dark), "已应用主题恒有值");
     }
 
     /// 节流 reset 语义(钉:reset 后首次必放行)。

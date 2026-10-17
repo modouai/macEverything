@@ -41,6 +41,9 @@ pub struct FullWindowPalette {
     pub column_text: egui::Color32,
     pub status_fill: egui::Color32,
     pub status_text: egui::Color32,
+    /// 状态栏错误提示（排序未生效 / 查询失败等；§4.2 表外新增，与悬浮条
+    /// `badge_error_text` 同源——同一错误红在两种底上各取一值）。
+    pub error_text: egui::Color32,
     pub gap_badge_fill: egui::Color32,
     /// 缺口徽标文字与图标同色（§4.2 末行）。
     pub gap_badge_text: egui::Color32,
@@ -67,6 +70,7 @@ pub fn dark() -> FullWindowPalette {
         column_text: c(0x8B929AFF),
         status_fill: c(0xFFFFFF0A),
         status_text: c(0x8B929AFF),
+        error_text: c(0xF87171FF),
         gap_badge_fill: c(0xF59E0B29),
         gap_badge_text: c(0xF0B357FF),
         title_icon: c(0xC6CBD1FF),
@@ -91,6 +95,7 @@ pub fn light() -> FullWindowPalette {
         column_text: c(0x5F6774FF),
         status_fill: c(0x00000005),
         status_text: c(0x5F6774FF),
+        error_text: c(0xB91C1CFF),
         gap_badge_fill: c(0xF59E0B1F),
         gap_badge_text: c(0xB45309FF),
         title_icon: c(0x4B5563FF),
@@ -180,7 +185,7 @@ mod tests {
     /// 钉住：深/浅两套颜色与 §4.2 表逐项相等。
     #[test]
     fn full_window_palette_matches_spec_table() {
-        let rows: [(egui::Color32, egui::Color32, u32, u32, &str); 16] = [
+        let rows: [(egui::Color32, egui::Color32, u32, u32, &str); 17] = [
             (
                 dark().window_fill,
                 light().window_fill,
@@ -278,6 +283,13 @@ mod tests {
                 0x8B929AFF,
                 0x5F6774FF,
                 "状态栏文本",
+            ),
+            (
+                dark().error_text,
+                light().error_text,
+                0xF87171FF,
+                0xB91C1CFF,
+                "状态栏错误提示",
             ),
             (
                 dark().gap_badge_fill,

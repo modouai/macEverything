@@ -636,7 +636,7 @@ path = "src/main.rs"
 client = { path = "../client" }
 protocol = { path = "../protocol" }
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
-egui_extras = "0.29"      # 表格与虚拟化(Task 17 用)
+# 表格与虚拟化:自定义 `ScrollArea::show_rows`,不引 egui_extras(Task 17 定案)
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSWindow", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent"] }
 global-hotkey = "0.6"
@@ -1052,7 +1052,7 @@ pub struct ResultsState {
     pub sorting_inflight: bool,
 }
 
-/// 绘制:顶部搜索框 + egui_extras::TableBuilder(列:名称/大小/修改时间/路径;列宽可拖;行虚拟化)+ 底部状态栏。
+/// 绘制:顶部搜索框 + 自定义虚拟化表格(`ScrollArea::show_rows`;列:名称/大小/修改时间/路径;列宽可拖)+ 底部状态栏。
 /// 列头点击:同列切换 asc/desc;异列切换键并重置 asc(默认:名称升序,大小升序,mtime 降序,路径升序——与 plan Task 8 定案一致)。
 /// 排序变更 → session.on_sort_change → 防抖窗内合并 → 重查(sorting_inflight=true,状态栏「排序中…」)。
 /// 多选:单击(清选+选)、shift+单击(锚点范围)、⌘+单击(切换)、⌘A(全选可见 K 行);⌘ 检测:ctx.input modifiers。

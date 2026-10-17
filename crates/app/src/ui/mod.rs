@@ -44,8 +44,10 @@
 //!
 //! ## 排帧纪律(L4)
 //!
-//! 只在悬浮条可见期排帧(悬浮条 pass 自排 `CHECK_INTERVAL` 上限;含主题跟随检查);
-//! 全隐藏期不排帧(隐藏态 CPU 0% 红线);唤起时 `ThemeFollow::check_now` 立即补查外观。
+//! 只在窗可见期排帧:悬浮条 pass 与根视口 `logic` 各自按 `CHECK_INTERVAL` 上限
+//! 自排主题跟随检查(根视口仅在可见时排;全窗单独可见也须跟随系统外观);
+//! 全隐藏期不排帧(隐藏态 CPU 0% 红线);唤起时 `ThemeFollow::check_now_with`
+//! 立即应用锁外探测到的外观。
 //!
 //! 中文字体(2026-10-16 调查结论,不显式加载字体文件):
 //! ① 苹方已无稳定路径——macOS 26 起移入 AssetsV2 哈希目录,本机实测
@@ -198,6 +200,8 @@ fn palette_show(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> bool {
     // （§2.9 / Task 9）。
     match platform::show_palette(palette::MASCOT_STRIP as f64) {
         Ok(w) => {
+            // 外观探测是原生调用:在共享锁外完成(锁纪律)。
+            let detected = theme::current_theme();
             {
                 let mut s = lock_shared(shared);
                 // 先按屏幕回填宽(窄屏收窄),再 reset——reset 内的 send_h 须带新宽。
@@ -207,7 +211,7 @@ fn palette_show(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> bool {
                 s.palette.reset(); // 每次唤起都是全新查询(product §1)
                 s.palette.on_shown(std::time::Instant::now()); // 首帧计时起点(诊断)
                 s.palette_visible = true;
-                s.theme.check_now(ctx); // 隐藏期切过外观:亮起立即补查
+                s.theme.check_now_with(ctx, detected); // 隐藏期切过外观:亮起立即补查
             }
             ctx.request_repaint_of(palette_viewport_id());
             true
@@ -234,7 +238,15 @@ fn palette_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str
 /// 打开完整窗口(托盘「打开完整窗口」/「缺口面板」/⌥⇧F 直达共用):
 /// 聚焦搜索框 + 补查引擎状态后原生唤到前台(原生调用在锁外,见锁纪律)。
 fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
-    lock_shared(shared).results.on_window_shown();
+    // 外观探测是原生调用:在共享锁外完成(锁纪律);锁内只写状态与 egui 主题队列。
+    let detected = theme::current_theme();
+    {
+        let mut s = lock_shared(shared);
+        s.results.on_window_shown();
+        // 悬浮条隐藏、全窗单独可见时,主题跟随由根视口 logic 驱动(见 App::logic);
+        // 此处补查免「隐藏期切外观,开窗首帧仍旧主题」。
+        s.theme.check_now_with(ctx, detected);
+    }
     show_root_window(ctx);
 }
 
@@ -475,6 +487,8 @@ impl App {
                     // 退出路径(置 quitting 放行根窗关闭 → eframe 收尾 → on_exit 还原
                     // 窗口类;`std::process::exit` 会跳过 on_exit,platform/mac.rs 的
                     // 改类还原是干净退出的必要步骤,故不用)。
+                    // 退出前把 400ms 限频窗内未落盘的最终尺寸补写(on_exit 兜底同一动作)。
+                    self.window_size.flush(&self.paths.data_dir);
                     log::info!("托盘:退出 App(引擎常驻)");
                     self.quitting = true;
                     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
@@ -539,6 +553,14 @@ impl eframe::App for App {
 
         // 完整窗口尺寸持久化(visual.md §1.2):可见期跟踪,400ms 限频合并写盘。
         self.persist_window_size(ctx, Instant::now());
+
+        // 主题跟随(根视口可见期):悬浮条隐藏、全窗单独可见时只有这里驱动探测。
+        // 节流窗上限排一帧(主题变化后 `set_theme` 自带重绘);根窗隐藏/最小化不排帧,
+        // 守 L4 隐藏零帧红线。`root_visible()==None` = 平台未接/非 macOS,同样不排。
+        if platform::root_visible() == Some(true) {
+            self.shared().theme.maybe_apply(ctx, Instant::now());
+            ctx.request_repaint_after(theme::CHECK_INTERVAL);
+        }
 
         // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/
         // 文本更新要求主线程——muda 约束;快照由刷新线程写、悬停/点击/拉起后触发)。
@@ -607,6 +629,9 @@ impl eframe::App for App {
                 log::info!("退出:根窗关闭请求放行");
             } else {
                 log::info!("根窗关闭请求:取消关闭,改为隐藏窗口(「退出 App」按钮才真退)");
+                // 隐藏后不再有帧观察尺寸:限频窗内未写的最终尺寸在此补写,
+                // 否则「调整后 400ms 内点红点」会丢最后一次调整。
+                self.window_size.flush(&self.paths.data_dir);
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
@@ -644,6 +669,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 退出兜底:400ms 限频窗内最后一次调整若未写盘,退出前补写(隐藏路径、
+        // 托盘退出路径已各调一次;flush 幂等,重复调用无副作用)。
+        self.window_size.flush(&self.paths.data_dir);
         // 补丁 b:窗口销毁前还原窗口类(改类窗口被 winit drop → abort;
         // PoC-1b 三方对照实证「还原即干净退出」)。
         platform::revert_class();

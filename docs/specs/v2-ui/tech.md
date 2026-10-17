@@ -165,7 +165,7 @@ pub fn execute_sorted(
 | 维度 | 决策 |
 |---|---|
 | crate 划分 | protocol(契约)+ client(客户端承载层:连接/stat/离线/状态常量)+ app(GUI)+ cli(daemon 宿主与子命令);engine 零业务改动(仅 query 排序扩展) |
-| UI 技术栈 | eframe/egui 0.x(workspace 锁版本);egui_extras(表格/虚拟化);中文字体:内置 Noto Sans SC 子集或系统字体加载(避免豆腐块——实现期验证) |
+| UI 技术栈 | eframe/egui 0.37(workspace 锁版本);表格 = 自定义虚拟化(`ScrollArea::show_rows`,不引 egui_extras);中文字体 = 系统回退(实现见 `crates/app/src/ui/mod.rs`「中文字体」) |
 | 平台补丁 | objc2 + objc2-app-kit(unsafe 集中 platform/mac.rs,SAFETY 逐处) |
 | 托盘/快捷键/自启 | tray-icon / global-hotkey(tauri 系)/ SMAppService(经 objc2 或 launchd plist 兜底) |
 | 进程编排 | 单实例 = app.sock 通道(二次启动唤起悬浮条);daemon 探测=socket connect;拉起=引擎定位三档(随包→PATH→列搜过路径);退出只退 App |
