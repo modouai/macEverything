@@ -396,7 +396,7 @@ impl ResultsState {
         let mut restart_clicked = false;
         let (shift_down, cmd_down) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
 
-        // 行间无缝(item_spacing.y = 0):选中/斑马底连成整块(表格式观感)。
+        // 行间无缝(item_spacing.y = 0):选中/悬停底连成整块(表格式观感)。
         ui.spacing_mut().item_spacing.y = 0.0;
 
         // 整窗底色(先于所有分段):根窗标题栏透明化后,原生交通灯浮在内容之上,
@@ -584,9 +584,11 @@ impl ResultsState {
                     egui::CornerRadius::ZERO,
                     palette.divider,
                 );
-                // 拖拽结果下一帧生效(本帧行已按旧宽排;差一帧不可见)。
+                // 拖拽结果下一帧生效(本帧行已按旧宽排;差一帧不可见)。起点宽取
+                // 本帧投影后的显示宽(不是 stored),否则窄窗首帧会跳变(见
+                // `drag_from_layout`)。
                 if let Some((boundary, delta)) = header_action.drag {
-                    self.col_fixed = drag_fixed(boundary, self.col_fixed, delta, area.width());
+                    self.col_fixed = drag_from_layout(boundary, &cols, delta, area.width());
                 }
                 let table_rect = egui::Rect::from_min_max(
                     egui::pos2(
@@ -1002,6 +1004,21 @@ fn drag_fixed(boundary: ColBoundary, fixed: [f32; 3], delta: f32, total_w: f32) 
     fixed
 }
 
+/// 拖拽起算宽 = `col_layout` 投影后的实际显示宽(纯函数)。
+///
+/// 窄窗下 `col_layout` 会把超预算的 stored 固定列收缩到当前窗口预算;若拖拽仍按
+/// stored 起算,首帧增量会一次性抹掉隐藏的超额宽度,边界跳变。以投影宽为起点,
+/// 拖拽即把 stored 归一化到当前可见布局,边界始终跟手。
+fn drag_from_layout(
+    boundary: ColBoundary,
+    cols: &[(f32, f32); 4],
+    delta: f32,
+    total_w: f32,
+) -> [f32; 3] {
+    let effective = [cols[COL_SIZE].1, cols[COL_MTIME].1, cols[COL_PATH].1];
+    drag_fixed(boundary, effective, delta, total_w)
+}
+
 /// 单行各内容矩形(绝对坐标):名称图标 / 名称文本 / 大小 / 修改时间 / 路径。
 /// 名称文本起点 = 图标右缘 + 8(§3.5);四个 cell 共享行高、垂直居中绘制。
 #[derive(Clone, Copy, Debug)]
@@ -1169,7 +1186,7 @@ fn draw_sort_arrow(painter: &egui::Painter, rect: egui::Rect, up: bool, color: e
 
 /// 数据行(§3.5):高 30、左右内边距 16;行底全宽(选中 token / 悬停 50%),
 /// 名称 cell = 16×16 系统图标(兜底中性文档字形)+ 8 + 文件名 13pt;
-/// 大小右对齐(目录「—」)、修改时间 / 路径 12pt。鼠标移动不改选中集。
+/// 大小右对齐(目录「—」、文件缺失留空)、修改时间 / 路径 12pt。鼠标移动不改选中集。
 fn draw_row(
     ui: &mut egui::Ui,
     entry: &HitEntry,
@@ -1499,14 +1516,15 @@ fn empty_hint(state: &State) -> Option<&'static str> {
 }
 
 /// 大小显示(与 cli 的 human_size 同边界;自写简版,不引依赖)。
+/// 缺失 → 空串(visual.md §3.5:元数据缺失留空,不显示占位符)。
 fn size_text(size: Option<u64>) -> String {
     match size {
         Some(bytes) => human_size(bytes),
-        None => "—".into(),
+        None => String::new(),
     }
 }
 
-/// 大小列文案(§3.5):目录恒显示「—」(目录大小无意义);文件走 `size_text`。
+/// 大小列文案(§3.5):目录恒显示「—」(目录大小无意义);文件缺失留空。
 fn size_cell(entry: &HitEntry) -> String {
     if entry.is_dir {
         "—".into()
@@ -1551,10 +1569,11 @@ fn human_size(bytes: u64) -> String {
 
 /// 修改时间显示:unix 秒 → "YYYY-MM-DD HH:MM"(**本地时区**,localtime_r;
 /// Finder 同观感——cli 的 fmt_time 是 UTC 且带秒,窗口口径更贴近文件管理器)。
+/// 缺失 → 空串(§3.5 留空);0 = 未取,沿用 cli 的「—」约定。
 fn mtime_text(mtime: Option<u64>) -> String {
     match mtime {
         Some(secs) => fmt_mtime(secs),
-        None => "—".into(),
+        None => String::new(),
     }
 }
 
@@ -1596,9 +1615,9 @@ mod tests {
     }
 
     #[test]
-    fn size_and_mtime_none_show_placeholder() {
-        assert_eq!(size_text(None), "—", "读取失败不留空");
-        assert_eq!(mtime_text(None), "—");
+    fn size_and_mtime_none_render_empty() {
+        assert_eq!(size_text(None), "", "元数据缺失留空(visual.md §3.5)");
+        assert_eq!(mtime_text(None), "", "元数据缺失留空(visual.md §3.5)");
         assert_eq!(mtime_text(Some(0)), "—", "0 = 未取(与 cli fmt_time 同约定)");
     }
 
@@ -1774,6 +1793,34 @@ mod tests {
         );
     }
 
+    /// 窄窗投影态拖拽回归(审查发现):stored 固定宽超窄窗预算时,拖拽必须从
+    /// 当前实际显示的宽度起算。720 + stored [456,160,300] 投影为
+    /// [84,326,110,120];名称/大小边界右拖 10 → 名称 94、大小 316,
+    /// 修改时间 / 路径保持 110 / 120(不跳回 stored)。
+    #[test]
+    fn drag_from_projected_layout_does_not_jump_in_narrow_window() {
+        let stored = [456.0, 160.0, 300.0];
+        let before = col_layout(720.0, stored);
+        assert_eq!(before[COL_NAME].1, NAME_MIN_W);
+        assert_eq!(
+            (before[COL_SIZE].1, before[COL_MTIME].1, before[COL_PATH].1),
+            (326.0, 110.0, 120.0),
+            "窄窗投影:超预算固定列按 路径 → 修改时间 → 大小 让宽"
+        );
+
+        let new_fixed = drag_from_layout(ColBoundary::NameSize, &before, 10.0, 720.0);
+        let after = col_layout(720.0, new_fixed);
+        assert_eq!(
+            after[COL_NAME].1,
+            before[COL_NAME].1 + 10.0,
+            "名称随边界右移 +10"
+        );
+        assert_eq!(after[COL_SIZE].1, before[COL_SIZE].1 - 10.0, "大小反向 -10");
+        assert_eq!(after[COL_MTIME].1, before[COL_MTIME].1, "修改时间不跳变");
+        assert_eq!(after[COL_PATH].1, before[COL_PATH].1, "路径不跳变");
+        assert_eq!(after[COL_PATH].0 + after[COL_PATH].1, 704.0, "右内边距 16");
+    }
+
     /// 行几何:高 30、左内边距 16、图标 16×16 垂直居中、名称起点 = 图标右缘 + 8。
     #[test]
     fn row_cells_geometry_matches_spec() {
@@ -1833,6 +1880,11 @@ mod tests {
         };
         assert_eq!(size_cell(&file), "2.0 KB");
         assert_eq!(size_cell(&dir), "—", "目录大小恒为占位");
+        let no_size = HitEntry {
+            size: None,
+            ..file.clone()
+        };
+        assert_eq!(size_cell(&no_size), "", "文件大小缺失留空,不加占位符");
     }
 
     /// 自定义表头 + 虚拟化行出帧:选中行底可见;1000 行只绘可见行(文本形状
@@ -1869,6 +1921,27 @@ mod tests {
             .filter(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == palette.row_selected))
             .count();
         assert_eq!(selected_bg, 1, "选中行底恰好一条");
+        // 下界:800 高窗口至少绘出满屏行数(行底矩形高 = ROW_H),防止「只画
+        // 1 行也通过虚拟化上界断言」的假绿。
+        let visible_rows = out
+            .shapes
+            .iter()
+            .filter(|s| {
+                matches!(&s.shape, egui::Shape::Rect(r)
+                    if (r.rect.height() - window_tokens::ROW_H).abs() < 0.01)
+            })
+            .count();
+        let min_rows = ((800.0
+            - window_tokens::TITLEBAR_H
+            - (window_tokens::SEARCH_ROW_H + window_tokens::DIVIDER_H)
+            - (window_tokens::HEADER_H + window_tokens::DIVIDER_H)
+            - window_tokens::STATUS_H)
+            / window_tokens::ROW_H)
+            .floor() as usize;
+        assert!(
+            visible_rows >= min_rows,
+            "800 高窗口至少绘出满屏 {min_rows} 行(实际 {visible_rows})"
+        );
         let texts = out
             .shapes
             .iter()
@@ -1878,6 +1951,80 @@ mod tests {
             texts < 200,
             "1000 行应只绘可见行(实际 {texts} 个文本形状;非虚拟化会 >4000)"
         );
+        out.textures_delta.clear();
+    }
+
+    /// 表头拖拽接线(窄窗):720 宽 + stored 超预算时,在名称/大小边界右拖 10px,
+    /// `draw_impl` 必须按投影宽归一化且边界跟手(守 call site 不退回 stored 起算)。
+    #[test]
+    fn header_drag_at_min_window_follows_pointer() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.col_fixed = [456.0, 160.0, 300.0];
+        st.results = vec![HitEntry {
+            name: "报告.pdf".into(),
+            path: "/tmp/报告.pdf".into(),
+            size: Some(2048),
+            mtime: Some(1_700_000_000),
+            is_dir: false,
+        }];
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(720.0, 600.0);
+        // 720 投影:名称 84(16..100),名称/大小间隙中心 x = 100 + 8 = 108;
+        // 表头垂直中心 = 标题栏 32 + 搜索行 53 + 表头 16 = 101。
+        let from = egui::pos2(108.0, 101.0);
+        let to = from + egui::vec2(10.0, 0.0);
+        let press = egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // 先空跑一帧注册控件矩形(egui 交互用上一帧的 widget rects 命中)。
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![]);
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![egui::Event::PointerMoved(from), press],
+        );
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![egui::Event::PointerMoved(to)],
+        );
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![release]);
+        assert_eq!(
+            st.col_fixed,
+            [316.0, 110.0, 120.0],
+            "窄窗拖拽按投影宽归一化:名称 84→94、大小 326→316、时间/路径不跳"
+        );
+    }
+
+    /// 带原始输入事件的一帧(拖拽等指针交互测试)。
+    fn run_frame_with_events(
+        ctx: &egui::Context,
+        st: &mut ResultsState,
+        icons: &mut IconCache,
+        screen: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, icons));
         out.textures_delta.clear();
     }
 

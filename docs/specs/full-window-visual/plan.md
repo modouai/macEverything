@@ -62,7 +62,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 
 **Files:** `crates/app/src/ui/results.rs`（替换 `TableBuilder`）；复用 `ui/icons.rs` 的 `IconCache`。
 
-- [ ] **Step 1:** 表头高 32、左右 16、子间距 16、12pt；列宽 名称弹性 ｜ 96 ｜ 160 ｜ 300；排序箭头 12×12（chevron up/down，仅当前排序列）；列宽拖拽热区边界 ±4，最小宽沿用现有。
+- [ ] **Step 1:** 表头高 32、左右 16、子间距 16、12pt；列宽 名称弹性 ｜ 96 ｜ 160 ｜ 300；排序箭头 12×12（chevron up/down，仅当前排序列）；列宽拖拽热区边界 ±4，名称最小 84（720 最小窗仍能容纳四列）。
 - [ ] **Step 2:** 行高 30、左右 16、子间距 16、文件名 13pt、其余 12pt；名称 cell = 16×16 图标（UTI 缓存）+ 间距 8 + 文件名；目录大小列「—」。
 - [ ] **Step 3:** 行状态：选中行底 token、悬停 = 选中 50% 强度、鼠标移动不改选中；多选/双击/右键语义沿用 product §2，零功能丢失。
 - [ ] **Step 4:** 虚拟化 `ScrollArea::show_rows`/等价；滚动条默认隐藏、滚动时出现（可用 egui 样式近似，必要时补自定义淡入）。
