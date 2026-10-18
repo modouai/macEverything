@@ -549,7 +549,7 @@ fn language_save_error_renders_one_extra_line() {
 
 - [ ] **Step 3: 跑测试确认失败**
 
-Run: `cargo test -p macEverything-app language_row_exposes_three_options_and_action language_save_error_renders_one_extra_line`
+Run: `cargo test -p macEverything-app language_`
 Expected: FAIL（字段/动作不存在）。
 
 - [ ] **Step 4: 实现设置错误类型**
@@ -832,11 +832,19 @@ language_error: None,
 - `draw_segmented` 内三档文案改用：
 
 ```rust
-for (size, label) in [
-    (FontSize::Small, i18n::s().font_small),
-    (FontSize::Standard, i18n::s().font_standard),
-    (FontSize::Large, i18n::s().font_large),
-] { /* 原绘制逻辑 */ }
+fn font_label(size: FontSize) -> &'static str {
+    match size {
+        FontSize::Small => i18n::s().font_small,
+        FontSize::Standard => i18n::s().font_standard,
+        FontSize::Large => i18n::s().font_large,
+    }
+}
+
+// draw_segmented 内：
+for (index, option) in options.into_iter().enumerate() {
+    // ...
+    draw_text(/* ... */, font_label(option), /* ... */);
+}
 ```
 
 - 错误/提示渲染：在 `draw_*_group` 内先把 typed error 转成 `String`，再 `as_deref()` 传给 `GroupRow.error`：
@@ -948,7 +956,7 @@ if platform::confirm_action(
 let save_error = store::save(&data_dir, &file).err().map(|err| {
     let detail = format!("{err:#}");
     log::warn!("字号 {size:?} 已应用,但设置保存失败:{detail}");
-    SettingsError::SaveFailed(detail)
+    SettingsError::SaveFailed
 });
 ```
 
