@@ -68,6 +68,7 @@ catalog! {
     reset_confirm_title: "恢复默认排除目录？" / "Restore default excluded folders?",
     reset_confirm_message: "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。" / "This clears custom exclusions and restores ~/Library, node_modules, and .git. This will trigger a full index rescan.",
     reset_confirm_action: "恢复默认" / "Restore Defaults",
+    cancel: "取消" / "Cancel",
     settings_save_failed: "设置保存失败" / "Failed to save settings",
     language_save_failed: "语言已切换,但设置保存失败" / "Language changed, but the settings could not be saved",
     autostart_read_failed: "读取开机自启状态失败" / "Failed to read Launch at Login status",
@@ -141,6 +142,27 @@ catalog! {
     empty_search_failed: "搜索失败" / "Search failed",
     empty_search_failed_sub: "请重试或检查引擎状态" / "Try again or check the engine status",
     empty_searching: "搜索中…" / "Searching…",
+    // 托盘
+    tray_open_search: "打开搜索" / "Open Quick Search",
+    tray_open_window: "打开完整窗口" / "Open Full Window",
+    tray_autostart: "开机自启" / "Launch at Login",
+    tray_settings: "设置…" / "Settings…",
+    tray_quit: "退出" / "Quit",
+    tray_state_building: "引擎:构建中" / "Engine: Building",
+    tray_state_ready: "引擎:就绪" / "Engine: Ready",
+    tray_state_reconciling: "引擎:补齐中" / "Engine: Reconciling",
+    tray_state_degraded: "引擎:重扫中" / "Engine: Rescanning",
+    tray_state_offline: "引擎:未运行(离线索引)" / "Engine: Not Running (Offline Index)",
+    tray_state_not_running: "引擎:未运行" / "Engine: Not Running",
+    // 右键菜单
+    menu_open: "打开" / "Open",
+    menu_open_in_finder: "在访达中打开" / "Open in Finder",
+    menu_show_in_finder: "在访达中显示" / "Show in Finder",
+    menu_copy_path: "拷贝路径" / "Copy Path",
+    menu_locate_failed: "无法定位所在目录" / "Could not locate the containing folder",
+    menu_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
+    menu_open_failed: "打开失败" / "Failed to open",
+    menu_copy_failed: "拷贝路径失败" / "Failed to copy path",
 }
 
 #[cfg(test)]

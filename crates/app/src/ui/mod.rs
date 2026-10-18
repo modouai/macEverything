@@ -1005,7 +1005,13 @@ impl eframe::App for App {
         // 快捷键录制命令(设置页 → App):挂起/恢复/提交只能主线程执行。
         // 顺序由 `hotkey_frame_events` 单点定义：先命令，后关闭/⌘W 取消。
         self.process_hotkey_events(ctx);
+        // 语言切换后原生托盘菜单不随 egui 重绘:主线程消费挂起标记并原地刷新文案,
+        // 再走常规快照同步(状态项/缺口项也按当前语言重写)。
+        let relabel_tray = self.shared().settings.take_tray_relabel_pending();
         if let Some(tray) = &mut self.tray {
+            if relabel_tray {
+                tray.relabel();
+            }
             tray.sync();
         }
 

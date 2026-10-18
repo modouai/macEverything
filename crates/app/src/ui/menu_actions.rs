@@ -22,6 +22,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Result};
 
+use crate::i18n;
+
 /// 四动作(product §2「菜单项」列)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -66,12 +68,13 @@ pub fn menu_items(files: usize, dirs: usize) -> Vec<(&'static str, MenuAction)> 
     if files == 0 && dirs == 0 {
         return Vec::new();
     }
-    let mut v = vec![("打开", MenuAction::Open)];
+    let s = i18n::s();
+    let mut v = vec![(s.menu_open, MenuAction::Open)];
     if files > 0 {
-        v.push(("在访达中打开", MenuAction::OpenInFinderDir));
+        v.push((s.menu_open_in_finder, MenuAction::OpenInFinderDir));
     }
-    v.push(("在访达中显示", MenuAction::RevealInFinder));
-    v.push(("拷贝路径", MenuAction::CopyPaths));
+    v.push((s.menu_show_in_finder, MenuAction::RevealInFinder));
+    v.push((s.menu_copy_path, MenuAction::CopyPaths));
     v
 }
 
@@ -133,7 +136,7 @@ fn plan(action: MenuAction, paths: &[String]) -> Result<Vec<Step>> {
             for p in paths {
                 let parent = Path::new(p)
                     .parent()
-                    .ok_or_else(|| anyhow!("无法定位所在目录:{p}"))?;
+                    .ok_or_else(|| anyhow!("{}:{p}", i18n::s().menu_locate_failed))?;
                 let parent = parent.to_string_lossy().into_owned();
                 ensure_exists(&parent)?;
                 if !targets.contains(&parent) {
@@ -192,7 +195,7 @@ pub fn execute(action: MenuAction, paths: &[String]) -> Result<()> {
 /// 存在性前置校验(失败文案与 palette::open_path 一致——同一根因:索引陈旧)。
 fn ensure_exists(path: &str) -> Result<()> {
     if std::fs::metadata(path).is_err() {
-        return Err(anyhow!("文件不存在,索引可能待更新"));
+        return Err(anyhow!("{}", i18n::s().menu_file_missing));
     }
     Ok(())
 }
@@ -211,7 +214,7 @@ fn spawn_run(program: &'static str, args: &[String]) -> Result<()> {
             });
             Ok(())
         }
-        Err(e) => Err(anyhow!("打开失败:{e}")),
+        Err(e) => Err(anyhow!("{}: {e}", i18n::s().menu_open_failed)),
     }
 }
 
@@ -220,7 +223,7 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     let mut child = Command::new("pbcopy")
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow!("拷贝路径失败:{e}"))?;
+        .map_err(|e| anyhow!("{}: {e}", i18n::s().menu_copy_failed))?;
     // stdin 于本作用域末 drop → EOF(pbcopy 读到 EOF 才落剪贴板)
     let write_res = match child.stdin.take() {
         Some(mut stdin) => stdin.write_all(text.as_bytes()),
@@ -228,18 +231,19 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     };
     let wait_res = child.wait();
     if let Err(e) = write_res {
-        return Err(anyhow!("拷贝路径失败:{e}"));
+        return Err(anyhow!("{}: {e}", i18n::s().menu_copy_failed));
     }
     match wait_res {
         Ok(st) if st.success() => Ok(()),
-        Ok(st) => Err(anyhow!("拷贝路径失败(pbcopy 退出 {st})")),
-        Err(e) => Err(anyhow!("拷贝路径失败:{e}")),
+        Ok(st) => Err(anyhow!("{} (pbcopy exit {st})", i18n::s().menu_copy_failed)),
+        Err(e) => Err(anyhow!("{}: {e}", i18n::s().menu_copy_failed)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{with_lang, Lang};
 
     fn names(items: &[(&'static str, MenuAction)]) -> Vec<&'static str> {
         items.iter().map(|(t, _)| *t).collect()
@@ -263,6 +267,18 @@ mod tests {
             ]
         );
         assert_eq!(menu_items(5, 0).len(), 4, "多文件同形");
+    }
+
+    /// 文案随语言切换:英文菜单项逐字(muda 原生菜单直接取这些标题)。
+    #[test]
+    fn menu_items_localized_in_english() {
+        with_lang(Lang::En, || {
+            let items = menu_items(1, 0);
+            assert_eq!(
+                names(&items),
+                ["Open", "Open in Finder", "Show in Finder", "Copy Path"]
+            );
+        });
     }
 
     /// product §2 表:纯目录三项,无「在访达中打开」(目录的「打开」即此语义)。
@@ -415,6 +431,20 @@ mod tests {
         let deep = "/tmp/mce-menu-actions-不存在-000000/sub/file.txt".to_string();
         let err = execute(MenuAction::OpenInFinderDir, &[deep]).unwrap_err();
         assert!(err.to_string().contains("文件不存在"));
+    }
+
+    /// 执行错误随语言切换(状态栏直接展示;中文文案由上方用例钉住)。
+    #[test]
+    fn execute_missing_path_error_is_localized() {
+        let missing = "/tmp/mce-menu-actions-不存在-000000".to_string();
+        with_lang(Lang::En, || {
+            let err = execute(MenuAction::Open, std::slice::from_ref(&missing)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("File not found; the index may be out of date"),
+                "错误文案应随语言切换:{err}"
+            );
+        });
     }
 
     /// 空集防御:不发无参 `open`(无参 open 会新开 Finder 窗口),返回 Ok。

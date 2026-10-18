@@ -607,8 +607,7 @@ impl SettingsState {
         self.tray_relabel_pending = true;
     }
 
-    /// 取走托盘文案刷新标记（App::logic 消费；接入点在后续托盘文案任务）。
-    #[allow(dead_code)]
+    /// 取走托盘文案刷新标记（App::logic 消费）。
     pub(crate) fn take_tray_relabel_pending(&mut self) -> bool {
         std::mem::take(&mut self.tray_relabel_pending)
     }

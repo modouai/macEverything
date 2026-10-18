@@ -58,7 +58,9 @@ use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
-use super::{monotonic_ms, palette_width, SpaceChange, ICON_PX, PALETTE_TITLE, SETTINGS_TITLE};
+use super::{
+    monotonic_ms, palette_width, settings_window_titles, SpaceChange, ICON_PX, PALETTE_TITLE,
+};
 
 /// 面板顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
 /// 视觉稿 y=110 是含 28px 菜单栏的画布坐标,故物理位置比画布低 28;
@@ -497,7 +499,7 @@ pub fn show_settings_window(center: bool) -> Result<()> {
     };
     // 重入安全(同 show_root_window):状态短借用取出,AppKit 调用全在借用外。
     let root = PALETTE.with(|cell| cell.borrow().root.clone());
-    let win = find_window_by_title(mtm, root.as_deref(), SETTINGS_TITLE)
+    let win = find_window_by_title(mtm, root.as_deref(), &settings_window_titles())
         .ok_or_else(|| anyhow!("设置窗口未就绪(视口尚未创建)"))?;
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
@@ -634,8 +636,8 @@ pub fn pick_directory() -> Option<PathBuf> {
 ///    只会取消;第二个破坏性按钮显式清空 Return 键等价,必须鼠标点选；
 /// ③ `runModal()` 阻塞到用户选择；仅响应码为第二按钮时返回 true。
 /// 取消/关闭/中止/非主线程均返回 false（宁可不执行破坏性操作）。
-/// 注：AppKit 只自动给标题恰为 "Cancel" 的按钮绑定 Esc；中文「取消」不触发 Esc，
-/// 因此 Esc 在本弹窗里没有显式动作（不会误确认）。
+/// 注：AppKit 只自动给标题恰为 "Cancel" 的按钮绑定 Esc；中文「取消」不触发 Esc。
+/// 两种语言下 Esc 都不会误确认(英文 Esc = 取消,中文 Esc 无显式动作)。
 pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         log::warn!("确认弹窗:非主线程调用,按取消处理");
@@ -646,8 +648,8 @@ pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
     alert.setMessageText(&NSString::from_str(title));
     alert.setInformativeText(&NSString::from_str(message));
     alert.setAlertStyle(NSAlertStyle::Warning);
-    // 按钮添加顺序 = 响应码顺序:取消在前(默认 Return)。
-    let cancel = alert.addButtonWithTitle(&NSString::from_str("取消"));
+    // 按钮添加顺序 = 响应码顺序:取消在前(默认 Return),文案随当前语言。
+    let cancel = alert.addButtonWithTitle(&NSString::from_str(crate::i18n::s().cancel));
     let action = alert.addButtonWithTitle(&NSString::from_str(action_label));
     cancel.setKeyEquivalent(&NSString::from_str("\r"));
     action.setKeyEquivalent(&NSString::from_str(""));
@@ -1142,7 +1144,7 @@ pub fn palette_visible() -> Option<bool> {
 pub fn settings_visible() -> Option<bool> {
     let mtm = MainThreadMarker::new()?;
     let root = PALETTE.with(|cell| cell.borrow().root.clone());
-    find_window_by_title(mtm, root.as_deref(), SETTINGS_TITLE).map(|w| w.isVisible())
+    find_window_by_title(mtm, root.as_deref(), &settings_window_titles()).map(|w| w.isVisible())
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,21 +1168,25 @@ fn find_palette_window(
     mtm: MainThreadMarker,
     root: Option<&NSWindow>,
 ) -> Option<Retained<NSWindow>> {
-    find_window_by_title(mtm, root, PALETTE_TITLE)
+    find_window_by_title(mtm, root, &[PALETTE_TITLE])
 }
 
 /// 按标题找视口窗(排除根窗;设置窗诊断走同一路径)。
+///
+/// `titles` = 可接受标题集:设置窗传 [`settings_window_titles`](切换瞬间两种语言
+/// 标题都可能出现),悬浮条恒传 `PALETTE_TITLE`。
 fn find_window_by_title(
     mtm: MainThreadMarker,
     root: Option<&NSWindow>,
-    title: &str,
+    titles: &[&str],
 ) -> Option<Retained<NSWindow>> {
     let app = NSApplication::sharedApplication(mtm);
     for win in app.windows().iter() {
         if root.is_some_and(|r| std::ptr::eq(r, &*win)) {
             continue;
         }
-        if window_title_matches(&win.title().to_string(), title) {
+        let actual = win.title().to_string();
+        if titles.iter().any(|t| window_title_matches(&actual, t)) {
             return Some(win);
         }
     }
@@ -1690,10 +1696,22 @@ mod tests {
     /// 标题查找安全性:精确匹配且目标非空(空标题/不同窗口/仅前缀均不得命中)。
     #[test]
     fn window_title_lookup_requires_exact_nonempty_match() {
-        assert!(window_title_matches(SETTINGS_TITLE, SETTINGS_TITLE));
-        assert!(!window_title_matches(PALETTE_TITLE, SETTINGS_TITLE));
-        assert!(!window_title_matches("", SETTINGS_TITLE));
-        assert!(!window_title_matches("设置窗口", SETTINGS_TITLE));
+        let titles = settings_window_titles();
+        assert!(window_title_matches(titles[0], titles[0]));
+        assert!(window_title_matches(titles[1], titles[1]));
+        assert!(!window_title_matches(PALETTE_TITLE, titles[0]));
+        assert!(!window_title_matches("", titles[0]));
+        assert!(!window_title_matches("设置窗口", titles[0]));
         assert!(!window_title_matches("", ""), "空目标不得匹配无标题窗");
+    }
+
+    /// 设置窗查找接受中英两种原生标题(修复英文设置窗定位回归)。
+    #[test]
+    fn window_title_lookup_accepts_both_settings_titles() {
+        let titles = settings_window_titles();
+        assert!(window_title_matches("设置", titles[0]));
+        assert!(window_title_matches("Settings", titles[1]));
+        assert!(!window_title_matches("设置窗口", titles[0]));
+        assert!(!window_title_matches("", titles[0]));
     }
 }

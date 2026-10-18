@@ -21,8 +21,16 @@ pub mod mac;
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
 
-/// 设置窗口标题(同上;平台层诊断按标题回读设置窗原生可见性)。
-pub const SETTINGS_TITLE: &str = "设置";
+/// 设置窗可接受的两种原生标题(查找时同时匹配,避免切换瞬间竞态)。
+///
+/// 标题随语言切换(视口标题取 `i18n::s().settings_title`);语言切换后旧窗口
+/// 标题可能尚未更新,故平台层按两种标题同时定位。
+pub fn settings_window_titles() -> [&'static str; 2] {
+    [
+        crate::i18n::strings(crate::i18n::Lang::ZhHans).settings_title,
+        crate::i18n::strings(crate::i18n::Lang::En).settings_title,
+    ]
+}
 
 /// 悬浮条最大宽(视觉稿 §1.1/§2.2 = 700;ui 侧 `tokens::PANEL_W` 编译期互钉)。
 pub const PALETTE_MAX_W: f64 = 700.0;

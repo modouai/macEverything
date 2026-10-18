@@ -48,6 +48,7 @@ use tray_icon::menu::{
 };
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+use crate::i18n;
 use crate::platform;
 
 /// 菜单项 id(分派键;字符串常量集中本处,禁散落)。
@@ -103,16 +104,17 @@ pub struct TrayStatus {
     pub gaps: u32,
 }
 
-/// 状态项文案(SOT:product §7 表「托盘菜单首项」列,逐字)。纯函数 + 单测。
+/// 状态项文案(SOT:product §7 表「托盘菜单首项」列,按当前语言)。纯函数 + 单测。
 pub fn state_label(state: &str) -> &'static str {
+    let s = i18n::s();
     match state {
-        client::state::BUILDING => "引擎:构建中",
-        client::state::READY => "引擎:就绪",
-        client::state::RECONCILING => "引擎:补齐中",
-        client::state::DEGRADED => "引擎:重扫中",
-        client::state::OFFLINE => "引擎:未运行(离线索引)",
+        client::state::BUILDING => s.tray_state_building,
+        client::state::READY => s.tray_state_ready,
+        client::state::RECONCILING => s.tray_state_reconciling,
+        client::state::DEGRADED => s.tray_state_degraded,
+        client::state::OFFLINE => s.tray_state_offline,
         // NO_ENGINE(未运行且无索引)、尚未取到(空串)与未知态同按未运行呈现。
-        _ => "引擎:未运行",
+        _ => s.tray_state_not_running,
     }
 }
 
@@ -122,9 +124,9 @@ pub fn engine_launchable(state: &str) -> bool {
     matches!(state, "" | NO_ENGINE | client::state::OFFLINE)
 }
 
-/// 缺口项文案(product §2/§3 逐字)。
+/// 缺口项文案(product §2/§3;计数段复用结果复数函数)。
 pub fn gaps_label(gaps: u32) -> String {
-    format!("⚠ {gaps} 个目录未收录")
+    format!("⚠ {}", crate::i18n::format::gaps(gaps))
 }
 
 /// 菜单项 id → 动作(纯函数,可测;未知 id = 非本模块菜单,返回 None 不误触发)。
@@ -150,11 +152,19 @@ pub struct TrayRuntime {
     menu: Menu,
     /// 状态项(六态文本 + 未运行时可点)。
     state_item: MenuItem,
+    /// 「打开搜索」静态项(语言切换后 `relabel` 原地改写文案)。
+    open_search: MenuItem,
+    /// 「打开完整窗口」静态项(同上)。
+    open_window: MenuItem,
     /// 缺口项(有缺口才挂;归零即移除)。
     gaps_item: Option<MenuItem>,
     /// 「开机自启」勾选项(勾选态 = 真实注册态;Task 20 起,操作成败在
     /// `ui::drain_tray` 里校准——muda 只按点击翻转,不反映注册结果)。
     autostart: CheckMenuItem,
+    /// 「设置…」静态项(语言切换后 `relabel` 原地改写文案)。
+    settings: MenuItem,
+    /// 「退出」静态项(同上)。
+    quit: MenuItem,
     /// 动作消息(泵线程 → 帧内 `poll`)。
     rx: Receiver<TrayMsg>,
     /// 状态刷新请求(悬停/点击/拉起后;非阻塞发,刷新线程阻塞收)。
@@ -186,6 +196,21 @@ impl TrayRuntime {
     /// 校准勾选态(注册/注销失败时复原;muda 自身只按点击翻转,不反映调用成败)。
     pub fn set_autostart_checked(&self, checked: bool) {
         self.autostart.set_checked(checked);
+    }
+
+    /// 语言切换后原地刷新菜单文案(原生菜单不随 egui 重绘;主线程调用)。
+    pub fn relabel(&mut self) {
+        let s = i18n::s();
+        self.open_search.set_text(s.tray_open_search);
+        self.open_window.set_text(s.tray_open_window);
+        self.autostart.set_text(s.tray_autostart);
+        self.settings.set_text(s.tray_settings);
+        self.quit.set_text(s.tray_quit);
+        self.state_item.set_text(state_label(&self.applied.state));
+        if let Some(item) = &self.gaps_item {
+            item.set_text(gaps_label(self.applied.gaps));
+        }
+        log::info!("托盘菜单文案已按当前语言刷新");
     }
 
     /// 主线程每帧调用:快照有变才动菜单项(状态文本/可点击性、缺口项增删)。
@@ -239,10 +264,11 @@ impl TrayRuntime {
 pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRuntime> {
     // —— 菜单(主线程;muda 硬约束) ——
     let menu = Menu::new();
+    let s = i18n::s();
     // 状态项:初始按「未运行」占位(首次刷新即校准);可点击 = 未运行态。
     let state_item = MenuItem::with_id(ids::STATE, state_label(""), true, None);
-    let open_search = MenuItem::with_id(ids::OPEN_SEARCH, "打开搜索", true, None);
-    let open_window = MenuItem::with_id(ids::OPEN_WINDOW, "打开完整窗口", true, None);
+    let open_search = MenuItem::with_id(ids::OPEN_SEARCH, s.tray_open_search, true, None);
+    let open_window = MenuItem::with_id(ids::OPEN_WINDOW, s.tray_open_window, true, None);
     // Task 20:勾选态 = 真实注册态(SMAppService):勾选 = 登录时会自动启动
     // (= status Enabled;requiresApproval 视为未启用——用户尚未在系统设置放行)。
     // 启动默认注册已在 main 里跑过(产品 §4「首次启动 App 时注册自启」),此处查询
@@ -252,10 +278,15 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         log::debug!("托盘:开机自启状态不可用(按未勾选呈现): {err:#}");
         false
     });
-    let autostart =
-        CheckMenuItem::with_id(ids::AUTOSTART, "开机自启", true, autostart_checked, None);
-    let settings = MenuItem::with_id(ids::SETTINGS, "设置…", true, None);
-    let quit = MenuItem::with_id(ids::QUIT, "退出", true, None);
+    let autostart = CheckMenuItem::with_id(
+        ids::AUTOSTART,
+        s.tray_autostart,
+        true,
+        autostart_checked,
+        None,
+    );
+    let settings = MenuItem::with_id(ids::SETTINGS, s.tray_settings, true, None);
+    let quit = MenuItem::with_id(ids::QUIT, s.tray_quit, true, None);
     let sep1 = PredefinedMenuItem::separator();
     let sep2 = PredefinedMenuItem::separator();
     let sep3 = PredefinedMenuItem::separator();
@@ -305,8 +336,12 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         _tray: tray,
         menu,
         state_item,
+        open_search,
+        open_window,
         gaps_item: None,
         autostart,
+        settings,
+        quit,
         rx: msg_rx,
         refresh_tx,
         snapshot,
@@ -534,18 +569,38 @@ fn dist_to_segment(x: f64, y: f64, p0: (f64, f64), p1: (f64, f64)) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{with_lang, Lang};
 
-    /// 状态项文案与 product §7 表「托盘菜单首项」列逐字一致(含「未运行」无索引与未知态)。
+    /// 状态项文案与 product §7 表「托盘菜单首项」列一致(含「未运行」无索引与未知态);
+    /// 中英双语逐项钉住。
     #[test]
     fn state_label_maps_six_states() {
-        assert_eq!(state_label(client::state::BUILDING), "引擎:构建中");
-        assert_eq!(state_label(client::state::READY), "引擎:就绪");
-        assert_eq!(state_label(client::state::RECONCILING), "引擎:补齐中");
-        assert_eq!(state_label(client::state::DEGRADED), "引擎:重扫中");
-        assert_eq!(state_label(client::state::OFFLINE), "引擎:未运行(离线索引)");
-        assert_eq!(state_label(NO_ENGINE), "引擎:未运行", "未运行且无落盘索引");
-        assert_eq!(state_label(""), "引擎:未运行", "尚未取到状态");
-        assert_eq!(state_label("未来的新态"), "引擎:未运行", "未知态兜底");
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(state_label(client::state::BUILDING), "引擎:构建中");
+            assert_eq!(state_label(client::state::READY), "引擎:就绪");
+            assert_eq!(state_label(client::state::RECONCILING), "引擎:补齐中");
+            assert_eq!(state_label(client::state::DEGRADED), "引擎:重扫中");
+            assert_eq!(state_label(client::state::OFFLINE), "引擎:未运行(离线索引)");
+            assert_eq!(state_label(NO_ENGINE), "引擎:未运行", "未运行且无落盘索引");
+            assert_eq!(state_label(""), "引擎:未运行", "尚未取到状态");
+            assert_eq!(state_label("未来的新态"), "引擎:未运行", "未知态兜底");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(state_label(client::state::BUILDING), "Engine: Building");
+            assert_eq!(state_label(client::state::READY), "Engine: Ready");
+            assert_eq!(
+                state_label(client::state::RECONCILING),
+                "Engine: Reconciling"
+            );
+            assert_eq!(state_label(client::state::DEGRADED), "Engine: Rescanning");
+            assert_eq!(
+                state_label(client::state::OFFLINE),
+                "Engine: Not Running (Offline Index)"
+            );
+            assert_eq!(state_label(NO_ENGINE), "Engine: Not Running");
+            assert_eq!(state_label(""), "Engine: Not Running");
+            assert_eq!(state_label("未来的新态"), "Engine: Not Running");
+        });
     }
 
     /// 可点击性:仅未运行/未知可点(已运行态点击无意义 → 置灰)。
@@ -564,11 +619,17 @@ mod tests {
         }
     }
 
-    /// 缺口项文案(product §2/§3 逐字「⚠ N 个目录未收录」)。
+    /// 缺口项文案(product §2/§3「⚠ N 个目录未收录」):前缀与中英单复数。
     #[test]
     fn gaps_label_matches_product_copy() {
-        assert_eq!(gaps_label(3), "⚠ 3 个目录未收录");
-        assert_eq!(gaps_label(1), "⚠ 1 个目录未收录");
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(gaps_label(1), "⚠ 1 个目录未收录");
+            assert_eq!(gaps_label(2), "⚠ 2 个目录未收录");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(gaps_label(1), "⚠ 1 folder not indexed", "英文单数");
+            assert_eq!(gaps_label(2), "⚠ 2 folders not indexed", "英文复数");
+        });
     }
 
     /// 菜单项 id 分派:六项各就其位;未知 id 不误触发。
