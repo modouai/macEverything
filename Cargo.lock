@@ -844,6 +844,7 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "once_cell",
+ "serde",
  "thiserror 2.0.21",
  "windows-sys 0.59.0",
  "x11-dl",
@@ -1221,6 +1222,9 @@ dependencies = [
  "objc2-uniform-type-identifiers 0.3.2",
  "protocol",
  "raw-window-handle",
+ "serde",
+ "tempfile",
+ "toml",
  "tray-icon",
 ]
 

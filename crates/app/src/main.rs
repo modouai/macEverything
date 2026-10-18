@@ -10,6 +10,7 @@ mod engine_launcher;
 mod hotkey;
 mod platform;
 mod session;
+mod settings;
 mod single_instance;
 mod tray;
 mod ui;

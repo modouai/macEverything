@@ -69,6 +69,7 @@ pub mod menu_actions;
 pub mod palette;
 pub mod results;
 pub mod settings;
+pub mod settings_tokens;
 pub mod theme;
 pub mod tokens;
 pub mod window_tokens;
