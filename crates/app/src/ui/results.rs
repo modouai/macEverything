@@ -44,6 +44,7 @@ use std::time::Instant;
 use crate::engine_launcher;
 use crate::platform;
 use crate::session::{Session, SortKey, State};
+use crate::ui::font as ui_font;
 use crate::ui::icons::{self, IconCache};
 use crate::ui::menu_actions;
 use crate::ui::palette::{self, EngineStatus, Payload, QueryResult};
@@ -455,7 +456,7 @@ impl ResultsState {
                         egui::pos2(layout.text_rect.left(), layout.text_rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         "搜索文件…",
-                        egui::FontId::proportional(window_tokens::FONT_QUERY),
+                        ui_font::id(window_tokens::FONT_QUERY),
                         palette.search_hint,
                     );
                 }
@@ -474,7 +475,7 @@ impl ResultsState {
                     layout.text_rect,
                     egui::TextEdit::singleline(&mut self.input)
                         .id(input_id)
-                        .font(egui::FontId::proportional(window_tokens::FONT_QUERY))
+                        .font(ui_font::id(window_tokens::FONT_QUERY))
                         .text_color(palette.query_text)
                         .frame(egui::Frame::NONE)
                         .min_size(layout.text_rect.size())
@@ -1101,7 +1102,7 @@ fn draw_header(
         };
         let galley = egui::WidgetText::from(
             egui::RichText::new(*label)
-                .size(window_tokens::FONT_TABLE)
+                .size(ui_font::size(window_tokens::FONT_TABLE))
                 .color(palette.header_text),
         )
         .into_galley(
@@ -1285,6 +1286,7 @@ fn draw_row(
 }
 
 /// 单元格单行文本(超宽截断加省略号;垂直居中,水平按 `align`)。
+/// `size` 为 token 基准 pt,这里按全局字号倍率换算(几何不变)。
 fn draw_cell_text(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -1296,13 +1298,17 @@ fn draw_cell_text(
     if rect.width() <= 0.0 || text.is_empty() {
         return;
     }
-    let galley = egui::WidgetText::from(egui::RichText::new(text).size(size).color(color))
-        .into_galley(
-            ui,
-            Some(egui::TextWrapMode::Truncate),
-            rect.width(),
-            egui::TextStyle::Body,
-        );
+    let galley = egui::WidgetText::from(
+        egui::RichText::new(text)
+            .size(ui_font::size(size))
+            .color(color),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        rect.width(),
+        egui::TextStyle::Body,
+    );
     let text_rect = align.align_size_within_rect(galley.size(), rect);
     ui.painter().galley(text_rect.min, galley, color);
 }
@@ -1613,7 +1619,7 @@ fn status_text_width(ui: &egui::Ui, text: &str) -> f32 {
     ui.painter()
         .layout_no_wrap(
             text.to_owned(),
-            egui::FontId::proportional(window_tokens::FONT_STATUS),
+            ui_font::id(window_tokens::FONT_STATUS),
             egui::Color32::PLACEHOLDER,
         )
         .size()
@@ -1627,7 +1633,7 @@ fn draw_status_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Co
     }
     let galley = egui::WidgetText::from(
         egui::RichText::new(text)
-            .size(window_tokens::FONT_STATUS)
+            .size(ui_font::size(window_tokens::FONT_STATUS))
             .color(color),
     )
     .into_galley(
@@ -1682,7 +1688,7 @@ fn draw_status_row(
     let badge_galley = badge_text.as_deref().map(|text| {
         ui.painter().layout_no_wrap(
             text.to_owned(),
-            egui::FontId::proportional(window_tokens::FONT_STATUS),
+            ui_font::id(window_tokens::FONT_STATUS),
             palette.gap_badge_text,
         )
     });
@@ -1829,7 +1835,7 @@ fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
         ui.add_space(pad);
         ui.label(
             egui::RichText::new(format!("权限缺口({} 个目录,未收录):", gaps.len()))
-                .size(window_tokens::FONT_STATUS)
+                .size(ui_font::size(window_tokens::FONT_STATUS))
                 .weak(),
         );
     });
@@ -1843,12 +1849,12 @@ fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
                     ui.spacing_mut().item_spacing.x = window_tokens::GAP_BADGE_GAP;
                     ui.label(
                         egui::RichText::new(&g.path)
-                            .size(window_tokens::FONT_STATUS)
+                            .size(ui_font::size(window_tokens::FONT_STATUS))
                             .color(ui.visuals().text_color()),
                     );
                     ui.label(
                         egui::RichText::new(format!("({})", g.reason))
-                            .size(window_tokens::FONT_STATUS)
+                            .size(ui_font::size(window_tokens::FONT_STATUS))
                             .weak(),
                     );
                 });
@@ -1859,7 +1865,7 @@ fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
             ui.add_space(pad);
             ui.label(
                 egui::RichText::new(format!("… 其余 {rest} 个"))
-                    .size(window_tokens::FONT_STATUS)
+                    .size(ui_font::size(window_tokens::FONT_STATUS))
                     .weak(),
             );
         });
@@ -1922,12 +1928,12 @@ fn draw_empty_state(
     let painter = ui.painter();
     let main_galley = painter.layout_no_wrap(
         main.to_owned(),
-        egui::FontId::proportional(window_tokens::FONT_EMPTY_TITLE),
+        ui_font::id(window_tokens::FONT_EMPTY_TITLE),
         palette.file_name,
     );
     let sub_galley = painter.layout_no_wrap(
         sub.to_owned(),
-        egui::FontId::proportional(window_tokens::FONT_TABLE),
+        ui_font::id(window_tokens::FONT_TABLE),
         // 完整窗口的「所在目录色」= 路径列次要文本色(§4.2 column_text)。
         palette.column_text,
     );

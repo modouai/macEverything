@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::platform;
 use crate::session::{Fire, Session, SortKey, State};
+use crate::ui::font as ui_font;
 use crate::ui::icons;
 use crate::ui::mascot;
 use crate::ui::tokens as tk;
@@ -110,8 +111,10 @@ fn search_row_badge_max_w(panel_w: f32) -> f32 {
 }
 
 /// 结果行/输入框字号（proportional；供 RichText/TextEdit 直接引用）。
+///
+/// 入参为 token 层的基准 pt；绘制与 `text_w` 测量共用本函数，全局倍率只换算一次。
 fn font(size: f32) -> egui::FontId {
-    egui::FontId::proportional(size)
+    ui_font::id(size)
 }
 
 /// 首查按协议上限请求一次（product §1 分页语义：不重查、不翻页请求）。
@@ -890,7 +893,7 @@ impl PaletteState {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(note)
-                            .size(FONT_META)
+                            .size(ui_font::size(FONT_META))
                             .color(ui.visuals().warn_fg_color),
                     );
                 }
@@ -918,10 +921,15 @@ impl PaletteState {
                     );
                     empty_ui.add_space((tk::EMPTY_H - tk::EMPTY_TEXT_H) / 2.0);
                     empty_ui.spacing_mut().item_spacing.y = tk::EMPTY_GAP;
-                    empty_ui.label(egui::RichText::new(primary).size(14.0).color(t.file_name));
+                    // 空态主文案 14pt（基准值经全局倍率；几何占位不变）。
+                    empty_ui.label(
+                        egui::RichText::new(primary)
+                            .size(ui_font::size(14.0))
+                            .color(t.file_name),
+                    );
                     empty_ui.label(
                         egui::RichText::new(secondary)
-                            .size(FONT_DIR)
+                            .size(ui_font::size(FONT_DIR))
                             .color(t.dir_text),
                     );
                 } else {
@@ -1678,14 +1686,18 @@ fn draw_result_row(
     );
     col_ui.spacing_mut().item_spacing.y = tk::ROW_TEXT_GAP_Y;
     col_ui.add(
-        egui::Label::new(egui::RichText::new(&e.name).size(FONT_ROW).color(name_c))
-            .truncate()
-            .sense(egui::Sense::hover()),
+        egui::Label::new(
+            egui::RichText::new(&e.name)
+                .size(ui_font::size(FONT_ROW))
+                .color(name_c),
+        )
+        .truncate()
+        .sense(egui::Sense::hover()),
     );
     col_ui.add(
         egui::Label::new(
             egui::RichText::new(dir_display(&e.path))
-                .size(FONT_DIR)
+                .size(ui_font::size(FONT_DIR))
                 .color(t.dir_text),
         )
         .truncate()

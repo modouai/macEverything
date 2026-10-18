@@ -63,6 +63,7 @@
 //! 逐簇查系统字体(zh 语境 → 苹方;韩文 → AppleSDGothicNeo;emoji → Apple Color Emoji)。
 //! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
 
+pub mod font;
 pub mod icons;
 pub mod mascot;
 pub mod menu_actions;
@@ -116,15 +117,24 @@ fn palette_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("palette")
 }
 
+/// 全局字号基准（纯函数：`[Small, Body, Button, Heading, Monospace]` 基准 × scale）。
+///
+/// 抽成纯函数便于测试：并行测试不得改写全局原子，否则会与其它 UI 测试竞态。
+fn base_text_sizes(scale: f32) -> [f32; 5] {
+    [11.0, 15.0, 15.0, 20.0, 15.0].map(|base| font::scaled(base, scale))
+}
+
 /// 全局字号基准(各视口共用;2026-10-16 辉哥实机反馈「整体字号偏小,放大两号」)。
 ///
-/// 字号基准**单点设置**:未来「自定义字号」设置项(v2.1 候选)只需改这一处,
-/// 悬浮条、完整窗口与设置窗口自动同基准。egui 默认档(egui-0.37 style.rs:1524 实测):
-/// Small 9 / Body 13 / Button 13 / Heading 18 / Monospace 13 → 统一 +2:
-/// 11 / 15 / 15 / 20 / 15。幂等(写死目标值,不累加);两主题都写
-/// (`all_styles_mut`——egui 的 Style 按主题各存一份,只改当前主题会在切换后丢)。
-/// 悬浮条另有更细的字号档(ui/palette.rs 的 `FONT_*` 常量,直接引用 FontId)。
+/// 字号基准**单点设置**:悬浮条、完整窗口与设置窗口共用同一基准与全局倍率
+/// (`font::scale()`,启动前由 `App::new` 按设置写入)。egui 默认档
+/// (egui-0.37 style.rs:1524 实测):Small 9 / Body 13 / Button 13 / Heading 18 /
+/// Monospace 13 → 统一 +2 得基准 11 / 15 / 15 / 20 / 15,再乘全局倍率。
+/// 幂等(写死目标值,不累加);两主题都写(`all_styles_mut`——egui 的 Style 按主题
+/// 各存一份,只改当前主题会在切换后丢)。悬浮条/完整窗口另有更细的基准字号档
+/// (ui/palette.rs、ui/window_tokens.rs 的 `FONT_*` 常量,绘制时经 `font::size` 换算)。
 fn install_base_text_styles(ctx: &egui::Context) {
+    let [small, body, button, heading, monospace] = base_text_sizes(font::scale());
     ctx.all_styles_mut(|s| {
         let set = |s: &mut egui::Style, ts: egui::TextStyle, size: f32| {
             // 保留原 family(Monospace 档不能改成 proportional)
@@ -134,11 +144,11 @@ fn install_base_text_styles(ctx: &egui::Context) {
                 .map_or(egui::FontFamily::Proportional, |f| f.family.clone());
             s.text_styles.insert(ts, egui::FontId::new(size, family));
         };
-        set(s, egui::TextStyle::Small, 11.0);
-        set(s, egui::TextStyle::Body, 15.0);
-        set(s, egui::TextStyle::Button, 15.0);
-        set(s, egui::TextStyle::Heading, 20.0);
-        set(s, egui::TextStyle::Monospace, 15.0);
+        set(s, egui::TextStyle::Small, small);
+        set(s, egui::TextStyle::Body, body);
+        set(s, egui::TextStyle::Button, button);
+        set(s, egui::TextStyle::Heading, heading);
+        set(s, egui::TextStyle::Monospace, monospace);
     });
 }
 
@@ -348,10 +358,13 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         incoming: Receiver<Incoming>,
         paths: client::DaemonPaths,
+        settings_file: crate::settings::SettingsFile,
         hotkey: hotkey::HotkeyRuntime,
         tray: Option<tray::TrayRuntime>,
     ) -> Self {
         probe_fonts();
+        // 全局字号倍率先于基准安装（设置 · 字号：只缩放文字，几何尺寸不变）。
+        font::set_scale(settings_file.font_size.scale());
         // 字号基准(全局长大两号);悬浮条另有更细的字号档(ui/palette.rs 常量)。
         install_base_text_styles(&cc.egui_ctx);
         // 首个 pass 之前先应用一次外观:egui 首帧按 System 偏好的 fallback(Dark)
@@ -373,7 +386,10 @@ impl App {
                 hotkey_note,
             ),
             results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
-            settings: settings::SettingsState::default(),
+            settings: settings::SettingsState {
+                open: false,
+                file: settings_file,
+            },
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
             palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
         }));
@@ -853,6 +869,21 @@ mod tests {
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.commands.clone())
             .unwrap_or_default()
+    }
+
+    /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。
+    #[test]
+    fn base_text_sizes_follow_scale() {
+        assert_eq!(base_text_sizes(1.0), [11.0, 15.0, 15.0, 20.0, 15.0]);
+        for (got, base) in base_text_sizes(1.15)
+            .iter()
+            .zip([11.0, 15.0, 15.0, 20.0, 15.0])
+        {
+            assert!(
+                (got - base * 1.15).abs() < 1e-5,
+                "基准 {base} × 1.15，实际 {got}"
+            );
+        }
     }
 
     /// ⌘W = 根窗隐藏（与红点关闭同语义）；裸 W 不触发。

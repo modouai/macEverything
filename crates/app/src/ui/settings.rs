@@ -41,10 +41,15 @@ pub fn builder() -> egui::ViewportBuilder {
         .with_visible(false)
 }
 
-/// 设置窗口状态（Task 1 只登记开合；Task 2+ 接入持久化与控件）。
+/// 设置窗口状态：开合 + 启动读取的设置（Task 3）。
+///
+/// `file` 为 `settings.toml` 的已加载快照；控件写入与落盘由 Task 4–5 接入。
 #[derive(Default)]
 pub struct SettingsState {
     pub open: bool,
+    /// 已加载的设置快照（Task 4–5 设置页控件读取；Task 3 仅启动写入）。
+    #[allow(dead_code)] // Task 4 接入控件后移除
+    pub file: crate::settings::SettingsFile,
 }
 
 /// 设置视口 pass（deferred 回调）。
@@ -64,7 +69,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ui.painter()
         .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, palette.window_fill);
 
-    // 44px 标题栏：原生交通灯在左，标题居中（13pt；Task 3 接全局字号后改 font::id）。
+    // 44px 标题栏：原生交通灯在左，标题居中（13pt 基准 × 全局字号倍率）。
     let bar = egui::Rect::from_min_size(
         ui.max_rect().min,
         egui::vec2(ui.max_rect().width(), TITLEBAR_H),
@@ -90,7 +95,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         bar.center(),
         egui::Align2::CENTER_CENTER,
         "设置",
-        egui::FontId::proportional(13.0),
+        crate::ui::font::id(crate::ui::settings_tokens::TITLE_FONT),
         palette.file_name,
     );
 

@@ -58,6 +58,14 @@ fn main() -> anyhow::Result<()> {
         window_state::MIN_H
     );
 
+    // 设置(Task 3 起:字号倍率):读取失败/无文件回落默认;损坏文件不改写。
+    let settings = settings::load(&paths.data_dir);
+    log::info!(
+        "设置字号:{:?}(scale {:.2})",
+        settings.font_size,
+        settings.font_size.scale()
+    );
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
@@ -116,7 +124,9 @@ fn main() -> anyhow::Result<()> {
                     None
                 }
             };
-            Ok(Box::new(ui::App::new(cc, incoming, paths, hotkey, tray)))
+            Ok(Box::new(ui::App::new(
+                cc, incoming, paths, settings, hotkey, tray,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 启动失败: {e}"))
