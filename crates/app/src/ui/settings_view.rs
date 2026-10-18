@@ -11,7 +11,6 @@ use eframe::egui;
 use crate::settings::FontSize;
 use crate::ui::{
     font as ui_font,
-    settings::SettingsState,
     settings_layout::{card_height, take_row, RowSpec},
     settings_tokens::{
         self, SettingsPalette, ADD_BUTTON_FONT, ADD_BUTTON_H, ADD_BUTTON_PAD_X, ADD_BUTTON_RADIUS,
@@ -27,12 +26,14 @@ use crate::ui::{
 
 /// 添加目录按钮文案（宽度测量与绘制共用）。
 const ADD_DIR_LABEL: &str = "＋ 添加目录…";
-/// 语言禁用值（本期仅简中）。
-const LANGUAGE_LABEL: &str = "简体中文";
+/// 语言禁用值（本期仅简中；快照构造也复用）。
+pub(crate) const LANGUAGE_LABEL: &str = "简体中文";
 /// 语言禁用态提示。
 const LANGUAGE_TOOLTIP: &str = "暂仅支持简体中文，语言切换将在后续版本提供";
 /// 排除目录空态文案（Task 8 换真实 daemon 列表）。
 const EXCLUDED_EMPTY: &str = "未排除任何目录";
+/// 已注册但等待系统「登录项」允许的行内提示（`RequiresApproval`）。
+const AUTOSTART_APPROVAL_NOTE: &str = "已注册,待系统设置「登录项」允许";
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -45,30 +46,16 @@ const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SettingsData {
     pub(crate) font_size: FontSize,
-    /// 实际自启态；未知（读取失败）按关态显示。
+    /// 实际自启态（仅 `Status::Enabled`）；未知/待审批按关态显示。
     pub(crate) autostart: bool,
+    /// 已注册但等待系统「登录项」允许（显示关态 + 行内提示）。
+    pub(crate) autostart_approval: bool,
     pub(crate) autostart_error: Option<String>,
     pub(crate) font_error: Option<String>,
     pub(crate) language: &'static str,
     pub(crate) palette_keys: Vec<String>,
     pub(crate) window_keys: Vec<String>,
     pub(crate) excluded: Vec<String>,
-}
-
-impl SettingsData {
-    /// 从运行期状态复制一帧快照（锁内调用，绘制在锁外）。
-    pub(crate) fn from_state(state: &SettingsState) -> Self {
-        Self {
-            font_size: state.file.font_size,
-            autostart: state.autostart.unwrap_or(false),
-            autostart_error: state.autostart_error.clone(),
-            font_error: state.font_error.clone(),
-            language: LANGUAGE_LABEL,
-            palette_keys: state.palette_keys.clone(),
-            window_keys: state.window_keys.clone(),
-            excluded: state.excluded.clone(),
-        }
-    }
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
@@ -129,19 +116,21 @@ fn support_extra_height(ui: &egui::Ui) -> f32 {
     LABEL_SUPPORT_GAP + ui.fonts_mut(|fonts| fonts.row_height(&ui_font::id(SUPPORT_FONT)))
 }
 
-fn extra_for(error: Option<&str>, extra_h: f32) -> f32 {
-    if error.is_some() {
+fn extra_for(has_message: bool, extra_h: f32) -> f32 {
+    if has_message {
         extra_h
     } else {
         0.0
     }
 }
 
-/// 分组行模型：`kind` 决定控件，`spec` 同时驱动高度与游标，`error` 为行内错误。
+/// 分组行模型：`kind` 决定控件，`spec` 同时驱动高度与游标；
+/// `error`（红色）/ `note`（次要色）二选一显示在行下方。
 struct GroupRow<'a> {
     kind: RowKind<'a>,
     spec: RowSpec,
     error: Option<&'a str>,
+    note: Option<&'a str>,
 }
 
 enum RowKind<'a> {
@@ -167,8 +156,9 @@ fn draw_appearance_group(
     let error = data.font_error.as_deref();
     let rows = [GroupRow {
         kind: RowKind::FontSize,
-        spec: RowSpec::new(ROW_H).with_extra(extra_for(error, extra_h)),
+        spec: RowSpec::new(ROW_H).with_extra(extra_for(error.is_some(), extra_h)),
         error,
+        note: None,
     }];
     draw_card(ui, full_w, "外观", &rows, data, palette, actions);
 }
@@ -183,26 +173,36 @@ fn draw_general_group(
     actions: &mut Vec<SettingsAction>,
 ) {
     let autostart_error = data.autostart_error.as_deref();
+    let autostart_note = if autostart_error.is_none() && data.autostart_approval {
+        Some(AUTOSTART_APPROVAL_NOTE)
+    } else {
+        None
+    };
+    let has_message = autostart_error.is_some() || autostart_note.is_some();
     let rows = [
         GroupRow {
             kind: RowKind::Autostart,
-            spec: RowSpec::new(ROW_H).with_extra(extra_for(autostart_error, extra_h)),
+            spec: RowSpec::new(ROW_H).with_extra(extra_for(has_message, extra_h)),
             error: autostart_error,
+            note: autostart_note,
         },
         GroupRow {
             kind: RowKind::Language,
             spec: RowSpec::new(ROW_H),
             error: None,
+            note: None,
         },
         GroupRow {
             kind: RowKind::PaletteKeys,
             spec: RowSpec::new(ROW_H),
             error: None,
+            note: None,
         },
         GroupRow {
             kind: RowKind::WindowKeys,
             spec: RowSpec::new(ROW_H),
             error: None,
+            note: None,
         },
     ];
     draw_card(ui, full_w, "通用", &rows, data, palette, actions);
@@ -220,12 +220,14 @@ fn draw_index_group(
         kind: RowKind::ExcludeHeader,
         spec: RowSpec::new(EXCLUDE_HEADER_H),
         error: None,
+        note: None,
     }];
     if data.excluded.is_empty() {
         rows.push(GroupRow {
             kind: RowKind::ExcludedEmpty,
             spec: RowSpec::new(EXCLUDE_ROW_H),
             error: None,
+            note: None,
         });
     } else {
         rows.extend(
@@ -236,6 +238,7 @@ fn draw_index_group(
                     kind: RowKind::Exclusion { index, path },
                     spec: RowSpec::new(EXCLUDE_ROW_H),
                     error: None,
+                    note: None,
                 }),
         );
     }
@@ -263,7 +266,9 @@ fn draw_card(
         }
         draw_row_body(ui, rects.body, &row.kind, data, palette, actions);
         if let Some(error) = row.error {
-            draw_support_line(ui, rects.extra, error, palette);
+            draw_support_line(ui, rects.extra, error, palette.error_text);
+        } else if let Some(note) = row.note {
+            draw_support_line(ui, rects.extra, note, palette.text_secondary);
         }
     }
     debug_assert!(
@@ -382,8 +387,9 @@ fn draw_row_body(
     }
 }
 
-/// 行内错误（辅助字号、次要红、左对齐；高度已计入行模型）。
-fn draw_support_line(ui: &egui::Ui, extra: egui::Rect, text: &str, palette: &SettingsPalette) {
+/// 行内提示（辅助字号、左对齐；错误红 / 审批提示次要色）。
+/// 高度已计入行模型。
+fn draw_support_line(ui: &egui::Ui, extra: egui::Rect, text: &str, color: egui::Color32) {
     let rect = egui::Rect::from_min_max(
         egui::pos2(extra.left() + ROW_PAD_X, extra.top() + LABEL_SUPPORT_GAP),
         egui::pos2(extra.right() - ROW_PAD_X, extra.bottom()),
@@ -393,7 +399,7 @@ fn draw_support_line(ui: &egui::Ui, extra: egui::Rect, text: &str, palette: &Set
         rect,
         text,
         SUPPORT_FONT,
-        palette.error_text,
+        color,
         egui::Align2::LEFT_CENTER,
     );
 }
@@ -839,6 +845,7 @@ mod tests {
         SettingsData {
             font_size: FontSize::Standard,
             autostart: false,
+            autostart_approval: false,
             autostart_error: None,
             font_error: None,
             language: LANGUAGE_LABEL,
@@ -1050,9 +1057,9 @@ mod tests {
         );
     }
 
-    /// 自启错误行同理:增高通用卡片（「语言」行随之下移）。
+    /// 自启错误行同理:增高通用卡片（「语言」行随之下移），错误文案须实际绘制。
     #[test]
-    fn autostart_error_row_adds_card_height() {
+    fn autostart_error_row_adds_card_height_and_draws_text() {
         let baseline = run_body(&layout_test_data());
         let baseline_language = text_center(find_text(&all_texts(&baseline), "语言")).y;
 
@@ -1064,6 +1071,25 @@ mod tests {
         assert!(
             error_language > baseline_language + 10.0,
             "自启错误行必须增高通用卡片:基线 {baseline_language},错误 {error_language}"
+        );
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        assert!(
+            labels.iter().any(|text| text.contains("未打包")),
+            "自启错误文案须绘制:实际 {labels:?}"
+        );
+    }
+
+    /// 待审批：开关仍为关态，行内显示「已注册,待系统设置「登录项」允许」。
+    #[test]
+    fn autostart_approval_note_is_drawn() {
+        let mut data = layout_test_data();
+        data.autostart_approval = true;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        assert!(
+            labels.contains(&AUTOSTART_APPROVAL_NOTE),
+            "审批提示须绘制:实际 {labels:?}"
         );
     }
 

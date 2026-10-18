@@ -2,3 +2,6 @@
 *.tmp
 .DS_Store
 /release/
+
+# Claude Code 本地配置（不随仓库分发）
+.claude/

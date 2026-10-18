@@ -68,6 +68,13 @@ enum SettingsAction {
 > 本期（Task 5）只落地字号/自启：自启不经该枚举，成功时置
 > `settings.tray_autostart_sync` 由 `App::logic` 同步托盘（§7）；`SettingsAction`
 > 的录制项留给 `plan-hotkeys.md`。字号在绘制回调收集动作后锁外立即应用。
+>
+> **动作所有权（2026-10-18 定案）：** `settings_view::SettingsAction` 是
+> `Copy` 的即时视图动作（字号/自启），由设置 pass 在绘制后立即落地，不跨帧。
+> Task 6 快捷键需要带数据的动作（`BeginRecord`/`CommitHotkey { slot, hotkey }`），
+> 且注册/注销必须在主线程 App 侧执行 → 进 `Shared.settings` 的 App 动作队列，
+> 由 `App::logic` drain；Task 8 排除目录的添加/移除是异步 daemon 调用 → 同样走
+> App 队列 + 工作线程，绘制回调只置请求位并显示忙碌态，绝不持锁/阻塞绘制。
 
 `App::logic` 每帧 drain：
 - hotkey 动作在主线程处理（manager 只能在主线程用）；
@@ -140,7 +147,7 @@ Content (padding 上下 20 / 左右 24, gap 20)
 
 - 卡片圆角 10、行间 1px 分隔线；控件按 §2.4 尺寸。
 - 字号分段：容器 180×28、圆角 7、padding 2；选中段底色/文字按 token。
-- 开关：38×22、圆角 11；开态系统蓝；钮 18×18 白 + 1px 柔和投影。
+- 开关：38×22、圆角 11；开态系统蓝；钮 18×18 白 + 3 层递减 alpha 柔和投影。
 - 语言：152×28 下拉按钮禁用态「简体中文」，tooltip「暂仅支持简体中文，语言切换将在后续版本提供」。
 - 快捷键字段：152×28 键帽字段；录制中显示「按下快捷键…」，下方内联错误（冲突/注册失败/需修饰键）。
 - 排除目录：Header 行「排除目录」+ 右侧「＋ 添加目录…」；目录行文件夹图标 16 + 路径 13 + 移除 ×14；空列表显示「未排除任何目录」。
@@ -192,12 +199,20 @@ Committing → 成功: Idle + 新键；失败: Recording + 内联错误（旧键
 
 ## 七、开机自启
 
-- 打开设置页时在共享锁外查询 `autostart::is_enabled()`（失败按未知/关态 + 错误文案）。
-- 点击开关：
-  - 锁外 `apply_user_choice(data_dir, desired)`；成功更新 UI + 置
-    `tray_autostart_sync = Some(desired)`（`App::logic` drain 后同步托盘勾选）；
-  - 失败保持旧状态 + 内联错误（如开发形态「未打包」）。
-- 托盘勾选自启成功 → 更新 `Shared.settings.autostart_enabled`（设置页打开时即时反映）。
+- 打开设置页时（仅隐藏→显示）在共享锁外查询 `autostart::status()`；窗口已打开时
+  不重复查询，避免覆盖失败切换的行内错误。查询失败按未知/关态 + 错误文案。
+- 开关显示按**操作后真实状态**，不由请求值反推：
+  - 仅 `Status::Enabled` 显示开；
+  - `Status::RequiresApproval`（已注册待允许，登录不会拉起）显示关 + 行内提示
+    「已注册,待系统设置「登录项」允许」；
+  - 启用后仍 `NotRegistered`/`NotFound` → 显示关 + 内联错误。
+- 点击开关：锁外 `apply_user_choice(data_dir, desired)`（返回操作后 `Status`）；
+  成功按上述真实状态更新 UI，并把**实际启用值**置入
+  `tray_autostart_sync`（审批中/未生效 → false）；失败保持旧状态 + 内联错误。
+- 托盘勾选：按同一策略更新 `Shared.settings.autostart`/错误；仅 `Enabled` 勾选，
+  审批中/未生效取消勾选，注册失败复原。设置页打开时即时重绘。
+- `App::logic` 先消费托盘动作，再 drain 设置页同步；本帧托盘也切换了自启时丢弃
+  设置页旧同步值（托盘动作更新）。
 
 ---
 

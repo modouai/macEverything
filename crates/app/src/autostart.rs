@@ -21,7 +21,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use objc2_foundation::NSError;
 use objc2_service_management::{
     kSMErrorAlreadyRegistered, kSMErrorInvalidSignature, kSMErrorJobNotFound,
@@ -183,10 +183,14 @@ pub fn register_at_startup(data_dir: &Path) -> Result<()> {
     }
 }
 
-/// 用户经托盘主动开关(与启动默认注册区分:此处写/清「用户关闭」标记)。
-/// 注册/注销失败 → Err(调用方复原勾选);标记读写失败不回滚注册(注册已生效),
-/// 记 warn 后仍返回 Ok。返回值为操作后的状态说明(日志用)。
-pub fn apply_user_choice(data_dir: &Path, enabled: bool) -> Result<&'static str> {
+/// 用户经托盘/设置页主动开关(与启动默认注册区分:此处写/清「用户关闭」标记)。
+///
+/// 返回**操作后查询到的真实注册态**(注册/注销调用本身成功不代表目标态达成:
+/// 例如启用后可能停在 `RequiresApproval`,登录时不会拉起)。调用方须按 `Status`
+/// 决定开关显示与托盘勾选,勿用请求的 `enabled` 反推。注册/注销失败或状态查询
+/// 失败 → Err(调用方复原勾选/开关);标记读写失败不回滚注册(注册已生效),记
+/// warn 后仍返回 Ok。
+pub fn apply_user_choice(data_dir: &Path, enabled: bool) -> Result<Status> {
     set_enabled(enabled)?;
     let marker = opt_out_path(data_dir);
     let marker_result = if enabled {
@@ -198,17 +202,9 @@ pub fn apply_user_choice(data_dir: &Path, enabled: bool) -> Result<&'static str>
         // 注册已生效,不回滚;标记失败影响的是「下次启动默认注册」的意图记忆。
         log::warn!("开机自启:用户意图标记写入失败({}):{err}", marker.display());
     }
-    Ok(match status() {
-        Ok(s) => s.note(),
-        Err(err) => {
-            log::warn!("开机自启:操作后状态查询失败: {err:#}");
-            if enabled {
-                "已开启"
-            } else {
-                "已关闭"
-            }
-        }
-    })
+    let status = status().context("开机自启:操作后状态查询失败")?;
+    log::info!("开机自启:操作后状态 —— {}", status.note());
+    Ok(status)
 }
 
 /// 写「用户关闭」标记(建父目录;幂等覆盖)。

@@ -262,20 +262,23 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     }
 }
 
-/// 打开设置窗口(完整窗口齿轮/托盘「设置…」共用):查询自启真源 → 置开合态 +
-/// 命令显示/聚焦 + 排设置视口与 ROOT 两帧。
+/// 打开设置窗口(完整窗口齿轮/托盘「设置…」共用):置开合态 → (首次显示时)
+/// 查询自启真源 → 命令显示/聚焦 + 排设置视口与 ROOT 两帧。
 ///
-/// `autostart::is_enabled()` 是原生调用:在共享锁外查询(锁纪律见「悬浮条显隐」段);
+/// 查询只在隐藏→显示时进行:窗口已打开时再次点入口不得覆盖失败切换的行内错误。
+/// `autostart::status()` 是原生调用:在共享锁外查询(锁纪律见「悬浮条显隐」段);
 /// 查询失败按未知态 + 内联错误(设置页显示关态)。命令只入 egui 队列,可短锁内发。
 fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
-    let autostart = autostart::is_enabled().map_err(|err| format!("读取开机自启状态失败:{err:#}"));
     let was_open = {
         let mut s = lock_shared(shared);
         let was_open = s.settings.open;
         s.settings.open = true;
-        s.settings.autostart_loaded(autostart);
         was_open
     };
+    if !was_open {
+        let autostart = autostart::status().map_err(|err| format!("读取开机自启状态失败:{err:#}"));
+        lock_shared(shared).settings.autostart_loaded(autostart);
+    }
     ctx.send_viewport_cmd_to(
         settings::viewport_id(),
         egui::ViewportCommand::Visible(true),
@@ -511,7 +514,9 @@ impl App {
     }
 
     /// 消费托盘动作(Task 16):泵线程已为本帧请求 ROOT 重绘(与热键同模式,见 tray.rs)。
-    fn drain_tray(&mut self, ctx: &egui::Context) {
+    /// 返回本帧是否消费了「开机自启」切换(供设置页同步标记仲裁)。
+    fn drain_tray(&mut self, ctx: &egui::Context) -> bool {
+        let mut tray_toggled_autostart = false;
         while let Some(msg) = self.tray.as_ref().and_then(tray::TrayRuntime::poll) {
             match msg {
                 TrayMsg::TogglePalette => {
@@ -536,39 +541,38 @@ impl App {
                     open_settings(&self.shared, ctx);
                 }
                 TrayMsg::ToggleAutostart => {
-                    // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按真实注册结果校准——
-                    // 成功保留勾选并落下/清除「用户关闭」标记(下次启动不再默认注册),
-                    // 失败(如开发形态未打包)复原勾选 + 日志(无角标面,不静默)。
+                    // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按**操作后真实状态**
+                    // 校准:仅 Enabled 勾选;RequiresApproval / NotRegistered / NotFound
+                    // 一律取消勾选;失败复原勾选。用户意图标记语义不变。
+                    tray_toggled_autostart = true;
                     let checked = self.tray.as_ref().is_some_and(|t| t.autostart_checked());
-                    match autostart::apply_user_choice(&self.paths.data_dir, checked) {
-                        Ok(note) => {
-                            log::info!("托盘:开机自启 → {note}");
-                            // 设置页打开时即时反映托盘切换结果。
-                            let open = {
-                                let mut s = self.shared();
-                                s.settings.autostart = Some(checked);
-                                s.settings.autostart_error = None;
-                                s.settings.open
-                            };
-                            if open {
-                                ctx.request_repaint_of(settings::viewport_id());
+                    let result = autostart::apply_user_choice(&self.paths.data_dir, checked)
+                        .map_err(|err| format!("{err:#}"));
+                    match &result {
+                        Ok(status) => log::info!("托盘:开机自启 → {}", status.note()),
+                        Err(err) => log::warn!("托盘:开机自启设置失败: {err}"),
+                    }
+                    let (update, open) = {
+                        let mut s = self.shared();
+                        let update = s.settings.autostart_changed_externally(checked, result);
+                        (update, s.settings.open)
+                    };
+                    if let Some(tray) = &self.tray {
+                        if update.confirmed {
+                            tray.set_autostart_checked(update.enabled);
+                            if update.enabled != checked {
+                                log::warn!(
+                                    "托盘:自启未达成目标态(期望 {checked},实际 {});勾选按实际校准",
+                                    update.enabled
+                                );
                             }
+                        } else {
+                            // 注册/状态查询失败:复原为点击前值。
+                            tray.set_autostart_checked(!checked);
                         }
-                        Err(err) => {
-                            log::warn!("托盘:开机自启设置失败(勾选复原): {err:#}");
-                            if let Some(tray) = &self.tray {
-                                tray.set_autostart_checked(!checked);
-                            }
-                            let open = {
-                                let mut s = self.shared();
-                                let message = format!("开机自启设置失败:{err:#}");
-                                s.settings.autostart_failed(message);
-                                s.settings.open
-                            };
-                            if open {
-                                ctx.request_repaint_of(settings::viewport_id());
-                            }
-                        }
+                    }
+                    if open {
+                        ctx.request_repaint_of(settings::viewport_id());
                     }
                 }
                 TrayMsg::Quit => {
@@ -603,6 +607,7 @@ impl App {
                 }
             }
         }
+        tray_toggled_autostart
     }
 }
 
@@ -652,11 +657,14 @@ impl eframe::App for App {
             ctx.request_repaint_after(theme::CHECK_INTERVAL);
         }
 
-        // 设置页「开机自启」切换成功 → 同步托盘勾选(muda 菜单项须主线程写)。
-        // 放在 drain_tray 前:本帧托盘动作更新,不被上一帧设置页的旧值覆盖。
+        // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/
+        // 文本更新要求主线程——muda 约束;快照由刷新线程写、悬停/点击/拉起后触发)。
+        // 本帧若托盘也切换了自启,设置页排队的旧同步值必须作废(否则会用旧值
+        // 覆盖刚按真实状态校准过的勾选)——由 `take_tray_autostart_sync` 仲裁。
+        let tray_toggled_autostart = self.drain_tray(ctx);
         let autostart_sync = {
             let mut s = self.shared();
-            s.settings.take_tray_autostart_sync()
+            s.settings.take_tray_autostart_sync(tray_toggled_autostart)
         };
         if let Some(desired) = autostart_sync {
             if let Some(tray) = &self.tray {
@@ -664,10 +672,6 @@ impl eframe::App for App {
                 log::info!("设置页自启:同步托盘勾选 {desired}");
             }
         }
-
-        // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/
-        // 文本更新要求主线程——muda 约束;快照由刷新线程写、悬停/点击/拉起后触发)。
-        self.drain_tray(ctx);
         if let Some(tray) = &mut self.tray {
             tray.sync();
         }

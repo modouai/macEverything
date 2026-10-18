@@ -562,17 +562,21 @@ git commit -m "feat(app): 设置窗口三组五项布局"
 - Modify: `crates/app/src/ui/settings.rs`（视口/运行期状态/行为）
 - Create: `crates/app/src/ui/settings_view.rs`（纯视图 + headless 测试）
 - Create: `crates/app/src/ui/settings_layout.rs`（行模型/卡片高度）
-- Modify: `crates/app/src/ui/mod.rs`（`pub(crate)` 字号样式/调色板 id、开窗查询自启、托盘同步）
+- Modify: `crates/app/src/ui/mod.rs`（`pub(crate)` 字号样式/调色板 id、开窗查询自启、托盘同步仲裁）
 - Modify: `crates/app/src/settings.rs`（移除模块级 dead_code allow）
-- Modify: `crates/app/src/tray.rs`（勾选同步，沿用既有 API）
+- Modify: `crates/app/src/autostart.rs`（`apply_user_choice` 返回操作后真实 `Status`）
+- Modify: `crates/app/src/tray.rs`（无需改动；沿用既有 `set_autostart_checked` API）
+- Modify: `.gitignore`（忽略本地 `.claude/`）
 
 - [x] **Step 1: 写失败测试（纯状态）**
 
-为 `SettingsState` 增加 `autostart: Option<bool>`、`autostart_error: Option<String>`、
-`file: SettingsFile`、`font_error: Option<String>`、`tray_autostart_sync: Option<bool>`，测试：
+为 `SettingsState` 增加 `autostart: Option<bool>`、`autostart_approval: bool`、
+`autostart_error: Option<String>`、`file: SettingsFile`、`font_error: Option<String>`、
+`tray_autostart_sync: Option<bool>`，测试：
 - 字号纯状态转换：保存失败仍更新 `file.font_size` + `font_error`，成功清错误；
-- 自启查询失败 → 未知（显示关态）+ 错误；成功 → 实际态并清错误；
-- 自启切换成功更新状态并置/取一次性托盘同步标记；失败保持旧值 + 错误；
+- 自启查询失败 → 未知（显示关态）+ 错误；`RequiresApproval` → 关态 + 审批提示；
+- 切换成功按操作后真实 `Status` 落地（仅 Enabled 开），托盘同步只排实际值；
+- 失败保持旧值 + 错误且不同步托盘；同帧托盘切换弃用设置页旧同步值；
 - 快照 `SettingsData` 与运行期状态一致。
 
 生产 `font::set_scale` 写进程级原子，单测不调用；非默认倍率视觉测试只用
@@ -580,16 +584,20 @@ git commit -m "feat(app): 设置窗口三组五项布局"
 
 - [x] **Step 2: 实现自启读取/切换**
 
-`open_settings` 在共享锁外查询 `autostart::is_enabled()`；成功 `autostart=Some(..)`，
-失败 `autostart=None` + `autostart_error`（开关显示关态）。开关点击在锁外调
-`autostart::apply_user_choice(&data_dir, desired)`：
-- 成功：更新 `settings.autostart`、清错误、置 `tray_autostart_sync=Some(desired)`；
-- 失败：保持旧值 + `autostart_error`（如开发形态「未打包」）。
+`open_settings` 仅在隐藏→显示时于共享锁外查询 `autostart::status()`；窗口已打开
+不重复查询（保留失败切换的行内错误）。`RequiresApproval` → 关态 + 审批提示；
+查询失败 → 未知 + 错误。开关点击在锁外调
+`autostart::apply_user_choice(&data_dir, desired)`（返回操作后真实 `Status`）：
+- 仅 `Enabled` 显示开，置 `tray_autostart_sync=Some(true)`；
+- `RequiresApproval` 显示关 +「已注册,待系统设置「登录项」允许」，
+  `tray_autostart_sync=Some(false)`；
+- 启用后 `NotRegistered`/`NotFound` 显示关 + 内联错误、同步 false；
+- 失败保持旧值 + `autostart_error`（如开发形态「未打包」），不同步托盘。
 
-`App::logic` 每帧在 `drain_tray` 前 drain `tray_autostart_sync` →
-`self.tray.set_autostart_checked(desired)`。托盘切换成功 →
-`self.shared().settings.autostart = Some(checked)`（清错误）；失败复原勾选并落
-`autostart_error`；设置页打开时请求其重绘。
+设置页与托盘共用 `SettingsState` 的同一状态策略；托盘路径只校准勾选不排队同步。
+`App::logic` **先** `drain_tray`，再 drain `tray_autostart_sync`；若本帧托盘也切换了
+自启，则丢弃设置页旧同步值（`take_tray_autostart_sync(tray_toggled)` 仲裁）。
+设置页打开时请求其重绘；托盘失败复原勾选，审批中/未生效取消勾选。
 
 - [x] **Step 3: 实现字号分段**
 
@@ -609,7 +617,8 @@ hover 光标 `NotAllowed` + tooltip「暂仅支持简体中文，语言切换将
 - [x] **Step 5: 运行验证并提交**
 
 Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
-实机：字号三档切换两窗即时变化、重启保持；自启勾选与托盘一致（controller 走查）。
+实机：字号三档切换两窗即时变化、重启保持；自启勾选与托盘一致性**待 controller
+复核**（本轮未实机验证托盘勾选）。
 
 ```bash
 git add crates/app/src/ui/settings.rs crates/app/src/ui/settings_view.rs crates/app/src/ui/settings_layout.rs crates/app/src/ui/mod.rs crates/app/src/tray.rs crates/app/src/settings.rs crates/app/src/ui/settings_tokens.rs docs/specs/settings-v2.1
@@ -623,18 +632,35 @@ git commit -m "feat(app): 设置页字号与开机自启"
 - 高度与绘制共用同一行模型：卡片高 = Σ(行主体 + 行内错误行) + 行间分隔线；绘制
   末尾 `debug_assert` 卡片底 == 行游标。内联错误行增高不再导致卡片底/分隔线漂移。
 - 滚动模型定案：**整页纵向滚动、44px 标题栏固定**；不做卡片内独立滚动。
-  Task 8（排除目录真实列表）沿用整页滚动，列表变长只增高索引卡片。
+  Task 8（排除目录真实列表）沿用整页滚动，列表变长只增高索引卡片；本期不做
+  列表虚拟化（条目数量级低；如后续出现长列表再评估）。
 - 运行期真源收进 `SettingsState`（含 `data_dir`/`excluded` 一次性种子/默认键帽），
-  `SettingsData` 仅为出锁绘制快照；不再每帧克隆 `engine::config::default_config()`。
+  `SettingsData` 仅为出锁绘制快照（`from_state` 在 `settings.rs`，视图只依赖
+  快照）；不再每帧克隆 `engine::config::default_config()`。
+- 动作所有权：`settings_view::SettingsAction` 保持 `Copy` 即时动作（字号/自启），
+  绘制后由设置 pass 锁外落地；Task 6 快捷键（带数据、主线程注册）与 Task 8
+  排除目录（异步 daemon）改走 `Shared.settings` 的 App 动作队列，由 `App::logic`
+  drain / 工作线程执行，不在视图回调内做阻塞或原生调用。
 - 视觉修复：键帽组按原型在字段内水平居中；标题使用 `platform::SETTINGS_TITLE`；
   开关钮投影改 3 层递减 alpha 软影；排除目录空列表显示「未排除任何目录」。
 - 删除 `crates/app/src/settings.rs` 模块级 `#![allow(dead_code)]`；仅保留
   `SettingsPalette::control_text` 的 item-level allow（规格 token，禁用态改次要色）。
 
+**Review 修复（2026-10-18，follow-up）：**
+- 自启按操作后真实 `Status` 落地：`RequiresApproval` 不再显示/同步为已启用，
+  改为关态 +「已注册,待系统设置「登录项」允许」；启用后未注册为关态 + 错误。
+  `apply_user_choice` 改为返回 `Status`；设置页与托盘共用同一策略方法。
+- `App::logic` 改为先 `drain_tray`；本帧托盘切换自启时丢弃设置页旧同步
+  （`take_tray_autostart_sync(tray_toggled)` 单元测试钉住）。
+- `open_settings` 仅隐藏→显示时查询，已打开窗口保留失败切换的行内错误。
+- `SettingsData::from_state` 移入 `ui/settings.rs`，视图不再依赖 `SettingsState`。
+- 补充错误文案实际绘制断言与审批提示绘制测试；`.claude/` 加入 `.gitignore`。
+
 **验证记录（2026-10-18）：** `cargo fmt --check` / `cargo clippy --workspace
 --all-targets -- -D warnings` / `cargo test --workspace` 全绿。app 新增/更新测试：
-字号与自启纯状态 4 个、行模型 2 个、headless 布局 9 个（含错误行增高、空态、
-键帽居中、选中段填充、两处点击动作、大字号冒烟）。
+设置状态/策略 9 个、行模型 2 个、headless 布局 10 个（含错误行增高与文案、
+审批提示、空态、键帽居中、选中段填充、两处点击动作、大字号冒烟）；托盘勾选
+实机复核仍待 controller。
 
 ---
 

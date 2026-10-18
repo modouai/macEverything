@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use crate::autostart;
+use crate::autostart::{self, Status};
 use crate::platform;
 use crate::settings::{self as store, FontSize, SettingsFile};
 use crate::ui::{
@@ -60,8 +60,10 @@ pub struct SettingsState {
     pub(crate) file: SettingsFile,
     /// 设置文件所在数据目录（保存字号用）。
     pub(crate) data_dir: PathBuf,
-    /// 实际自启态；`None` = 尚未查询或查询失败。
+    /// 实际自启态（仅 `Status::Enabled` 为 true）；`None` = 尚未查询或查询失败。
     pub(crate) autostart: Option<bool>,
+    /// 已注册但等待系统「登录项」允许（`RequiresApproval`）：显示关态 + 行内提示。
+    pub(crate) autostart_approval: bool,
     pub(crate) autostart_error: Option<String>,
     /// 字号保存失败的内联错误（已应用的字号不因保存失败回退）。
     pub(crate) font_error: Option<String>,
@@ -83,6 +85,7 @@ impl SettingsState {
             file,
             data_dir,
             autostart: None,
+            autostart_approval: false,
             autostart_error: None,
             font_error: None,
             excluded: engine::config::default_config().excluded,
@@ -92,30 +95,79 @@ impl SettingsState {
         }
     }
 
-    /// 打开设置页的自启查询结果：成功取实际态，失败按未知（显示关态）+ 内联错误。
-    pub(crate) fn autostart_loaded(&mut self, result: Result<bool, String>) {
+    /// 打开设置页的自启查询结果：成功按**真实状态**落地（审批中 → 关态 + 提示），
+    /// 失败按未知（关态）+ 内联错误。
+    pub(crate) fn autostart_loaded(&mut self, result: Result<Status, String>) {
         match result {
-            Ok(enabled) => {
-                self.autostart = Some(enabled);
-                self.autostart_error = None;
+            Ok(status) => {
+                self.apply_autostart_status(false, status);
             }
             Err(err) => {
                 self.autostart = None;
+                self.autostart_approval = false;
                 self.autostart_error = Some(err);
             }
         }
     }
 
-    /// 设置页自启切换成功：更新实际态、清错误、置托盘同步标记。
-    pub(crate) fn autostart_succeeded(&mut self, enabled: bool) {
-        self.autostart = Some(enabled);
-        self.autostart_error = None;
-        self.tray_autostart_sync = Some(enabled);
+    /// 设置页切换：按真实状态落地，成功时把**实际启用值**排队给托盘同步
+    ///（审批中 / 未生效 → false，避免托盘勾选虚高）。
+    pub(crate) fn autostart_toggled(
+        &mut self,
+        desired: bool,
+        result: Result<Status, String>,
+    ) -> AutostartUpdate {
+        let update = self.apply_autostart_result(desired, result);
+        if update.confirmed {
+            self.tray_autostart_sync = Some(update.enabled);
+        }
+        update
     }
 
-    /// 设置页自启切换失败：保留旧状态，只落内联错误（开关显示实际/旧值）。
-    pub(crate) fn autostart_failed(&mut self, error: String) {
-        self.autostart_error = Some(error);
+    /// 托盘切换：与设置页共用同一策略更新显示；托盘勾选由调用方按返回结果校准
+    ///（失败时复原为点击前值）。
+    pub(crate) fn autostart_changed_externally(
+        &mut self,
+        desired: bool,
+        result: Result<Status, String>,
+    ) -> AutostartUpdate {
+        self.apply_autostart_result(desired, result)
+    }
+
+    /// 切换结果落地（纯状态）：仅 `Enabled` 显示开；`RequiresApproval` 显示关 +
+    /// 待允许提示；启用后仍 `NotRegistered`/`NotFound` → 关 + 内联错误。
+    fn apply_autostart_status(&mut self, desired: bool, status: Status) -> AutostartUpdate {
+        let enabled = status == Status::Enabled;
+        self.autostart = Some(enabled);
+        self.autostart_approval = status == Status::RequiresApproval;
+        self.autostart_error = if !enabled && status != Status::RequiresApproval && desired {
+            Some(format!("开机自启未生效:{}", status.note()))
+        } else {
+            None
+        };
+        AutostartUpdate {
+            enabled,
+            confirmed: true,
+        }
+    }
+
+    /// 注册/注销或状态查询失败：保持旧启用显示，清除审批提示、落内联错误。
+    fn apply_autostart_result(
+        &mut self,
+        desired: bool,
+        result: Result<Status, String>,
+    ) -> AutostartUpdate {
+        match result {
+            Ok(status) => self.apply_autostart_status(desired, status),
+            Err(message) => {
+                self.autostart_approval = false;
+                self.autostart_error = Some(format!("开机自启设置失败:{message}"));
+                AutostartUpdate {
+                    enabled: self.autostart.unwrap_or(false),
+                    confirmed: false,
+                }
+            }
+        }
     }
 
     /// 字号选择的状态落地（纯状态；调用方已完成 `font::set_scale` 与保存）。
@@ -126,8 +178,42 @@ impl SettingsState {
     }
 
     /// 取走待同步给托盘的自启值（App::logic 每帧 drain）。
-    pub(crate) fn take_tray_autostart_sync(&mut self) -> Option<bool> {
-        self.tray_autostart_sync.take()
+    /// 本帧托盘也切换了自启 → 丢弃设置页旧值（托盘动作更新，且勾选已按真实态校准）。
+    pub(crate) fn take_tray_autostart_sync(&mut self, tray_toggled: bool) -> Option<bool> {
+        let queued = self.tray_autostart_sync.take();
+        if tray_toggled {
+            None
+        } else {
+            queued
+        }
+    }
+}
+
+/// 自启切换的统一落地结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AutostartUpdate {
+    /// 实际启用（仅 `Status::Enabled`）。
+    pub(crate) enabled: bool,
+    /// 是否拿到确定状态；false = 失败（托盘须复原勾选、不排队同步）。
+    pub(crate) confirmed: bool,
+}
+
+impl SettingsData {
+    /// 从运行期状态复制一帧快照（锁内调用，绘制在锁外）。
+    ///
+    /// 放在行为模块：视图只依赖 `SettingsData`，构造真源仍在 `SettingsState`。
+    pub(crate) fn from_state(state: &SettingsState) -> Self {
+        Self {
+            font_size: state.file.font_size,
+            autostart: state.autostart.unwrap_or(false),
+            autostart_approval: state.autostart_approval,
+            autostart_error: state.autostart_error.clone(),
+            font_error: state.font_error.clone(),
+            language: settings_view::LANGUAGE_LABEL,
+            palette_keys: state.palette_keys.clone(),
+            window_keys: state.window_keys.clone(),
+            excluded: state.excluded.clone(),
+        }
     }
 }
 
@@ -240,32 +326,35 @@ fn apply_font_size(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, size: FontS
     ctx.request_repaint_of(viewport_id());
 }
 
-/// 自启开关即时生效：SMAppService 调用在锁外；成功队列托盘勾选同步。
+/// 自启开关即时生效：SMAppService 调用在锁外；按**操作后真实状态**落地。
+///
+/// 仅 `Status::Enabled` 显示开；审批中（已注册待允许）显示关 + 行内提示；
+/// 启用后仍未注册 → 关 + 内联错误。成功拿到状态时把实际值排队同步托盘。
 fn apply_autostart(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bool) {
     let data_dir = {
         let s = lock_shared(shared);
         s.settings.data_dir.clone()
     };
-    match autostart::apply_user_choice(&data_dir, enabled) {
-        Ok(note) => {
-            log::info!("设置页:开机自启 → {note}");
-            {
-                let mut s = lock_shared(shared);
-                s.settings.autostart_succeeded(enabled);
-            }
-            ctx.request_repaint_of(viewport_id());
-            // 让 App::logic 尽快 drain `tray_autostart_sync`（根窗可能隐藏）。
-            ctx.request_repaint_of(egui::ViewportId::ROOT);
+    let result = autostart::apply_user_choice(&data_dir, enabled).map_err(|err| format!("{err:#}"));
+    if let Err(err) = &result {
+        log::warn!("设置页:开机自启设置失败: {err}");
+    }
+    let update = {
+        let mut s = lock_shared(shared);
+        s.settings.autostart_toggled(enabled, result)
+    };
+    log::info!(
+        "设置页:开机自启 → 实际{}",
+        if update.enabled {
+            "启用"
+        } else {
+            "未启用"
         }
-        Err(err) => {
-            let message = format!("开机自启设置失败:{err:#}");
-            log::warn!("{message}");
-            {
-                let mut s = lock_shared(shared);
-                s.settings.autostart_failed(message);
-            }
-            ctx.request_repaint_of(viewport_id());
-        }
+    );
+    ctx.request_repaint_of(viewport_id());
+    if update.confirmed {
+        // 让 App::logic 尽快 drain `tray_autostart_sync`（根窗可能隐藏）。
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 
@@ -296,6 +385,7 @@ mod tests {
         assert!(!state.open);
         assert_eq!(state.file.font_size, FontSize::Standard);
         assert_eq!(state.autostart, None, "打开前未知");
+        assert!(!state.autostart_approval);
         assert!(state.autostart_error.is_none());
         assert!(state.font_error.is_none());
         assert_eq!(state.excluded, engine::config::default_config().excluded);
@@ -336,9 +426,10 @@ mod tests {
         assert!(state.font_error.is_none(), "保存成功须清错误");
     }
 
-    /// 自启查询失败 → 未知（显示关态）+ 内联错误；成功 → 实际态并清错误。
+    /// 打开设置页：查询失败 → 未知（关态）+ 错误；真实状态 → 按状态显示。
+    /// `RequiresApproval` 必须关态 + 审批提示，不得显示已启用。
     #[test]
-    fn autostart_load_updates_known_state_or_error() {
+    fn autostart_load_uses_actual_status() {
         let mut state = test_state();
         state.autostart = Some(true);
         state.autostart_loaded(Err("读取开机自启状态失败".into()));
@@ -348,44 +439,119 @@ mod tests {
             Some("读取开机自启状态失败")
         );
 
-        state.autostart_loaded(Ok(true));
+        state.autostart_loaded(Ok(Status::Enabled));
         assert_eq!(state.autostart, Some(true));
+        assert!(!state.autostart_approval);
         assert!(state.autostart_error.is_none());
+
+        state.autostart_loaded(Ok(Status::RequiresApproval));
+        assert_eq!(state.autostart, Some(false), "待审批不得显示已启用");
+        assert!(state.autostart_approval);
+        assert!(state.autostart_error.is_none(), "审批提示走 note，不是错误");
+
+        state.autostart_loaded(Ok(Status::NotRegistered));
+        assert_eq!(state.autostart, Some(false));
+        assert!(!state.autostart_approval);
+        assert!(state.autostart_error.is_none(), "打开时未注册不是错误");
     }
 
-    /// 自启成功：更新状态 + 置/取托盘同步标记；失败：保持旧值 + 错误、不同步托盘。
+    /// 切换策略：仅 Enabled 开；RequiresApproval 关 + 提示；启用后未注册关 + 错误。
+    /// 托盘同步只排**实际值**；失败保持旧态且不同步。
     #[test]
-    fn autostart_transitions_sync_tray_once() {
+    fn autostart_toggle_policy_and_tray_sync() {
         let mut state = test_state();
         state.autostart = Some(false);
-        state.autostart_error = Some("旧错误".into());
 
-        state.autostart_succeeded(true);
+        let update = state.autostart_toggled(true, Ok(Status::Enabled));
+        assert!(update.enabled && update.confirmed);
         assert_eq!(state.autostart, Some(true));
+        assert!(!state.autostart_approval);
         assert!(state.autostart_error.is_none());
-        assert_eq!(state.take_tray_autostart_sync(), Some(true));
+        assert_eq!(state.take_tray_autostart_sync(false), Some(true));
+
+        let update = state.autostart_toggled(true, Ok(Status::RequiresApproval));
+        assert!(!update.enabled && update.confirmed);
+        assert_eq!(state.autostart, Some(false), "待审批显示关态");
+        assert!(state.autostart_approval);
+        assert!(state.autostart_error.is_none());
         assert_eq!(
-            state.take_tray_autostart_sync(),
-            None,
-            "同步标记只能被消费一次"
+            state.take_tray_autostart_sync(false),
+            Some(false),
+            "待审批托盘勾选必须为 OFF"
         );
+
+        let update = state.autostart_toggled(true, Ok(Status::NotFound));
+        assert!(!update.enabled && update.confirmed);
+        assert_eq!(state.autostart, Some(false));
+        assert!(!state.autostart_approval);
+        assert!(
+            state
+                .autostart_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("开机自启未生效")),
+            "启用后未注册须落内联错误:{:?}",
+            state.autostart_error
+        );
+        assert_eq!(state.take_tray_autostart_sync(false), Some(false));
 
         state.autostart = Some(true);
-        state.autostart_failed("开机自启设置失败:未打包".into());
+        state.autostart_approval = false;
+        let update = state.autostart_toggled(false, Err("未打包".into()));
+        assert!(!update.confirmed);
         assert_eq!(state.autostart, Some(true), "失败必须保持旧状态");
-        assert_eq!(
-            state.autostart_error.as_deref(),
-            Some("开机自启设置失败:未打包")
+        assert!(!state.autostart_approval);
+        assert!(
+            state
+                .autostart_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("未打包")),
+            "失败须落内联错误"
         );
-        assert_eq!(state.take_tray_autostart_sync(), None, "失败不得同步托盘");
+        assert_eq!(
+            state.take_tray_autostart_sync(false),
+            None,
+            "失败不得同步托盘"
+        );
     }
 
-    /// 快照与运行期真源一致（语言/键帽/目录/错误均复制）。
+    /// 托盘侧使用同一策略，但不排队托盘同步（勾选由托盘调用方校准）。
+    #[test]
+    fn autostart_external_change_shares_policy() {
+        let mut state = test_state();
+        let update = state.autostart_changed_externally(true, Ok(Status::RequiresApproval));
+        assert!(!update.enabled && update.confirmed);
+        assert_eq!(state.autostart, Some(false));
+        assert!(state.autostart_approval);
+        assert_eq!(state.take_tray_autostart_sync(false), None);
+    }
+
+    /// 设置→托盘同步与同帧托盘动作的仲裁：托盘动作优先，旧同步值被丢弃。
+    #[test]
+    fn tray_toggle_drops_queued_settings_sync() {
+        let mut state = test_state();
+        state.tray_autostart_sync = Some(false);
+        assert_eq!(
+            state.take_tray_autostart_sync(true),
+            None,
+            "同帧托盘切换自启须丢弃设置页旧同步"
+        );
+        assert_eq!(
+            state.take_tray_autostart_sync(false),
+            None,
+            "被丢弃的值不得留下"
+        );
+
+        state.tray_autostart_sync = Some(true);
+        assert_eq!(state.take_tray_autostart_sync(false), Some(true));
+    }
+
+    /// 快照与运行期真源一致（语言/键帽/目录/错误/审批均复制）。
     #[test]
     fn snapshot_copies_state_for_painting() {
         let mut state = test_state();
         state.file.font_size = FontSize::Large;
-        state.autostart = None;
+        state.autostart = Some(false);
+        state.autostart_approval = true;
         state.autostart_error = Some("未打包".into());
         state.font_error = Some("保存失败".into());
         state.palette_keys.push("K".into());
@@ -393,7 +559,8 @@ mod tests {
 
         let data = SettingsData::from_state(&state);
         assert_eq!(data.font_size, FontSize::Large);
-        assert!(!data.autostart, "未知自启态显示为关");
+        assert!(!data.autostart, "审批中显示为关");
+        assert!(data.autostart_approval);
         assert_eq!(data.autostart_error.as_deref(), Some("未打包"));
         assert_eq!(data.font_error.as_deref(), Some("保存失败"));
         assert_eq!(data.language, "简体中文");
