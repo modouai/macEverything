@@ -706,18 +706,31 @@ impl ResultsState {
         self.status_note_until = Some(now + GEAR_NOTE_TTL);
     }
 
-    /// 列头点击:同列翻转方向;异列切键并按该键默认方向;两者都触发同串重查
-    /// (on_sort_change 在防抖窗内合并;响应按新方向由引擎落序)。
+    /// 列头点击:异列切键并按该键自然方向;同列「自然方向 → 反向 → 默认」
+    /// (mtime 自然为降,故不能用 asc 布尔判断第几次点击)。三种状态都触发
+    /// 同串重查(on_sort_change 在防抖窗内合并;响应按新方向落序)。
     fn on_header_click(&mut self, key: SortKey) {
-        if self.sort == key {
-            self.sort_asc = !self.sort_asc;
-        } else {
+        if self.sort != key {
             self.sort = key;
             self.sort_asc = natural_asc(key);
+        } else if self.sort_asc == natural_asc(key) {
+            // 第一次(自然方向)→ 第二次(反向)
+            self.sort_asc = !natural_asc(key);
+        } else {
+            // 第三次:回到默认(匹配质量,表头无箭头)。
+            self.sort = SortKey::Relevance;
+            self.sort_asc = natural_asc(key);
         }
-        log::info!("列头点击:{key:?}(asc={})", self.sort_asc);
-        self.session
-            .on_sort_change(key, request_desc(key, self.sort_asc), Instant::now());
+        log::info!(
+            "列头点击:{key:?} → sort={:?}(asc={})",
+            self.sort,
+            self.sort_asc
+        );
+        self.session.on_sort_change(
+            self.sort,
+            request_desc(self.sort, self.sort_asc),
+            Instant::now(),
+        );
         self.ctx
             .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
     }
@@ -2724,6 +2737,36 @@ mod tests {
         // Relevance 无方向:恒 false(引擎忽略;不依赖 asc 取值)
         assert!(!request_desc(SortKey::Relevance, true));
         assert!(!request_desc(SortKey::Relevance, false));
+    }
+
+    /// 列头点击三态循环:异列按自然方向;同列升 → 降 → 默认匹配质量。
+    #[test]
+    fn header_click_cycles_asc_desc_default() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx, daemon_paths_for_test());
+        assert_eq!(st.sort, SortKey::Relevance, "默认 = 匹配质量");
+
+        // 名称:自然升 → 降 → 默认
+        st.on_header_click(SortKey::Name);
+        assert_eq!((st.sort, st.sort_asc), (SortKey::Name, true));
+        st.on_header_click(SortKey::Name);
+        assert_eq!((st.sort, st.sort_asc), (SortKey::Name, false));
+        st.on_header_click(SortKey::Name);
+        assert_eq!(st.sort, SortKey::Relevance, "第三次点同列回默认");
+
+        // 修改时间:自然降 → 升 → 默认
+        st.on_header_click(SortKey::Mtime);
+        assert_eq!((st.sort, st.sort_asc), (SortKey::Mtime, false));
+        st.on_header_click(SortKey::Mtime);
+        assert_eq!((st.sort, st.sort_asc), (SortKey::Mtime, true));
+        st.on_header_click(SortKey::Mtime);
+        assert_eq!(st.sort, SortKey::Relevance, "第三次点同列回默认");
+
+        // 换列:直接进入新列自然方向,不是回默认
+        st.on_header_click(SortKey::Size);
+        assert_eq!((st.sort, st.sort_asc), (SortKey::Size, true));
+        st.on_header_click(SortKey::Mtime);
+        assert_eq!((st.sort, st.sort_asc), (SortKey::Mtime, false));
     }
 
     #[test]

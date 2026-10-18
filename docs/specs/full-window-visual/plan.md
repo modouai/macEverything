@@ -95,6 +95,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 - 齿轮：展示「设置将在 v2.1 提供」3s 后消失；验收中将其从错误红改为状态栏中性文本色（信息提示，非错误）。
 - 已知偏差（接受）：滚动条为 egui floating——指针悬停即淡入、滚动本身不改变可见性（滚动时指针在表内，实际可见）；窗口圆角/阴影由原生窗口提供，§4.6 数值仅作参考，不使用自绘圆角/阴影。
 - 追加（2026-10-18）：表头四列之间新增 1px 竖线（divider token，列距居中，上下内缩 8 不顶头，仅表头行内，结果行不画）；新增 `header_column_separators_only_in_header_row` 单测钉住几何与「不贯穿结果行」。
+- 追加（2026-10-18）：同列第三次点击回到默认匹配质量（箭头消失）；循环按「自然方向 → 反向 → 默认」判定，兼容 mtime 自然降序；新增 `header_click_cycles_asc_desc_default` 单测。
 
 ## 交付顺序
 
