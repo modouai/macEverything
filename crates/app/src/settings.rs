@@ -13,10 +13,12 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use global_hotkey::hotkey::HotKey;
 use serde::{Deserialize, Serialize};
 
-pub const FILE_NAME: &str = "settings.toml";
+/// 文件名（模块私有；路径一律经 [`path`] 取得，防调用方自行拼接）。
+const FILE_NAME: &str = "settings.toml";
 
 /// 全局字号倍率档（design §四：0.9 / 1.0 / 1.15；几何尺寸不变）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -86,12 +88,23 @@ pub fn load(data_dir: &Path) -> SettingsFile {
 }
 
 /// 原子保存：建目录 → 同目录 `settings.toml.tmp` → rename 替换。
+///
+/// 写入/替换失败会清理临时文件，并返回带路径上下文的错误（调用方留痕即可，
+/// 不中断设置流程）。
 pub fn save(data_dir: &Path, f: &SettingsFile) -> anyhow::Result<()> {
-    std::fs::create_dir_all(data_dir)?;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("创建设置目录失败({})", data_dir.display()))?;
     let p = path(data_dir);
-    let tmp = p.with_extension("toml.tmp");
-    std::fs::write(&tmp, toml::to_string_pretty(f)?)?;
-    std::fs::rename(&tmp, &p)?;
+    let tmp = data_dir.join(format!("{FILE_NAME}.tmp"));
+    let text = toml::to_string_pretty(f).context("序列化设置失败")?;
+    if let Err(e) = std::fs::write(&tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("写入设置临时文件失败({})", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &p) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("替换设置文件失败({})", p.display()));
+    }
     Ok(())
 }
 
@@ -104,7 +117,8 @@ mod tests {
     fn defaults_roundtrip_and_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         let p = path(dir.path());
-        assert_eq!(p, dir.path().join(FILE_NAME));
+        assert_eq!(FILE_NAME, "settings.toml");
+        assert_eq!(p, dir.path().join("settings.toml"), "路径口径");
         assert_eq!(load(dir.path()), SettingsFile::default(), "无文件 = 默认");
 
         let f = SettingsFile::default();
@@ -152,5 +166,64 @@ mod tests {
         })
         .unwrap();
         assert!(text.contains("font_size = \"large\""), "{text}");
+    }
+
+    /// 钉住 global-hotkey 0.6.4 的规范序列化文本（大小写/修饰键顺序固定）。
+    /// 输入侧解析兼容 `Alt+Space` / `Alt+Shift+F` 等写法，保存后统一为规范形式。
+    #[test]
+    fn hotkey_serialization_is_canonical() {
+        let f = SettingsFile {
+            font_size: FontSize::Standard,
+            palette_hotkey: Some("Alt+Space".parse().unwrap()),
+            window_hotkey: Some("Alt+Shift+F".parse().unwrap()),
+        };
+        let text = toml::to_string(&f).unwrap();
+        assert!(text.contains("palette_hotkey = \"alt+Space\""), "{text}");
+        assert!(
+            text.contains("window_hotkey = \"shift+alt+KeyF\""),
+            "{text}"
+        );
+        assert_eq!(
+            toml::from_str::<SettingsFile>(&text).unwrap(),
+            f,
+            "规范文本可回读"
+        );
+    }
+
+    /// 部分文件与未知键：缺字段取默认，未知键忽略（前向兼容）。
+    #[test]
+    fn partial_and_unknown_keys_load_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            path(dir.path()),
+            "font_size = \"large\"\nfuture_key = { nested = true }\n",
+        )
+        .unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.font_size, FontSize::Large);
+        assert!(loaded.palette_hotkey.is_none());
+        assert!(loaded.window_hotkey.is_none());
+    }
+
+    /// 保存成功不残留 tmp；rename 失败（目标被目录占用）返回 Err 且清理 tmp。
+    #[test]
+    fn save_cleans_tmp_and_reports_rename_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = SettingsFile::default();
+        let tmp = dir.path().join("settings.toml.tmp");
+
+        save(dir.path(), &f).unwrap();
+        assert!(!tmp.exists(), "成功保存后不得残留临时文件");
+
+        let target = path(dir.path());
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let err = save(dir.path(), &f).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("settings.toml"),
+            "错误须带路径上下文: {message}"
+        );
+        assert!(!tmp.exists(), "失败后必须清理临时文件");
     }
 }

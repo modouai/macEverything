@@ -5,12 +5,22 @@
 //!
 //! 规则同悬浮条 / 完整窗口 token：绘制代码只读这里，禁散落色值/字号/几何值
 //! （visual.md §6.6「视图层不写条件分支」）。
+//!
+//! 字号 token（`*_FONT`）均为**基准点**（base pt）：Task 3 的全局字号倍率落地后，
+//! 绘制时必须经 `font::size(base)` 换算，勿直接使用常量；几何尺寸不随字号缩放。
+//!
+//! 窗口圆角 / 内描边 / 交通灯交互预留沿用完整结果窗口的 `window_tokens`
+//! （单点定义），本文件只 re-export 供设置窗口消费。
 
 // token 表按规格一次建全、消费方分 Task 接入；测试逐项钉住数值。
-// Task 4（设置窗口布局与控件）接入后移除本 allow：届时全部 token 均应有消费者。
+// 仅「规格对账」、应用永不读取的参考值已逐条 `#[allow(dead_code)]`；其余 token
+// 在 Task 4/5 接入后即被消费，届时可移除本模块级 allow。
 #![allow(dead_code)]
 
 use eframe::egui;
+
+// 设置窗口与完整结果窗口共用同一套窗口圆角/描边/交通灯交互预留（单点定义）。
+pub use super::window_tokens::{TRAFFIC_LIGHTS_RESERVE, WINDOW_RADIUS, WINDOW_STROKE};
 
 /// `#RRGGBBAA` → `Color32`。
 fn c(hex: u32) -> egui::Color32 {
@@ -29,7 +39,8 @@ pub struct SettingsPalette {
     pub window_fill: egui::Color32,
     /// 1px 内描边（内容层整窗绘制；圆角裁剪由原生窗口负责）。
     pub window_stroke: egui::Color32,
-    /// 原生窗口阴影参考值：由系统窗口阴影提供，不自绘；保留供规格对账。
+    /// 规格对账专用：原生窗口阴影由系统提供，应用不读取。
+    #[allow(dead_code)]
     pub window_shadow: egui::Color32,
     /// 标题「设置」/ 行标签（§2.5「标题 / 行标签」）。
     pub text_primary: egui::Color32,
@@ -53,6 +64,8 @@ pub struct SettingsPalette {
     pub switch_on: egui::Color32,
     /// 开关钮（两主题均为白色）。
     pub switch_knob: egui::Color32,
+    /// 开关钮 1px 柔和投影（§2.4 表外补充：黑色 20%，两主题同值）。
+    pub switch_knob_shadow: egui::Color32,
     /// 键帽底。
     pub keycap_fill: egui::Color32,
     /// 键帽文字。
@@ -86,6 +99,7 @@ pub fn dark() -> SettingsPalette {
         segment_unselected_text: c(0x8B929AFF),
         switch_on: c(0x0A84FFFF),
         switch_knob: c(0xFFFFFFFF),
+        switch_knob_shadow: c(0x00000033),
         keycap_fill: c(0xFFFFFF1A),
         keycap_text: c(0xC6CBD1FF),
         add_button_fill: c(0xFFFFFF1A),
@@ -112,6 +126,7 @@ pub fn light() -> SettingsPalette {
         segment_unselected_text: c(0x6B7280FF),
         switch_on: c(0x007AFFFF),
         switch_knob: c(0xFFFFFFFF),
+        switch_knob_shadow: c(0x00000033),
         keycap_fill: c(0x0000000D),
         keycap_text: c(0x4B5563FF),
         add_button_fill: c(0x0000000D),
@@ -132,27 +147,27 @@ pub fn palette(is_dark: bool) -> SettingsPalette {
 }
 
 // —— 窗口 / 标题栏（§2.1 / §2.2）——
-pub const WINDOW_W: f32 = 620.0;
-pub const WINDOW_H: f32 = 600.0;
-/// 窗口圆角（原生窗口裁剪；内容层内描边复用同值）。
-pub const WINDOW_RADIUS: u8 = 12;
-/// 窗口内描边宽（§2.1：1px）。
-pub const WINDOW_STROKE: f32 = 1.0;
+// 设置窗口尺寸由本文件单点拥有（`ui/settings.rs` 从这里引用）。
+pub const SETTINGS_W: f32 = 620.0;
+pub const SETTINGS_H: f32 = 600.0;
 
-/// 自绘标题栏高（原生交通灯浮在内容之上）。
+/// 设置窗口专用自绘标题栏高（44；勿与完整结果窗口的 32 混用）。
 pub const TITLEBAR_H: f32 = 44.0;
-/// 标题栏左右内边距（§2.1）。
+/// 标题栏左右内边距（§2.1；规格对账专用：标题居中、交通灯由原生绘制）。
+#[allow(dead_code)]
 pub const TITLEBAR_PAD_X: f32 = 20.0;
 /// 标题「设置」字号（§2.1：13pt）。
 pub const TITLE_FONT: f32 = 13.0;
-/// 交通灯单枚直径（§2.2）。
+/// 交通灯单枚直径（§2.2；规格对账专用：原生交通灯不由应用绘制）。
+#[allow(dead_code)]
 pub const TRAFFIC_LIGHT_SIZE: f32 = 12.0;
-/// 交通灯间距（§2.2）。
+/// 交通灯间距（§2.2；规格对账专用）。
+#[allow(dead_code)]
 pub const TRAFFIC_LIGHT_GAP: f32 = 8.0;
-/// 标题栏左侧交通灯交互预留（拖拽区起点；与完整窗口同值，避开原生红点命中区）。
-pub const TRAFFIC_LIGHTS_RESERVE: f32 = 80.0;
-/// 标题右侧弹性占位（§2.2「Right Spacer (52)」；与交通灯组等宽以保持标题居中）。
-pub const TITLEBAR_RIGHT_SPACER: f32 = 52.0;
+/// 标题右侧弹性占位（§2.2「Right Spacer (52)」；规格对账专用：
+/// 与交通灯组等宽以保持标题居中，由灯组尺寸推导）。
+#[allow(dead_code)]
+pub const TITLEBAR_RIGHT_SPACER: f32 = TRAFFIC_LIGHT_SIZE * 3.0 + TRAFFIC_LIGHT_GAP * 2.0;
 
 // —— 内容 / 分组 / 卡片（§2.1 / §2.3）——
 /// 内容区内边距：上下 / 左右（§2.1「左右 24，上下 20」）。
@@ -195,12 +210,14 @@ pub const SEG_GAP: f32 = 2.0;
 pub const SEG_ITEM_RADIUS: u8 = 6;
 pub const SEG_FONT: f32 = 12.0;
 
-// —— 开关（§2.4）——
+// —— 开关（§2.4；命名与色板 `switch_*` 统一）——
 /// 开关尺寸（宽, 高）。
-pub const TOGGLE: (f32, f32) = (38.0, 22.0);
-pub const TOGGLE_RADIUS: u8 = 11;
+pub const SWITCH_SIZE: (f32, f32) = (38.0, 22.0);
+pub const SWITCH_RADIUS: u8 = 11;
 /// 开关钮直径（§2.4：18×18）。
-pub const TOGGLE_KNOB: f32 = 18.0;
+pub const SWITCH_KNOB: f32 = 18.0;
+/// 开关钮投影扩边（§2.4「1px 柔和投影」）。
+pub const SWITCH_KNOB_SHADOW_SIZE: f32 = 1.0;
 
 // —— 下拉 / 键帽字段（§2.4）——
 /// 语言下拉与快捷键字段尺寸（宽, 高）。
@@ -390,18 +407,45 @@ mod tests {
         }
     }
 
-    /// 钉住：错误提示色（§2.5 表外，与完整窗口同源）。
+    /// 钉住：错误提示色与完整窗口同源（直接比对，防两处漂移）。
     #[test]
     fn error_text_matches_full_window() {
-        assert_eq!(dark().error_text.to_array(), c(0xF87171FF).to_array());
-        assert_eq!(light().error_text.to_array(), c(0xB91C1CFF).to_array());
+        use crate::ui::window_tokens;
+        assert_eq!(
+            dark().error_text.to_array(),
+            window_tokens::dark().error_text.to_array()
+        );
+        assert_eq!(
+            light().error_text.to_array(),
+            window_tokens::light().error_text.to_array()
+        );
+    }
+
+    /// 钉住：开关钮投影色（§2.4 表外补充：黑色 20%，两主题同值）。
+    #[test]
+    fn switch_knob_shadow_is_documented_value() {
+        assert_eq!(
+            dark().switch_knob_shadow.to_array(),
+            c(0x00000033).to_array()
+        );
+        assert_eq!(
+            light().switch_knob_shadow.to_array(),
+            c(0x00000033).to_array()
+        );
+    }
+
+    /// `c()` 转换本身不是自证：用已知不透明 RGBA 十六进制校验字节序
+    /// （`Color32` 存储预乘 alpha，半透明值不适合直接比对原始字节）。
+    #[test]
+    fn color_helper_preserves_opaque_rgba_hex() {
+        assert_eq!(c(0x112233FF).to_array(), [0x11, 0x22, 0x33, 0xFF]);
     }
 
     /// 钉住：§2.2 / §2.4 的几何与字号。
     #[test]
     fn geometry_matches_spec() {
         assert_eq!(
-            (WINDOW_W, WINDOW_H, WINDOW_RADIUS, WINDOW_STROKE),
+            (SETTINGS_W, SETTINGS_H, WINDOW_RADIUS, WINDOW_STROKE),
             (620.0, 600.0, 12, 1.0)
         );
 
@@ -453,8 +497,13 @@ mod tests {
             (180.0, 28.0, 7, 2.0, 2.0, 6, 12.0)
         );
         assert_eq!(
-            (TOGGLE, TOGGLE_RADIUS, TOGGLE_KNOB),
-            ((38.0, 22.0), 11, 18.0)
+            (
+                SWITCH_SIZE,
+                SWITCH_RADIUS,
+                SWITCH_KNOB,
+                SWITCH_KNOB_SHADOW_SIZE
+            ),
+            ((38.0, 22.0), 11, 18.0, 1.0)
         );
         assert_eq!(
             (FIELD, FIELD_RADIUS, FIELD_FONT, FIELD_CHEVRON),

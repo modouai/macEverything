@@ -222,7 +222,7 @@ git commit -m "feat(app): 设置窗口骨架与齿轮/托盘入口"
 - Create: `crates/app/src/ui/settings_tokens.rs`
 - Modify: `crates/app/Cargo.toml`（serde/toml/global-hotkey serde）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `settings.rs`：
 
@@ -254,12 +254,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `cargo test -p macEverything-app settings::tests`
-Expected: FAIL（模块不存在）
+Expected: FAIL（模块不存在）——实际：编译失败，24 个未定义项错误。
 
-- [ ] **Step 3: 实现 `settings.rs`**
+- [x] **Step 3: 实现 `settings.rs`**
 
 ```rust
 //! v2.1 设置持久化：数据目录 `settings.toml`。
@@ -349,17 +349,27 @@ global-hotkey = { version = "0.6", features = ["serde"] }
 tempfile = "3"
 ```
 
-- [ ] **Step 4: 实现 `settings_tokens.rs`**
+- [x] **Step 4: 实现 `settings_tokens.rs`**
 
-按 `visual` §2.5 建 `SettingsPalette`（窗口底/描边/标题/分组标题/卡片底/分隔线/控件底/控件文字/选中段底/选中段文字/未选中段文字/开关开态/键帽底/键帽文字/目录路径/移除图标），深/浅两套 + `palette(is_dark)`；按 §2.2/2.4 建几何常量（`CONTENT_PAD=(20,24)`、`GROUP_GAP=20`、`CARD_RADIUS=10`、`ROW_H=44`、`EXCLUDE_HEADER_H=52`、`EXCLUDE_ROW_H=40`、`SEG_W=180`、`SEG_H=28`、`TOGGLE=(38,22)`、`FIELD=(152,28)` 等）。单测逐项钉住色值与尺寸。
+按 `visual` §2.5 建 `SettingsPalette`（窗口底/描边/标题/分组标题/卡片底/分隔线/控件底/控件文字/选中段底/选中段文字/未选中段文字/开关开态/键帽底/键帽文字/目录路径/移除图标），深/浅两套 + `palette(is_dark)`；按 §2.2/2.4 建几何常量（`CONTENT_PAD=(20,24)`、`GROUP_GAP=20`、`CARD_RADIUS=10`、`ROW_H=44`、`EXCLUDE_HEADER_H=52`、`EXCLUDE_ROW_H=40`、`SEG_W=180`、`SEG_H=28`、`SWITCH_SIZE=(38,22)`、`FIELD=(152,28)` 等）。单测逐项钉住色值与尺寸。
 
-- [ ] **Step 5: 运行测试并提交**
+- [x] **Step 5: 运行测试并提交**
 
-Run: `cargo test -p macEverything-app settings` / `cargo fmt --check`
+Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: PASS。
 
+验证记录（2026-10-18，review 修复后）：
+- 三条命令全绿；app 全量 182 passed / 3 ignored。
+- 本任务单测：`settings.rs` 5 个（默认值/往返/损坏、字号倍率、HotKey 规范序列化、部分文件+未知键、save tmp 清理与失败路径）；`settings_tokens.rs` 6 个（§2.5 色板、错误色跨模块比对、开关钮投影、几何、主题选择、`c()` 字节序）。
+
+Review 后定稿差异：
+- 设置窗口尺寸/chrome 单一来源：`settings_tokens` 拥有 `SETTINGS_W/H`、`TITLEBAR_H`；`WINDOW_RADIUS/WINDOW_STROKE/TRAFFIC_LIGHTS_RESERVE` 从 `window_tokens` re-export；`ui/settings.rs` 删除本地副本。
+- 参考值（原生阴影/交通灯/标题栏留白）用 item-level `#[allow(dead_code)]` 标注；模块级 allow 在 Task 4/5 消费 token 接入后移除。
+- `FILE_NAME` 私有；`save` 失败清理 tmp 并带路径上下文；`TOGGLE*` 命名统一为 `SWITCH_*`，新增 `switch_knob_shadow`。
+- HotKey 序列化以 `alt+Space` / `shift+alt+KeyF` 规范形式钉住（design §3 已同步）。
+
 ```bash
-git add crates/app/src/settings.rs crates/app/src/ui/settings_tokens.rs crates/app/Cargo.toml Cargo.lock
+git add Cargo.lock crates/app/Cargo.toml crates/app/src/main.rs crates/app/src/settings.rs crates/app/src/ui/mod.rs crates/app/src/ui/settings_tokens.rs
 git commit -m "feat(app): 设置持久化与视觉 token"
 ```
 

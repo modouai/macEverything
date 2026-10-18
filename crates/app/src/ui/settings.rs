@@ -9,14 +9,13 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use crate::platform;
-use crate::ui::{lock_shared, window_tokens, Shared};
-
-/// 设置窗口宽（settings-visual.md §2；固定不可缩放）。
-pub const SETTINGS_W: f32 = 620.0;
-/// 设置窗口高。
-pub const SETTINGS_H: f32 = 600.0;
-/// 自绘标题栏高（原生交通灯浮在内容之上，标题居中）。
-pub const TITLEBAR_H: f32 = 44.0;
+use crate::ui::{
+    lock_shared,
+    settings_tokens::{
+        SETTINGS_H, SETTINGS_W, TITLEBAR_H, TRAFFIC_LIGHTS_RESERVE, WINDOW_RADIUS, WINDOW_STROKE,
+    },
+    window_tokens, Shared,
+};
 
 /// 设置视口 id（注册与命令定向同一处，勿散落）。
 pub fn viewport_id() -> egui::ViewportId {
@@ -74,10 +73,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 拖拽区 = 交通灯预留区之后到标题栏右缘（与结果窗 draw_titlebar 同法；
     // 左侧原生交通灯自带命中，不接管其附近）。
     let drag_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            bar.left() + window_tokens::TRAFFIC_LIGHTS_RESERVE,
-            bar.top(),
-        ),
+        egui::pos2(bar.left() + TRAFFIC_LIGHTS_RESERVE, bar.top()),
         bar.max,
     );
     let drag = ui.interact(
@@ -101,8 +97,8 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 窗口内 1px 描边（原生窗口负责圆角裁剪与投影；内容层按同半径内侧补线）。
     ui.painter().rect_stroke(
         ui.max_rect(),
-        egui::CornerRadius::same(window_tokens::WINDOW_RADIUS),
-        egui::Stroke::new(window_tokens::WINDOW_STROKE, palette.window_stroke),
+        egui::CornerRadius::same(WINDOW_RADIUS),
+        egui::Stroke::new(WINDOW_STROKE, palette.window_stroke),
         egui::StrokeKind::Inside,
     );
 }

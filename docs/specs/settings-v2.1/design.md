@@ -75,12 +75,17 @@ enum SettingsAction {
 ## 三、设置数据（`settings.toml`）
 
 ```toml
-font_size = "standard"        # small | standard | large
-palette_hotkey = "Alt+Space"  # 缺省 = 内置默认（⌥Space 降级链）
-window_hotkey = "Alt+Shift+F" # 缺省 = 内置默认（⌥⇧F）
+font_size = "standard"           # small | standard | large
+palette_hotkey = "alt+Space"     # 缺省 = 内置默认（⌥Space 降级链）
+window_hotkey = "shift+alt+KeyF" # 缺省 = 内置默认（⌥⇧F）
 ```
 
-- `HotKey` 使用 `global-hotkey` 的 serde feature（字符串序列化）。
+- `HotKey` 使用 `global-hotkey` 的 serde feature（字符串序列化）。0.6.4 的规范形式为
+  小写修饰键、顺序固定 `shift+control+alt+super`，后接 `Code` 名（如 `alt+Space`、
+  `shift+alt+KeyF`）；输入解析大小写不敏感（`Alt+Space` / `Alt+Shift+F` 均可读），
+  保存时统一写回规范形式（两者 parse-compatible）。
+- `SettingsFile` 只负责解析/保存，**不校验**裸键（无修饰键）或两个槽位冲突；
+  校验与「冲突时不落盘」属于快捷键录制/注册流程（`plan-hotkeys.md`）。
 - 原子写：同目录 tmp + rename，失败只 warn，不中断设置。
 - 文件损坏 → 默认设置 + 留痕（不覆盖坏文件）。
 - 字号：`FontSize → 0.9/1.0/1.15`，启动时在 `install_base_text_styles` 之前应用。
