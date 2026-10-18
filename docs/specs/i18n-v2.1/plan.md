@@ -1025,7 +1025,7 @@ git commit -m "feat(app): 设置页语言下拉与即时切换"
     hotkey_saved_palette_unavailable: "保存的唤起快捷键 {custom} 不可用,{reason}" / "Saved Quick Search shortcut {custom} is unavailable; {reason}",
     hotkey_saved_window_conflict_default: "保存的完整窗口快捷键 {custom} 与唤起键冲突,已回落默认 {name}" / "Full Window shortcut {custom} conflicts with Quick Search; reverted to default {name}",
     hotkey_saved_window_default: "保存的完整窗口快捷键 {custom} 不可用,已回落默认 {name}" / "Full Window shortcut {custom} is unavailable; reverted to default {name}",
-    hotkey_saved_window_conflict_unavailable: "保存的完整窗口快捷键 {custom} 与唤起键冲突,{reason}" / "Full Window shortcut {custom} conflicts; {reason}",
+    hotkey_saved_window_conflict_unavailable: "保存的完整窗口快捷键 {custom} 与唤起键冲突,{reason}" / "Full Window shortcut {custom} conflicts with Quick Search; {reason}",
     hotkey_saved_window_unavailable: "保存的完整窗口快捷键 {custom} 不可用,{reason}" / "Full Window shortcut {custom} is unavailable; {reason}",
 ```
 
@@ -1271,8 +1271,11 @@ let window_note = data.hotkeys.window_note.as_ref().map(HotkeyNote::text);
 
 - [ ] **Step 9: 跑测试并修断言**
 
-Run: `cargo test -p macEverything-app hotkey palette`
+Run: `cargo test -p macEverything-app hotkey`
+Run: `cargo test -p macEverything-app palette`
 Expected: 旧断言引用 `String`/常量处逐项改为 `HotkeyNote` 变体或 `.text()` 后通过。
+
+英文宽度回归测试必须断言 `!galley.elided`（仅比较 `size().x <= 540` 无法发现截断：`Galley::size()` 会被截断宽度钳住，`text()` 仍返回完整原文），并覆盖 `SavedWindowConflictDefault` 与 `SavedWindowConflictUnavailable` 两个最长变体、使用最长键名 `⌃⌥⇧Space`。
 
 - [ ] **Step 10: 全量验证并提交**
 
