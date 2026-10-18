@@ -182,9 +182,11 @@ Content (padding 上下 20 / 左右 24, gap 20)
 
 - `ActiveKeys { palette: Option<HotKey>, direct: Option<HotKey> }` 放 `Arc<Mutex<_>>`，事件泵每次事件读取当前 id，不再捕获固定键。
 - `HotkeyRuntime` 暴露：
-  - `snapshot() -> HotkeySnapshot`（当前键、显示名、启动回退提示）；
+  - `snapshot() -> HotkeySnapshot`（当前键、显示名、按槽拆分的启动回退提示：
+    唤起槽 `note` 供悬浮条警告，完整窗口槽 `window_note` 仅设置页展示）；
   - `suspend()` / `resume()`（录制期）；
-  - `commit(slot, HotKey) -> Result<HotkeySnapshot, String>`（注册新键；失败恢复旧键）。
+  - `commit(slot, HotKey) -> Result<HotkeySnapshot, String>`（注册新键；挂起态任何
+    失败都恢复旧键并退出挂起，成功清空回退提示）。
 - 启动：
   - 读取 `settings.toml`；自定义键优先注册；
   - 自定义键注册失败 → 回落该槽默认键（悬浮条仍走原降级链；完整窗口走 ⌥⇧F），在设置页显示「已回落默认」；
@@ -197,7 +199,7 @@ Content (padding 上下 20 / 左右 24, gap 20)
 Idle → (点击字段) Beginning → (App suspend 完成) Recording
 Recording → (Esc/点击他处/关闭窗口) Cancelled → App resume → Idle
 Recording → (合法组合) Committing → App commit
-Committing → 成功: Idle + 新键；失败: Recording + 内联错误（旧键已恢复）
+Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已恢复，用户可重试）
 ```
 
 - 合法组合：至少一个 ⌘/⌥/⌃/⇧ + 一个非修饰键；不支持纯修饰键、纯单键。
