@@ -1550,7 +1550,6 @@ git commit -m "feat(app): 完整窗口双语与状态提示类型化"
 - Modify: `crates/app/src/ui/mod.rs`
 - Modify: `crates/app/src/platform/mod.rs`
 - Modify: `crates/app/src/platform/mac.rs`
-- Modify: `crates/app/src/ui/settings.rs`（确认弹窗取消按钮）
 
 - [ ] **Step 1: 追加文案**
 
@@ -1649,6 +1648,8 @@ if let Some(tray) = &mut self.tray {
 }
 ```
 
+同时删除 `settings.rs` 中 `take_tray_relabel_pending` 上的 `#[allow(dead_code)]`（本任务起有生产消费者）。
+
 - [ ] **Step 4: 右键菜单文案**
 
 `menu_actions.rs` 的 `menu_items` 改为：
@@ -1726,8 +1727,15 @@ let cancel = alert.addButtonWithTitle(&NSString::from_str(crate::i18n::s().cance
 
 - [ ] **Step 7: 跑测试并修断言**
 
-Run: `cargo test -p macEverything-app tray platform menu_actions`
+Run: `cargo test -p macEverything-app tray`
+Run: `cargo test -p macEverything-app platform`
+Run: `cargo test -p macEverything-app menu_actions`
 Expected: 旧断言改为目录文案后通过；托盘 relabel 由真实运行验收（原生菜单无法 headless）。
+
+补充双语断言：
+- `state_label` 六态与 `gaps_label(1/2)` 在 zh/en 下精确匹配（含托盘 `⚠ ` 前缀与英文单复数）。
+- `menu_items` 在 `with_lang(En)` 下返回 `["Open","Open in Finder","Show in Finder","Copy Path"]`（文件选中时），中文默认断言保持。
+- `window_title_lookup_accepts_both_settings_titles` 覆盖中/英标题。
 
 - [ ] **Step 8: 全量验证并提交**
 
