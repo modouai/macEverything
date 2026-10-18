@@ -1320,7 +1320,6 @@ git commit -m "feat(app): 热键提示类型化与悬浮条双语"
     // 缺口面板
     gaps_more: "… 其余 {n} 个" / "… {n} more",
     // 索引状态
-    index_building_count: "索引构建中({n} 条)" / "Building index ({n} entries)",
     index_ready: "就绪" / "Ready",
     index_reconciling: "索引补齐中(结果可能不全)" / "Reconciling index (results may be incomplete)",
     index_degraded: "索引重扫中(结果可能不全)" / "Rescanning index (results may be incomplete)",
@@ -1394,14 +1393,13 @@ pub fn gaps_header(n: usize) -> String {
     }
 }
 
-/// 索引构建条目数。
+/// 索引构建条目数（英文单复数）。
 pub fn index_building_count(n: u64) -> String {
-    let n = n.to_string();
-    super::fill(s().index_building_count, &[("n", n.as_str())])
-}
-
-fn s() -> &'static super::Strings {
-    super::s()
+    match lang() {
+        Lang::ZhHans => format!("索引构建中({n} 条)"),
+        Lang::En if n == 1 => "Building index (1 entry)".to_owned(),
+        Lang::En => format!("Building index ({n} entries)"),
+    }
 }
 ```
 
@@ -1569,7 +1567,6 @@ git commit -m "feat(app): 完整窗口双语与状态提示类型化"
     tray_state_degraded: "引擎:重扫中" / "Engine: Rescanning",
     tray_state_offline: "引擎:未运行(离线索引)" / "Engine: Not Running (Offline Index)",
     tray_state_not_running: "引擎:未运行" / "Engine: Not Running",
-    tray_gaps: "⚠ {n} 个目录未收录" / "⚠ {n} folders not indexed",
     // 右键菜单
     menu_open: "打开" / "Open",
     menu_open_in_finder: "在访达中打开" / "Open in Finder",
@@ -1601,7 +1598,13 @@ fn state_label(state: &str) -> &'static str {
 }
 ```
 
-- `gaps_label` 改为 `i18n::fill(i18n::s().tray_gaps, &[("n", &gaps.to_string())])`。
+- `gaps_label` 复用完整窗口的 plural 实现并加托盘前缀：
+
+```rust
+fn gaps_label(gaps: u32) -> String {
+    format!("⚠ {}", crate::i18n::format::gaps(gaps))
+}
+```
 - 安装时静态项文案改用目录条目。
 - `TrayRuntime` 增加字段：
 
@@ -1748,6 +1751,7 @@ git commit -m "feat(app): 托盘与原生层双语"
 - Modify: `crates/app/src/hotkey.rs`
 - Modify: `crates/app/src/ui/hotkey_keys.rs`
 - Modify: `crates/app/src/ui/palette.rs`（悬浮条打开失败文案）
+- Modify: `crates/app/src/ui/results.rs`（打开失败 `OpenError::text()` 与重启前缀）
 - Modify: `crates/app/src/i18n/catalog.rs`
 - Modify: `crates/app/src/i18n/format.rs`
 
@@ -1892,6 +1896,8 @@ impl OpenError {
 - `open_path` 返回 `Result<(), OpenError>`（文件不存在 → `FileMissing`；启动失败 → `Failed(detail)`），
   `open_selected` 改为 `Badge::error(BadgeText::Open(err))`。
 - `BadgeText::Raw` 只保留给真正外部/技术文本；更新其文档注释。
+- `results.rs` 的打开失败路径同样使用 `OpenError::text()`（或给 `OpenError` 实现 `Display`），
+  不要继续把中文串塞进 `StatusNote::Raw`。
 - 测试：`with_lang(En)` 下 `FileMissing` 文案为 `File not found; the index may be out of date`；
   中文默认下为「文件不存在,索引可能待更新」。
 
@@ -1911,7 +1917,7 @@ cargo test --workspace
 ```
 
 ```bash
-git add crates/app/src/engine_launcher.rs crates/app/src/hotkey.rs crates/app/src/ui/hotkey_keys.rs crates/app/src/ui/palette.rs crates/app/src/ui/mod.rs crates/app/src/i18n
+git add crates/app/src/engine_launcher.rs crates/app/src/hotkey.rs crates/app/src/ui/hotkey_keys.rs crates/app/src/ui/palette.rs crates/app/src/ui/results.rs crates/app/src/ui/mod.rs crates/app/src/i18n
 git commit -m "feat(app): 剩余自产消息双语"
 ```
 
