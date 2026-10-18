@@ -1773,6 +1773,7 @@ git commit -m "feat(app): 托盘与原生层双语"
     engine_locate_app_failed: "定位 App 可执行文件失败" / "Could not locate the app executable",
     engine_start_failed: "启动引擎失败" / "Failed to start the engine",
     engine_start_timeout: "引擎进程已拉起,但未能连接引擎 socket" / "The engine process started but did not accept connections",
+    engine_restart_failed: "引擎重启失败" / "Failed to restart the engine",
     // 热键校验/运行时错误（一次性）
     hotkey_needs_modifier: "需包含修饰键" / "A modifier key is required",
     hotkey_unsupported: "不支持该键" / "Unsupported key",
@@ -1792,12 +1793,12 @@ git commit -m "feat(app): 托盘与原生层双语"
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyError {
+pub enum HotkeyError {
     NeedsModifier,
     Unsupported,
 }
 
-impl KeyError {
+impl HotkeyError {
     pub fn text(self) -> &'static str {
         match self {
             Self::NeedsModifier => i18n::s().hotkey_needs_modifier,
@@ -1806,13 +1807,18 @@ impl KeyError {
     }
 }
 
-impl std::fmt::Display for KeyError {
+impl std::fmt::Display for HotkeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.text())
     }
 }
 
-pub fn validate(hotkey: HotKey) -> Result<(), KeyError> { /* 原逻辑，返回变体 */ }
+impl std::error::Error for HotkeyError {}
+
+const NO_MODIFIER: HotkeyError = HotkeyError::NeedsModifier;
+const UNSUPPORTED_KEY: HotkeyError = HotkeyError::Unsupported;
+
+pub fn validate(hotkey: HotKey) -> Result<(), HotkeyError> { /* 原逻辑，返回变体 */ }
 ```
 
 调用方 `hotkey_keys::validate(...).map_err(|err| err.to_string())` 自动得到当前语言文案；测试默认中文保持通过。
@@ -1915,6 +1921,9 @@ impl OpenError {
 Run: `cargo test -p macEverything-app engine_launcher`
 Run: `cargo test -p macEverything-app hotkey_keys`
 Run: `cargo test -p macEverything-app hotkey`
+Run: `cargo test -p macEverything-app settings`
+Run: `cargo test -p macEverything-app palette`
+Run: `cargo test -p macEverything-app results`
 Expected: 默认中文断言保持通过；英文用例用 `with_lang` 新增断言。
 
 - [ ] **Step 7: 全量验证并提交**
