@@ -428,6 +428,31 @@ fn lock_active(active: &Arc<Mutex<ActiveKeys>>) -> MutexGuard<'_, ActiveKeys> {
     }
 }
 
+/// 取消录制后的恢复结果(供 App 如实日志;分槽提示以快照为准)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeReport {
+    /// 本次是否真的从挂起态恢复(false = manager 不可用或本就没有挂起)。
+    pub resumed: bool,
+    /// 唤起槽恢复成功(原本为空的槽视为成功)。
+    pub palette_ok: bool,
+    /// 完整窗口槽恢复成功(原本为空的槽视为成功)。
+    pub window_ok: bool,
+}
+
+impl ResumeReport {
+    /// manager 不可用:未做任何恢复。
+    const UNAVAILABLE: Self = Self {
+        resumed: false,
+        palette_ok: true,
+        window_ok: true,
+    };
+
+    /// 挂起态已恢复且两槽都成功(空槽视为成功)。
+    pub fn fully_restored(self) -> bool {
+        self.resumed && self.palette_ok && self.window_ok
+    }
+}
+
 /// 全局热键运行时(挂 `ui::App` 保活):
 /// manager drop 即注销全部热键,须与进程同寿。
 pub struct HotkeyRuntime {
@@ -473,12 +498,13 @@ impl HotkeyRuntime {
     /// 进入录制:注销两槽并记住旧键(主线程;幂等)。
     ///
     /// 快照保持不变——设置页录制期间仍显示旧键,另一槽的键帽不消失。
-    pub fn suspend(&mut self) {
+    /// 返回 false = 热键运行时不可用(manager 创建失败),调用方日志须如实说明。
+    pub fn suspend(&mut self) -> bool {
         let Some(manager) = self.manager.as_ref() else {
-            return;
+            return false;
         };
         if self.suspended.is_some() {
-            return;
+            return true;
         }
         // 先让泵看不到任何键,再走系统注销:关闭注销期间旧事件仍被派发的窗口。
         let mut active = *lock_active(&self.active);
@@ -488,15 +514,18 @@ impl HotkeyRuntime {
             &mut active,
             &mut self.suspended,
         );
+        true
     }
 
     /// 取消录制:重新注册挂起的旧键(主线程;无挂起 = 无操作)。
     ///
     /// 恢复失败按槽留提示(唤起槽进悬浮条警告,完整窗口槽仅设置页展示)。
-    pub fn resume(&mut self) {
+    /// 返回本次是否真的从挂起态恢复以及各槽结果,供 App 日志如实描述。
+    pub fn resume(&mut self) -> ResumeReport {
         let Some(manager) = self.manager.as_ref() else {
-            return;
+            return ResumeReport::UNAVAILABLE;
         };
+        let was_suspended = self.suspended.is_some();
         let mut active = *lock_active(&self.active);
         let outcome = resume_with(
             &mut ManagerRegistrar(manager),
@@ -510,6 +539,11 @@ impl HotkeyRuntime {
             outcome,
         );
         self.snapshot = HotkeySnapshot::from_active(active, note, window_note);
+        ResumeReport {
+            resumed: was_suspended,
+            palette_ok: outcome.palette,
+            window_ok: outcome.window,
+        }
     }
 
     /// 提交录制结果(主线程;设置页命令队列调用)。
@@ -1729,6 +1763,27 @@ mod tests {
         assert_eq!(plan.note, None, "唤起槽默认正常,悬浮条不得出现提示");
         let note = plan.window_note.expect("窗口槽须留提示");
         assert!(note.contains("保存的完整窗口快捷键"), "{note}");
+    }
+
+    /// 无 manager:挂起/恢复如实报告不可用,不得让调用方误记「已挂起/已恢复」。
+    #[test]
+    fn runtime_without_manager_reports_unavailable_suspend_and_resume() {
+        let mut runtime = HotkeyRuntime {
+            manager: None,
+            active: Arc::new(Mutex::new(ActiveKeys::default())),
+            snapshot: HotkeySnapshot::default(),
+            suspended: None,
+            on_action: Arc::new(OnceLock::new()),
+            deferred: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        assert!(!runtime.suspend(), "无 manager 不得谎报已挂起");
+        let report = runtime.resume();
+        assert!(!report.resumed, "无 manager 不得谎报已恢复");
+        assert!(!report.fully_restored());
+        assert!(
+            !runtime.resume().fully_restored(),
+            "非挂起态重复恢复也不得视为完整恢复"
+        );
     }
 
     /// 兜底队列:空 = None;入列动作按先进先出逐条消费,取尽不再重复。

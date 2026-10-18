@@ -654,45 +654,86 @@ impl App {
         tray_toggled_autostart
     }
 
-    /// 消费设置页排队的快捷键命令（主线程；运行时调用一律在共享锁外）。
+    /// 消费排队命令与关闭取消（主线程；运行时调用一律在共享锁外）。
     ///
     /// 设置 pass 只入队（Carbon manager 只能主线程），命令按 FIFO 在此落地。
-    /// `Begin` 在窗口已关闭时丢弃：关闭路径另发取消信号，不能先挂起再无处取消。
-    fn drain_hotkey_commands(&mut self, ctx: &egui::Context) {
-        let commands = self.shared().settings.take_hotkey_commands();
-        for command in commands {
-            match command {
-                settings::HotkeyCommand::BeginRecord(slot) => {
-                    self.begin_hotkey_recording(ctx, slot)
+    /// **顺序**：先逐条执行命令，再消费关闭/⌘W 的取消信号——关闭当帧排队的
+    /// `Begin` 会因 `open=false` 丢弃；已在录制中的状态则由随后关闭取消恢复旧键。
+    fn process_hotkey_events(&mut self, ctx: &egui::Context) {
+        let (commands, close_pending) = {
+            let mut s = self.shared();
+            (
+                s.settings.take_hotkey_commands(),
+                s.settings.take_cancel_recording_pending(),
+            )
+        };
+        for event in hotkey_frame_events(commands, close_pending) {
+            match event {
+                HotkeyFrameEvent::Command(command) => self.apply_hotkey_command(ctx, command),
+                HotkeyFrameEvent::CloseCancel => {
+                    self.cancel_hotkey_recording(ctx, "设置窗口关闭");
                 }
-                settings::HotkeyCommand::CancelRecord => {
-                    self.cancel_hotkey_recording(ctx, "取消录制")
-                }
-                settings::HotkeyCommand::Commit { slot, hotkey } => {
-                    self.commit_hotkey(ctx, slot, hotkey)
-                }
+            }
+        }
+    }
+
+    /// 落地一条快捷键命令（运行时调用不在共享锁内）。
+    fn apply_hotkey_command(&mut self, ctx: &egui::Context, command: settings::HotkeyCommand) {
+        match command {
+            settings::HotkeyCommand::BeginRecord(slot) => self.begin_hotkey_recording(ctx, slot),
+            settings::HotkeyCommand::CancelRecord => self.cancel_hotkey_recording(ctx, "取消录制"),
+            settings::HotkeyCommand::Commit { slot, hotkey } => {
+                self.commit_hotkey(ctx, slot, hotkey)
             }
         }
     }
 
     /// 开始/切换录制：首槽 suspend；切槽时运行时保持挂起（旧键仍在 `suspended`）。
     fn begin_hotkey_recording(&mut self, ctx: &egui::Context, slot: hotkey::HotkeySlot) {
-        let (open, already) = {
+        let (open, already, focused) = {
             let s = self.shared();
-            (s.settings.open, s.settings.recording)
+            (
+                s.settings.open,
+                s.settings.recording,
+                s.settings.viewport_focused,
+            )
         };
-        if !open {
-            log::info!("快捷键录制开始被忽略:设置窗口已关闭");
-            return;
+        let decision = begin_decision(open, focused, already, slot);
+        match decision {
+            BeginDecision::DropClosed => {
+                log::info!("快捷键录制开始被忽略:设置窗口已关闭");
+                return;
+            }
+            BeginDecision::DropUnfocused => {
+                // 点击后到命令落地之间窗口已失焦（罕见竞态）：不能在无键盘输入的
+                // 窗口里开始录制，否则热键会一直挂起。
+                log::info!("快捷键录制开始被忽略:设置窗口当前未聚焦");
+                return;
+            }
+            BeginDecision::CancelDuplicate => {
+                // 陈旧视图（或重复命令）在录制中再次 Begin 同槽：按取消处理，
+                // 否则录制态无法退出、全局热键会一直挂起。
+                log::info!("重复开始录制({slot:?}):按取消处理");
+                self.cancel_hotkey_recording(ctx, "重复开始录制");
+                return;
+            }
+            BeginDecision::Suspend | BeginDecision::Switch => {}
         }
-        if already == Some(slot) {
-            return; // 重复 Begin（视图对同槽点击只发 Cancel）
+        // suspend 幂等：切槽时保持挂起。无 manager 时返回 false，日志如实描述。
+        let suspended = self.hotkey.suspend();
+        match decision {
+            BeginDecision::Suspend => log::info!("快捷键录制开始({slot:?})"),
+            BeginDecision::Switch => {
+                log::info!("快捷键录制切槽({already:?} → {slot:?})");
+            }
+            BeginDecision::DropClosed
+            | BeginDecision::DropUnfocused
+            | BeginDecision::CancelDuplicate => unreachable!(),
         }
-        if already.is_none() {
-            self.hotkey.suspend();
-            log::info!("快捷键录制开始({slot:?}):已挂起全局热键");
+        if suspended {
+            log::info!("全局热键已挂起(录制期不会触发旧动作)");
         } else {
-            log::info!("快捷键录制切槽({already:?} → {slot:?}):热键保持挂起");
+            log::warn!("全局热键运行时不可用,录制仍继续(提交将失败)");
         }
         let snapshot = self.hotkey.snapshot();
         {
@@ -703,21 +744,31 @@ impl App {
         request_hotkey_repaint(ctx);
     }
 
-    /// 取消录制并恢复旧键（Esc/点击他处/窗口关闭共用；未录制 = no-op）。
+    /// 取消录制并恢复旧键（Esc/点击他处/失焦/窗口关闭共用；未录制 = 静默 no-op）。
     fn cancel_hotkey_recording(&mut self, ctx: &egui::Context, reason: &str) {
         let recording = self.shared().settings.recording;
         let Some(slot) = recording else {
-            log::info!("{reason}:当前未录制快捷键(忽略)");
+            log::debug!("{reason}:当前未录制快捷键(忽略)");
             return;
         };
-        self.hotkey.resume();
+        let report = self.hotkey.resume();
         let snapshot = self.hotkey.snapshot();
         {
             let mut s = self.shared();
             s.settings.end_recording(snapshot);
             s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
         }
-        log::info!("{reason}:快捷键录制结束({slot:?}),旧热键已恢复");
+        if !report.resumed {
+            log::info!("{reason}:快捷键录制结束({slot:?}),运行时无挂起旧键");
+        } else if report.fully_restored() {
+            log::info!("{reason}:快捷键录制结束({slot:?}),旧热键已恢复");
+        } else {
+            log::warn!(
+                "{reason}:快捷键录制结束({slot:?}),旧热键部分恢复失败(palette_ok={}, window_ok={})",
+                report.palette_ok,
+                report.window_ok
+            );
+        }
         request_hotkey_repaint(ctx);
     }
 
@@ -726,7 +777,7 @@ impl App {
     fn commit_hotkey(&mut self, ctx: &egui::Context, slot: hotkey::HotkeySlot, hotkey: HotKey) {
         // 同一帧若先取消后提交（点击他处 + 按键），以取消为准：不得在非录制态换键。
         let recording = self.shared().settings.recording;
-        if recording != Some(slot) {
+        if !commit_allowed(recording, slot) {
             log::warn!("快捷键提交被忽略({slot:?}):当前录制槽为 {recording:?}");
             return;
         }
@@ -777,6 +828,67 @@ fn request_hotkey_repaint(ctx: &egui::Context) {
     ctx.request_repaint_of(settings::viewport_id());
     ctx.request_repaint_of(egui::ViewportId::ROOT);
     ctx.request_repaint_of(palette_viewport_id());
+}
+
+/// `BeginRecord` 的落地决策（纯判定；实际 suspend/resume 仍在主线程执行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeginDecision {
+    /// 设置窗口已关闭：丢弃，避免挂起热键后无人可取消。
+    DropClosed,
+    /// 已观测到失焦（点击→命令落地之间的竞态）：丢弃，不在无键盘输入的窗口录制。
+    DropUnfocused,
+    /// 陈旧视图重复 Begin 同槽：按取消处理，防止录制态无法退出。
+    CancelDuplicate,
+    /// 已录制另一槽：运行时保持挂起，只切录制槽。
+    Switch,
+    /// 空闲：调用 suspend 进入录制。
+    Suspend,
+}
+
+fn begin_decision(
+    open: bool,
+    focused: Option<bool>,
+    recording: Option<hotkey::HotkeySlot>,
+    slot: hotkey::HotkeySlot,
+) -> BeginDecision {
+    if !open {
+        BeginDecision::DropClosed
+    } else if recording == Some(slot) {
+        // 陈旧重复 Begin 优先按取消处理（可能同时已失焦，取消更安全）。
+        BeginDecision::CancelDuplicate
+    } else if focused == Some(false) {
+        BeginDecision::DropUnfocused
+    } else if recording.is_some() {
+        BeginDecision::Switch
+    } else {
+        BeginDecision::Suspend
+    }
+}
+
+/// 提交只对当前录制槽有效（缺席/错槽一律忽略）。
+fn commit_allowed(recording: Option<hotkey::HotkeySlot>, slot: hotkey::HotkeySlot) -> bool {
+    recording == Some(slot)
+}
+
+/// 单帧快捷键事件：排队命令先于关闭/⌘W 取消（顺序的单一真源，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyFrameEvent {
+    Command(settings::HotkeyCommand),
+    CloseCancel,
+}
+
+fn hotkey_frame_events(
+    commands: Vec<settings::HotkeyCommand>,
+    close_pending: bool,
+) -> Vec<HotkeyFrameEvent> {
+    let mut events: Vec<HotkeyFrameEvent> = commands
+        .into_iter()
+        .map(HotkeyFrameEvent::Command)
+        .collect();
+    if close_pending {
+        events.push(HotkeyFrameEvent::CloseCancel);
+    }
+    events
 }
 
 impl eframe::App for App {
@@ -841,13 +953,8 @@ impl eframe::App for App {
             }
         }
         // 快捷键录制命令(设置页 → App):挂起/恢复/提交只能主线程执行。
-        // 先 drain 再消费关闭信号:关闭当帧排队的 Begin 会因 open=false 被丢弃，
-        // 已在录制中的状态则由紧随其后的关闭取消恢复旧键。
-        self.drain_hotkey_commands(ctx);
-        // 设置窗口关闭/⌘W：录制中恢复旧热键（未录制 = no-op，信号取走即清）。
-        if self.shared().settings.take_cancel_recording_pending() {
-            self.cancel_hotkey_recording(ctx, "设置窗口关闭");
-        }
+        // 顺序由 `hotkey_frame_events` 单点定义：先命令，后关闭/⌘W 取消。
+        self.process_hotkey_events(ctx);
         if let Some(tray) = &mut self.tray {
             tray.sync();
         }
@@ -1213,6 +1320,111 @@ mod tests {
         assert!(
             !autostart_check_after_failure(None, true),
             "未知 → 保持点击前值（关）"
+        );
+    }
+
+    fn alt_k() -> HotKey {
+        HotKey::new(
+            Some(global_hotkey::hotkey::Modifiers::ALT),
+            global_hotkey::hotkey::Code::KeyK,
+        )
+    }
+
+    /// Begin 判定：关闭丢弃 > 同槽重复取消 > 已失焦丢弃 > 切槽 > 空闲挂起。
+    #[test]
+    fn begin_decision_covers_closed_duplicate_unfocused_switch_and_fresh() {
+        use hotkey::HotkeySlot::{Palette, Window};
+
+        assert_eq!(
+            begin_decision(false, Some(true), None, Palette),
+            BeginDecision::DropClosed,
+            "关闭后到达的 Begin 必须丢弃（不得挂起无人恢复）"
+        );
+        assert_eq!(
+            begin_decision(false, None, Some(Window), Palette),
+            BeginDecision::DropClosed,
+            "关闭优先于其它分支"
+        );
+        assert_eq!(
+            begin_decision(true, Some(true), Some(Palette), Palette),
+            BeginDecision::CancelDuplicate,
+            "陈旧视图重复 Begin 同槽 = 取消"
+        );
+        assert_eq!(
+            begin_decision(true, Some(false), Some(Palette), Palette),
+            BeginDecision::CancelDuplicate,
+            "重复 Begin 优先取消（即使窗口已失焦）"
+        );
+        assert_eq!(
+            begin_decision(true, Some(true), Some(Palette), Window),
+            BeginDecision::Switch
+        );
+        assert_eq!(
+            begin_decision(true, Some(true), None, Palette),
+            BeginDecision::Suspend
+        );
+        assert_eq!(
+            begin_decision(true, None, None, Palette),
+            BeginDecision::Suspend,
+            "焦点未知（尚未报告）不得拒绝正常开始"
+        );
+        assert_eq!(
+            begin_decision(true, Some(false), None, Palette),
+            BeginDecision::DropUnfocused,
+            "已观测失焦后落地的 Begin 必须丢弃（否则录制长期挂起）"
+        );
+        assert_eq!(
+            begin_decision(true, Some(false), Some(Palette), Window),
+            BeginDecision::DropUnfocused,
+            "失焦时不得借切槽开始新录制"
+        );
+    }
+
+    /// Commit 只接受当前录制槽；缺席/错槽忽略。
+    #[test]
+    fn commit_requires_matching_recording_slot() {
+        use hotkey::HotkeySlot::{Palette, Window};
+
+        assert!(commit_allowed(Some(Palette), Palette));
+        assert!(!commit_allowed(None, Palette), "无录制态不得换键");
+        assert!(!commit_allowed(Some(Window), Palette), "错槽提交不得换键");
+        assert!(!commit_allowed(Some(Palette), Window));
+    }
+
+    /// 排队命令先于关闭取消执行：关闭当帧的 Commit 仍先落地，Begin 则由
+    /// `open=false` 丢弃；队列内部保持 FIFO。
+    #[test]
+    fn hotkey_frame_commands_run_before_close_cancel() {
+        use hotkey::HotkeySlot::Palette;
+
+        let begin = settings::HotkeyCommand::BeginRecord(Palette);
+        let commit = settings::HotkeyCommand::Commit {
+            slot: Palette,
+            hotkey: alt_k(),
+        };
+        assert_eq!(
+            hotkey_frame_events(vec![begin, commit], true),
+            vec![
+                HotkeyFrameEvent::Command(begin),
+                HotkeyFrameEvent::Command(commit),
+                HotkeyFrameEvent::CloseCancel,
+            ],
+            "命令保持 FIFO，关闭取消永远最后"
+        );
+
+        let events = hotkey_frame_events(vec![commit], true);
+        assert_eq!(events.first(), Some(&HotkeyFrameEvent::Command(commit)));
+        assert_eq!(events.last(), Some(&HotkeyFrameEvent::CloseCancel));
+        assert!(
+            commit_allowed(Some(Palette), Palette),
+            "关闭取消尚未执行时 Commit 仍是当前槽，先提交"
+        );
+
+        assert!(hotkey_frame_events(vec![], false).is_empty());
+        assert_eq!(
+            hotkey_frame_events(vec![], true),
+            vec![HotkeyFrameEvent::CloseCancel],
+            "无命令也须消费关闭取消"
         );
     }
 }

@@ -645,6 +645,10 @@ git commit -m "feat(app): 设置页字号与开机自启"
   绘制后由设置 pass 锁外落地；Task 6 快捷键（带数据、主线程注册）与 Task 8
   排除目录（异步 daemon）改走 `Shared.settings` 的 App 动作队列，由 `App::logic`
   drain / 工作线程执行，不在视图回调内做阻塞或原生调用。
+  > **2026-10-18 H3 更新**：H3 已去掉 `SettingsAction` 的 `Copy`（快捷键动作携带
+  > `HotKey`/错误文案）；跨帧队列为 `SettingsState.hotkey_commands:
+  > VecDeque<HotkeyCommand>`（不存在 `Shared.settings.actions` 字段）。字号/自启
+  > 仍是绘制后即时落地；快捷键命令由 `App::logic` 先于关闭取消按 FIFO 执行。
 - 视觉修复：键帽组按原型在字段内水平居中；标题使用 `platform::SETTINGS_TITLE`；
   开关钮投影改 3 层递减 alpha 软影；排除目录空列表显示「未排除任何目录」。
 - 删除 `crates/app/src/settings.rs` 模块级 `#![allow(dead_code)]`；仅保留

@@ -93,8 +93,8 @@ pub struct SettingsState {
     pub(crate) hotkey_snapshot: HotkeySnapshot,
     /// 当前录制槽（None = 未录制）；录制期全局热键已挂起。
     pub(crate) recording: Option<HotkeySlot>,
-    /// App 已完成 suspend、可以开始接收按键（准备期显示「准备录制…」）。
-    pub(crate) recording_ready: bool,
+    /// 设置视口最近一次焦点观测（None = 尚未报告）；用于录制中失焦取消。
+    pub(crate) viewport_focused: Option<bool>,
     /// 最近一条快捷键内联错误（按槽定位：校验/冲突/注册失败/保存失败）。
     pub(crate) hotkey_error: Option<(HotkeySlot, String)>,
     /// 待 `App::logic` 消费的快捷键命令（FIFO；设置 pass 不碰运行时）。
@@ -126,7 +126,7 @@ impl SettingsState {
             excluded: engine::config::default_config().excluded,
             hotkey_snapshot,
             recording: None,
-            recording_ready: false,
+            viewport_focused: None,
             hotkey_error: None,
             hotkey_commands: VecDeque::new(),
             tray_autostart_sync: None,
@@ -149,9 +149,10 @@ impl SettingsState {
         first_open
     }
 
-    /// 标记隐藏（红点 / ⌘W 共用，纯状态）：清开合态并挂起录制取消。
+    /// 标记隐藏（红点 / ⌘W 共用，纯状态）：清开合态/焦点观测并挂起录制取消。
     pub(crate) fn mark_hidden(&mut self) {
         self.open = false;
+        self.viewport_focused = None;
         self.cancel_recording_pending = true;
     }
 
@@ -164,14 +165,12 @@ impl SettingsState {
     ///
     /// 切换槽位录制时补一条 `CancelRecord`：App 先恢复旧键再重新挂起，
     /// 保证「先 resume 再 suspend」的明确语义（幂等，不会丢键）。
-    /// 已在录制目标槽时忽略重复 Begin（视图对同槽点击发的是 Cancel）。
+    /// 同槽重复 Begin **照常入队**：陈旧视图可能重复发 Begin，由 App 按取消处理
+    /// （否则录制态无法退出、热键会一直挂起）；正常视图同槽点击发的是 Cancel。
     pub(crate) fn queue_hotkey_command(&mut self, command: HotkeyCommand) {
         match command {
             HotkeyCommand::BeginRecord(slot) => {
-                if self.recording == Some(slot) {
-                    return;
-                }
-                if self.recording.is_some() {
+                if self.recording.is_some_and(|current| current != slot) {
                     self.hotkey_commands.push_back(HotkeyCommand::CancelRecord);
                 }
                 self.hotkey_commands.push_back(command);
@@ -185,10 +184,11 @@ impl SettingsState {
         self.hotkey_commands.drain(..).collect()
     }
 
-    /// App `suspend()` 完成后进入录制：切槽、可接收按键、清旧错误。
+    /// App `suspend()` 完成后进入录制：切槽、开始接收按键、清旧错误。
+    ///
+    /// `suspend()` 在主线程同步完成，因此不存在可渲染的「准备中」中间态。
     pub(crate) fn begin_recording(&mut self, slot: HotkeySlot, snapshot: HotkeySnapshot) {
         self.recording = Some(slot);
-        self.recording_ready = true;
         self.hotkey_error = None;
         self.hotkey_snapshot = snapshot;
     }
@@ -196,9 +196,23 @@ impl SettingsState {
     /// 取消录制/恢复旧键完成后落地：清录制态与错误，刷新快照。
     pub(crate) fn end_recording(&mut self, snapshot: HotkeySnapshot) {
         self.recording = None;
-        self.recording_ready = false;
         self.hotkey_error = None;
         self.hotkey_snapshot = snapshot;
+    }
+
+    /// 记录设置视口焦点，并判定是否因「录制中失焦」取消录制。
+    ///
+    /// 只在 `true → false` 跃迁时返回 true：窗口刚打开、尚未获得焦点的 `false`
+    /// 不误取消。macOS 最小化同样表现为失焦；`None` = 平台未报告，保守不动作。
+    pub(crate) fn observe_focus(&mut self, focused: Option<bool>, open: bool) -> bool {
+        let lost = open
+            && self.recording.is_some()
+            && self.viewport_focused == Some(true)
+            && focused == Some(false);
+        if let Some(focused) = focused {
+            self.viewport_focused = Some(focused);
+        }
+        lost
     }
 
     /// 提交成功（运行时已注册新键）后落地：结束录制、写设置文件快照并返回待落盘副本。
@@ -226,7 +240,6 @@ impl SettingsState {
         snapshot: HotkeySnapshot,
     ) {
         self.recording = None;
-        self.recording_ready = false;
         self.hotkey_error = Some((slot, message));
         self.hotkey_snapshot = snapshot;
     }
@@ -356,11 +369,8 @@ impl SettingsData {
             autostart_error: state.autostart_error.clone(),
             font_error: state.font_error.clone(),
             language: settings_view::LANGUAGE_LABEL,
-            palette_keys: state.hotkey_snapshot.palette_keys.clone(),
-            window_keys: state.hotkey_snapshot.window_keys.clone(),
             hotkeys: state.hotkey_snapshot.clone(),
             recording: state.recording,
-            recording_ready: state.recording_ready,
             hotkey_error: state.hotkey_error.clone(),
             excluded: state.excluded.clone(),
         }
@@ -383,16 +393,24 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 可见期跟随系统外观：根窗与悬浮条都隐藏时，设置 pass 是唯一驱动点。
     // 与 palette/root 同模式——`maybe_apply` 按 CHECK_INTERVAL 节流探测；
     // 应用后本视口立即重绘，并在本 pass 末尾排下一帧（隐藏后不排，守 L4）。
-    let (data, open, theme_changed) = {
+    let focused = ctx.input(|i| i.viewport().focused);
+    let (data, open, theme_changed, focus_lost) = {
         let mut s = lock_shared(shared);
         let open = s.settings.open;
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
+        let focus_lost = s.settings.observe_focus(focused, open);
         let data = SettingsData::from_state(&s.settings);
-        (data, open, theme_changed)
+        (data, open, theme_changed, focus_lost)
     };
     if theme_changed {
         // `set_theme` 只改偏好；显式排一帧让本视口按新主题出图。
         ctx.request_repaint_of(viewport_id());
+    }
+    if focus_lost {
+        // 失焦/最小化期间键盘事件不再进入设置窗；继续录制会让两槽热键长期挂起。
+        // 交给 App 的取消命令走主线程 resume；只在焦点 true→false 跃迁时触发一次。
+        enqueue_hotkey_command(shared, &ctx, HotkeyCommand::CancelRecord);
+        log::info!("设置窗口失焦:取消快捷键录制");
     }
 
     // 整窗底色（标题栏与内容同底；原生交通灯浮于其上）。
@@ -639,7 +657,7 @@ mod tests {
             "快照由 App::new 植入,构造时为默认空值"
         );
         assert_eq!(state.recording, None);
-        assert!(!state.recording_ready);
+        assert_eq!(state.viewport_focused, None);
         assert_eq!(state.hotkey_error, None);
         assert!(state.hotkey_commands.is_empty());
         assert!(!state.positioned_once, "首开前未定位");
@@ -711,7 +729,7 @@ mod tests {
         out.textures_delta.clear();
     }
 
-    /// 队列顺序：切槽先补取消；同槽重复 Begin 忽略；Commit/Cancel 保持 FIFO。
+    /// 队列顺序：切槽先补取消；同槽重复 Begin 交由 App 视为取消；Commit/Cancel FIFO。
     #[test]
     fn hotkey_commands_queue_in_order() {
         let mut state = test_state();
@@ -728,10 +746,14 @@ mod tests {
             "切换录制槽必须先取消旧槽"
         );
 
-        // 已在录制该槽：重复 Begin 忽略（视图对同槽点击发 Cancel）。
+        // 已在录制该槽：陈旧视图重复 Begin 照常入队，由 App 按取消处理。
         state.recording = Some(HotkeySlot::Window);
         state.queue_hotkey_command(HotkeyCommand::BeginRecord(HotkeySlot::Window));
-        assert!(state.hotkey_commands.is_empty(), "同槽重复 Begin 不得入队");
+        assert_eq!(
+            state.take_hotkey_commands(),
+            vec![HotkeyCommand::BeginRecord(HotkeySlot::Window)],
+            "同槽重复 Begin 必须交给 App 视为取消（不得静默丢弃）"
+        );
 
         state.queue_hotkey_command(HotkeyCommand::Commit {
             slot: HotkeySlot::Window,
@@ -752,7 +774,7 @@ mod tests {
         assert!(state.hotkey_commands.is_empty(), "取走即清");
     }
 
-    /// 进入录制：清旧错误、置 ready、快照保持运行时真源；结束录制清全部录制态。
+    /// 进入录制：清旧错误、快照保持运行时真源；结束录制清全部录制态。
     #[test]
     fn begin_and_end_recording_transitions() {
         let mut state = test_state();
@@ -761,7 +783,6 @@ mod tests {
 
         state.begin_recording(HotkeySlot::Palette, before.clone());
         assert_eq!(state.recording, Some(HotkeySlot::Palette));
-        assert!(state.recording_ready, "App suspend 完成后即可接收按键");
         assert_eq!(state.hotkey_error, None, "新录制清旧错误");
         assert_eq!(state.hotkey_snapshot, before, "挂起期快照仍显示旧键");
 
@@ -769,7 +790,6 @@ mod tests {
         state.hotkey_error = Some((HotkeySlot::Window, "提示".into()));
         state.end_recording(after.clone());
         assert_eq!(state.recording, None);
-        assert!(!state.recording_ready);
         assert_eq!(state.hotkey_error, None);
         assert_eq!(state.hotkey_snapshot, after);
     }
@@ -790,7 +810,6 @@ mod tests {
         let file = state.commit_recorded_hotkey(HotkeySlot::Palette, committed, next.clone());
 
         assert_eq!(state.recording, None);
-        assert!(!state.recording_ready);
         assert_eq!(state.hotkey_error, None);
         assert_eq!(state.hotkey_snapshot, next, "提交成功须刷新展示快照");
         assert_eq!(state.file.palette_hotkey, Some(committed));
@@ -817,7 +836,6 @@ mod tests {
         );
 
         assert_eq!(state.recording, None, "失败退出录制（旧键已恢复）");
-        assert!(!state.recording_ready);
         assert_eq!(state.hotkey_snapshot, old, "回滚后的快照 = 旧键");
         assert_eq!(
             state.hotkey_error,
@@ -874,7 +892,6 @@ mod tests {
         state.begin_recording(HotkeySlot::Palette, HotkeySnapshot::default());
         state.hotkey_rejected(HotkeySlot::Palette, "需包含修饰键".into());
         assert_eq!(state.recording, Some(HotkeySlot::Palette));
-        assert!(state.recording_ready);
         assert_eq!(
             state.hotkey_error,
             Some((HotkeySlot::Palette, "需包含修饰键".to_owned()))
@@ -887,7 +904,6 @@ mod tests {
         let mut state = test_state();
         state.request_open();
         state.recording = Some(HotkeySlot::Window);
-        state.recording_ready = true;
         state.hotkey_error = Some((HotkeySlot::Window, "错误".into()));
         state.mark_hidden();
 
@@ -902,7 +918,6 @@ mod tests {
         let restored = hotkey_snapshot(Some(alt_space()), Some(alt_shift_f()));
         state.end_recording(restored.clone());
         assert_eq!(state.recording, None);
-        assert!(!state.recording_ready);
         assert_eq!(state.hotkey_error, None);
         assert_eq!(state.hotkey_snapshot, restored);
 
@@ -912,6 +927,46 @@ mod tests {
         assert!(state.take_cancel_recording_pending());
         assert_eq!(state.recording, None);
         assert!(!state.take_cancel_recording_pending(), "不得重复消费");
+    }
+
+    /// 录制中失焦/最小化 → 请求取消；只在 true→false 跃迁触发，避免插值/重复帧。
+    #[test]
+    fn focus_loss_cancels_recording_only_on_focused_transition() {
+        let mut state = test_state();
+        state.request_open();
+        assert!(!state.observe_focus(Some(true), true), "首次获得焦点不取消");
+        state.recording = Some(HotkeySlot::Palette);
+        assert!(state.observe_focus(Some(false), true), "录制中失焦须取消");
+        assert!(
+            !state.observe_focus(Some(false), true),
+            "持续失焦不得每帧重复取消"
+        );
+        assert!(!state.observe_focus(Some(true), true), "重新聚焦不取消");
+        assert!(state.observe_focus(Some(false), true), "再次失焦须再取消");
+
+        // 窗口刚打开且从未观测到聚焦：首个 false 不得误取消。
+        let mut state = test_state();
+        state.request_open();
+        state.recording = Some(HotkeySlot::Window);
+        assert!(
+            !state.observe_focus(Some(false), true),
+            "首次焦点报告为 false(瞬态)不取消"
+        );
+
+        // 未录制 / 窗口已关闭：失焦不触发。
+        let mut state = test_state();
+        state.request_open();
+        state.observe_focus(Some(true), true);
+        assert!(!state.observe_focus(Some(false), true), "未录制不取消");
+        state.recording = Some(HotkeySlot::Palette);
+        assert!(
+            !state.observe_focus(Some(false), false),
+            "窗口关闭时不再触发失焦取消"
+        );
+
+        // 关闭重置焦点观测，重开从 None 重新学习。
+        state.mark_hidden();
+        assert_eq!(state.viewport_focused, None);
     }
 
     /// 字号纯状态：保存失败也更新 file.font_size + 留内联错误；成功清错误。
@@ -1094,7 +1149,6 @@ mod tests {
         state.hotkey_snapshot.palette_keys = vec!["⌃".into(), "⌥".into(), "K".into()];
         state.hotkey_snapshot.window_keys = vec!["⇧".into(), "⌘".into(), "J".into()];
         state.recording = Some(HotkeySlot::Window);
-        state.recording_ready = true;
         state.hotkey_error = Some((HotkeySlot::Palette, "需包含修饰键".into()));
         state.excluded = vec!["node_modules".into()];
 
@@ -1105,11 +1159,13 @@ mod tests {
         assert_eq!(data.autostart_error.as_deref(), Some("未打包"));
         assert_eq!(data.font_error.as_deref(), Some("保存失败"));
         assert_eq!(data.language, "简体中文");
-        assert_eq!(data.palette_keys, vec!["⌃", "⌥", "K"]);
-        assert_eq!(data.window_keys, vec!["⇧", "⌘", "J"]);
-        assert_eq!(data.hotkeys, state.hotkey_snapshot, "键帽展示真源 = 快照");
+        assert_eq!(
+            data.hotkeys, state.hotkey_snapshot,
+            "键帽展示唯一真源 = 快照"
+        );
+        assert_eq!(data.hotkeys.palette_keys, vec!["⌃", "⌥", "K"]);
+        assert_eq!(data.hotkeys.window_keys, vec!["⇧", "⌘", "J"]);
         assert_eq!(data.recording, Some(HotkeySlot::Window));
-        assert!(data.recording_ready);
         assert_eq!(
             data.hotkey_error,
             Some((HotkeySlot::Palette, "需包含修饰键".to_owned()))
