@@ -1,5 +1,7 @@
 # 设置 · 排除目录实现计划
 
+**Status:** E1–E3 已实现（2026-10-18）；E4 实机验收与文档收尾待办。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use `- [ ]`.
 
 **Goal:** 设置页排除目录列表接真实引擎状态；可添加（系统目录选择器）与移除；变更触发重扫，异步不卡 UI；默认相对名条目可移除。
@@ -14,65 +16,85 @@
 
 **Files:** `crates/cli/src/daemon.rs`; tests in same file.
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - 配置 `excluded = ["node_modules", "/abs/x"]`；`Remove "node_modules"` 成功并从配置移除（当前会被绝对路径校验拒绝）。
   - `Remove "/not/existing"` → Err（条目不存在），配置不变。
   - `Add "relative/x"` → Err（仍要求绝对路径/扫描根内）。
   - Add 绝对根内路径成功；Add 根外/相对仍失败。
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `apply_exclude_change` 分流：
     - Add：保留 `validate_exclude_in_roots`。
     - Remove：只检查 `cfg.excluded.iter().any(|e| e == path)`；不存在 → `Err("条目不存在: {path}")`；存在 → retain 剩余；不做绝对路径/根校验。
   - 保存配置 + `degrade_and_rescan` 行为不变。
-- [ ] **Step 3: 运行 `cargo test -p macEverything exclude` + 全量；提交** `fix(engine): 允许移除已存在的相对名排除项`.
+- [x] **Step 3: 运行 `cargo test -p macEverything exclude` + 全量；提交** `fix(engine): 允许移除已存在的相对名排除项`（833d6c1）.
 
 ## Task E2: 原生目录选择器
 
 **Files:** `platform/mac.rs`, `platform/mod.rs`, `crates/app/Cargo.toml`.
 
-- [ ] **Step 1: PoC/接口**
+- [x] **Step 1: PoC/接口**
   - 新增 `pub fn pick_directory() -> Option<PathBuf>` facade（非 macOS None）。
   - macOS：`NSOpenPanel::openPanel(mtm)`; `setCanChooseFiles(false)`, `setCanChooseDirectories(true)`, `setAllowsMultipleSelection(false)`; `runModal() == NSModalResponseOK`; `URLs().first().and_then(|u| u.path())` → PathBuf.
   - 主线程 guard；`NSApp.activate()` 前置（避免后台弹不出）；日志取消/失败。
   - Cargo 增加 `NSOpenPanel`、`NSURL` 已有、`NSButton` 已有；按 objc2 0.3.2 feature 需要补 `NSOpenPanel`。
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
   - 单测只能覆盖非原生部分/路径转换；实机手动：点击按钮弹系统目录选择器，取消返回 None，选择目录返回路径。
-- [ ] **Step 3: fmt/clippy/test；提交** `feat(app): 原生目录选择器`.
+- [x] **Step 3: fmt/clippy/test；提交** `feat(app): 原生目录选择器`（7be8889）.
+  - E3 接线时清理：移除 facade/macOS impl 的临时 `#[allow(dead_code)]`；修正
+    “系统共享面板”注释为**每次调用新建独立面板**；`NSModalResponseAbort` 记
+    warn、`NSModalResponseCancel` 记 info。
+  - **已知偏差（不改变最低系统版本）：** 前置的 `NSApplication.activate()`（无参）
+    是 macOS 14+ API，而 README 最低支持 macOS 13；既有 `show_root_window` /
+    `show_settings_window` 已在 macOS 13 目标上调用同一方法（先于本计划），E2
+    沿用。若将来需 macOS 13 严格兼容，另起任务改用 `activateIgnoringOtherApps:true`。
 
 ## Task E3: 设置页排除目录真实数据 + 异步 add/remove
 
 **Files:** `ui/settings.rs` (state/commands/workers), `ui/settings_view.rs` (actions/busy/error/empty), `ui/mod.rs` (open load/tick), tests.
 
-- [ ] **Step 1: 状态模型**
-  ```rust
-  pub enum ExcludeAction { Add, Remove(String), }
-  pub struct ExcludeState {
-      pub entries: Vec<String>,
-      pub busy: bool,
-      pub error: Option<String>,
-      pub loaded: bool,
-  }
-  ```
-  - `SettingsState` 用 `exclude: ExcludeState` 替换 seeded `excluded`；打开设置时若未 loaded → 启动 list worker。
-  - worker：`client::exclude(DaemonPaths{data_dir}, "list"/"add"/"remove", arg)`，结果经 mpsc 回投；`SettingsState::tick` 在 settings pass 与 App::logic 都可 drain（幂等）。
-  - 结果：`ok` → 用返回 `excluded` 覆盖 + clear error + busy=false；失败 → 保留旧列表 + error + busy=false。
-  - 引擎离线：显示「引擎未运行，无法修改排除目录」；不直改 config.toml。
-- [ ] **Step 2: UI actions**
-  - Add 按钮点击 → `platform::pick_directory()`（主线程 modal）；有路径 → 设 busy 并 spawn add worker，状态「重扫中…」，禁用 add/移除。
-  - 移除 × 点击 → busy + worker remove；成功后列表刷新。
-  - 空列表显示「未排除任何目录」；busy 时行内/卡片头显示「重扫中…」。
-  - 错误内联显示（daemon 文案原样）。
-  - 列表过长：本期整页滚动；Task 后续可虚拟化。
-- [ ] **Step 3: 测试**
-  - 纯状态：list success/failure、add busy/success/failure、remove、离线错误、覆盖列表。
+- [x] **Step 1: 状态模型**
+  - 实际落地：保留 `excluded: Vec<String>`，在 `SettingsState` 上新增
+    `exclude_busy / exclude_busy_list / exclude_error / exclude_loaded /
+    exclude_refresh_pending / exclude_rx: Option<Receiver<ExcludeResult>>`
+    （比原计划的 `ExcludeState` 少一层嵌套，便于既有快照字段平移）。
+  - 打开设置（`request_open` 的 closed→open）置 `exclude_refresh_pending`；
+    settings pass 在短锁内 `tick_exclude()` 后若 pending && !busy → spawn `list`
+    （清除 pending）。重开时若旧操作仍在途，等它回投后再补 list。
+  - worker：`client::exclude(DaemonPaths{data_dir}, "list"/"add"/"remove", arg)`，
+    结果经**单操作** mpsc 回投并 `request_repaint_of(settings)`；`tick_exclude`
+    非阻塞收取。共享锁只覆盖 busy/通道/`data_dir` 落地，锁外 spawn/client。
+  - 结果映射：`ok=true` → 用返回 `excluded` 覆盖 + clear error + busy=false；
+    `ok=false` → 保留旧列表 + daemon 原文案；client Err（离线等）→ 保留旧列表 +
+    错误原文；两者 busy=false、loaded=true。工作线程无结果退出按失败处理，busy
+    不会卡死。
+- [x] **Step 2: UI actions**
+  - Add 按钮点击 → `SettingsAction::AddExclude` → 设置 pass 主线程
+    `platform::pick_directory()`（不持锁）；有路径 → busy + spawn add worker，
+    取消 → 无 busy/无状态变化。
+  - 移除 × 点击 → `SettingsAction::RemoveExclude(原文路径)` → busy + worker remove。
+  - busy：add/移除 × 全部禁用（置灰 + `NotAllowed`，不产出动作）；Header 下
+    支持行显示「加载中…」（list）或「重扫中…」（add/remove），高度计入
+    `RowSpec.extra`。
+  - 空列表显示「未排除任何目录」；错误（红）/busy（次要色）可同时出现在
+    Header 下方并与空态并存。
+  - 列表过长：本期整页滚动（不做卡片内独立滚动/虚拟化）。
+- [x] **Step 3: 测试**
+  - 纯状态：list success/failure、add/remove success/failure、busy 单操作约束、
+    closed→open 刷新挂起、失败保留旧列表、离线 err 映射、假通道非阻塞 drain、
+    线程断开兜底。
   - 用假 worker 通道（不启真实 daemon）；daemon 相对名移除由 E1 单测覆盖。
-  - Headless UI：add/remove action、busy 禁用、空态、错误文案。
-- [ ] **Step 4: fmt/clippy/test；提交** `feat(app): 设置页排除目录接入引擎`.
+  - Headless UI：add/remove action、busy 禁用、加载/重扫支持行与行高、错误
+    支持行、空态 + busy/error 并存。
+- [x] **Step 4: fmt/clippy/test；提交** `feat(app): 设置页排除目录接入引擎`.
 
 ## Task E4: 验收与文档
 
 - [ ] 实机：打开设置加载真实列表；添加根内目录（重扫提示 → 列表更新）；移除 `node_modules`/添加的目录；越界路径错误；引擎离线提示；重扫期间 UI 不卡；大列表滚动。
 - [ ] 更新 `design.md` §8 偏差（列表滚动模型/异步状态）、`settings-visual.md` 状态、本计划勾选。
+- [ ] **CLI 帮助文案待修（E4）：** `crates/cli/src/main.rs` 的
+  `exclude add|remove|list [绝对路径]` 与 `docs/usage.md` §`exclude` 仍写
+  `remove` 必须绝对路径；E1 起**已存在的相对名条目**（如 `node_modules`）也可
+  移除。E4 改为「add 须扫描根内绝对路径；remove 接受已有条目原文」。
 - [ ] 全量 fmt/clippy/test；提交。
 
 ## 验证命令

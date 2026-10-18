@@ -101,8 +101,12 @@ impl SpaceExemptDecider {
 /// 系统目录选择器（主线程；取消/失败 = None）。非 macOS = None。
 ///
 /// 原生 `NSOpenPanel` 模态面板：仅目录、单选。阻塞返回——调用方须在主线程
-/// （egui 绘制/事件处理中）调用。
-#[allow(dead_code)] // E3(设置页“添加目录”)接线前暂未调用
+/// （egui 绘制/事件处理中）调用，且调用期间不得持有共享锁。
+///
+/// 已知可用性偏差：实现前置的 `NSApplication.activate()`（无参）是 macOS 14+
+/// API，本仓最低支持 macOS 13（README）；既有 `show_root_window` /
+/// `show_settings_window` 早已在 macOS 13 目标上调用同一方法。本任务不改变
+/// 最低系统版本，仅记录该既有偏差（E4 实机在 macOS 26 验证）。
 pub fn pick_directory() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {

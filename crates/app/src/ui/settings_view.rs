@@ -1,8 +1,9 @@
 //! 设置页纯视图：快照数据 → 分组/卡片/行控制绘制（不读 `Shared`、不执行动作）。
 //!
 //! 行为编排在 `ui/settings.rs`：它短暂持锁构造 [`SettingsData`]，出锁绘制，最后
-//! 消费 [`SettingsAction`]（字号/自启/快捷键命令）。本文件只负责视觉与点击/按键
-//! 收集；录制期的 suspend/commit 一律由命令队列交给 App（主线程 manager）。
+//! 消费 [`SettingsAction`]（字号/自启/快捷键命令/排除目录异步操作）。本文件只负责
+//! 视觉与点击/按键收集；录制期的 suspend/commit 一律由命令队列交给 App（主线程
+//! manager），排除目录的 daemon 调用一律交给工作线程。
 //!
 //! 行模型：[`RowSpec`] 同时决定卡片高度与绘制游标；行内错误/提示行（字号保存失败 /
 //! 自启未打包 / 快捷键回落或失败）通过 `with_extra` 增高，卡片底与分隔线随之走同一
@@ -34,8 +35,12 @@ const ADD_DIR_LABEL: &str = "＋ 添加目录…";
 pub(crate) const LANGUAGE_LABEL: &str = "简体中文";
 /// 语言禁用态提示。
 const LANGUAGE_TOOLTIP: &str = "暂仅支持简体中文，语言切换将在后续版本提供";
-/// 排除目录空态文案（Task 8 换真实 daemon 列表）。
+/// 排除目录空态文案（列表为空或首次加载尚未返回时均可见）。
 const EXCLUDED_EMPTY: &str = "未排除任何目录";
+/// 打开设置页/重开时的列表加载提示。
+const EXCLUDE_LOADING: &str = "加载中…";
+/// add/remove 触发 daemon 重扫期间的提示。
+const EXCLUDE_RESCANNING: &str = "重扫中…";
 /// 已注册但等待系统「登录项」允许的行内提示（`RequiresApproval`）。
 const AUTOSTART_APPROVAL_NOTE: &str = "已注册,待系统设置「登录项」允许";
 /// 录制中的字段文案（App 已同步挂起全局热键）。
@@ -68,6 +73,12 @@ pub(crate) struct SettingsData {
     /// 按槽定位的快捷键内联错误。
     pub(crate) hotkey_error: Option<(HotkeySlot, String)>,
     pub(crate) excluded: Vec<String>,
+    /// 排除目录后台操作进行中（禁用添加/移除）。
+    pub(crate) exclude_busy: bool,
+    /// 在途操作为列表加载（「加载中…」；否则「重扫中…」）。
+    pub(crate) exclude_busy_list: bool,
+    /// 排除目录加载/变更失败原因（daemon/离线文案原样显示）。
+    pub(crate) exclude_error: Option<String>,
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
@@ -88,6 +99,10 @@ pub(crate) enum SettingsAction {
     CommitHotkey { slot: HotkeySlot, hotkey: HotKey },
     /// 录制组合非法或与另一槽重复：仅显示内联错误（录制继续）。
     HotkeyError { slot: HotkeySlot, message: String },
+    /// 点击「＋ 添加目录…」：设置 pass 弹原生目录选择器并启动 add 工作线程。
+    AddExclude,
+    /// 点击目录行移除 ×：设置 pass 启动 remove 工作线程（原文路径）。
+    RemoveExclude(String),
 }
 
 /// 一帧绘制结果：动作队列（通常为空或单条）。
@@ -98,7 +113,7 @@ pub(crate) struct BodyOutput {
 /// 绘制标题栏以下的内容（纯绘制：数据来自 [`SettingsData`]，动作回传调用方）。
 ///
 /// 标题栏固定；内容区自带 (20,24) 内边距，超出可视高时整页纵向滚动
-/// （不做卡片内独立滚动，排除目录列表 Task 8 沿用整页）。
+/// （不做卡片内独立滚动，排除目录列表同样随整页滚动）。
 pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
     let window = ui.max_rect();
     let content_rect = egui::Rect::from_min_max(
@@ -133,7 +148,7 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             ui.add_space(GROUP_GAP);
             draw_general_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(GROUP_GAP);
-            draw_index_group(ui, full_w, data, &palette, &mut actions);
+            draw_index_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(CONTENT_PAD.0);
         });
     BodyOutput { actions }
@@ -282,18 +297,27 @@ fn draw_general_group(
 }
 
 /// 索引组：Header 52（排除目录 + 添加按钮）+ 目录行 40；列表空时一行空态。
+/// 加载/重扫与错误提示挂在 Header 下，均由 `RowSpec.extra` 计入卡片高度。
 fn draw_index_group(
     ui: &mut egui::Ui,
     full_w: f32,
     data: &SettingsData,
     palette: &SettingsPalette,
+    extra_h: f32,
     actions: &mut Vec<SettingsAction>,
 ) {
+    let busy_label = data.exclude_busy.then_some(if data.exclude_busy_list {
+        EXCLUDE_LOADING
+    } else {
+        EXCLUDE_RESCANNING
+    });
+    let error = data.exclude_error.as_deref();
+    let extra = extra_for(error.is_some(), extra_h) + extra_for(busy_label.is_some(), extra_h);
     let mut rows = vec![GroupRow {
         kind: RowKind::ExcludeHeader,
-        spec: RowSpec::new(EXCLUDE_HEADER_H),
-        error: None,
-        note: None,
+        spec: RowSpec::new(EXCLUDE_HEADER_H).with_extra(extra),
+        error,
+        note: busy_label,
         hint: None,
     }];
     if data.excluded.is_empty() {
@@ -468,9 +492,15 @@ fn draw_row_body(
                 egui::vec2(button_w, ADD_BUTTON_H),
                 palette,
             );
-            draw_add_button(ui, control, palette);
+            if let Some(action) = draw_add_button(ui, control, data.exclude_busy, palette) {
+                actions.push(action);
+            }
         }
-        RowKind::Exclusion { index, path } => draw_dir_row(ui, body, index, path, palette),
+        RowKind::Exclusion { index, path } => {
+            if let Some(action) = draw_dir_row(ui, body, index, path, data.exclude_busy, palette) {
+                actions.push(action);
+            }
+        }
         RowKind::ExcludedEmpty => draw_excluded_empty(ui, body, palette),
     }
 }
@@ -943,19 +973,39 @@ fn capture_recorded_key(
 }
 
 /// 「＋ 添加目录…」按钮（高 28、圆角 7、12pt；宽随文案）。
-/// 点击不打开选择器（Task 8）。
-fn draw_add_button(ui: &mut egui::Ui, rect: egui::Rect, palette: &SettingsPalette) {
+/// not busy 时点击 → [`SettingsAction::AddExclude`]；busy 时置灰/禁用。
+fn draw_add_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    busy: bool,
+    palette: &SettingsPalette,
+) -> Option<SettingsAction> {
     let response = ui.interact(
         rect,
         ui.scope_id().with("settings-add-dir"),
-        egui::Sense::click(),
+        if busy {
+            egui::Sense::hover()
+        } else {
+            egui::Sense::click()
+        },
     );
-    let fill = if response.is_pointer_button_down_on() {
-        palette.add_button_fill.gamma_multiply(0.8)
+    let (fill, text_color) = if busy {
+        (
+            palette.add_button_fill.gamma_multiply(0.5),
+            palette.add_button_text.gamma_multiply(0.5),
+        )
+    } else if response.is_pointer_button_down_on() {
+        (
+            palette.add_button_fill.gamma_multiply(0.8),
+            palette.add_button_text,
+        )
     } else if response.hovered() {
-        palette.add_button_fill.gamma_multiply(1.4)
+        (
+            palette.add_button_fill.gamma_multiply(1.4),
+            palette.add_button_text,
+        )
     } else {
-        palette.add_button_fill
+        (palette.add_button_fill, palette.add_button_text)
     };
     let painter = ui.painter();
     painter.rect_filled(rect, egui::CornerRadius::same(ADD_BUTTON_RADIUS), fill);
@@ -964,19 +1014,26 @@ fn draw_add_button(ui: &mut egui::Ui, rect: egui::Rect, palette: &SettingsPalett
         egui::Align2::CENTER_CENTER,
         ADD_DIR_LABEL,
         ui_font::id(ADD_BUTTON_FONT),
-        palette.add_button_text,
+        text_color,
     );
+    if busy {
+        let _ = response.on_hover_cursor(egui::CursorIcon::NotAllowed);
+        None
+    } else {
+        response.clicked().then_some(SettingsAction::AddExclude)
+    }
 }
 
 /// 目录行（40）：文件夹图标 16 + 路径 13pt + 右侧移除 ×14。
-/// 移除只画 hover 视觉，不删除条目（Task 8）。
+/// 移除 × 点击 → [`SettingsAction::RemoveExclude`]（原样路径）；busy 时禁用。
 fn draw_dir_row(
     ui: &mut egui::Ui,
     row: egui::Rect,
     index: usize,
     path: &str,
+    busy: bool,
     palette: &SettingsPalette,
-) {
+) -> Option<SettingsAction> {
     let painter = ui.painter().clone();
     let icon = egui::Rect::from_min_size(
         egui::pos2(row.left() + ROW_PAD_X, row.center().y - FOLDER_ICON / 2.0),
@@ -1007,17 +1064,29 @@ fn draw_dir_row(
     let response = ui.interact(
         remove,
         ui.scope_id().with(("settings-remove-dir", index)),
-        egui::Sense::click(),
+        if busy {
+            egui::Sense::hover()
+        } else {
+            egui::Sense::click()
+        },
     );
-    let color = if response.hovered() || response.is_pointer_button_down_on() {
+    let response = if busy {
+        response.on_hover_cursor(egui::CursorIcon::NotAllowed)
+    } else {
+        response
+    };
+    let color = if busy {
+        palette.remove_icon.gamma_multiply(0.5)
+    } else if response.hovered() || response.is_pointer_button_down_on() {
         palette.text_primary
     } else {
         palette.remove_icon
     };
     draw_remove_icon(&painter, remove, color);
+    (!busy && response.clicked()).then(|| SettingsAction::RemoveExclude(path.to_owned()))
 }
 
-/// 排除目录空态（Task 8 接真实列表前的可见空行）。
+/// 排除目录空态（真实列表为空时显示；加载/错误提示可与之并存）。
 fn draw_excluded_empty(ui: &egui::Ui, row: egui::Rect, palette: &SettingsPalette) {
     draw_text(
         ui,
@@ -1160,6 +1229,9 @@ mod tests {
             recording: None,
             hotkey_error: None,
             excluded: vec!["~/Library".into(), "node_modules".into(), ".git".into()],
+            exclude_busy: false,
+            exclude_busy_list: false,
+            exclude_error: None,
         }
     }
 
@@ -1405,6 +1477,142 @@ mod tests {
         assert!(
             labels.contains(&EXCLUDED_EMPTY),
             "空列表须显示 {EXCLUDED_EMPTY:?};实际 {labels:?}"
+        );
+    }
+
+    /// 添加按钮中心（按钮宽随文案，文字中心即按钮中心）。
+    fn add_button_center(out: &egui::FullOutput) -> egui::Pos2 {
+        text_center(find_text(&all_texts(out), ADD_DIR_LABEL))
+    }
+
+    /// 目录行右侧移除 × 中心（行几何与路径文本同排）。
+    fn remove_button_center(out: &egui::FullOutput, path: &str) -> egui::Pos2 {
+        let row = text_center(find_text(&all_texts(out), path));
+        egui::pos2(
+            SETTINGS_W - CONTENT_PAD.1 - ROW_PAD_X - REMOVE_ICON / 2.0,
+            row.y,
+        )
+    }
+
+    /// 点击「＋ 添加目录…」→ AddExclude（选择器/worker 由设置 pass 落地）。
+    #[test]
+    fn add_button_click_emits_add_exclude() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = layout_test_data();
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let pos = add_button_center(&out);
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(output.actions, vec![SettingsAction::AddExclude]);
+    }
+
+    /// 点击目录行移除 × → RemoveExclude(原文路径)。
+    #[test]
+    fn remove_click_emits_exact_path() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = layout_test_data();
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let pos = remove_button_center(&out, "node_modules");
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::RemoveExclude("node_modules".to_owned())]
+        );
+    }
+
+    /// busy 时添加/移除均禁点（无动作；视觉置灰/NotAllowed 由绘制分支保证）。
+    #[test]
+    fn busy_disables_add_and_remove_actions() {
+        let mut data = layout_test_data();
+        data.exclude_busy = true;
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let add = add_button_center(&out);
+        let remove = remove_button_center(&out, "~/Library");
+
+        let output = click_at(&ctx, &data, add);
+        assert!(
+            output.actions.is_empty(),
+            "busy 时添加不得产生动作:{:?}",
+            output.actions
+        );
+        let output = click_at(&ctx, &data, remove);
+        assert!(
+            output.actions.is_empty(),
+            "busy 时移除不得产生动作:{:?}",
+            output.actions
+        );
+    }
+
+    /// 加载/重扫提示：list →「加载中…」，add/remove →「重扫中…」；均增高 Header。
+    #[test]
+    fn busy_support_line_distinguishes_list_and_rescan() {
+        let baseline = run_body(&layout_test_data());
+        let baseline_dir = text_center(find_text(&all_texts(&baseline), "~/Library")).y;
+
+        let mut data = layout_test_data();
+        data.exclude_busy = true;
+        data.exclude_busy_list = true;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(
+            labels.iter().any(|text| text == EXCLUDE_LOADING),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|text| text == EXCLUDE_RESCANNING));
+        let list_dir = text_center(find_text(&texts, "~/Library")).y;
+        assert!(
+            list_dir > baseline_dir + 10.0,
+            "加载提示须计入 Header 行高:基线 {baseline_dir},加载 {list_dir}"
+        );
+
+        data.exclude_busy_list = false;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(
+            labels.iter().any(|text| text == EXCLUDE_RESCANNING),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|text| text == EXCLUDE_LOADING));
+        let rescan_dir = text_center(find_text(&texts, "~/Library")).y;
+        assert!(rescan_dir > baseline_dir + 10.0);
+    }
+
+    /// 错误提示与 busy/空态可并存：错误文案、重扫提示、「未排除任何目录」同帧可见，
+    /// 两行提示均计入 Header 高度（空态行下移）。
+    #[test]
+    fn exclude_error_and_busy_draw_with_empty_state() {
+        let mut baseline = layout_test_data();
+        baseline.excluded.clear();
+        let baseline_out = run_body(&baseline);
+        let baseline_empty = text_center(find_text(&all_texts(&baseline_out), EXCLUDED_EMPTY)).y;
+
+        let mut data = layout_test_data();
+        data.excluded.clear();
+        data.exclude_busy = true;
+        data.exclude_busy_list = false;
+        data.exclude_error = Some("daemon 未在运行;排除变更需引擎在线".into());
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(
+            labels.iter().any(|text| text.contains("daemon 未在运行")),
+            "错误须原样绘制:{labels:?}"
+        );
+        assert!(labels.iter().any(|text| text == EXCLUDE_RESCANNING));
+        assert!(
+            labels.iter().any(|text| text == EXCLUDED_EMPTY),
+            "空列表 + busy/error 仍须显示空态:{labels:?}"
+        );
+        let empty_y = text_center(find_text(&texts, EXCLUDED_EMPTY)).y;
+        assert!(
+            empty_y > baseline_empty + 20.0,
+            "错误 + 重扫两行提示须增高 Header:基线 {baseline_empty},当前 {empty_y}"
         );
     }
 
