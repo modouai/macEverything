@@ -41,8 +41,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSEvent,
-    NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem, NSPanel, NSResponder, NSScreen, NSView,
+    NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel,
+    NSImage, NSMenu, NSMenuItem, NSPanel, NSResponder, NSScreen, NSView,
     NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
     NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
     NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
@@ -461,22 +461,6 @@ pub fn show_root_window() -> Result<()> {
         f.origin.y
     );
     Ok(())
-}
-
-/// 原生信息提示(阻塞;主线程)。用于 v2.1 未实现入口的占位反馈。
-/// 先激活 App,避免提示框在后台应用里弹出看不到。
-pub fn show_info_alert(title: &str, message: &str) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        log::warn!("show_info_alert 非主线程调用,忽略");
-        return;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    app.activate();
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str(title));
-    alert.setInformativeText(&NSString::from_str(message));
-    alert.addButtonWithTitle(&NSString::from_str("好"));
-    alert.runModal();
 }
 
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。

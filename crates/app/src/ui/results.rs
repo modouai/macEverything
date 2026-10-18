@@ -39,7 +39,7 @@
 use eframe::egui;
 use std::collections::BTreeSet;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::engine_launcher;
 use crate::platform;
@@ -53,9 +53,6 @@ use protocol::{Gap, HitEntry};
 
 /// 查询上限(与悬浮条同口径:协议上限一次取满;product §2「展示前 K 条」的 K)。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
-/// 齿轮点击的 v2.1 提示(不放假入口;短驻留,避免长期占据状态栏)。
-const GEAR_PENDING_NOTE: &str = "设置将在 v2.1 提供";
-const GEAR_NOTE_TTL: Duration = Duration::from_secs(3);
 
 /// 表头列:(排序键, 标题)。顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径。
 const COLUMNS: [(SortKey, &str); 4] = [
@@ -113,11 +110,10 @@ pub struct ResultsState {
     pub input: String,
     /// 瞬时提示(打开失败/查询失败;显示于状态栏)。
     pub status_note: Option<String>,
-    /// 提示是否为错误态(决定状态栏用错误红还是中性文本色)。
-    /// 齿轮 v2.1 提示属信息态:说「设置暂未提供」不是失败。
+    /// 提示是否为错误态(决定状态栏错误红;中性文本色留给非错误提示)。
     pub status_note_is_error: bool,
-    /// 齿轮 v2.1 提示的到期时刻(只对 `GEAR_PENDING_NOTE` 生效,其他提示不设 TTL)。
-    status_note_until: Option<Instant>,
+    /// 齿轮点击的「打开设置」请求(绘制内只置位;共享锁释放后由 App::ui 消费)。
+    pub settings_requested: bool,
     /// 引擎状态快照(status 面;状态栏「索引状态」段)。
     engine: Option<EngineStatus>,
     /// 是否已取过一次引擎状态(区分「未检查」与「引擎未运行」)。
@@ -178,7 +174,7 @@ impl ResultsState {
             input: String::new(),
             status_note: None,
             status_note_is_error: false,
-            status_note_until: None,
+            settings_requested: false,
             engine: None,
             engine_known: false,
             // 启动即显示窗口(dev 形态):首帧补查状态 + 聚焦搜索框。
@@ -202,10 +198,14 @@ impl ResultsState {
     pub fn on_window_shown(&mut self) {
         self.focus_input_pending = true;
         self.status_refresh_pending = true;
-        // 每次唤起从干净状态开始:上次会话的齿轮提示不得跨唤起驻留。
+        // 每次唤起从干净状态开始:上次会话的瞬时提示(如查询失败)不得跨唤起驻留。
         self.status_note = None;
         self.status_note_is_error = false;
-        self.status_note_until = None;
+    }
+
+    /// 消费齿轮的「打开设置」请求(置位发生在结果绘制内,开窗放在共享锁释放后)。
+    pub fn take_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_requested)
     }
 
     /// 托盘缺口项(product §3):唤起完整窗口并展开缺口面板。
@@ -239,16 +239,6 @@ impl ResultsState {
     /// 每帧驱动(App::logic 调用;根窗隐藏期也经 run_logic 收取响应,状态不落后):
     /// 补查状态 → 防抖到期发查询 → 收三路回投(结果/状态/重启)。
     pub fn tick(&mut self, now: Instant) {
-        // 齿轮提示到期清除(其他状态提示不设 TTL;被新提示替换时丢弃到期点)。
-        if self.status_note.as_deref() == Some(GEAR_PENDING_NOTE) {
-            if self.status_note_until.is_some_and(|until| now >= until) {
-                self.status_note = None;
-                self.status_note_is_error = false;
-                self.status_note_until = None;
-            }
-        } else {
-            self.status_note_until = None;
-        }
         // 在途防抖逐帧补排(与悬浮条同款;根因见 `Session::pending_delay`:
         // 同一 pass 里 0ms 立即重绘请求会吞掉 60ms 防抖请求)。
         if let Some(delay) = self.session.pending_delay(now) {
@@ -425,16 +415,10 @@ impl ResultsState {
             .frame(egui::Frame::NONE.fill(palette.window_fill))
             .show(ui, |ui| draw_titlebar(ui, &palette));
         if titlebar.inner {
-            self.show_gear_note(Instant::now());
-            // 提示 TTL 到期需一帧来清除。实测 `request_repaint_after_for` 在根窗
-            // 空闲期不保证唤醒(悬浮条 pass 不会驱动根窗 logic),用短命线程在
-            // 到期点主动 request_repaint(与查询 worker 同一唤醒路径)。
-            let ctx = self.ctx.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(GEAR_NOTE_TTL);
-                ctx.request_repaint_of(egui::ViewportId::ROOT);
-            });
-            log::info!("标题栏齿轮点击:设置窗口未实现(v2.1 提示已落状态栏)");
+            // 只置请求位:本帧仍持共享锁(results.draw 调用方),开窗命令与状态写入
+            // 由 App::ui 在锁释放后经 `take_settings_request` 统一执行。
+            self.settings_requested = true;
+            log::info!("标题栏齿轮点击:请求打开设置窗口");
         }
 
         // —— 顶部:搜索行(52 + 1 分隔线,§3.1/§3.3) ——
@@ -697,13 +681,6 @@ impl ResultsState {
             egui::Stroke::new(window_tokens::WINDOW_STROKE, palette.window_stroke),
             egui::StrokeKind::Inside,
         );
-    }
-
-    /// 齿轮点击的 v2.1 提示:`status_note` + 到期时刻(由 tick 清除)。
-    fn show_gear_note(&mut self, now: Instant) {
-        self.status_note = Some(GEAR_PENDING_NOTE.into());
-        self.status_note_is_error = false; // 信息提示,不套错误红
-        self.status_note_until = Some(now + GEAR_NOTE_TTL);
     }
 
     /// 列头点击:异列切键并按该键自然方向;同列「自然方向 → 反向 → 默认」
@@ -1346,7 +1323,7 @@ fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
 }
 
 /// 标题栏(§3.1/§3.3):左侧 80px 留给原生交通灯(不绘制内容),右端齿轮按钮,
-/// 其余区域为窗口拖拽区。返回齿轮是否被点击(调用方落 v2.1 提示)。
+/// 其余区域为窗口拖拽区。返回齿轮是否被点击(调用方置「打开设置」请求)。
 ///
 /// 交通灯是原生 NSWindow 按钮,浮在内容之上;此处只负责不遮挡它们的视觉。
 fn draw_titlebar(ui: &mut egui::Ui, palette: &FullWindowPalette) -> bool {
@@ -1692,7 +1669,7 @@ fn draw_status_row(
         "重启引擎"
     });
     let note = st.status_note.as_deref();
-    // 信息提示(齿轮 v2.1)走中性文本色;打开/查询失败才用错误红。
+    // 打开/查询失败走错误红;非错误提示(预留)用中性文本色。
     let note_color = if st.status_note_is_error {
         error
     } else {
@@ -1757,7 +1734,7 @@ fn draw_status_row(
             action.restart_clicked = resp.clicked();
         }
     }
-    // 瞬时提示(打开失败/查询失败/齿轮 v2.1):11pt,按左区剩余宽截断。
+    // 瞬时提示(打开失败/查询失败):11pt,按左区剩余宽截断。
     if let (Some(rect), Some(note)) = (layout.note, note) {
         draw_status_text(ui, rect, note, note_color);
     }
@@ -3061,42 +3038,17 @@ mod tests {
         assert!(st.status_note_is_error, "重启失败是错误态");
     }
 
-    /// 齿轮 v2.1 提示:3s 到期由 tick 清除;窗口重新唤起立即清除;其他提示不被 TTL 误清。
+    /// 齿轮请求:置位可被 `take_settings_request` 取走,且消费一次即清
+    /// (后续帧不得重复开窗)。
     #[test]
-    fn gear_note_expires_and_window_shown_clears() {
+    fn gear_sets_and_take_consumes_settings_request() {
         let ctx = egui::Context::default();
         let mut st = ResultsState::new(ctx, daemon_paths_for_test());
-        let t0 = Instant::now();
-        st.show_gear_note(t0);
-        assert_eq!(st.status_note.as_deref(), Some(GEAR_PENDING_NOTE));
-        assert!(!st.status_note_is_error, "齿轮提示是信息态,不套错误红");
-        assert_eq!(st.status_note_until, Some(t0 + GEAR_NOTE_TTL));
+        assert!(!st.take_settings_request(), "初始无设置请求");
 
-        // 未到期:保留
-        st.tick(t0 + GEAR_NOTE_TTL - Duration::from_millis(1));
-        assert_eq!(st.status_note.as_deref(), Some(GEAR_PENDING_NOTE));
-
-        // 到期:tick 清除
-        st.tick(t0 + GEAR_NOTE_TTL);
-        assert_eq!(st.status_note, None);
-        assert!(!st.status_note_is_error);
-        assert_eq!(st.status_note_until, None);
-
-        // 重新唤起:立即清除,不等 TTL
-        st.show_gear_note(t0);
-        st.on_window_shown();
-        assert_eq!(st.status_note, None);
-        assert!(!st.status_note_is_error);
-        assert_eq!(st.status_note_until, None);
-
-        // 其他状态提示(非齿轮文案)不受 TTL 影响:到期点被丢弃,文案保留到业务清除
-        st.status_note = Some("查询失败".into());
-        st.status_note_is_error = true;
-        st.status_note_until = Some(t0); // 模拟遗留到期点
-        st.tick(t0 + GEAR_NOTE_TTL * 2);
-        assert_eq!(st.status_note.as_deref(), Some("查询失败"));
-        assert!(st.status_note_is_error, "错误提示保持错误态");
-        assert_eq!(st.status_note_until, None);
+        st.settings_requested = true; // draw_impl 齿轮命中分支的置位
+        assert!(st.take_settings_request(), "置位后应取到设置请求");
+        assert!(!st.take_settings_request(), "消费即清,不重复开窗");
     }
 
     /// 状态栏几何(§3.6):底 = 1px 分隔线 + 28 内容;右侧缺口徽标圆角 6、

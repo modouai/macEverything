@@ -289,15 +289,6 @@ pub fn popup_menu(
     }
 }
 
-/// 原生信息提示(主线程;用于 v2.1 未实现入口的占位反馈)。
-/// 非 macOS:no-op(stub 只为保持 facade 可编译)。
-pub fn show_info_alert(title: &str, message: &str) {
-    #[cfg(target_os = "macos")]
-    mac::show_info_alert(title, message);
-    #[cfg(not(target_os = "macos"))]
-    let _ = (title, message);
-}
-
 /// 注册托盘菜单(install 期一次;`Menu::ns_menu()` 的裸指针,按屏自弹用)。
 /// 非 macOS:no-op(本仓交付面仅 macOS,stub 只为保持 facade 可编译)。
 pub fn register_tray_menu(ns_menu: *mut std::ffi::c_void) {

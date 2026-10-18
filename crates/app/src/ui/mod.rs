@@ -1,7 +1,8 @@
-//! UI 层:双视口壳。
+//! UI 层:三视口壳。
 //!
 //! 主视口(ROOT)= 完整结果窗口(`ui/results.rs`,Task 17:表格虚拟化/列排序/多选);
-//! 第二视口 = 悬浮条(Task 12 UI;Task 14 接平台层:跨 Space/浮动级别/失焦隐藏/多屏定位)。
+//! 第二视口 = 悬浮条(Task 12 UI;Task 14 接平台层:跨 Space/浮动级别/失焦隐藏/多屏定位);
+//! 第三视口 = 设置窗口(v2.1 Task 1:620×600 固定,deferred + 常驻,骨架见 `ui/settings.rs`)。
 //!
 //! ## 菜单栏托盘(Task 16)
 //!
@@ -67,6 +68,7 @@ pub mod mascot;
 pub mod menu_actions;
 pub mod palette;
 pub mod results;
+pub mod settings;
 pub mod theme;
 pub mod tokens;
 pub mod window_tokens;
@@ -113,10 +115,10 @@ fn palette_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("palette")
 }
 
-/// 全局字号基准(两视口共用;2026-10-16 辉哥实机反馈「整体字号偏小,放大两号」)。
+/// 全局字号基准(各视口共用;2026-10-16 辉哥实机反馈「整体字号偏小,放大两号」)。
 ///
 /// 字号基准**单点设置**:未来「自定义字号」设置项(v2.1 候选)只需改这一处,
-/// 悬浮条与完整窗口自动同基准。egui 默认档(egui-0.37 style.rs:1524 实测):
+/// 悬浮条、完整窗口与设置窗口自动同基准。egui 默认档(egui-0.37 style.rs:1524 实测):
 /// Small 9 / Body 13 / Button 13 / Heading 18 / Monospace 13 → 统一 +2:
 /// 11 / 15 / 15 / 20 / 15。幂等(写死目标值,不累加);两主题都写
 /// (`all_styles_mut`——egui 的 Style 按主题各存一份,只改当前主题会在切换后丢)。
@@ -246,6 +248,29 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     }
 }
 
+/// 打开设置窗口(完整窗口齿轮/托盘「设置…」共用):置开合态 + 命令显示/聚焦 +
+/// 排设置视口与 ROOT 两帧。`send_viewport_cmd` 只入 egui 队列、无 AppKit 调用
+/// (可在短锁内发;锁纪律见「悬浮条显隐」段)。
+fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
+    let was_open = {
+        let mut s = lock_shared(shared);
+        let was_open = s.settings.open;
+        s.settings.open = true;
+        was_open
+    };
+    ctx.send_viewport_cmd_to(
+        settings::viewport_id(),
+        egui::ViewportCommand::Visible(true),
+    );
+    ctx.send_viewport_cmd_to(settings::viewport_id(), egui::ViewportCommand::Focus);
+    ctx.request_repaint_of(settings::viewport_id());
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    log::info!(
+        "打开设置窗口(此前{})",
+        if was_open { "已打开" } else { "隐藏" }
+    );
+}
+
 /// 打开完整窗口(托盘「打开完整窗口」/「缺口面板」/⌥⇧F 直达共用):
 /// 聚焦搜索框 + 补查引擎状态后原生唤到前台(原生调用在锁外,见锁纪律)。
 fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
@@ -280,7 +305,7 @@ fn palette_builder() -> egui::ViewportBuilder {
 pub struct App {
     /// 二次启动唤起通道(app.sock 监听线程 → 主线程;main 接线)。
     incoming: Receiver<Incoming>,
-    /// 两视口共享状态(悬浮条回调与根视口逻辑共持同一份)。
+    /// 各视口共享状态(悬浮条/设置回调与根视口逻辑共持同一份)。
     shared: Arc<Mutex<Shared>>,
     /// 运行期系统字体回退留痕一次(`ui()`;诊断用)。
     fonts_logged: bool,
@@ -303,12 +328,14 @@ pub struct App {
     window_size: WindowSizeTracker,
 }
 
-/// 两视口共享的运行时状态。
+/// 各视口共享的运行时状态。
 pub struct Shared {
     /// 悬浮条状态与查询会话(Task 12)。
     pub palette: palette::PaletteState,
     /// 完整窗口(根视口)状态与查询会话(Task 17;与悬浮条各自防抖/代际)。
     pub results: results::ResultsState,
+    /// 设置窗口开合态(v2.1 Task 1 骨架;控件由后续任务接入)。
+    pub settings: settings::SettingsState,
     /// 主题跟随(节流 + 已应用值;Task 13 起为局部状态,Task 14 收进共享态)。
     pub theme: theme::ThemeFollow,
     /// 悬浮条可见标志(真源;排帧门禁与按钮态都读它)。
@@ -345,6 +372,7 @@ impl App {
                 hotkey_note,
             ),
             results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
+            settings: settings::SettingsState::default(),
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
             palette_visible: false, // 启动隐藏(产品形态:两窗皆隐,仅菜单栏图标)
         }));
@@ -482,9 +510,9 @@ impl App {
                     self.open_results(ctx);
                 }
                 TrayMsg::OpenSettings => {
-                    // 设置窗口属 v2.1:v2.0 用原生提示占位,不放假入口。
-                    log::info!("托盘:设置入口(v2.1 未实现,显示占位提示)");
-                    platform::show_info_alert("macEverything", "设置将在 v2.1 提供");
+                    // 设置窗口(v2.1 Task 1):与完整窗口齿轮同一开窗路径。
+                    log::info!("托盘:打开设置");
+                    open_settings(&self.shared, ctx);
                 }
                 TrayMsg::ToggleAutostart => {
                     // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按真实注册结果校准——
@@ -674,6 +702,13 @@ impl eframe::App for App {
             results.draw(ui, frame, palette.icons_mut());
         }
 
+        // 齿轮点击只置请求位(results 绘制内不重入共享锁);锁释放后统一开窗。
+        let settings_requested = self.shared().results.take_settings_request();
+        if settings_requested {
+            log::info!("齿轮:打开设置窗口");
+            open_settings(&self.shared, &ctx);
+        }
+
         // 悬浮条第二视口:常驻注册(deferred;隐藏不销毁,L1/L2 选路 A)。
         // 回调在悬浮条自己的 pass 里跑(根窗被完全遮挡时照常渲染)。
         let shared = Arc::clone(&self.shared);
@@ -682,9 +717,17 @@ impl eframe::App for App {
             palette_builder(),
             move |ui, _class| draw_palette(ui, &shared),
         );
+
+        // 设置第三视口:常驻注册(deferred;与悬浮条同模式,隐藏走 Visible(false))。
+        let shared = Arc::clone(&self.shared);
+        ctx.show_viewport_deferred(
+            settings::viewport_id(),
+            settings::builder(),
+            move |ui, _class| settings::draw(ui, &shared),
+        );
     }
 
-    /// 清屏色 = 全透明(两视口共用;eframe 默认 `(12,12,12,180)` 半透明黑)。
+    /// 清屏色 = 全透明(各视口共用;eframe 默认 `(12,12,12,180)` 半透明黑)。
     ///
     /// 悬浮条圆角外区域靠这一层透出桌面:eframe 默认色会把整圈染成暗色
     /// (实测圆角外 (20,21,24) = 默认色叠桌面 (41,44,53) 的合成——透明已生效但
