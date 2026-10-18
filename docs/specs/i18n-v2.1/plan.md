@@ -998,6 +998,8 @@ git commit -m "feat(app): 设置页语言下拉与即时切换"
 
 ```rust
     // 悬浮条
+    // 注：悬浮条空词按视觉规格只有光标（visual.md:276），没有可见 hint；
+    // 此条供完整窗口搜索框（Task 4）使用；悬浮条的字体预热诊断也复用它。
     search_placeholder: "搜索文件…" / "Search files…",
     open_in_full_window: "在完整窗口中打开（⌥↵）" / "Open in Full Window (⌥↵)",
     empty_start: "输入关键词开始搜索" / "Type to search",
@@ -1229,10 +1231,11 @@ impl BadgeText {
 
 | 原字面量 | 替换为 |
 |---|---|
-| `"搜索文件…"`（hint） | `i18n::s().search_placeholder` |
 | `"在完整窗口中打开（⌥↵）"` | `i18n::s().open_in_full_window` |
 | `("无匹配项", "换个关键词试试")` | `(i18n::s().empty_no_match, i18n::s().empty_no_match_sub)` |
 | `("输入关键词开始搜索", "可搜文件名，也可搜路径")` | `(i18n::s().empty_start, i18n::s().empty_start_sub)` |
+
+> 悬浮条空词按视觉规格**只有光标、没有可见 hint**（`docs/specs/floatbar-visual/visual.md:276`），保持 `hint_text("")` 不变；`search_placeholder` 的可见使用点是完整窗口搜索框（Task 4），Task 3 中仅字体预热诊断引用它。
 
 - [ ] **Step 8: 设置页热键 note 渲染**
 
