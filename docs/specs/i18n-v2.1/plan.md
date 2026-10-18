@@ -1782,6 +1782,8 @@ git commit -m "feat(app): 托盘与原生层双语"
     hotkey_duplicate: "该快捷键已用于另一个功能" / "This shortcut is already used for another feature",
     hotkey_saved_but_save_failed: "快捷键已生效,但设置保存失败" / "Shortcut applied, but settings could not be saved",
     hotkey_reset_but_save_failed: "快捷键已恢复默认,但设置保存失败" / "Default shortcut restored, but settings could not be saved",
+    hotkey_global_unavailable: "全局热键不可用" / "Global shortcuts unavailable",
+    hotkey_restore_other_failed: "恢复另一快捷键 {name} 失败(可能被占用)" / "Failed to restore the other shortcut {name} (it may be in use)",
     // 悬浮条打开失败（应用自产）
     palette_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
     palette_open_failed: "打开失败" / "Failed to open",
@@ -1830,7 +1832,10 @@ pub fn validate(hotkey: HotKey) -> Result<(), HotkeyError> { /* 原逻辑，返�
 - `RESET_FAILED_PREFIX` → `i18n::s().hotkey_reset_failed`（使用处格式化为 `format!("{}: {err}", ...)`）。
 - `DUPLICATE_HOTKEY_MESSAGE` → `i18n::s().hotkey_duplicate`（常量删除；`ui/settings_view` 查重处改为调用目录）。
 - 注册失败文案（`"注册失败(可能被系统或其他应用占用): {err}"`）→ `format!("{}: {err}", i18n::s().hotkey_register_failed)`。
+- manager 缺失文案 `"全局热键不可用"` → `i18n::s().hotkey_global_unavailable`。
+- 回滚路径 `"恢复另一快捷键 {} 失败(可能被占用): {err}"` → `i18n::fill(i18n::s().hotkey_restore_other_failed, &[("name", &display_name(other_key))])` + `: {err}`。
 - `ui/mod.rs` 的“已生效/已恢复默认但保存失败”改为目录条目。
+- `BadgeText::Raw` 无生产消费者时删除该变体（布局测试改用 `BadgeText::Open(OpenError::Failed(long))`），不要保留 `#[allow(dead_code)]`。
 
 - [ ] **Step 4: 引擎拉起错误类型化**
 
