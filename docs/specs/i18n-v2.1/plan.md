@@ -1773,6 +1773,7 @@ git commit -m "feat(app): 托盘与原生层双语"
     engine_locate_app_failed: "定位 App 可执行文件失败" / "Could not locate the app executable",
     engine_start_failed: "启动引擎失败" / "Failed to start the engine",
     engine_start_timeout: "引擎进程已拉起,但未能连接引擎 socket" / "The engine process started but did not accept connections",
+    engine_start_timeout_hint: "请查看 {log} 了解启动失败原因" / "See {log} for details",
     engine_restart_failed: "引擎重启失败" / "Failed to restart the engine",
     // 热键校验/运行时错误（一次性）
     hotkey_needs_modifier: "需包含修饰键" / "A modifier key is required",
@@ -1786,7 +1787,7 @@ git commit -m "feat(app): 托盘与原生层双语"
     hotkey_restore_other_failed: "恢复另一快捷键 {name} 失败(可能被占用)" / "Failed to restore the other shortcut {name} (it may be in use)",
     hotkey_all_candidates_unavailable: "候选快捷键均不可用" / "No shortcut candidates are available",
     // 悬浮条结果行 / 页脚
-    palette_action_enter: "进入" / "Open Folder",
+    palette_action_enter: "进入" / "Enter",
     palette_action_open: "打开" / "Open",
     palette_footer_hide: "隐藏" / "Hide",
     palette_footer_full_window: "完整窗口" / "Full Window",
@@ -1855,7 +1856,7 @@ pub enum LaunchError {
     NotFound { tried: Vec<PathBuf> },
     LocateApp,
     Start,
-    Timeout,
+    Timeout { log: PathBuf },
 }
 
 impl std::fmt::Display for LaunchError {
@@ -1872,7 +1873,14 @@ impl std::fmt::Display for LaunchError {
             }
             Self::LocateApp => f.write_str(i18n::s().engine_locate_app_failed),
             Self::Start => f.write_str(i18n::s().engine_start_failed),
-            Self::Timeout => f.write_str(i18n::s().engine_start_timeout),
+            Self::Timeout { log } => {
+                write!(f, "{}: ", i18n::s().engine_start_timeout)?;
+                let log = log.display().to_string();
+                f.write_str(&i18n::fill(
+                    i18n::s().engine_start_timeout_hint,
+                    &[("log", log.as_str())],
+                ))
+            }
         }
     }
 }
@@ -1923,7 +1931,7 @@ impl OpenError {
 - `BadgeText` 增加 `Open(OpenError)`；`BadgeText::text` 映射到 `error.text()`。
 - `open_path` 返回 `Result<(), OpenError>`（文件不存在 → `FileMissing`；启动失败 → `Failed(detail)`），
   `open_selected` 改为 `Badge::error(BadgeText::Open(err))`。
-- `BadgeText::Raw` 只保留给真正外部/技术文本；更新其文档注释。
+- `BadgeText::Raw` 已删除（无生产消费者）；不要恢复该变体或 `#[allow(dead_code)]`。
 - `results.rs` 的打开失败路径同样使用 `OpenError::text()`（或给 `OpenError` 实现 `Display`），
   不要继续把中文串塞进 `StatusNote::Raw`。
 - 测试：`with_lang(En)` 下 `FileMissing` 文案为 `File not found; the index may be out of date`；
@@ -1942,6 +1950,9 @@ impl OpenError {
     }
     ```
   - 测试：`action_hint(true/false)`、页脚标签与 `total_items(0/1/2)` 的 zh/en 文案。
+  - 英文宽度断言：`text_w(action_hint(true), FONT_META) <= ACTION_HINT_W`；页脚在 `PANEL_MIN_W` 下
+    「计数 + 最后一组」必须放得下（用实测 `text_w` 计算，不写死 120px）。
+  - `open_path` 文档改为「由 `OpenError::text()` 在绘制时按当前语言渲染」。
 
 - [ ] **Step 6: 跑测试并修断言**
 
