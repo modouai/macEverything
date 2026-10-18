@@ -1684,6 +1684,17 @@ fn footer_groups() -> [(&'static str, &'static str); 4] {
     ]
 }
 
+/// 结果行文本列右缘与动作提示左缘（两者之间保留 6px）。
+///
+/// `hint_measured` = 以绘制字体实测的提示宽；文本列预留宽取实测宽与
+/// [`tk::ACTION_HINT_W`] 的较大者，避免大字号下提示压到文件名。
+fn result_row_text_and_hint_rights(rect_right: f32, hint_measured: f32) -> (f32, f32) {
+    let reserve = hint_measured.max(tk::ACTION_HINT_W);
+    let hint_left = rect_right - tk::ROW_PAD_X - hint_measured;
+    let text_right = rect_right - tk::ROW_PAD_X - reserve - 6.0;
+    (text_right, hint_left)
+}
+
 /// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
 /// 动作提示 12pt 仅选中行。悬停 = 选中态约 50% 强度；鼠标移动不改键盘选中。
 fn draw_result_row(
@@ -1750,12 +1761,12 @@ fn draw_result_row(
     // 文本列（左对齐；`Ui::put` 是居中布局，不能用——改用定宽子 Ui 顶部左排）
     let tx = icon_rect.max.x + tk::ROW_INNER_GAP;
     let hint = action_hint(e.is_dir);
-    let hint_w = if is_sel {
-        text_w(ui, hint, FONT_META).max(tk::ACTION_HINT_W)
+    // 未选中行不画提示：沿用不含提示预留的右缘；选中行与提示共用同一布局 helper。
+    let (right, hint_left) = if is_sel {
+        result_row_text_and_hint_rights(rect.max.x, text_w(ui, hint, FONT_META))
     } else {
-        0.0
+        (rect.max.x - tk::ROW_PAD_X - 6.0, rect.max.x - tk::ROW_PAD_X)
     };
-    let right = rect.max.x - tk::ROW_PAD_X - hint_w - 6.0;
     let col = egui::Rect::from_min_max(
         egui::pos2(tx, rect.center().y - 18.0),
         egui::pos2(right, rect.center().y + 18.0),
@@ -1786,9 +1797,10 @@ fn draw_result_row(
     );
     if is_sel {
         // 动作提示：文件「打开」/ 目录「进入」（协议 HitEntry.is_dir 分流）。
+        // 左缘由 helper 按实测宽给出，区间为 `hint_left..rect.max.x − ROW_PAD_X`。
         row_ui.painter().text(
-            egui::pos2(rect.max.x - tk::ROW_PAD_X, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
+            egui::pos2(hint_left, rect.center().y),
+            egui::Align2::LEFT_CENTER,
             hint,
             font(FONT_META),
             t.action_hint,
@@ -2012,34 +2024,109 @@ mod tests {
         }
     }
 
-    /// 动作提示按实测宽动态预留：Normal / Large 倍率下都覆盖文案宽。
+    /// 动作提示布局与绘制共用 helper：文本列与提示间固定 6px，
+    /// 1.15 倍率下提示左缘按实测宽定位，且提示完整绘制不省略。
     #[test]
-    fn action_hint_width_covers_supported_scales() {
+    fn action_hint_layout_keeps_six_px_gap_and_uses_measured_width() {
+        fn collect_texts(shape: &egui::Shape, out: &mut Vec<egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_texts(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         i18n::with_lang(i18n::Lang::En, || {
             for scale in [1.0, 1.15] {
                 ui_font::with_test_scale(scale, || {
                     let ctx = egui::Context::default();
                     let raw = egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
-                            egui::pos2(0.0, 0.0),
+                            egui::Pos2::ZERO,
                             egui::vec2(PANEL_W, 200.0),
                         )),
                         ..Default::default()
                     };
+                    let mut layout = None;
                     let mut out = ctx.run_ui(raw, |ui| {
-                        let measured = text_w(ui, action_hint(true), FONT_META);
-                        // 与 draw_result_row 同口径的动态预留。
-                        let reserved = measured.max(tk::ACTION_HINT_W);
-                        assert!(
-                            measured <= reserved,
-                            "scale {scale}: 提示实测宽 {measured} 超过预留 {reserved}"
+                        // 超长文件名强制截断：其换行宽即文本列宽（生产 helper 的产物）。
+                        let entry = HitEntry {
+                            name: format!("{}.md", "very-long-file-name-".repeat(20)),
+                            path: "/tmp/report.md".into(),
+                            size: None,
+                            mtime: None,
+                            is_dir: true,
+                        };
+                        // 真实绘制一行选中行；提示几何须与 helper 完全一致。
+                        let _ = draw_result_row(
+                            ui,
+                            &entry,
+                            true,
+                            &tk::palette(true),
+                            0.0,
+                            PANEL_W,
+                            None,
                         );
+                        let hint = action_hint(true);
+                        let measured = text_w(ui, hint, FONT_META);
+                        // 行矩形右缘 = panel_x + LIST_SIDE_PAD + (panel_w − 2×LIST_SIDE_PAD)。
+                        let rect_right = PANEL_W - tk::LIST_SIDE_PAD;
+                        let (text_right, hint_left) =
+                            result_row_text_and_hint_rights(rect_right, measured);
                         assert!(
-                            reserved >= tk::ACTION_HINT_W,
-                            "scale {scale}: 预留不得低于固定下限"
+                            text_right <= hint_left - 6.0 + 0.01,
+                            "scale {scale}: 文本右缘 {text_right} 与提示左缘 {hint_left} \
+                             之间不足 6px"
                         );
+                        layout = Some((measured, text_right, hint_left, rect_right));
                     });
                     out.textures_delta.clear();
+                    let (measured, text_right, hint_left, rect_right) = layout.expect("布局未运行");
+
+                    let mut texts = Vec::new();
+                    for clipped in &out.shapes {
+                        collect_texts(&clipped.shape, &mut texts);
+                    }
+                    // 文本列真实右缘：由截断文件名的换行宽反推，验证生产确实用了 helper。
+                    let name = texts
+                        .iter()
+                        .find(|text| text.galley.text().starts_with("very-long-file-name-"))
+                        .expect("须绘制文件名");
+                    assert!(name.galley.elided, "scale {scale}: 超长文件名须截断");
+                    let painted_text_right = name.pos.x + name.galley.job.wrap.max_width;
+                    assert!(
+                        (painted_text_right - text_right).abs() <= 0.5,
+                        "scale {scale}: 文本列实际右缘 {painted_text_right} 与 helper 的 \
+                         {text_right} 不一致"
+                    );
+
+                    let painted = texts
+                        .iter()
+                        .find(|text| text.galley.text() == action_hint(true))
+                        .expect("选中行须绘制动作提示");
+                    assert!(!painted.galley.elided, "scale {scale}: 动作提示不得被省略");
+                    assert!(
+                        (painted.galley.size().x - measured).abs() <= 0.01,
+                        "scale {scale}: 实测宽 {measured} 与绘制宽 {} 不一致",
+                        painted.galley.size().x
+                    );
+                    assert!(
+                        (painted.pos.x - hint_left).abs() <= 0.5,
+                        "scale {scale}: 提示绘制左缘 {} 须与 helper 的 {hint_left} 一致",
+                        painted.pos.x
+                    );
+                    if scale > 1.0 {
+                        // 用真实绘制位置（而非 helper 返回值）证明左缘由实测宽决定。
+                        assert!(
+                            (painted.pos.x - (rect_right - tk::ROW_PAD_X - measured)).abs() <= 0.5,
+                            "scale {scale}: 提示绘制左缘 {} 须由实测宽 {measured} 决定",
+                            painted.pos.x
+                        );
+                    }
                 });
             }
         });

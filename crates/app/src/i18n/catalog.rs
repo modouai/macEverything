@@ -59,7 +59,7 @@ catalog! {
     exclude_rescanning: "重扫中…" / "Rescanning…",
     // 快捷键录制
     recording_prompt: "按下快捷键…" / "Press shortcut…",
-    recording_hint: "按 Esc 或点击别处取消,Backspace 恢复默认" / "Press Esc or click elsewhere to cancel; Backspace restores the default",
+    recording_hint: "按 Esc 或点击别处取消,Backspace 恢复默认" / "Press Esc or click elsewhere to cancel recording; Backspace restores the default",
     recording_hint_hover: "按 Esc 或点击别处取消录制,Backspace 恢复默认" / "Press Esc or click elsewhere to cancel recording; Backspace restores the default",
     keycap_hover_record: "点击录制快捷键" / "Click to record shortcut",
     keycap_hover_rerecord: "点击改为录制此快捷键" / "Click to record a new shortcut",

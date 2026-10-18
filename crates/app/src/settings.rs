@@ -227,6 +227,23 @@ mod tests {
         assert_eq!(f.font_size, FontSize::Large, "未知语言不得拖垮其它字段");
     }
 
+    /// 非字符串语言值（数字/布尔）也按跟随系统处理，且不重置同文件的其它字段。
+    #[test]
+    fn non_string_language_values_fall_back_without_resetting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = path(dir.path());
+
+        std::fs::write(&p, "font_size = \"large\"\nlanguage = 1\n").unwrap();
+        let f = load(dir.path());
+        assert_eq!(f.language, LanguageSetting::System);
+        assert_eq!(f.font_size, FontSize::Large, "数字语言不得重置整个文件");
+
+        std::fs::write(&p, "font_size = \"large\"\nlanguage = true\n").unwrap();
+        let f = load(dir.path());
+        assert_eq!(f.language, LanguageSetting::System);
+        assert_eq!(f.font_size, FontSize::Large, "布尔语言不得重置整个文件");
+    }
+
     #[test]
     fn language_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

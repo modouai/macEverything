@@ -793,10 +793,10 @@ impl App {
                     (file, s.settings.data_dir.clone())
                 };
                 // 保存与运行时调用都不持共享锁；失败只留内联错误，键保持生效。
+                // 原始错误只进日志，界面仅展示当前语言的句子。
                 let save_error = store::save(&data_dir, &file).err().map(|err| {
-                    let message = format!("{}: {err:#}", i18n::s().hotkey_saved_but_save_failed);
-                    log::warn!("{message}");
-                    message
+                    log::warn!("快捷键 {slot:?} 已生效,但设置保存失败: {err:#}");
+                    i18n::s().hotkey_saved_but_save_failed.to_owned()
                 });
                 let saved = save_error.is_none();
                 if let Some(message) = save_error {
@@ -842,10 +842,10 @@ impl App {
                     (file, s.settings.data_dir.clone())
                 };
                 // 保存与运行时调用都不持共享锁；失败只留内联错误，默认键保持生效。
+                // 原始错误只进日志，界面仅展示当前语言的句子。
                 let save_error = store::save(&data_dir, &file).err().map(|err| {
-                    let message = format!("{}: {err:#}", i18n::s().hotkey_reset_but_save_failed);
-                    log::warn!("{message}");
-                    message
+                    log::warn!("快捷键 {slot:?} 已恢复默认,但设置保存失败: {err:#}");
+                    i18n::s().hotkey_reset_but_save_failed.to_owned()
                 });
                 let saved = save_error.is_none();
                 if let Some(message) = save_error {

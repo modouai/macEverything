@@ -558,6 +558,10 @@ git commit -m "feat(app): 设置窗口三组五项布局"
 
 ## Task 5: 开机自启 + 语言占位 + 字号选择生效
 
+> **历史说明（i18n v2.1 回填）**：本任务中的「语言占位」是当时的阶段性方案，已被
+> [`docs/specs/i18n-v2.1/`](../i18n-v2.1/) 的实际交付取代（见其 design/plan）；下文
+> 占位描述仅保留为历史记录，不代表当前实现。
+
 **Files:**
 - Modify: `crates/app/src/ui/settings.rs`（视口/运行期状态/行为）
 - Create: `crates/app/src/ui/settings_view.rs`（纯视图 + headless 测试）

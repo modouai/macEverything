@@ -602,6 +602,12 @@ impl SettingsState {
         self.language_error = save_error;
     }
 
+    /// 任一设置保存成功：清掉两类保存失败内联错误，避免旧错误跨设置常驻。
+    pub(crate) fn clear_save_errors(&mut self) {
+        self.font_error = None;
+        self.language_error = None;
+    }
+
     /// 语言切换后请求 App 刷新托盘文案（App::logic 消费）。
     pub(crate) fn request_tray_relabel(&mut self) {
         self.tray_relabel_pending = true;
@@ -926,10 +932,14 @@ fn apply_font_size(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, size: FontS
         SettingsError::SaveFailed
     });
 
-    // 4. 设置快照/选中态与运行期倍率一致。
+    // 4. 设置快照/选中态与运行期倍率一致；成功保存清掉两类陈旧保存错误。
     {
         let mut s = lock_shared(shared);
+        let saved = save_error.is_none();
         s.settings.set_font_size_result(size, save_error);
+        if saved {
+            s.settings.clear_save_errors();
+        }
     }
     log::info!("设置字号 → {:?}(scale {:.2})", size, size.scale());
 
@@ -939,30 +949,48 @@ fn apply_font_size(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, size: FontS
     ctx.request_repaint_of(viewport_id());
 }
 
+/// 语言切换的纯编排：解析有效语言 → 写入设置快照 → 落盘并映射错误。
+///
+/// 不触碰全局语言/共享状态/重绘，供单测直接验证；`apply_language` 只负责副作用。
+fn plan_language_change(
+    setting: LanguageSetting,
+    preferred: &[String],
+    mut file: SettingsFile,
+    save: impl FnOnce(&SettingsFile) -> Result<(), String>,
+) -> (crate::i18n::Lang, SettingsFile, Option<LanguageError>) {
+    let lang = crate::i18n::resolve_language(setting, preferred);
+    file.language = setting;
+    let error = save(&file).err().map(|_| LanguageError::SaveFailed);
+    (lang, file, error)
+}
+
 /// 语言即时生效：解析 → 全局切换 → 落盘（失败仅内联留痕）→ 重绘三窗 + 托盘刷新标记。
 fn apply_language(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, setting: LanguageSetting) {
     let preferred = platform::preferred_languages().unwrap_or_else(|err| {
         log::warn!("读取系统语言失败,按简体中文: {err}");
         Vec::new()
     });
-    let lang = crate::i18n::resolve_language(setting, &preferred);
-    crate::i18n::set_lang(lang);
 
-    let (mut file, data_dir) = {
+    let (file, data_dir) = {
         let s = lock_shared(shared);
         (s.settings.file.clone(), s.settings.data_dir.clone())
     };
-    file.language = setting;
-
-    let save_error = store::save(&data_dir, &file).err().map(|err| {
-        let detail = format!("{err:#}");
-        log::warn!("语言 {setting:?} 已应用,但设置保存失败:{detail}");
-        LanguageError::SaveFailed
+    let (lang, _file, save_error) = plan_language_change(setting, &preferred, file, |file| {
+        store::save(&data_dir, file).map_err(|err| {
+            let detail = format!("{err:#}");
+            log::warn!("语言 {setting:?} 已应用,但设置保存失败:{detail}");
+            detail
+        })
     });
+    crate::i18n::set_lang(lang);
 
     {
         let mut s = lock_shared(shared);
+        let saved = save_error.is_none();
         s.settings.set_language_result(setting, save_error);
+        if saved {
+            s.settings.clear_save_errors();
+        }
         s.settings.clear_transient_messages();
         s.settings.request_tray_relabel();
         s.results.clear_transient_messages();
@@ -1798,10 +1826,14 @@ mod tests {
         let committed = alt_k();
         let next = hotkey_snapshot(Some(committed), None);
         let file = state.commit_recorded_hotkey(HotkeySlot::Palette, committed, next.clone());
-        let err = crate::settings::save(&state.data_dir, &file).unwrap_err();
+        assert!(
+            crate::settings::save(&state.data_dir, &file).is_err(),
+            "目标路径被目录占用须保存失败"
+        );
+        // 界面只展示本地化句子；原始错误只进日志（与 ui/mod.rs 保存路径一致）。
         state.hotkey_save_failed(
             HotkeySlot::Palette,
-            format!("{}: {err:#}", i18n::s().hotkey_saved_but_save_failed),
+            i18n::s().hotkey_saved_but_save_failed.to_owned(),
         );
 
         assert_eq!(
@@ -1811,13 +1843,13 @@ mod tests {
         );
         assert_eq!(state.file.palette_hotkey, Some(committed));
         assert_eq!(state.recording, None);
-        assert!(
-            state.hotkey_error.as_ref().is_some_and(|(slot, message)| {
-                *slot == HotkeySlot::Palette
-                    && message.contains(i18n::s().hotkey_saved_but_save_failed)
-            }),
-            "保存失败须落内联错误:{:?}",
-            state.hotkey_error
+        assert_eq!(
+            state.hotkey_error,
+            Some((
+                HotkeySlot::Palette,
+                i18n::s().hotkey_saved_but_save_failed.to_owned()
+            )),
+            "保存失败须落本地化内联文案"
         );
     }
 
@@ -2150,6 +2182,70 @@ mod tests {
         state.set_language_result(LanguageSetting::ZhHans, None);
         assert_eq!(state.file.language, LanguageSetting::ZhHans);
         assert!(state.language_error.is_none(), "保存成功须清错误");
+    }
+
+    /// 成功保存清两类旧错误；失败只落各自类型（不误清另一项）。
+    #[test]
+    fn save_success_clears_both_errors_and_failure_sets_only_its_own() {
+        let mut state = test_state();
+        state.set_font_size_result(FontSize::Large, Some(SettingsError::SaveFailed));
+        state.set_language_result(LanguageSetting::En, Some(LanguageError::SaveFailed));
+        assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
+        assert_eq!(state.language_error, Some(LanguageError::SaveFailed));
+
+        state.clear_save_errors();
+        assert!(state.font_error.is_none());
+        assert!(state.language_error.is_none());
+
+        state.set_font_size_result(FontSize::Small, Some(SettingsError::SaveFailed));
+        assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
+        assert!(
+            state.language_error.is_none(),
+            "字号保存失败不得影响语言错误"
+        );
+
+        state.set_language_result(LanguageSetting::ZhHans, Some(LanguageError::SaveFailed));
+        assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
+        assert_eq!(state.language_error, Some(LanguageError::SaveFailed));
+    }
+
+    /// 纯编排：解析语言 + 写入快照 + 保存；不触碰全局语言。
+    #[test]
+    fn plan_language_change_resolves_explicit_and_system_settings() {
+        let preferred = vec!["en-US".to_string()];
+
+        let (lang, file, error) = plan_language_change(
+            LanguageSetting::System,
+            &preferred,
+            SettingsFile::default(),
+            |_| Ok(()),
+        );
+        assert_eq!(lang, crate::i18n::Lang::En, "跟随系统取首选英文");
+        assert_eq!(file.language, LanguageSetting::System);
+        assert!(error.is_none());
+
+        let (lang, file, error) = plan_language_change(
+            LanguageSetting::ZhHans,
+            &preferred,
+            SettingsFile::default(),
+            |_| Ok(()),
+        );
+        assert_eq!(lang, crate::i18n::Lang::ZhHans, "显式选择忽略系统首选");
+        assert_eq!(file.language, LanguageSetting::ZhHans);
+        assert!(error.is_none());
+    }
+
+    /// 保存失败：错误类型化，设置快照仍保留用户选择（已生效语言不回退）。
+    #[test]
+    fn plan_language_change_keeps_selected_setting_on_save_error() {
+        let (_, file, error) = plan_language_change(
+            LanguageSetting::En,
+            &["zh-Hans".to_string()],
+            SettingsFile::default(),
+            |_| Err("磁盘已满".into()),
+        );
+        assert_eq!(error, Some(LanguageError::SaveFailed));
+        assert_eq!(file.language, LanguageSetting::En);
     }
 
     fn key_w(modifiers: egui::Modifiers) -> egui::RawInput {

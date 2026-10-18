@@ -1705,6 +1705,122 @@ mod tests {
         );
     }
 
+    /// 英文设置页：分组/行/字号段/语言值/按钮/空态/busy/录制/下拉全部可见。
+    #[test]
+    fn english_settings_page_covers_all_sections() {
+        i18n::with_lang(i18n::Lang::En, || {
+            let data = layout_test_data();
+            let out = run_body(&data);
+            let texts = all_texts(&out);
+            let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+
+            for expected in [
+                // 分组标题
+                "Appearance",
+                "General",
+                "Index",
+                // 行标签
+                "Text Size",
+                "Launch at Login",
+                "Language",
+                "Quick Search Shortcut",
+                "Full Window Shortcut",
+                "Excluded Folders",
+                // 字号段
+                "Small",
+                "Standard",
+                "Large",
+                // 语言当前值
+                "System Default",
+                // 按钮
+                "Add Folder…",
+                "Restore Defaults",
+            ] {
+                assert!(
+                    labels.contains(&expected),
+                    "缺少英文文案 {expected:?};实际 {labels:?}"
+                );
+            }
+
+            // 空态
+            let empty = SettingsData {
+                excluded: vec![],
+                ..layout_test_data()
+            };
+            let empty_out = run_body(&empty);
+            let empty_texts = all_texts(&empty_out);
+            let empty_labels: Vec<&str> =
+                empty_texts.iter().map(|text| text.galley.text()).collect();
+            assert!(
+                empty_labels.contains(&"No excluded folders"),
+                "空列表须显示英文空态;实际 {empty_labels:?}"
+            );
+
+            // busy：list → Loading…；变更 → Rescanning…
+            let mut busy = layout_test_data();
+            busy.exclude_busy = true;
+            busy.exclude_busy_list = true;
+            let list_out = run_body(&busy);
+            let list_texts = all_texts(&list_out);
+            let list_labels: Vec<&str> = list_texts.iter().map(|text| text.galley.text()).collect();
+            assert!(
+                list_labels.contains(&"Loading…"),
+                "list 在途须显示 Loading…;实际 {list_labels:?}"
+            );
+            assert!(!list_labels.contains(&"Rescanning…"));
+
+            busy.exclude_busy_list = false;
+            let rescan_out = run_body(&busy);
+            let rescan_texts = all_texts(&rescan_out);
+            let rescan_labels: Vec<&str> =
+                rescan_texts.iter().map(|text| text.galley.text()).collect();
+            assert!(
+                rescan_labels.contains(&"Rescanning…"),
+                "变更在途须显示 Rescanning…;实际 {rescan_labels:?}"
+            );
+            assert!(!rescan_labels.contains(&"Loading…"));
+
+            // 录制中：字段提示 + 行下 Esc/Backspace 可见提示
+            let recording = SettingsData {
+                recording: Some(HotkeySlot::Palette),
+                ..layout_test_data()
+            };
+            let rec_out = run_body(&recording);
+            let rec_texts = all_texts(&rec_out);
+            let rec_labels: Vec<&str> = rec_texts.iter().map(|text| text.galley.text()).collect();
+            assert!(
+                rec_labels.contains(&"Press shortcut…"),
+                "录制中须显示英文提示;实际 {rec_labels:?}"
+            );
+            assert!(
+                rec_labels.contains(
+                    &"Press Esc or click elsewhere to cancel recording; \
+                      Backspace restores the default"
+                ),
+                "录制提示须完整可见;实际 {rec_labels:?}"
+            );
+
+            // 语言下拉：展开后三个选项全可见
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let (out, _) = run_frame(&ctx, &data, Vec::new());
+            let field = keycap_field_center(&out, "Language");
+            let _ = click_at(&ctx, &data, field);
+            let (out, _) = run_frame(&ctx, &data, Vec::new());
+            let options_texts = all_texts(&out);
+            let options: Vec<&str> = options_texts
+                .iter()
+                .map(|text| text.galley.text())
+                .collect();
+            for expected in ["System Default", "简体中文", "English"] {
+                assert!(
+                    options.contains(&expected),
+                    "语言下拉缺少 {expected:?};实际 {options:?}"
+                );
+            }
+        });
+    }
+
     /// 添加按钮中心（按钮宽随文案，文字中心即按钮中心）。
     fn add_button_center(out: &egui::FullOutput) -> egui::Pos2 {
         text_center(find_text(&all_texts(out), i18n::s().add_folder))

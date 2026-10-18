@@ -4,16 +4,17 @@
 //! 当前语言是进程级原子（与 `ui/font.rs` 的字号倍率同模式）；测试用线程局部
 //! `with_lang` 覆盖，避免并行测试竞态。
 
+use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod catalog;
 pub mod format;
 
-// `s` 是绘制路径的文案入口；`strings`/`Strings`/`all_entries` 供语言切换与单测使用。
-#[allow(unused_imports)]
-pub use catalog::{all_entries, s, strings, Strings};
+// `s` 是绘制路径的文案入口；`strings` 供平台层按语言取标题。
+pub use catalog::{s, strings};
 
 /// 运行时语言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,20 +35,105 @@ pub enum LanguageSetting {
 }
 
 impl<'de> Deserialize<'de> for LanguageSetting {
+    /// 宽容解析：未知/非字符串值（数字、布尔、表、数组等）一律按跟随系统处理，
+    /// 只留 `log::warn`，不让单个坏字段拖垮整个 `settings.toml`。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "system" => Self::System,
-            "zh-hans" => Self::ZhHans,
-            "en" => Self::En,
-            other => {
-                log::warn!("未知语言设置 {other:?},按跟随系统处理");
-                Self::System
+        struct LanguageVisitor;
+
+        impl<'de> Visitor<'de> for LanguageVisitor {
+            type Value = LanguageSetting;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("语言字符串 system、zh-hans 或 en")
             }
-        })
+
+            fn visit_str<E>(self, raw: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(match raw {
+                    "system" => LanguageSetting::System,
+                    "zh-hans" => LanguageSetting::ZhHans,
+                    "en" => LanguageSetting::En,
+                    other => {
+                        log::warn!("未知语言设置 {other:?},按跟随系统处理");
+                        LanguageSetting::System
+                    }
+                })
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                log::warn!("语言设置应为字符串,收到布尔值 {value},按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                log::warn!("语言设置应为字符串,收到整数 {value},按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                log::warn!("语言设置应为字符串,收到整数 {value},按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                log::warn!("语言设置应为字符串,收到浮点数 {value},按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                log::warn!("语言设置应为字符串,收到空值,按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                log::warn!("语言设置应为字符串,收到空值,按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                // 消费掉整个映射，避免反序列化器残留状态。
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                log::warn!("语言设置应为字符串,收到映射,按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                log::warn!("语言设置应为字符串,收到数组,按跟随系统处理");
+                Ok(LanguageSetting::System)
+            }
+        }
+
+        deserializer.deserialize_any(LanguageVisitor)
     }
 }
 

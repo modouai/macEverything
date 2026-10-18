@@ -2017,7 +2017,9 @@ fn english_rows_fit_fixed_controls() {
             "Excluded Folders",
         ] {
             let text = find_text(&texts, label);
-            assert!(text.galley.size().x <= 420.0, "{label} 超宽: {:?}", text.galley.size());
+            // 标签列实际可用宽 372px（620 窗宽 − 2×24 内容内边距 − 2×16 行内边距
+            // − 152 控件宽 − 16 标签/控件间距）。
+            assert!(text.galley.size().x <= 372.0, "{label} 超宽: {:?}", text.galley.size());
         }
     });
 }

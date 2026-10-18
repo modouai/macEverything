@@ -135,9 +135,10 @@ window_hotkey = "shift+alt+KeyF" # 缺省 = 内置默认（⌥⇧F）
 
 ### 5.1 窗口
 
-- deferred viewport builder：620×600、不可缩放、标题「设置」、透明标题栏 + fullsize content、原生交通灯、阴影。
+- deferred viewport builder：620×600、不可缩放、标题随当前语言（`i18n::s().settings_title`）、透明标题栏 + fullsize content、原生交通灯、阴影。
 - 内容层每帧铺 `window_fill`；内描边 1px 圆角 12。
-- **首次打开居中 + 置前（2026-10-18 实现）**：平台层按 `platform::SETTINGS_TITLE` 定位
+- **首次打开居中 + 置前（2026-10-18 实现）**：平台层按 `platform::settings_window_titles()`
+  （简体中文 / English 双标题）定位
   设置 NSWindow，在**鼠标所在屏**的 `NSScreen.visibleFrame`（已扣菜单栏 / Dock）内居中
   620×600，四周 clamp 8pt；窗口大于可见区时保持**左上可见**（AppKit y 向上：原点 y =
   可见区顶 − 窗高 − 8，底部允许溢出，标题栏/交通灯不得移出屏）。

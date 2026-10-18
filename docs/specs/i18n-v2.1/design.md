@@ -36,7 +36,7 @@
 | `catalog.rs` | 宏一次性声明全部文案，生成 `Strings` 结构体、`ZH_HANS`/`EN` 静态表、`all_entries()` 测试清单 |
 | `format.rs` | 带参数文案的类型化函数（如 `items(n)`、`gaps(n)`、`engine_state(..)`） |
 
-依赖方向：`i18n` 只依赖标准库与 `log`；UI/托盘/平台层依赖 `i18n`，反向不依赖。`protocol`/`client`/`engine` 不感知 i18n。
+依赖方向：`i18n` 依赖标准库、`log` 与 `serde`（`LanguageSetting` 的序列化/反序列化）；UI/托盘/平台层依赖 `i18n`，反向不依赖。`protocol`/`client`/`engine` 不感知 i18n。
 
 ### 2.2 文案目录
 
