@@ -193,7 +193,10 @@ Content (padding 上下 20 / 左右 24, gap 20)
     唤起槽 `note` 供悬浮条警告，完整窗口槽 `window_note` 仅设置页展示）；
   - `suspend()` / `resume()`（录制期）；
   - `commit(slot, HotKey) -> Result<HotkeySnapshot, String>`（注册新键；挂起态任何
-    失败都恢复旧键并退出挂起，成功清空回退提示）。
+    失败都恢复旧键并退出挂起，成功清空回退提示）；
+  - `reset_slot(slot) -> Result<HotkeySnapshot, String>`（恢复内置默认：唤起槽走
+    `candidates()` 首个成功项、完整窗口槽走 `direct_key()`；挂起态与 commit 同
+    语义，失败尽力恢复两个旧键并退出挂起；非挂起态先注册默认、成功后才注销旧键）。
 - 启动：
   - 读取 `settings.toml`；自定义键优先注册；
   - 自定义键注册失败 → 回落该槽默认键（悬浮条仍走原降级链；完整窗口走 ⌥⇧F），在设置页显示「已回落默认」；
@@ -205,6 +208,8 @@ Content (padding 上下 20 / 左右 24, gap 20)
 ```
 Idle → (点击字段) Beginning → (App suspend 完成) Recording
 Recording → (Esc/点击他处/关闭窗口) Cancelled → App resume → Idle
+Recording → (Delete/Backspace) Resetting → App reset_slot
+Resetting → 成功: Idle + 内置默认（settings.toml 字段清空）；失败: Idle + 内联错误（旧键已恢复）
 Recording → (合法组合) Committing → App commit
 Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已恢复，用户可重试）
 ```
@@ -214,6 +219,13 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
 - 系统占用/注册失败：App commit 失败 → 恢复旧键 → 内联「注册失败（可能被系统或其他应用占用）」。
 - 显示名用 macOS 符号：⌘⌥⌃⇧ + 键名；默认键保持现有文案（⌥Space / ⌥⇧F）。
 - 录制期间全局热键注销，确保按键进入设置窗口；App 记录旧键用于恢复。
+- **恢复默认**：录制中 Delete/Backspace → `ResetHotkey(slot)` → `HotkeyCommand::Reset`
+  → `reset_slot`；成功清空设置字段（跟随内置默认）并落盘，失败恢复旧键 + 内联错误。
+  该路径用于 macOS 下 ⌥Space 不能可靠作为按键事件录制时回到内置默认。
+- **⌥Space 已知限制**：释放版中 ⌥Space 可能不以 `Event::Key` 到达；录制层额外识别
+  带 Alt 的 `Event::Text(" ")` / `Event::Text("\u{00A0}")` 并翻译为 ⌥Space。若平台
+  既不交付 Key 也不交付 Text，只能用 Delete/Backspace 恢复默认；不全局拦截系统
+  快捷键或文本输入。
 - 启动时保存的键注册失败：回落默认 + 设置页警标；不自动改写文件（用户可重新录制）。
 
 ### 6.3 键位映射
@@ -235,9 +247,9 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
   同一槽已录制时再次 Begin → 按取消处理（恢复旧键），避免录制态无法退出。
 - 录制 UI：空闲点击开始；`suspend()` 在主线程同步完成，字段立即显示
   「按下快捷键…」，不存在可渲染的「准备中」中间态（未保留 `recording_ready`）。
-  行下显示可见提示「按 Esc 或点击别处取消」；Esc / 再次点击字段 / 点击字段外 /
-  失焦或最小化 / ⌘W/红点关闭均取消。失焦用焦点 `true→false` 跃迁判定（窗口刚
-  打开、尚未获得焦点时的 `false` 不误取消；macOS 最小化同样表现为失焦）。
+  行下显示可见提示「按 Esc 或点击别处取消,Delete 恢复默认」；Esc / 再次点击字段 /
+  点击字段外 / 失焦或最小化 / ⌘W/红点关闭均取消。失焦用焦点 `true→false` 跃迁
+  判定（窗口刚打开、尚未获得焦点时的 `false` 不误取消；macOS 最小化同样表现为失焦）。
   `Begin` 落地时若已观测到失焦则直接丢弃，堵住「点击后瞬间切走」的竞态。
   所有按键事件被消费，不触发其它 UI。
 - 键位采集：按键 `Event::Key` 经 `from_egui`；纯修饰键（⇧⌃⌥⌘）按下被消费但不
@@ -246,6 +258,16 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
   `InputState.modifiers`（保留 Ctrl+Cmd+C 等额外修饰）。残留：⌘V 在剪贴板为空时
   egui-winit 不产生任何事件，故该次按键无法录入；不全局关闭剪贴板快捷键
   （会破坏搜索框的复制/粘贴）。
+- ⌥Space 兜底（2026-10-18）：录制层识别带 Alt 的 `Event::Text(" ")` /
+  `Event::Text("\u{00A0}")` 并翻译为 `(Space, modifiers)` 提交；录制期文本事件
+  一律消费。若平台既不交付 Key 也不交付 Text，则直接录制仍不可行，
+  **Delete/Backspace 恢复默认**为可靠路径。
+- 恢复默认实现：`SettingsAction::ResetHotkey(slot)` → `HotkeyCommand::Reset(slot)`
+  → `App::logic::reset_hotkey` → `HotkeyRuntime::reset_slot`；成功清空
+  `SettingsFile.palette_hotkey`/`window_hotkey`（`None` = 跟随内置默认）并锁外保存、
+  更新快照/悬浮条提示；失败由运行时恢复旧键并退出挂起，录制结束 + 按槽内联错误。
+  唤起槽默认链降级时快照 `note` 显示「⌥Space 不可用,已改用 …」。Delete/Backspace
+  不作为可录制键（不落白名单，捕获时优先解释为恢复默认）。
 - 错误与提示按槽显示：`hotkey_error: Option<(HotkeySlot, String)>`；回落提示
   `note`/`window_note` 也显示在对应行下；录制提示另占一行。错误 + 提示 + 录制
   提示可同时存在，`RowSpec.extra` 随消息条数增高（卡片底/分隔线仍由同一游标推进）。
@@ -254,8 +276,9 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
   保存失败」，内存 `SettingsFile` 保留新键供后续保存补写。
 - 默认展示完全来自 `HotkeyRuntime::snapshot()`（设置态不再硬编码键帽）；
   `PaletteState.hotkey_note` 随 begin/cancel/commit 后的快照同步。
-- 自动化覆盖纯状态/命令队列/headless 视图/剪贴板事件/焦点取消/文件持久化；
-  真实 Carbon 注册、系统占用、跨重启与实机失焦需手动验收（清单见
+- 自动化覆盖纯状态/命令队列/headless 视图/剪贴板事件/⌥Space 文本兜底/
+  Delete 恢复默认/运行时 reset 规划器/焦点取消/文件持久化；真实 Carbon 注册、
+  系统占用、⌥Space 平台事件行为、跨重启与实机失焦需手动验收（清单见
   `plan-hotkeys.md` H4）。
 
 ---

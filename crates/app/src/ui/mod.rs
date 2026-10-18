@@ -685,6 +685,7 @@ impl App {
             settings::HotkeyCommand::Commit { slot, hotkey } => {
                 self.commit_hotkey(ctx, slot, hotkey)
             }
+            settings::HotkeyCommand::Reset(slot) => self.reset_hotkey(ctx, slot),
         }
     }
 
@@ -816,6 +817,55 @@ impl App {
                     s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
                 }
                 log::warn!("快捷键提交失败({slot:?}):{message}");
+                request_hotkey_repaint(ctx);
+            }
+        }
+    }
+
+    /// 恢复该槽内置默认（录制中 Delete/Backspace）。
+    ///
+    /// 运行时注册默认并退出挂起；成功清空设置文件对应字段（跟随内置默认）后锁外
+    /// 保存，失败由运行时恢复旧键 → 结束录制并按槽内联错误。仅当前录制槽有效。
+    fn reset_hotkey(&mut self, ctx: &egui::Context, slot: hotkey::HotkeySlot) {
+        let recording = self.shared().settings.recording;
+        if !commit_allowed(recording, slot) {
+            log::warn!("快捷键恢复默认被忽略({slot:?}):当前录制槽为 {recording:?}");
+            return;
+        }
+        match self.hotkey.reset_slot(slot) {
+            Ok(snapshot) => {
+                let (file, data_dir) = {
+                    let mut s = self.shared();
+                    let file = s.settings.reset_recorded_hotkey(slot, snapshot);
+                    s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
+                    (file, s.settings.data_dir.clone())
+                };
+                // 保存与运行时调用都不持共享锁；失败只留内联错误，默认键保持生效。
+                let save_error = store::save(&data_dir, &file).err().map(|err| {
+                    let message = format!("快捷键已恢复默认,但设置保存失败:{err:#}");
+                    log::warn!("{message}");
+                    message
+                });
+                let saved = save_error.is_none();
+                if let Some(message) = save_error {
+                    let mut s = self.shared();
+                    s.settings.hotkey_save_failed(slot, message);
+                }
+                log::info!(
+                    "快捷键已恢复默认({slot:?};设置已保存:{})",
+                    if saved { "是" } else { "否" }
+                );
+                request_hotkey_repaint(ctx);
+            }
+            Err(message) => {
+                // 运行时失败已恢复旧键并退出挂起;这里只结束录制展示错误。
+                let snapshot = self.hotkey.snapshot();
+                {
+                    let mut s = self.shared();
+                    s.settings.recording_failed(slot, message.clone(), snapshot);
+                    s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
+                }
+                log::warn!("快捷键恢复默认失败({slot:?}):{message}");
                 request_hotkey_repaint(ctx);
             }
         }
@@ -1402,14 +1452,16 @@ mod tests {
             slot: Palette,
             hotkey: alt_k(),
         };
+        let reset = settings::HotkeyCommand::Reset(Palette);
         assert_eq!(
-            hotkey_frame_events(vec![begin, commit], true),
+            hotkey_frame_events(vec![begin, commit, reset], true),
             vec![
                 HotkeyFrameEvent::Command(begin),
                 HotkeyFrameEvent::Command(commit),
+                HotkeyFrameEvent::Command(reset),
                 HotkeyFrameEvent::CloseCancel,
             ],
-            "命令保持 FIFO，关闭取消永远最后"
+            "命令保持 FIFO（含恢复默认），关闭取消永远最后"
         );
 
         let events = hotkey_frame_events(vec![commit], true);

@@ -45,8 +45,11 @@ const EXCLUDE_RESCANNING: &str = "重扫中…";
 const AUTOSTART_APPROVAL_NOTE: &str = "已注册,待系统设置「登录项」允许";
 /// 录制中的字段文案（App 已同步挂起全局热键）。
 const RECORDING_PROMPT: &str = "按下快捷键…";
-/// 录制中的行内可见提示（plan 要求「按下快捷键… (Esc 取消)」；作为支持行展示）。
-const RECORDING_HINT: &str = "按 Esc 或点击别处取消";
+/// 录制中的行内可见提示（Esc/点击别处取消；Delete/Backspace 恢复内置默认）。
+///
+/// macOS 上 ⌥Space 可能不以 `Event::Key` 到达（释放版实测无法录制），恢复默认是
+/// 回到内置 ⌥Space 的可靠路径，故提示必须明确写出。
+const RECORDING_HINT: &str = "按 Esc 或点击别处取消,Delete 恢复默认";
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -97,6 +100,8 @@ pub(crate) enum SettingsAction {
     CancelHotkeyRecord,
     /// 录制到合法组合：提交给 App 校验/注册/落盘。
     CommitHotkey { slot: HotkeySlot, hotkey: HotKey },
+    /// 录制中按 Delete/Backspace：恢复该槽内置默认（App 注册默认并清空设置字段）。
+    ResetHotkey(HotkeySlot),
     /// 录制组合非法或与另一槽重复：仅显示内联错误（录制继续）。
     HotkeyError { slot: HotkeySlot, message: String },
     /// 点击「＋ 添加目录…」：设置 pass 弹原生目录选择器并启动 add 工作线程。
@@ -812,7 +817,7 @@ fn draw_keycap_field(
             egui::Align2::CENTER_CENTER,
         );
         capture_recorded_key(ui, slot, data, actions);
-        let _ = response.on_hover_text("按 Esc 或点击别处取消录制");
+        let _ = response.on_hover_text("按 Esc 或点击别处取消录制,Delete 恢复默认");
     } else {
         draw_keycaps(ui, rect, keys, &painter, palette);
         let _ = response.on_hover_text(if data.recording.is_some() {
@@ -872,19 +877,24 @@ fn draw_keycaps(
     }
 }
 
-/// 录制时取本帧第一个非修饰按键；所有按键/剪贴板事件一律消费。
+/// 录制时取本帧第一个非修饰按键；所有按键/剪贴板/文本事件一律消费。
 ///
 /// - 纯修饰键（⇧⌃⌥⌘）只更新修饰态，不当作一次录制结果；重复事件忽略。
 /// - eframe/egui-winit 默认把「仅 Command」的 ⌘C/⌘X/⌘V 转成 Copy/Cut/Paste
 ///   事件而非 `Event::Key`；这里翻译回 C/X/V，并**用 `input.modifiers`**（保留
 ///   Ctrl+Cmd+C 之类的额外修饰；`from_egui` 再映射 command→SUPER）。
+/// - ⌥Space 在 macOS 上可能不产生可用的 `Event::Key`（释放版实测录制不到）：
+///   兜底识别带 Alt 的文本事件 `" "` / `"\u{00A0}"`（选项键产生不断行空格），
+///   翻译为 `(Space, modifiers)`。文本事件在录制期一律消费，不进入其它控件。
 /// - 已知残留：⌘V 在剪贴板为空时 egui-winit 不产生任何事件（无法录制这一次按键）；
-///   不全局关闭剪贴板快捷键，否则搜索框的复制/粘贴会失效。
-/// - Esc 由调用方解释为取消；其余键经 `hotkey_keys::from_egui` 翻译。
+///   不全局关闭剪贴板快捷键，否则搜索框的复制/粘贴会失效。若 ⌥Space 连文本事件
+///   都不可见，录制视图的 Delete/Backspace「恢复默认」仍是可靠路径。
+/// - Esc 由调用方解释为取消，Delete/Backspace 解释为恢复默认；其余键经
+///   `hotkey_keys::from_egui` 翻译。
 fn take_recorded_key(ui: &egui::Ui) -> Option<(egui::Key, egui::Modifiers)> {
     ui.input_mut(|input| {
-        // 剪贴板事件本身不携带修饰态；本帧 InputState 的最终修饰态即按键时修饰键。
-        let clipboard_modifiers = input.modifiers;
+        // 剪贴板/文本事件本身不携带修饰态；本帧 InputState 的最终修饰态即按键时修饰键。
+        let event_modifiers = input.modifiers;
         let mut captured = None;
         let mut retained = Vec::with_capacity(input.events.len());
         for event in input.events.drain(..) {
@@ -896,7 +906,7 @@ fn take_recorded_key(ui: &egui::Ui) -> Option<(egui::Key, egui::Modifiers)> {
             };
             if let Some(key) = clipboard_key {
                 if captured.is_none() {
-                    captured = Some((key, clipboard_modifiers));
+                    captured = Some((key, event_modifiers));
                 }
                 continue; // 消费：录制期不得触发剪贴板/其它 UI
             }
@@ -912,12 +922,23 @@ fn take_recorded_key(ui: &egui::Ui) -> Option<(egui::Key, egui::Modifiers)> {
                         captured = Some((key, modifiers));
                     }
                 }
+                egui::Event::Text(text) => {
+                    if captured.is_none() && event_modifiers.alt && is_space_text(&text) {
+                        captured = Some((egui::Key::Space, event_modifiers));
+                    }
+                    // 消费：⌥ 组合的文本产出（⌥D→∂ / ⌥Space→NBSP）不得落入其它控件。
+                }
                 other => retained.push(other),
             }
         }
         input.events = retained;
         captured
     })
+}
+
+/// ⌥Space 的文本形态：ASCII 空格或选项键产生的不断行空格。
+fn is_space_text(text: &str) -> bool {
+    text == " " || text == "\u{00A0}"
 }
 
 /// 纯修饰键：录制期只改修饰态，不产生「不支持该键」。
@@ -943,7 +964,7 @@ fn other_slot_hotkey(data: &SettingsData, slot: HotkeySlot) -> Option<HotKey> {
     }
 }
 
-/// 一次按键 → 动作（Esc 取消 / 非法与重复错误 / 合法提交）。
+/// 一次按键 → 动作（Esc 取消 / Delete 恢复默认 / 非法与重复错误 / 合法提交）。
 fn capture_recorded_key(
     ui: &egui::Ui,
     slot: HotkeySlot,
@@ -955,6 +976,11 @@ fn capture_recorded_key(
     };
     if key == egui::Key::Escape {
         actions.push(SettingsAction::CancelHotkeyRecord);
+        return;
+    }
+    // Delete/Backspace 是「恢复内置默认」手势，不作为可录制按键（不落白名单）。
+    if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
+        actions.push(SettingsAction::ResetHotkey(slot));
         return;
     }
     match hotkey_keys::from_egui(key, modifiers) {
@@ -1329,7 +1355,7 @@ mod tests {
         run_events(ctx, data, vec![event])
     }
 
-    /// 跑一帧任意事件；`leftover` = 帧末仍残留录制输入(按键/剪贴板)事件。
+    /// 跑一帧任意事件；`leftover` = 帧末仍残留录制输入(按键/剪贴板/文本)事件。
     fn run_events(
         ctx: &egui::Context,
         data: &SettingsData,
@@ -1356,6 +1382,7 @@ mod tests {
                             | egui::Event::Cut
                             | egui::Event::Paste(_)
                             | egui::Event::PasteImage(_)
+                            | egui::Event::Text(_)
                     )
                 })
             });
@@ -1831,6 +1858,10 @@ mod tests {
             "录制提示（Esc/点击别处）须可见:实际 {labels:?}"
         );
         assert!(
+            RECORDING_HINT.contains("Delete 恢复默认"),
+            "录制提示须告知 Delete 恢复默认:{RECORDING_HINT}"
+        );
+        assert!(
             !labels.iter().any(|text| text == "Space"),
             "录制中不得再画本槽旧键帽（另一槽仍显示）"
         );
@@ -1939,6 +1970,89 @@ mod tests {
         );
         assert_eq!(output.actions, vec![SettingsAction::CancelHotkeyRecord]);
         assert!(!leftover, "Esc 须被录制消费");
+    }
+
+    /// Delete/Backspace 在录制中 = 恢复内置默认；不得当成可录制键报错。
+    #[test]
+    fn delete_and_backspace_reset_default_and_are_consumed() {
+        for key in [egui::Key::Delete, egui::Key::Backspace] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let data = recording_data(HotkeySlot::Window);
+            let (output, leftover) = run_key(&ctx, &data, key_event(key, egui::Modifiers::NONE));
+            assert_eq!(
+                output.actions,
+                vec![SettingsAction::ResetHotkey(HotkeySlot::Window)],
+                "{key:?} 应恢复默认"
+            );
+            assert!(!leftover, "{key:?} 事件必须被录制消费");
+        }
+    }
+
+    /// ⌥Space 的文本事件兜底：ASCII 空格 / 选项键 NBSP 均提交 ⌥Space。
+    #[test]
+    fn alt_space_text_events_commit_space() {
+        let expected = hotkey_keys::from_egui(egui::Key::Space, egui::Modifiers::ALT).unwrap();
+        for text in [" ", "\u{00A0}"] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let data = recording_data(HotkeySlot::Palette);
+            let (output, leftover) = run_events(
+                &ctx,
+                &data,
+                vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                    egui::Event::Text(text.to_owned()),
+                ],
+            );
+            assert_eq!(
+                output.actions,
+                vec![SettingsAction::CommitHotkey {
+                    slot: HotkeySlot::Palette,
+                    hotkey: expected,
+                }],
+                "{text:?} 应兜底录制 ⌥Space"
+            );
+            assert!(!leftover, "文本事件必须被录制消费");
+        }
+    }
+
+    /// 若 Key 与 Text 同帧到达，只提交一次（按键优先，文本兜底不重复）。
+    #[test]
+    fn alt_space_key_and_text_capture_once() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Palette);
+        let (output, leftover) = run_events(
+            &ctx,
+            &data,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                key_event(egui::Key::Space, egui::Modifiers::ALT),
+                egui::Event::Text("\u{00A0}".to_owned()),
+            ],
+        );
+        let expected = hotkey_keys::from_egui(egui::Key::Space, egui::Modifiers::ALT).unwrap();
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CommitHotkey {
+                slot: HotkeySlot::Palette,
+                hotkey: expected,
+            }],
+            "同帧 Key + Text 只能提交一次"
+        );
+        assert!(!leftover);
+    }
+
+    /// 无 Alt 的普通空格文本不提交/不报错（录制仍等待），且被消费。
+    #[test]
+    fn plain_space_text_does_not_commit() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Palette);
+        let (output, leftover) = run_events(&ctx, &data, vec![egui::Event::Text(" ".to_owned())]);
+        assert!(output.actions.is_empty(), "{:?}", output.actions);
+        assert!(!leftover, "录制期文本事件须被消费");
     }
 
     /// 无修饰键 → 内联错误（录制继续，不提交）；事件同样被消费。

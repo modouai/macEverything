@@ -58,7 +58,7 @@ pub fn builder() -> egui::ViewportBuilder {
         .with_visible(false)
 }
 
-/// 设置页 → App 的快捷键命令（录制 / 取消 / 提交）。
+/// 设置页 → App 的快捷键命令（录制 / 取消 / 提交 / 恢复默认）。
 ///
 /// 设置 pass 只入队；注册/注销必须在主线程由 `App::logic` 调
 /// `HotkeyRuntime`（Carbon manager 约束），因此命令跨帧存放在共享态。
@@ -70,6 +70,8 @@ pub(crate) enum HotkeyCommand {
     CancelRecord,
     /// 提交录制结果（App 侧校验/注册/落盘；失败退出录制并回滚旧键）。
     Commit { slot: HotkeySlot, hotkey: HotKey },
+    /// 恢复该槽内置默认（录制中 Delete/Backspace；App 侧注册默认并落盘）
+    Reset(HotkeySlot),
 }
 
 /// 排除目录后台操作的一次回投结果（工作线程 → 设置 pass）。
@@ -368,6 +370,23 @@ impl SettingsState {
         self.file.clone()
     }
 
+    /// 恢复默认成功（运行时已注册默认键）后落地：结束录制、清空目标槽的设置字段，
+    /// 返回待落盘副本（`None` = 跟随内置默认，不写死当前键）。
+    ///
+    /// 保存由调用方在共享锁外执行；失败只回填内联错误，不回退已注册的键。
+    pub(crate) fn reset_recorded_hotkey(
+        &mut self,
+        slot: HotkeySlot,
+        snapshot: HotkeySnapshot,
+    ) -> SettingsFile {
+        self.end_recording(snapshot);
+        match slot {
+            HotkeySlot::Palette => self.file.palette_hotkey = None,
+            HotkeySlot::Window => self.file.window_hotkey = None,
+        }
+        self.file.clone()
+    }
+
     /// 提交失败（运行时已回滚旧键并退出挂起）后落地：结束录制 + 按槽内联错误。
     pub(crate) fn recording_failed(
         &mut self,
@@ -638,6 +657,9 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
         }
         SettingsAction::CommitHotkey { slot, hotkey } => {
             enqueue_hotkey_command(shared, ctx, HotkeyCommand::Commit { slot, hotkey })
+        }
+        SettingsAction::ResetHotkey(slot) => {
+            enqueue_hotkey_command(shared, ctx, HotkeyCommand::Reset(slot))
         }
         SettingsAction::HotkeyError { slot, message } => {
             // 视图侧校验/查重错误只落共享态；录制保持（下次按键可重试）。
@@ -1356,6 +1378,7 @@ mod tests {
             slot: HotkeySlot::Window,
             hotkey: alt_k(),
         });
+        state.queue_hotkey_command(HotkeyCommand::Reset(HotkeySlot::Palette));
         state.queue_hotkey_command(HotkeyCommand::CancelRecord);
         assert_eq!(
             state.take_hotkey_commands(),
@@ -1364,9 +1387,10 @@ mod tests {
                     slot: HotkeySlot::Window,
                     hotkey: alt_k()
                 },
+                HotkeyCommand::Reset(HotkeySlot::Palette),
                 HotkeyCommand::CancelRecord
             ],
-            "命令须 FIFO 落地"
+            "命令须 FIFO 落地（含恢复默认）"
         );
         assert!(state.hotkey_commands.is_empty(), "取走即清");
     }
@@ -1417,6 +1441,72 @@ mod tests {
         let loaded = crate::settings::load(dir.path());
         assert_eq!(loaded.palette_hotkey, Some(committed), "重启后读回");
         assert_eq!(loaded.window_hotkey, None);
+    }
+
+    /// 恢复默认成功：清空目标槽设置字段（跟随内置默认）并落盘；另一槽保留。
+    #[test]
+    fn reset_success_clears_file_field_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = alt_k();
+        let window = alt_shift_f();
+        let mut state = SettingsState::new(
+            SettingsFile {
+                palette_hotkey: Some(custom),
+                window_hotkey: Some(window),
+                ..SettingsFile::default()
+            },
+            dir.path().to_path_buf(),
+            hotkey_snapshot(Some(custom), Some(window)),
+        );
+        state.begin_recording(HotkeySlot::Palette, state.hotkey_snapshot.clone());
+
+        let defaults = hotkey_snapshot(Some(alt_space()), Some(window));
+        let file = state.reset_recorded_hotkey(HotkeySlot::Palette, defaults.clone());
+
+        assert_eq!(state.recording, None);
+        assert_eq!(state.hotkey_error, None);
+        assert_eq!(state.hotkey_snapshot, defaults, "快照显示默认键");
+        assert_eq!(
+            state.file.palette_hotkey, None,
+            "恢复默认 = 跟随内置默认（字段清空）"
+        );
+        assert_eq!(state.file.window_hotkey, Some(window), "另一槽设置不得被清");
+        assert_eq!(file, state.file, "返回副本供锁外保存");
+
+        crate::settings::save(dir.path(), &file).unwrap();
+        let loaded = crate::settings::load(dir.path());
+        assert_eq!(loaded.palette_hotkey, None, "重启后仍跟随内置默认");
+        assert_eq!(loaded.window_hotkey, Some(window));
+    }
+
+    /// 恢复默认失败：运行时已恢复旧键 → 结束录制、按槽内联错误、设置文件不变。
+    #[test]
+    fn reset_failure_ends_recording_and_keeps_file_field() {
+        let mut state = test_state();
+        state.file.palette_hotkey = Some(alt_k());
+        let old = hotkey_snapshot(Some(alt_k()), None);
+        state.begin_recording(HotkeySlot::Palette, old.clone());
+
+        state.recording_failed(
+            HotkeySlot::Palette,
+            "恢复默认快捷键失败(可能被系统或其他应用占用): 被占用".into(),
+            old.clone(),
+        );
+
+        assert_eq!(state.recording, None, "失败退出录制（旧键已恢复）");
+        assert_eq!(state.hotkey_snapshot, old, "回滚后的快照 = 旧键");
+        assert_eq!(
+            state.file.palette_hotkey,
+            Some(alt_k()),
+            "失败不得清空已保存的自定义键"
+        );
+        assert!(
+            state.hotkey_error.as_ref().is_some_and(|(slot, message)| {
+                *slot == HotkeySlot::Palette && message.contains("恢复默认快捷键失败")
+            }),
+            "失败须按槽落内联错误:{:?}",
+            state.hotkey_error
+        );
     }
 
     /// 提交失败：运行时已恢复旧键 → 结束录制、按槽落内联错误、文件不变。

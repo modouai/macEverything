@@ -110,6 +110,24 @@
   Copy/Cut/Paste/PasteImage 事件；录制层翻译回 C/X/V 并使用 `InputState.modifiers`
   （Ctrl+Cmd+C 保留 Ctrl）。残留：⌘V 在剪贴板为空时 egui-winit 不产生事件，
   该次按键无法录入；不全局关闭剪贴板快捷键（会破坏搜索框复制/粘贴）。
+- **⌥Space 实机限制与恢复默认（2026-10-18 用户反馈补丁）**：释放版在录制中按
+  ⌥Space 不产生可提交结果（假设：macOS/egui-winit 不交付 `Event::Key`，可能只
+  以文本事件到达或被系统吞掉），导致无法把自定义键「录」回内置 ⌥Space。补丁：
+  - **Delete/Backspace = 恢复内置默认**（主路径）：录制中按下返回
+    `SettingsAction::ResetHotkey(slot)`（消费事件，不作为可录制键）→ 设置 pass
+    入队 `HotkeyCommand::Reset(slot)` → `App::logic` 调
+    `HotkeyRuntime::reset_slot(slot)`；成功后清空 `settings.toml` 对应字段
+    （`None` = 跟随内置默认）并锁外保存，失败恢复旧键 + 按槽内联错误。
+  - 录制提示改为「按 Esc 或点击别处取消,Delete 恢复默认」，仍经 `RowSpec.extra`
+    计入行高；键帽字段 hover 文案同步。
+  - **文本事件兜底**（次路径）：录制层识别带 Alt 的 `Event::Text(" ")` /
+    `Event::Text("\u{00A0}")`（选项键产生不断行空格）→ 翻译为 `(Space, modifiers)`
+    提交；录制期文本事件一律消费，不影响其他位置。若平台既不交付 Key 也不交付
+    Text，则现场无法直接「录」⌥Space，Delete/Backspace 是可靠路径。
+  - 运行时 `reset_slot`：唤起槽按 `candidates()` 首个成功项（降级时快照 `note`
+    如实提示「已改用」），完整窗口槽用 `direct_key()`；挂起态与 `commit` 同语义
+    （先恢复另一槽旧键，任何失败都尽力恢复两个旧键并退出挂起）；非挂起态先注册
+    默认、成功后才注销旧键，失败旧键保持。默认键已生效时幂等成功。
 - 录制中失焦/最小化按取消处理（焦点 true→false 跃迁；窗口刚打开的 false 不误取消）；
   若 Begin 落地时已观测到失焦则丢弃（堵住点击后瞬间切走的竞态）。
   可见提示「按 Esc 或点击别处取消」作为行内支持行，`RowSpec.extra` 计入。
@@ -127,6 +145,11 @@
   - [ ] 录制中按 Esc、再次点击字段、点击窗口其它位置、⌘W/红点关闭：均取消并恢复旧键。
   - [ ] 录制中切换到其它 App / 最小化设置窗口：取消录制并恢复旧键（不再长期挂起）。
   - [ ] 录制 ⌘C / ⌘X / ⌘V（含 Ctrl+Cmd+C 额外修饰）：可提交并按预期注册。
+  - [ ] **恢复默认**：录制中按 Delete（或 Backspace）→ 该槽立即回到内置默认
+    （唤起 ⌥Space / 完整窗口 ⌥⇧F），`settings.toml` 对应字段清空，重启后仍跟随默认。
+  - [ ] **⌥Space 录制核对**：从自定义键（如 ⌥D）进入录制后按 ⌥Space。若文本事件
+    兜底生效则直接提交 ⌥Space；若仍无响应，确认 Delete 可恢复默认，并记录实机
+    平台行为（已知限制：⌥Space 可能不以 `Event::Key` 到达）。
   - [ ] 已知残留核对：剪贴板为空时按 ⌘V 不产生事件（录制保持等待，无错误）。
   - [ ] 与另一槽相同组合：行内报「该快捷键已用于另一个功能」，不落盘、录制继续可重按。
   - [ ] 被系统/其它应用占用的组合：行内报注册失败，旧键恢复可用，文件不变。
@@ -150,3 +173,5 @@ cargo test --workspace
 - 录制期间必须 suspend，否则按当前键会触发旧动作。
 - `HotKey` 的 serde 规范形式为 `alt+Space` / `shift+alt+KeyF`；显示层用 macOS 符号，不写回显示串。
 - 保存失败/注册失败必须恢复旧键，不能留下无热键或半注册状态。
+- ⌥Space 在 macOS 释放版可能不以 `Event::Key` 到达（文本兜底也依赖平台交付
+  `Event::Text`）；Delete/Backspace 恢复默认是恢复内置 ⌥Space 的可靠路径。
