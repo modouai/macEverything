@@ -128,9 +128,13 @@ pub struct SettingsState {
     pub(crate) exclude_busy: bool,
     /// 在途操作是列表加载（「加载中…」；否则为变更重扫「重扫中…」）。
     pub(crate) exclude_busy_list: bool,
-    /// 最近一次排除目录加载/变更失败原因（新操作开始时清空，成功清空）。
+    /// 最近一次排除目录加载/变更失败原因。
+    ///
+    /// add/remove 开始即清；自动 list 刷新**保留**（否则刚收到的失败文案会被
+    /// 重开触发的刷新立刻吞掉），仅成功 list 响应清空。
     pub(crate) exclude_error: Option<String>,
-    /// 是否已收到 daemon 列表结果（成功或失败）；种子仅在此之前展示。
+    /// 是否收到过 daemon 列表响应（成功或失败）；启动失败/线程无结果退出不算，
+    /// 保持 false。种子列表在首次成功列表前也可能因失败而继续展示。
     pub(crate) exclude_loaded: bool,
     /// 关闭→打开时置位；设置 pass 负责启动一次 list（busy 中则等本次结束）。
     pub(crate) exclude_refresh_pending: bool,
@@ -220,31 +224,51 @@ impl SettingsState {
 
     /// 开始一次排除目录后台操作（锁内调用）：返回 false = 已有操作在途。
     ///
-    /// 新操作开始即清旧错误；busy 与通道同帧落地，避免陈旧结果跨操作串台。
-    pub(crate) fn begin_exclude(&mut self, list: bool, rx: Receiver<ExcludeResult>) -> bool {
+    /// `clear_error`：add/remove = true（新操作清旧提示）；自动 list 刷新 = false
+    /// （保留已展示的失败文案，直到一次成功 list 才清）。busy 与通道同帧落地，
+    /// 避免陈旧结果跨操作串台。
+    pub(crate) fn begin_exclude(
+        &mut self,
+        list: bool,
+        clear_error: bool,
+        rx: Receiver<ExcludeResult>,
+    ) -> bool {
         if self.exclude_busy {
             return false;
         }
         self.exclude_busy = true;
         self.exclude_busy_list = list;
-        self.exclude_error = None;
+        if clear_error {
+            self.exclude_error = None;
+        }
         self.exclude_rx = Some(rx);
         true
     }
 
-    /// 工作线程无法启动：清 busy/通道并落内联错误（种子列表保留）。
+    /// 设置 pass 的排除目录推进：非阻塞收结果，返回 true = 锁外应启动一次 list。
+    ///
+    /// 不在这里清 `exclude_refresh_pending`：只有工作线程真正启动（spawn 返回
+    /// 成功）后才由调用方清除，`begin_exclude` 被拒时挂起位保留待下次推进。
+    pub(crate) fn advance_exclude(&mut self, open: bool) -> bool {
+        self.tick_exclude();
+        open && self.exclude_refresh_pending && !self.exclude_busy
+    }
+
+    /// 工作线程无法启动：清 busy/通道并落内联错误（旧列表保留）。
+    ///
+    /// 未拿到 daemon 响应，`exclude_loaded` 保持 false（种子语义不变）。
     pub(crate) fn exclude_spawn_failed(&mut self, message: String) {
         self.exclude_busy = false;
         self.exclude_busy_list = false;
         self.exclude_rx = None;
         self.exclude_error = Some(message);
-        self.exclude_loaded = true;
+        self.exclude_loaded = false;
     }
 
     /// 非阻塞收取后台结果（设置 pass 锁内调用；空 = 保持 busy 等下一帧）。
     ///
-    /// 成功（daemon ok=true）覆盖列表；失败保留旧列表 + 内联错误。线程无结果退出
-    /// 也按失败处理，避免 busy 永久卡死。
+    /// 成功（daemon ok=true）覆盖列表并清错误；失败保留旧列表 + 内联错误。
+    /// 线程无结果退出也按失败处理，避免 busy 永久卡死（同样不算 daemon 响应）。
     pub(crate) fn tick_exclude(&mut self) {
         let Some(rx) = self.exclude_rx.take() else {
             return;
@@ -266,7 +290,7 @@ impl SettingsState {
                 self.exclude_busy = false;
                 self.exclude_busy_list = false;
                 self.exclude_error = Some("排除目录工作线程异常退出(无结果)".to_owned());
-                self.exclude_loaded = true;
+                self.exclude_loaded = false;
             }
         }
     }
@@ -510,19 +534,18 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let (open, theme_changed, focus_lost, load_exclude) = {
         let mut s = lock_shared(shared);
         // 排除目录：先收后台结果（非阻塞），再按打开挂起位决定是否补一次 list。
-        s.settings.tick_exclude();
         let open = s.settings.open;
+        let load_exclude = s.settings.advance_exclude(open);
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
         let focus_lost = s.settings.observe_focus(focused, open);
-        let load_exclude = open && s.settings.exclude_refresh_pending && !s.settings.exclude_busy;
-        if load_exclude {
-            s.settings.exclude_refresh_pending = false;
-        }
         (open, theme_changed, focus_lost, load_exclude)
     };
     if load_exclude {
         // 工作线程执行阻塞的 client 调用；锁内只落 busy/通道，spawn 在锁外。
-        spawn_exclude(&ctx, shared, "list", None);
+        // 只有 begin/spawn 真正成功才清挂起位；被拒时保留，下一 pass 重试。
+        if spawn_exclude(&ctx, shared, "list", None) {
+            lock_shared(shared).settings.exclude_refresh_pending = false;
+        }
         ctx.request_repaint_of(viewport_id());
     }
     // 快照放在启动 list 之后：首帧即带 busy（避免旧快照允许在加载中点击添加）。
@@ -640,23 +663,35 @@ fn apply_add_exclude(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
     ctx.request_repaint_of(viewport_id());
 }
 
+/// 操作 → `begin_exclude(list, clear_error)` 标志。
+///
+/// 自动 list 刷新**保留**已展示的错误（失败文案不被重开吞掉）；add/remove 是
+/// 新用户操作，开始即清旧提示。
+fn exclude_begin_flags(op: &str) -> (bool, bool) {
+    (op == "list", op != "list")
+}
+
 /// 启动一次排除目录后台操作（list/add/remove）。
 ///
 /// 共享锁只用于落 busy/错误/回投通道与取 `data_dir`，随即释放；`client::exclude`
 /// （add/remove 会触发 daemon 全量重扫）与线程启动都在锁外。完成时工作线程
 /// 请求设置视口重绘，`tick_exclude` 下一帧收取结果。
+///
+/// 返回 true = 操作已开始（线程启动失败也算：失败已按终态落错误，调用方可清
+/// 刷新挂起位）；false = 已有操作在途，未做任何状态修改。
 fn spawn_exclude(
     ctx: &egui::Context,
     shared: &Arc<Mutex<Shared>>,
     op: &'static str,
     arg: Option<String>,
-) {
+) -> bool {
     let (tx, rx) = mpsc::channel::<ExcludeResult>();
+    let (list, clear_error) = exclude_begin_flags(op);
     let data_dir = {
         let mut s = lock_shared(shared);
-        if !s.settings.begin_exclude(op == "list", rx) {
+        if !s.settings.begin_exclude(list, clear_error, rx) {
             log::warn!("排除目录操作 {op} 被忽略:已有操作在途");
-            return;
+            return false;
         }
         s.settings.data_dir.clone()
     };
@@ -688,6 +723,7 @@ fn spawn_exclude(
             .exclude_spawn_failed(format!("无法启动排除目录工作线程:{err}"));
         ctx.request_repaint_of(viewport_id());
     }
+    true
 }
 
 /// 快捷键命令入队（设置 pass 的唯一动作路径；不调用运行时 manager）。
@@ -887,9 +923,13 @@ mod tests {
     }
 
     /// 假通道：开始一次操作并拿到回投端（不启真实 client/daemon）。
+    /// list = 自动刷新（保留错误）；否则为 add/remove（清旧错误）。
     fn begin_fake_exclude(state: &mut SettingsState, list: bool) -> mpsc::Sender<ExcludeResult> {
         let (tx, rx) = mpsc::channel();
-        assert!(state.begin_exclude(list, rx), "空闲态首个操作应能开始");
+        assert!(
+            state.begin_exclude(list, !list, rx),
+            "空闲态首个操作应能开始"
+        );
         tx
     }
 
@@ -1003,7 +1043,7 @@ mod tests {
         let _tx = begin_fake_exclude(&mut state, true);
         let (_tx2, rx2) = mpsc::channel();
         assert!(
-            !state.begin_exclude(false, rx2),
+            !state.begin_exclude(false, true, rx2),
             "在途操作未回投前不得开始第二操作"
         );
         assert!(
@@ -1021,6 +1061,137 @@ mod tests {
         assert!(state.exclude_error.is_none());
     }
 
+    /// 重要回归：add/remove 失败后紧接着自动 list 刷新，失败文案必须保留到
+    /// 一次**成功** list；刷新失败则替换为新错误。
+    #[test]
+    fn exclude_auto_refresh_preserves_terminal_error_until_success() {
+        let mut state = test_state();
+
+        // 关窗期间 add 失败（结果在重开前落地）。
+        let add = begin_fake_exclude(&mut state, false);
+        add.send(ExcludeResult {
+            entries: Vec::new(),
+            error: Some("路径不在扫描根内: /etc".into()),
+        })
+        .unwrap();
+        state.tick_exclude();
+        assert_eq!(
+            state.exclude_error.as_deref(),
+            Some("路径不在扫描根内: /etc")
+        );
+
+        // 重开触发自动刷新：list 开始不得清掉刚展示的失败文案。
+        state.exclude_refresh_pending = true;
+        let refresh = begin_fake_exclude(&mut state, true);
+        assert_eq!(
+            state.exclude_error.as_deref(),
+            Some("路径不在扫描根内: /etc"),
+            "自动 list 刷新不得吞掉终端错误"
+        );
+        assert!(state.exclude_busy_list);
+
+        // 刷新自身失败：保留旧列表，错误替换为 list 的失败原因。
+        refresh
+            .send(ExcludeResult {
+                entries: Vec::new(),
+                error: Some("daemon 未在运行".into()),
+            })
+            .unwrap();
+        state.tick_exclude();
+        assert_eq!(state.exclude_error.as_deref(), Some("daemon 未在运行"));
+
+        // 成功 list 才清错误并覆盖列表。
+        let refresh = begin_fake_exclude(&mut state, true);
+        assert_eq!(
+            state.exclude_error.as_deref(),
+            Some("daemon 未在运行"),
+            "失败文案仍保留到成功响应前"
+        );
+        refresh
+            .send(ExcludeResult {
+                entries: vec!["node_modules".into()],
+                error: None,
+            })
+            .unwrap();
+        state.tick_exclude();
+        assert!(state.exclude_error.is_none(), "成功 list 才清错误");
+        assert_eq!(state.excluded, vec!["node_modules".to_owned()]);
+    }
+
+    /// pass 推进：busy 时 pending 保留；结果落地后同一 pass 请求刷新（tick→refresh）。
+    #[test]
+    fn exclude_pass_ticks_result_then_requests_refresh() {
+        let mut state = test_state();
+        state.exclude_refresh_pending = true;
+        let tx = begin_fake_exclude(&mut state, true);
+
+        assert!(!state.advance_exclude(true), "busy 中不得重复启动 list");
+        assert!(state.exclude_refresh_pending, "busy 时挂起位必须保留");
+
+        tx.send(ExcludeResult {
+            entries: vec!["/Users/t/Videos".into()],
+            error: None,
+        })
+        .unwrap();
+        assert!(
+            state.advance_exclude(true),
+            "结果落地后同一 pass 应请求一次刷新"
+        );
+        assert_eq!(state.excluded, vec!["/Users/t/Videos".to_owned()]);
+        assert!(!state.exclude_busy);
+        assert!(
+            state.exclude_refresh_pending,
+            "advance 不清挂起位；由 spawn 成功后清"
+        );
+    }
+
+    /// 关闭期间 add/remove 结果落地，重开后同一 pass 应用并请求刷新。
+    #[test]
+    fn exclude_close_reopen_applies_inflight_result() {
+        let mut state = test_state();
+        state.request_open();
+        state.exclude_refresh_pending = false;
+
+        let tx = begin_fake_exclude(&mut state, false);
+        state.mark_hidden();
+        state.request_open();
+        assert!(state.exclude_refresh_pending, "重开须补一次 list");
+
+        tx.send(ExcludeResult {
+            entries: vec!["node_modules".into()],
+            error: None,
+        })
+        .unwrap();
+        assert!(state.advance_exclude(true));
+        assert_eq!(state.excluded, vec!["node_modules".to_owned()]);
+        assert!(!state.exclude_busy);
+        assert!(state.exclude_refresh_pending);
+    }
+
+    /// 工作线程启动失败：终态落错误、清 busy，但不算收到 daemon 响应。
+    #[test]
+    fn exclude_spawn_failure_is_terminal_without_response() {
+        let mut state = test_state();
+        let before = state.excluded.clone();
+        state.exclude_spawn_failed("无法启动排除目录工作线程:资源不足".into());
+        assert!(!state.exclude_busy);
+        assert!(!state.exclude_busy_list);
+        assert!(state.exclude_rx.is_none());
+        assert!(
+            !state.exclude_loaded,
+            "未拿到 daemon 响应,loaded 保持 false"
+        );
+        assert_eq!(state.excluded, before);
+        assert!(
+            state
+                .exclude_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("无法启动")),
+            "{:?}",
+            state.exclude_error
+        );
+    }
+
     /// 工作线程无结果退出：不得让 busy 永久卡住；按失败展示并保留列表。
     #[test]
     fn exclude_worker_disconnect_ends_busy_with_error() {
@@ -1030,7 +1201,7 @@ mod tests {
         drop(tx);
         state.tick_exclude();
         assert!(!state.exclude_busy);
-        assert!(state.exclude_loaded);
+        assert!(!state.exclude_loaded, "无结果退出不算 daemon 响应");
         assert_eq!(state.excluded, before);
         assert!(
             state
@@ -1040,6 +1211,14 @@ mod tests {
             "{:?}",
             state.exclude_error
         );
+    }
+
+    /// 只有自动 list 保留错误；add/remove 开始即清旧提示（pass 级回归的接线钉）。
+    #[test]
+    fn exclude_op_begin_flags_preserve_error_only_for_auto_list() {
+        assert_eq!(exclude_begin_flags("list"), (true, false));
+        assert_eq!(exclude_begin_flags("add"), (false, true));
+        assert_eq!(exclude_begin_flags("remove"), (false, true));
     }
 
     /// `ExcludeOutcome` 映射：ok=true 才给覆盖列表；ok=false/Err 只给错误。

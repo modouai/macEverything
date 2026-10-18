@@ -363,7 +363,8 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
             }
         }
         "remove" => {
-            let p = arg.ok_or_else(|| anyhow!("用法: macEverything exclude remove <绝对路径>"))?;
+            let p =
+                arg.ok_or_else(|| anyhow!("用法: macEverything exclude remove <已存在的排除项>"))?;
             Request::ExcludeRemove {
                 v: protocol::PROTOCOL_VERSION,
                 path: p.into(),
@@ -391,6 +392,18 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// remove 缺参提示须反映 E1 语义:已有相对名条目也可移除(不再写「绝对路径」)。
+    /// 该分支在连接 daemon 前返回,不会触发真实 client/daemon。
+    #[test]
+    fn exclude_remove_usage_allows_existing_relative_names() {
+        let paths = DaemonPaths {
+            data_dir: PathBuf::from("/nonexistent-mace-test"),
+        };
+        let err = exclude(&paths, "remove", None).unwrap_err().to_string();
+        assert!(err.contains("已存在的排除项"), "{err}");
+        assert!(!err.contains("绝对路径"), "相对名条目也可移除:{err}");
+    }
 
     /// stat_rows 必须从同一次 metadata 同时填 size/mtime/is_dir:
     /// 目录 true、文件 false、不存在路径缺省 false(size/mtime 为 None)。

@@ -90,7 +90,7 @@
 ## Task E4: 验收与文档
 
 - [ ] 实机：打开设置加载真实列表；添加根内目录（重扫提示 → 列表更新）；移除 `node_modules`/添加的目录；越界路径错误；引擎离线提示；重扫期间 UI 不卡；大列表滚动。
-- [ ] 更新 `design.md` §8 偏差（列表滚动模型/异步状态）、`settings-visual.md` 状态、本计划勾选。
+- [ ] 实机若发现新偏差，补记 `design.md` §8 / `settings-visual.md`（E1–E3 的状态与勾选已在 E3 完成）。
 - [ ] **CLI 帮助文案待修（E4）：** `crates/cli/src/main.rs` 的
   `exclude add|remove|list [绝对路径]` 与 `docs/usage.md` §`exclude` 仍写
   `remove` 必须绝对路径；E1 起**已存在的相对名条目**（如 `node_modules`）也可

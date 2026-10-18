@@ -35,7 +35,7 @@ const ADD_DIR_LABEL: &str = "＋ 添加目录…";
 pub(crate) const LANGUAGE_LABEL: &str = "简体中文";
 /// 语言禁用态提示。
 const LANGUAGE_TOOLTIP: &str = "暂仅支持简体中文，语言切换将在后续版本提供";
-/// 排除目录空态文案（列表为空或首次加载尚未返回时均可见）。
+/// 排除目录空态文案（列表为空时显示；加载/错误支持行可与之并存）。
 const EXCLUDED_EMPTY: &str = "未排除任何目录";
 /// 打开设置页/重开时的列表加载提示。
 const EXCLUDE_LOADING: &str = "加载中…";
