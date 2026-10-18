@@ -235,6 +235,17 @@ fn palette_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str
     }
 }
 
+/// 根视口 ⌘W：与红点关闭同语义——隐藏窗口，不退出 App。
+/// 返回 true = 已处理（调用方负责落盘窗口尺寸）。
+fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    } else {
+        false
+    }
+}
+
 /// 打开完整窗口(托盘「打开完整窗口」/「缺口面板」/⌥⇧F 直达共用):
 /// 聚焦搜索框 + 补查引擎状态后原生唤到前台(原生调用在锁外,见锁纪律)。
 fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
@@ -470,6 +481,11 @@ impl App {
                     self.shared().results.open_gaps();
                     self.open_results(ctx);
                 }
+                TrayMsg::OpenSettings => {
+                    // 设置窗口属 v2.1:v2.0 用原生提示占位,不放假入口。
+                    log::info!("托盘:设置入口(v2.1 未实现,显示占位提示)");
+                    platform::show_info_alert("macEverything", "设置将在 v2.1 提供");
+                }
                 TrayMsg::ToggleAutostart => {
                     // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按真实注册结果校准——
                     // 成功保留勾选并落下/清除「用户关闭」标记(下次启动不再默认注册),
@@ -610,6 +626,14 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // ⌘W = 关闭完整窗口（与红点同语义：隐藏，不退出 App）。
+        // 仅根视口持焦时处理，避免悬浮条持焦时误关背后的完整窗口。
+        let root_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if root_focused && handle_root_close_shortcut(&ctx) {
+            log::info!("⌘W:隐藏完整窗口(与红点关闭同语义)");
+            self.window_size.flush(&self.paths.data_dir);
+        }
 
         // 运行期字体回退留痕一次(诊断:实际命中的系统 CJK 字体;
         // 延迟到 ui() 因 ctx.fonts() 在首个 pass 前不可用)。
@@ -756,4 +780,62 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         palette::MASCOT_STRIP as f64,
         s.palette.visible_panel_h() as f64,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_w(modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn root_commands(out: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// ⌘W = 根窗隐藏（与红点关闭同语义）；裸 W 不触发。
+    #[test]
+    fn cmd_w_hides_root_window() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(key_w(egui::Modifiers::COMMAND), |ui| {
+            assert!(handle_root_close_shortcut(ui.ctx()), "⌘W 应被消费");
+        });
+        let cmds = root_commands(&out);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Visible(false))),
+            "⌘W 应发 Visible(false)"
+        );
+        out.textures_delta.clear();
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(key_w(egui::Modifiers::NONE), |ui| {
+            assert!(!handle_root_close_shortcut(ui.ctx()), "裸 W 不消费");
+        });
+        let cmds = root_commands(&out);
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Visible(false))),
+            "裸 W 不得隐藏根窗"
+        );
+        out.textures_delta.clear();
+    }
 }

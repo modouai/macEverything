@@ -2,8 +2,9 @@
 //!
 //! 形态:菜单栏常驻图标(代码生成 RGBA,免 asset 文件);**左键** = 唤起/隐藏悬浮条
 //! (切换语义);**右键** = 菜单[引擎状态(§7 表六态)/⚠ N 个目录未收录(有缺口才挂)/
-//! 打开搜索 / 打开完整窗口 / 开机自启(勾选)/ 退出]。状态项在「未运行」时可点击拉起
-//! 引擎;状态项与缺口项随引擎快照动态刷新。
+//! ── / 打开搜索 / 打开完整窗口 / ── / 开机自启(勾选)/ 设置… / ── / 退出]。
+//! 结构与 `settings-visual.md` §4.2 一致;设置窗口属 v2.1,v2.0 点击弹原生提示占位。
+//! 状态项在「未运行」时可点击拉起引擎;状态项与缺口项随引擎快照动态刷新。
 //!
 //! ## 主线程约束(实锁核对,禁凭记忆)
 //!
@@ -56,6 +57,7 @@ mod ids {
     pub const OPEN_SEARCH: &str = "open-search";
     pub const OPEN_WINDOW: &str = "open-window";
     pub const AUTOSTART: &str = "autostart";
+    pub const SETTINGS: &str = "settings";
     pub const QUIT: &str = "quit";
 }
 
@@ -84,6 +86,8 @@ pub enum TrayMsg {
     /// 菜单「开机自启」(Task 20:真实注册态;muda 已按点击翻转勾选,成败由
     /// `ui::drain_tray` 经 `autostart::apply_user_choice` 校准)。
     ToggleAutostart,
+    /// 菜单「设置…」:设置窗口属 v2.1,v2.0 弹原生提示占位。
+    OpenSettings,
     /// 菜单「退出」:退 App(引擎常驻,product §5)。
     Quit,
     /// 状态项点击(仅未运行时可点):拉起引擎。
@@ -132,6 +136,7 @@ fn dispatch(menu_id: &MenuId) -> Option<TrayMsg> {
         ids::OPEN_SEARCH => TrayMsg::TogglePalette,
         ids::OPEN_WINDOW => TrayMsg::OpenResults,
         ids::AUTOSTART => TrayMsg::ToggleAutostart,
+        ids::SETTINGS => TrayMsg::OpenSettings,
         ids::QUIT => TrayMsg::Quit,
         _ => return None,
     })
@@ -249,14 +254,22 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
     });
     let autostart =
         CheckMenuItem::with_id(ids::AUTOSTART, "开机自启", true, autostart_checked, None);
+    let settings = MenuItem::with_id(ids::SETTINGS, "设置…", true, None);
     let quit = MenuItem::with_id(ids::QUIT, "退出", true, None);
-    let separator = PredefinedMenuItem::separator();
+    let sep1 = PredefinedMenuItem::separator();
+    let sep2 = PredefinedMenuItem::separator();
+    let sep3 = PredefinedMenuItem::separator();
+    // 分组与原型一致:状态 / 打开类 / 自启 + 设置 / 退出。缺口项动态插在状态项后
+    // (`apply_gaps` 的 index 1),因此仍在第一组内。
     menu.append_items(&[
         &state_item,
-        &separator,
+        &sep1,
         &open_search,
         &open_window,
+        &sep2,
         &autostart,
+        &settings,
+        &sep3,
         &quit,
     ])
     .map_err(|e| anyhow::anyhow!("托盘菜单构建失败: {e}"))?;
@@ -567,6 +580,7 @@ mod tests {
             (ids::OPEN_SEARCH, TrayMsg::TogglePalette),
             (ids::OPEN_WINDOW, TrayMsg::OpenResults),
             (ids::AUTOSTART, TrayMsg::ToggleAutostart),
+            (ids::SETTINGS, TrayMsg::OpenSettings),
             (ids::QUIT, TrayMsg::Quit),
         ];
         for (id, expected) in cases {
