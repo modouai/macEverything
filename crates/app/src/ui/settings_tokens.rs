@@ -13,9 +13,8 @@
 //! （单点定义），本文件只 re-export 供设置窗口消费。
 
 // token 表按规格一次建全、消费方分 Task 接入；测试逐项钉住数值。
-// 仅「规格对账」、应用永不读取的参考值已逐条 `#[allow(dead_code)]`；其余 token
-// 在 Task 4/5 接入后即被消费，届时可移除本模块级 allow。
-#![allow(dead_code)]
+// 仅「规格对账」、应用永不读取的参考值逐条 `#[allow(dead_code)]`（Task 4 已移除
+// 模块级 allow，避免掩盖后续新 token 的漏接）。
 
 use eframe::egui;
 
@@ -80,6 +79,8 @@ pub struct SettingsPalette {
     pub remove_icon: egui::Color32,
     /// 错误提示（settings-visual.md §2.5 表外：与完整窗口
     /// `FullWindowPalette::error_text` 同源——同一错误红在同类底上取同值）。
+    /// Task 4 静态布局无错误提示；Task 5/8 接自启/目录失败文案后消费。
+    #[allow(dead_code)]
     pub error_text: egui::Color32,
 }
 
@@ -195,8 +196,12 @@ pub const LABEL_FONT: f32 = 13.0;
 /// 标签与右侧控件间距（§2.3：16）。
 pub const LABEL_CONTROL_GAP: f32 = 16.0;
 /// 辅助说明字号（§2.3：11pt）。
+/// Task 4 静态布局无辅助说明；后续任务接行内错误/说明文字时消费。
+#[allow(dead_code)]
 pub const SUPPORT_FONT: f32 = 11.0;
 /// 辅助说明与标签间距（§2.3：2）。
+/// 同上：Task 4 无辅助说明行，留待后续任务。
+#[allow(dead_code)]
 pub const LABEL_SUPPORT_GAP: f32 = 2.0;
 
 // —— 字号分段（§2.4）——
@@ -218,6 +223,8 @@ pub const SWITCH_RADIUS: u8 = 11;
 pub const SWITCH_KNOB: f32 = 18.0;
 /// 开关钮投影扩边（§2.4「1px 柔和投影」）。
 pub const SWITCH_KNOB_SHADOW_SIZE: f32 = 1.0;
+/// 开关钮投影纵向偏移（§2.4「1px 柔和投影」；表外补充：正下方 1px）。
+pub const SWITCH_KNOB_SHADOW_OFFSET: f32 = 1.0;
 
 // —— 下拉 / 键帽字段（§2.4）——
 /// 语言下拉与快捷键字段尺寸（宽, 高）。
@@ -225,6 +232,8 @@ pub const FIELD: (f32, f32) = (152.0, 28.0);
 pub const FIELD_RADIUS: u8 = 7;
 /// 字段文字字号（§2.4：13pt）。
 pub const FIELD_FONT: f32 = 13.0;
+/// 字段内左右内边距（§2.4 表外补充：文字/键帽距字段边缘）。
+pub const FIELD_PAD_X: f32 = 8.0;
 /// 下拉 chevron-down 图标。
 pub const FIELD_CHEVRON: f32 = 14.0;
 
@@ -232,17 +241,29 @@ pub const FIELD_CHEVRON: f32 = 14.0;
 pub const KEYCAP_H: f32 = 20.0;
 pub const KEYCAP_RADIUS: u8 = 4;
 pub const KEYCAP_FONT: f32 = 11.0;
+/// 键帽内左右内边距（§2.4 表外补充：键帽宽 = 文字宽 + 2×本值）。
+pub const KEYCAP_PAD_X: f32 = 6.0;
+/// 键帽间距（§2.4 表外补充：同字段内相邻键帽的横向间距）。
+pub const KEYCAP_GAP: f32 = 4.0;
 
 /// 「＋ 添加目录…」按钮高（宽随内容）。
 pub const ADD_BUTTON_H: f32 = 28.0;
 pub const ADD_BUTTON_RADIUS: u8 = 7;
 pub const ADD_BUTTON_FONT: f32 = 12.0;
+/// 添加按钮内左右内边距（§2.4 表外补充：按钮宽 = 文字宽 + 2×本值）。
+pub const ADD_BUTTON_PAD_X: f32 = 10.0;
 
 // —— 图标（§2.4）——
 /// 排除目录行的文件夹图标。
 pub const FOLDER_ICON: f32 = 16.0;
+/// 文件夹图标与路径文字间距（§2.4 表外补充）。
+pub const FOLDER_ICON_GAP: f32 = 8.0;
 /// 排除目录行的移除 ×。
 pub const REMOVE_ICON: f32 = 14.0;
+/// 行内线条图标（文件夹 / chevron）描边宽（§2.4 表外补充）。
+pub const ICON_STROKE: f32 = 1.2;
+/// 移除 × 两条斜线描边宽（§2.4：1px）。
+pub const REMOVE_ICON_STROKE: f32 = 1.0;
 
 #[cfg(test)]
 mod tests {
@@ -501,20 +522,44 @@ mod tests {
                 SWITCH_SIZE,
                 SWITCH_RADIUS,
                 SWITCH_KNOB,
-                SWITCH_KNOB_SHADOW_SIZE
+                SWITCH_KNOB_SHADOW_SIZE,
+                SWITCH_KNOB_SHADOW_OFFSET
             ),
-            ((38.0, 22.0), 11, 18.0, 1.0)
+            ((38.0, 22.0), 11, 18.0, 1.0, 1.0)
         );
         assert_eq!(
-            (FIELD, FIELD_RADIUS, FIELD_FONT, FIELD_CHEVRON),
-            ((152.0, 28.0), 7, 13.0, 14.0)
+            (FIELD, FIELD_RADIUS, FIELD_FONT, FIELD_PAD_X, FIELD_CHEVRON),
+            ((152.0, 28.0), 7, 13.0, 8.0, 14.0)
         );
-        assert_eq!((KEYCAP_H, KEYCAP_RADIUS, KEYCAP_FONT), (20.0, 4, 11.0));
         assert_eq!(
-            (ADD_BUTTON_H, ADD_BUTTON_RADIUS, ADD_BUTTON_FONT),
-            (28.0, 7, 12.0)
+            (
+                KEYCAP_H,
+                KEYCAP_RADIUS,
+                KEYCAP_FONT,
+                KEYCAP_PAD_X,
+                KEYCAP_GAP
+            ),
+            (20.0, 4, 11.0, 6.0, 4.0)
         );
-        assert_eq!((FOLDER_ICON, REMOVE_ICON), (16.0, 14.0));
+        assert_eq!(
+            (
+                ADD_BUTTON_H,
+                ADD_BUTTON_RADIUS,
+                ADD_BUTTON_FONT,
+                ADD_BUTTON_PAD_X
+            ),
+            (28.0, 7, 12.0, 10.0)
+        );
+        assert_eq!(
+            (
+                FOLDER_ICON,
+                FOLDER_ICON_GAP,
+                REMOVE_ICON,
+                ICON_STROKE,
+                REMOVE_ICON_STROKE
+            ),
+            (16.0, 8.0, 14.0, 1.2, 1.0)
+        );
     }
 
     /// `palette(is_dark)` 按主题取表。
