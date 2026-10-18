@@ -293,7 +293,8 @@ fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
         // 设置窗打开即用当前系统外观(与 results_open 同法;隐藏期可能切过外观)。
         s.theme.check_now_with(ctx, detected);
     }
-    // 原生居中/置前:ROOT 隐藏或位于其他 Space 时也能把设置窗带到前台。
+    // 原生居中/置前:ROOT 隐藏(同 Space)时也能把设置窗带到前台。
+    // 跨 Space 未做额外 collectionBehavior,待实机验证(不擅自新增 Space 行为)。
     // 首次打开居中,之后只置前(保留用户拖动位置);失败退回 egui 命令。
     if let Err(err) = platform::show_settings_window(center) {
         log::warn!("设置窗口原生定位/置前失败,退回 egui 命令:{err}");

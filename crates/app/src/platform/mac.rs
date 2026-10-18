@@ -447,6 +447,12 @@ pub fn show_root_window() -> Result<()> {
         .ok_or_else(|| anyhow!("根窗句柄未记录(attach_root 未执行)"))?;
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
+    // 最小化态下单发 orderFront/makeKey 不会从 Dock 恢复:先 deminiaturize
+    //（与设置窗同法;2026-10-18 review 补）。
+    if root.isMiniaturized() {
+        root.deminiaturize(None);
+        log::info!("完整窗口(根窗)最小化中:deminiaturize 恢复");
+    }
     root.orderFrontRegardless();
     root.makeKeyWindow();
     root.makeMainWindow();
@@ -466,11 +472,12 @@ pub fn show_root_window() -> Result<()> {
 /// 设置窗口首次打开居中 + 置前(原生)。
 ///
 /// - `center = true`(仅首次打开):按**鼠标所在屏**的 `visibleFrame`(已扣菜单栏/
-///   Dock)居中,四周 clamp 到 `EDGE_MARGIN`;窗口大于可见区时优先左上留白
-///   (与悬浮条同语义,无法两全时允许溢出);
+///   Dock)居中,四周 clamp 到 `EDGE_MARGIN`;窗口大于可见区时保持左上可见
+///   (顶部/左缘贴留白,底部/右侧允许溢出;标题栏/交通灯不得移出屏);
 /// - 一律 `NSApp.activate()` + `orderFrontRegardless()` + `makeKeyWindow()`:
-///   ROOT 隐藏或设置窗位于其他 Space 时也能带到前台(与 `show_root_window` 同法,
-///   设置窗不需要 main 语义)。
+///   ROOT 隐藏(同 Space)时也能带到前台(与 `show_root_window` 同法,设置窗不需要
+///   main 语义);最小化态先 `deminiaturize` 恢复。跨 Space 未做额外
+///   collectionBehavior,待实机验证(不擅自新增 Space 行为)。
 ///
 /// 窗口按标题定位(eframe 不暴露子视口原生窗回取 API);未创建/非主线程 → Err,
 /// 调用方退回 egui `Visible(true)` + `Focus`。原生调用可能被 winit 同步派发
@@ -485,6 +492,11 @@ pub fn show_settings_window(center: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("设置窗口未就绪(视口尚未创建)"))?;
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
+    // 最小化态不会因 orderFrontRegardless/makeKeyWindow 自动从 Dock 恢复。
+    if win.isMiniaturized() {
+        win.deminiaturize(None);
+        log::info!("设置窗口最小化中:deminiaturize 恢复");
+    }
     if center {
         let visible = screen_with_point(mtm, NSEvent::mouseLocation())
             .map(|s| s.visibleFrame())
@@ -527,15 +539,26 @@ pub fn show_settings_window(center: bool) -> Result<()> {
     Ok(())
 }
 
-/// 设置窗口左上角(AppKit 坐标;纯函数,单测钉住):可见区内居中并 clamp
-/// (四周留 `EDGE_MARGIN`)。窗口大于可见区时 clamp 到左上留白线(无法两全时溢出)。
+/// 设置窗口原点(AppKit 坐标,左下角;纯函数,单测钉住):可见区内居中并 clamp
+/// (四周留 `EDGE_MARGIN`)。
+///
+/// 窗口大于可见区时保持**左上**可见:水平贴左留白、垂直贴**顶边**留白
+/// (AppKit y 向上,故原点 y 取可见区顶 − 窗高 − 留白;底部允许溢出)——
+/// 标题栏/交通灯不得被挤出屏外。
 fn settings_origin(visible: NSRect, w: f64, h: f64) -> NSPoint {
     let min_x = visible.origin.x + EDGE_MARGIN;
     let max_x = (visible.origin.x + visible.size.width - w - EDGE_MARGIN).max(min_x);
     let x = (visible.origin.x + (visible.size.width - w) / 2.0).clamp(min_x, max_x);
+
     let min_y = visible.origin.y + EDGE_MARGIN;
-    let max_y = (visible.origin.y + visible.size.height - h - EDGE_MARGIN).max(min_y);
-    let y = (visible.origin.y + (visible.size.height - h) / 2.0).clamp(min_y, max_y);
+    let top_anchored_y = visible.origin.y + visible.size.height - h - EDGE_MARGIN;
+    let centered_y = visible.origin.y + (visible.size.height - h) / 2.0;
+    let y = if top_anchored_y >= min_y {
+        centered_y.clamp(min_y, top_anchored_y)
+    } else {
+        // 窗高超过可见区:顶边优先(标题栏可见),底部溢出是既定的无法两全语义。
+        top_anchored_y
+    };
     NSPoint::new(x, y)
 }
 
@@ -1543,14 +1566,27 @@ mod tests {
         assert_eq!(p.y, -200.0 + (777.0 - 600.0) / 2.0);
     }
 
-    /// 可见区放不下 620×600:clamp 到左上留白线,不产生反向/NaN 坐标
-    /// (窗口溢出可见区是既定的「无法两全」语义)。
+    /// 可见区放不下 620×600:保持**顶边与左边**可见（AppKit y 向上，原点 y =
+    /// 可见区顶 − 窗高 − 留白），底部允许溢出；不产生反向/NaN 坐标。
     #[test]
-    fn settings_origin_clamps_when_window_larger_than_visible_frame() {
+    fn settings_origin_keeps_top_left_when_window_larger_than_visible_frame() {
         let tiny = NSRect::new(NSPoint::new(100.0, 60.0), NSSize::new(500.0, 400.0));
         let p = settings_origin(tiny, 620.0, 600.0);
-        assert_eq!(p.x, tiny.origin.x + EDGE_MARGIN);
-        assert_eq!(p.y, tiny.origin.y + EDGE_MARGIN);
+        assert_eq!(p.x, tiny.origin.x + EDGE_MARGIN, "左缘贴可见区左留白");
+        assert_eq!(
+            p.y,
+            tiny.origin.y + tiny.size.height - 600.0 - EDGE_MARGIN,
+            "原点 = 可见区顶 − 窗高 − 留白"
+        );
+        assert_eq!(
+            p.y + 600.0,
+            tiny.origin.y + tiny.size.height - EDGE_MARGIN,
+            "顶边贴可见区顶留白（标题栏/交通灯可见）"
+        );
+        assert!(
+            p.y < tiny.origin.y + EDGE_MARGIN,
+            "窗高超过可见区时底部溢出，而非把顶边压出屏"
+        );
         assert!(p.x.is_finite() && p.y.is_finite());
     }
 

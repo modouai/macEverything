@@ -204,7 +204,7 @@ Expected:
 - 再次点齿轮/托盘 → 同一实例重新出现，不新建窗口；
 - 根窗隐藏时从托盘打开也可见（若不可见，记录并转平台层 `orderFrontRegardless` 方案）。
 
-**状态（2026-10-18）:** 核心行为已由 controller 实机 PoC 验证（620×600、原生交通灯、红点隐藏、齿轮重开同一实例）；托盘在 ROOT 隐藏 / 跨 Space 时打开设置仍待验，留作 PoC 缺口。
+**状态（2026-10-18）:** 核心行为已由 controller 实机 PoC 验证（620×600、原生交通灯、红点隐藏、齿轮重开同一实例）；托盘在 ROOT 隐藏（同 Space）时打开设置已在 Task 6 实机验证；跨 Space 仍待验，留作缺口。
 
 - [x] **Step 8: 提交**
 
@@ -679,13 +679,16 @@ git commit -m "feat(app): 设置页字号与开机自启"
 - [x] **Step 1: 原生居中/置前（仅首次）**
   - `platform::show_settings_window(center)`：按 `platform::SETTINGS_TITLE` 定位设置
     NSWindow；`center=true`（首次）按鼠标所在屏 `NSScreen.visibleFrame`（已扣菜单栏/
-    Dock）居中 620×600，四周 clamp 8pt；一律 `NSApp.activate` +
-    `orderFrontRegardless` + `makeKeyWindow`。
+    Dock）居中 620×600，四周 clamp 8pt；放不下时保持**左上可见**（AppKit y 向上，
+    原点 y = 可见区顶 − 窗高 − 8，底部允许溢出，标题栏/交通灯不得移出屏）。
+    一律 `NSApp.activate` +（最小化态先 `deminiaturize`）`orderFrontRegardless` +
+    `makeKeyWindow`；`show_root_window` 同步补 deminiaturize 守卫。
   - `SettingsState::request_open()` 首开返回 true 并记账 `positioned_once`；已打开/
     关闭后重开只置前，保留用户拖动位置。
   - 原生调用在 `Shared` 锁外；窗口未就绪 → 留痕并退回既有 egui `Visible(true)` +
     `Focus`；非 macOS facade 返回错误（同样走退回路径）。
-  - 纯单测：`settings_origin`（主屏/副屏负坐标/小屏 clamp）、窗口标题精确匹配。
+  - ROOT 隐藏（同 Space）置前已实机验证；跨 Space 未加 `collectionBehavior`，待验。
+  - 纯单测：`settings_origin`（主屏/副屏负坐标/小屏左上锚定）、窗口标题精确匹配。
 
 - [x] **Step 2: 主题跟随（设置窗单独可见）**
   - 设置 pass 在 `settings.open` 时驱动 `Shared.theme.maybe_apply`，应用后立即重绘
@@ -696,12 +699,14 @@ git commit -m "feat(app): 设置页字号与开机自启"
 - [x] **Step 3: 关闭/录制 hook（不实现快捷键）**
   - 红点 / ⌘W → `SettingsState::mark_hidden()`：`open=false` +
     `cancel_recording_pending=true`；`App::logic` 取走并留痕。
-  - headless 测试：⌘W 被消费/同帧只消费一次、裸 W 不触发；隐藏状态纯转换。
+  - headless 测试：⌘W 被消费/同帧只消费一次、裸 W 不触发；隐藏状态纯转换；
+    `hide_with_command` 粘合测试（状态置隐藏 + 挂起取消录制 + `Visible(false)`）。
 
 - [x] **Step 4: Task 5 review 可选加固**
   - 自启关闭成功（`desired=false, Ok(NotRegistered)`）单测：关态、无错误、托盘同步 OFF。
-  - 托盘同帧切换失败：勾选改按 `SettingsState` 实际值（`update.enabled`）校准，
-    不再用点击前值——修复「设置页排队同步被仲裁丢弃后，托盘勾选停在旧态」。
+  - 托盘同帧切换失败：设置页已加载实际态时按 `s.settings.autostart` 校准；
+    未知（设置页从未打开）回退点击前值——避免把托盘安装时读到的真实启用态误改成关。
+    纯函数 `autostart_check_after_failure(known, checked_after_click)` 钉住。
   - Task 5 的 `git add` 命令已修正（补 `autostart.rs`/`.gitignore`，移除 `tray.rs`）。
 
 - [x] **Step 5: 文档**
@@ -715,30 +720,39 @@ git commit -m "feat(app): 设置页字号与开机自启"
 
 ### 实机结果（controller，2026-10-18）
 
-- 字号：**Large 即时应用并重启保持**；随后已恢复 **Standard**。
+- 首次打开：设置窗在鼠标所在屏居中于 **(425,155)** 并置前（controller 实测坐标）。
+- 移动窗口到 **(300,200)** → ⌘W 关闭 → 再次打开：位置保持 **(300,200)**，不重新居中。
+- ROOT 隐藏且 App 隐藏时，托盘「设置…」把设置窗唤到 **(300,200)**（**同 Space**）。
+- 关闭：设置窗口 **⌘W 隐藏**（App 不退出）。
+- 字号：**Large 即时应用、重启保持、无裁切**；随后已恢复 **Standard**。
 - 开机自启：开 / 关均生效（系统「登录项」条目增加 / 移除）；`autostart-off`
   用户意图标记写入后已恢复。
-- 关闭：设置窗口 **⌘W 隐藏**（App 不退出）。
-- 托盘「开机自启」勾选视觉：**仍待 controller 复核**（沿用 Task 5 缺口）。
+- **仍待验**：主题跟随（设置窗单独可见）、**跨 Space**、托盘「开机自启」勾选视觉。
 
 ### 手动验收清单（controller）
 
-- [ ] 首次打开（齿轮或托盘「设置…」）：设置窗在**鼠标所在屏**居中（可见区，扣菜单栏/
-  Dock），且置前成 key；ROOT 在别的 Space 时设置窗出现在当前 Space。
+- [x] 首次打开（齿轮或托盘「设置…」）：设置窗在**鼠标所在屏**居中（可见区，扣菜单栏/
+  Dock），且置前成 key（实测 (425,155)）。
+- [x] 关闭后（可先拖动窗口）再打开：保留上次位置，只有首次打开居中（实测 (300,200)）。
+- [x] ROOT 隐藏且 App 隐藏时，从托盘「设置…」打开：设置窗被唤到前台（**同 Space**，
+  实测位置 (300,200)）。
+- [ ] 设置窗最小化 → 托盘/齿轮恢复（`deminiaturize`；待 controller 实机验证）。
 - [ ] 已打开时再点入口：同一实例置前，不新建、不重置位置。
-- [ ] 关闭后（可先拖动窗口）再打开：保留上次位置，只有首次打开居中。
 - [ ] 系统浅色 ↔ 深色：设置窗口 2s 内跟随；ROOT/悬浮条都隐藏时同样生效。
+- [ ] **跨 Space**：ROOT 与设置窗位于其他 Space 时的唤起行为待验（本期未加
+  `collectionBehavior`，不擅自新增 Space 行为）。
 - [x] 字号 小/标准/大：设置窗与另两窗即时变化、重启保持（Large 已验，Standard 已恢复）。
-- [x] 开机自启开/关：设置页与托盘勾选一致；系统「登录项」增加/移除（已验）。
-  审批态（若系统要求）显示关态 +「已注册,待系统设置「登录项」允许」。
+- [x] 开机自启开/关（设置页）：系统「登录项」条目增加 / 移除；`autostart-off` 标记
+  写入后已恢复。审批态（若系统要求）显示关态 +
+  「已注册,待系统设置「登录项」允许」。
+- [ ] 托盘「开机自启」勾选视觉与设置页一致（**待 controller 复核**，沿用 Task 5 缺口）。
 - [x] 红点 / ⌘W：隐藏设置窗、App 不退出；再次打开同一实例（⌘W 已验）。
-- [ ] 大字号（Large）：整页可滚动、标题栏固定、内容无裁切。
-- [ ]（待复核）托盘「开机自启」勾选视觉与设置页一致。
+- [x] 大字号（Large）：整页可滚动、标题栏固定、内容无裁切（已验）。
 
-**验证记录（2026-10-18）：** `cargo fmt --check` / `cargo clippy --workspace
---all-targets -- -D warnings` / `cargo test --workspace` 全绿。新增测试：
-`settings_origin` 2 个、标题精确匹配 1 个、首开定位/关闭取消录制/⌘W 各 1 个、
-自启关闭成功 1 个、托盘失败勾选校准 1 个。
+**验证记录（2026-10-18，quality review follow-up）：** `cargo fmt --check` /
+`cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace`
+全绿。测试覆盖：`settings_origin` 2 个（含小屏左上锚定）、标题精确匹配 1 个、
+首开定位/关闭取消录制/⌘W/隐藏粘合各 1 个、自启关闭成功 1 个、托盘失败勾选校准 1 个。
 
 ---
 

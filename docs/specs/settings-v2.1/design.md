@@ -132,8 +132,12 @@ window_hotkey = "shift+alt+KeyF" # 缺省 = 内置默认（⌥⇧F）
 - 内容层每帧铺 `window_fill`；内描边 1px 圆角 12。
 - **首次打开居中 + 置前（2026-10-18 实现）**：平台层按 `platform::SETTINGS_TITLE` 定位
   设置 NSWindow，在**鼠标所在屏**的 `NSScreen.visibleFrame`（已扣菜单栏 / Dock）内居中
-  620×600，四周 clamp 8pt；`NSApp.activate()` + `orderFrontRegardless()` +
-  `makeKeyWindow()`，ROOT 隐藏或位于其他 Space 时也能带到前台。
+  620×600，四周 clamp 8pt；窗口大于可见区时保持**左上可见**（AppKit y 向上：原点 y =
+  可见区顶 − 窗高 − 8，底部允许溢出，标题栏/交通灯不得移出屏）。
+  `NSApp.activate()` +（最小化态先 `deminiaturize`）`orderFrontRegardless()` +
+  `makeKeyWindow()`。ROOT 隐藏（**同 Space**）已实机验证；**跨 Space 待验**
+  （未额外设置 `collectionBehavior`，不擅自新增 Space 行为）。完整窗口唤起同步补
+  `deminiaturize` 守卫。
 - **只居中一次**：`SettingsState::request_open()` 首次打开返回居中请求并记账
   `positioned_once`；再次打开只置前，保留用户拖动后的位置。首次原生窗口未就绪时
   退回 egui `Visible(true)` + `Focus`，同样不再重试居中。
@@ -262,7 +266,8 @@ Committing → 成功: Idle + 新键；失败: Recording + 内联错误（旧键
 
 - 完整窗口齿轮：删除「设置将在 v2.1 提供」占位，改为 `settings_open(shared, ctx)`。
 - 托盘「设置…」：删除 NSAlert 占位，改为 `settings_open`。
-- 单实例：已打开则 `Visible(true)` + `Focus` + 置前；不新建第二窗。
+- 单实例：已打开则原生激活 + 置前（`deminiaturize` + `orderFrontRegardless` +
+  `makeKeyWindow`；原生不可用时退回 `Visible(true)` + `Focus`）；不新建第二窗。
 - 关闭：设置窗口的 `close_requested` → 取消关闭 + `Visible(false)` + 取消录制。
 - 设置窗口打开不改变完整窗口显隐。
 

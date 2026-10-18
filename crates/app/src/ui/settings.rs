@@ -34,7 +34,8 @@ pub fn viewport_id() -> egui::ViewportId {
 /// 设置视口 builder（常量；每 pass 传同一份——`patch` 无差异则无命令/无重建）。
 ///
 /// min/max 同时锁死尺寸（`resizable(false)` 之外的双保险：builder 尺寸即规格）。
-/// `visible(false)`：启动隐藏；打开走 `open_settings` 的 `Visible(true)` + `Focus`。
+/// `visible(false)`：启动隐藏；打开走 `open_settings` 的原生居中/置前，
+/// egui `Visible(true)` + `Focus` 仅为原生窗口未就绪时的退回路径。
 /// 标题与标题栏关闭 + 全尺寸内容视图 = 原生交通灯浮在自绘 44px 标题栏上。
 pub fn builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
@@ -418,11 +419,16 @@ fn apply_autostart(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bo
 /// 命令只入 egui 队列，不销毁视口——再次打开仍是同一实例。
 /// 录制取消挂起由 `App::logic` 消费（快捷键 plan 接入点，当前无录制状态）。
 fn hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
-    lock_shared(shared).settings.mark_hidden();
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-    // 唤醒根视口消费取消录制挂起（根窗隐藏时也尽力排一帧；无录制态时仅留痕）。
-    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    hide_with_command(&mut lock_shared(shared).settings, ctx);
     log::info!("设置窗口隐藏(open=false;录制取消挂起)");
+}
+
+/// 隐藏的状态 + egui 命令（纯粘合，headless 测）：开合态/录制取消挂起 +
+/// `Visible(false)` + 唤醒根视口消费挂起（无录制态时仅留痕）。
+fn hide_with_command(state: &mut SettingsState, ctx: &egui::Context) {
+    state.mark_hidden();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
 }
 
 #[cfg(test)]
@@ -490,6 +496,37 @@ mod tests {
             !state.take_cancel_recording_pending(),
             "不得跨帧残留重复消费"
         );
+    }
+
+    /// 隐藏粘合（headless）：状态置隐藏/挂起录制取消，同时下发 `Visible(false)`。
+    #[test]
+    fn hide_glue_marks_state_and_emits_visible_false() {
+        let ctx = egui::Context::default();
+        let mut state = test_state();
+        state.request_open();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(SETTINGS_W, SETTINGS_H),
+                )),
+                ..Default::default()
+            },
+            |ui| hide_with_command(&mut state, ui.ctx()),
+        );
+        assert!(!state.open);
+        assert!(state.cancel_recording_pending);
+        let cmds = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default();
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Visible(false))),
+            "隐藏须下发 Visible(false)"
+        );
+        out.textures_delta.clear();
     }
 
     /// 字号纯状态：保存失败也更新 file.font_size + 留内联错误；成功清错误。
