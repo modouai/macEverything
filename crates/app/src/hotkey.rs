@@ -85,6 +85,7 @@ use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
+use crate::i18n;
 use crate::settings::SettingsFile;
 use crate::ui::hotkey_keys;
 
@@ -110,14 +111,71 @@ pub fn direct_key() -> (Modifiers, Code, &'static str) {
     (Modifiers::ALT | Modifiers::SHIFT, Code::KeyF, "⌥⇧F")
 }
 
-/// 全部候选项注册失败时的悬浮条提示(托盘唤起 Task 16 接,先给文案)。
-pub const UNAVAILABLE_NOTE: &str = "快捷键不可用,可从托盘唤起";
+/// 持久热键提示（跨帧展示；语言切换时按当前语言重新渲染）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyNote {
+    Fallback { default: String, used: String },
+    Unavailable,
+    ResumeFailed,
+    SavedPaletteDefault { custom: String, default: String },
+    SavedPaletteOther { custom: String, used: String },
+    SavedPaletteUnavailable { custom: String },
+    SavedWindowConflictDefault { custom: String, default: String },
+    SavedWindowDefault { custom: String, default: String },
+    SavedWindowConflictUnavailable { custom: String },
+    SavedWindowUnavailable { custom: String },
+}
 
-/// 完整窗口快捷键缺失/注册失败提示(仍有托盘与悬浮条 ⌥↵入口)。
-const WINDOW_UNAVAILABLE_NOTE: &str = "完整窗口快捷键不可用,可从托盘打开";
-
-/// 录制取消后旧键恢复失败提示(键可能已被其他应用抢占)。
-const RESUME_FAILED_NOTE: &str = "快捷键恢复失败,请重新录制";
+impl HotkeyNote {
+    pub fn text(&self) -> String {
+        let s = i18n::s();
+        match self {
+            Self::Fallback { default, used } => i18n::fill(
+                s.hotkey_fallback,
+                &[("default", default.as_str()), ("name", used.as_str())],
+            ),
+            Self::Unavailable => s.hotkey_unavailable.to_owned(),
+            Self::ResumeFailed => s.hotkey_resume_failed.to_owned(),
+            Self::SavedPaletteDefault { custom, default } => i18n::fill(
+                s.hotkey_saved_palette_default,
+                &[("custom", custom.as_str()), ("name", default.as_str())],
+            ),
+            Self::SavedPaletteOther { custom, used } => i18n::fill(
+                s.hotkey_saved_palette_other,
+                &[("custom", custom.as_str()), ("name", used.as_str())],
+            ),
+            Self::SavedPaletteUnavailable { custom } => i18n::fill(
+                s.hotkey_saved_palette_unavailable,
+                &[
+                    ("custom", custom.as_str()),
+                    ("reason", s.hotkey_unavailable_reason),
+                ],
+            ),
+            Self::SavedWindowConflictDefault { custom, default } => i18n::fill(
+                s.hotkey_saved_window_conflict_default,
+                &[("custom", custom.as_str()), ("name", default.as_str())],
+            ),
+            Self::SavedWindowDefault { custom, default } => i18n::fill(
+                s.hotkey_saved_window_default,
+                &[("custom", custom.as_str()), ("name", default.as_str())],
+            ),
+            Self::SavedWindowConflictUnavailable { custom } => i18n::fill(
+                s.hotkey_saved_window_conflict_unavailable,
+                &[
+                    ("custom", custom.as_str()),
+                    ("reason", s.window_hotkey_unavailable_reason),
+                ],
+            ),
+            Self::SavedWindowUnavailable { custom } => i18n::fill(
+                s.hotkey_saved_window_unavailable,
+                &[
+                    ("custom", custom.as_str()),
+                    ("reason", s.window_hotkey_unavailable_reason),
+                ],
+            ),
+        }
+    }
+}
 
 /// 恢复内置默认时系统注册失败(错误文案前缀;设置页内联展示)。
 const RESET_FAILED_PREFIX: &str = "恢复默认快捷键失败(可能被系统或其他应用占用)";
@@ -190,13 +248,17 @@ pub struct HotkeySnapshot {
     /// 完整窗口槽键帽展示(如 `["⌥", "⇧", "F"]`)。
     pub window_keys: Vec<String>,
     /// 唤起槽启动回落/不可用提示(悬浮条警告;正常 = None)。
-    pub note: Option<String>,
+    pub note: Option<HotkeyNote>,
     /// 完整窗口槽启动回落/不可用提示(仅设置页;正常 = None)。
-    pub window_note: Option<String>,
+    pub window_note: Option<HotkeyNote>,
 }
 
 impl HotkeySnapshot {
-    fn from_active(active: ActiveKeys, note: Option<String>, window_note: Option<String>) -> Self {
+    fn from_active(
+        active: ActiveKeys,
+        note: Option<HotkeyNote>,
+        window_note: Option<HotkeyNote>,
+    ) -> Self {
         Self {
             palette: active.palette,
             window: active.window,
@@ -255,12 +317,15 @@ fn action_for(event: &GlobalHotKeyEvent, keys: ActiveKeys) -> Option<Action> {
 }
 
 /// 注册结果 → 悬浮条提示(纯逻辑):默认键正常 = 不打扰;降级/全失败 = 常驻提示。
-fn note_for(registered: Option<&str>) -> Option<String> {
+fn note_for(registered: Option<&str>) -> Option<HotkeyNote> {
     let default_name = candidates()[0].2;
     match registered {
         Some(name) if name == default_name => None,
-        Some(name) => Some(format!("{default_name} 不可用,已改用 {name}")),
-        None => Some(UNAVAILABLE_NOTE.to_string()),
+        Some(name) => Some(HotkeyNote::Fallback {
+            default: default_name.to_owned(),
+            used: name.to_owned(),
+        }),
+        None => Some(HotkeyNote::Unavailable),
     }
 }
 
@@ -321,14 +386,18 @@ fn register_palette_default_with<R: KeyRegistrar>(
 }
 
 /// 自定义唤起键失败后的回落提示(区分「默认键」与「降级键」)。
-fn palette_fallback_note(custom: HotKey, fallback_name: Option<&str>) -> String {
+fn palette_fallback_note(custom: HotKey, fallback_name: Option<&str>) -> HotkeyNote {
     let custom = display_name(custom);
     match fallback_name {
-        Some(name) if name == candidates()[0].2 => {
-            format!("保存的唤起快捷键 {custom} 不可用,已回落默认 {name}")
-        }
-        Some(name) => format!("保存的唤起快捷键 {custom} 不可用,已改用 {name}"),
-        None => format!("保存的唤起快捷键 {custom} 不可用,{UNAVAILABLE_NOTE}"),
+        Some(name) if name == candidates()[0].2 => HotkeyNote::SavedPaletteDefault {
+            custom,
+            default: name.to_owned(),
+        },
+        Some(name) => HotkeyNote::SavedPaletteOther {
+            custom,
+            used: name.to_owned(),
+        },
+        None => HotkeyNote::SavedPaletteUnavailable { custom },
     }
 }
 
@@ -338,22 +407,23 @@ fn register_window_default<R: KeyRegistrar>(
     reg: &mut R,
     custom: Option<HotKey>,
     conflict: bool,
-) -> (Option<HotKey>, Option<String>) {
+) -> (Option<HotKey>, Option<HotkeyNote>) {
     let (mods, code, name) = direct_key();
     let hotkey = HotKey::new(Some(mods), code);
     match reg.register(hotkey) {
         Ok(()) => {
             let note = custom.map(|custom| {
+                let custom = display_name(custom);
                 if conflict {
-                    format!(
-                        "保存的完整窗口快捷键 {} 与唤起键冲突,已回落默认 {name}",
-                        display_name(custom)
-                    )
+                    HotkeyNote::SavedWindowConflictDefault {
+                        custom,
+                        default: name.to_owned(),
+                    }
                 } else {
-                    format!(
-                        "保存的完整窗口快捷键 {} 不可用,已回落默认 {name}",
-                        display_name(custom)
-                    )
+                    HotkeyNote::SavedWindowDefault {
+                        custom,
+                        default: name.to_owned(),
+                    }
                 }
             });
             (Some(hotkey), note)
@@ -362,16 +432,11 @@ fn register_window_default<R: KeyRegistrar>(
             log::warn!("完整窗口快捷键({name})注册失败(入口仍有托盘与悬浮条 ⌥↵): {err}");
             // 无自定义键时保持旧行为:只留日志不常驻提示;自定义回落失败才提示。
             let note = custom.map(|custom| {
+                let custom = display_name(custom);
                 if conflict {
-                    format!(
-                        "保存的完整窗口快捷键 {} 与唤起键冲突,{WINDOW_UNAVAILABLE_NOTE}",
-                        display_name(custom)
-                    )
+                    HotkeyNote::SavedWindowConflictUnavailable { custom }
                 } else {
-                    format!(
-                        "保存的完整窗口快捷键 {} 不可用,{WINDOW_UNAVAILABLE_NOTE}",
-                        display_name(custom)
-                    )
+                    HotkeyNote::SavedWindowUnavailable { custom }
                 }
             });
             (None, note)
@@ -384,9 +449,9 @@ fn register_window_default<R: KeyRegistrar>(
 struct InitialPlan {
     active: ActiveKeys,
     /// 唤起槽提示(悬浮条警告;正常 = None)。
-    note: Option<String>,
+    note: Option<HotkeyNote>,
     /// 完整窗口槽提示(仅设置页;正常 = None)。
-    window_note: Option<String>,
+    window_note: Option<HotkeyNote>,
 }
 
 fn register_initial<R: KeyRegistrar>(reg: &mut R, file: &SettingsFile) -> InitialPlan {
@@ -502,8 +567,8 @@ impl HotkeyRuntime {
     /// 唤起槽常驻提示(悬浮条警告;默认键正常 = None)。
     ///
     /// 完整窗口槽的回落提示在 [`HotkeySnapshot::window_note`],不得进入悬浮条。
-    pub fn note(&self) -> Option<&str> {
-        self.snapshot.note.as_deref()
+    pub fn note(&self) -> Option<&HotkeyNote> {
+        self.snapshot.note.as_ref()
     }
 
     /// 当前热键快照(设置页展示/录制用)。
@@ -712,19 +777,19 @@ fn resume_with<R: KeyRegistrar>(
 
 /// resume 后的分槽提示:成功槽保留原启动提示,失败槽改用恢复失败提示。
 fn resume_notes(
-    note: Option<String>,
-    window_note: Option<String>,
+    note: Option<HotkeyNote>,
+    window_note: Option<HotkeyNote>,
     outcome: ResumeOutcome,
-) -> (Option<String>, Option<String>) {
+) -> (Option<HotkeyNote>, Option<HotkeyNote>) {
     let palette_note = if outcome.palette {
         note
     } else {
-        Some(RESUME_FAILED_NOTE.to_string())
+        Some(HotkeyNote::ResumeFailed)
     };
     let window_note = if outcome.window {
         window_note
     } else {
-        Some(RESUME_FAILED_NOTE.to_string())
+        Some(HotkeyNote::ResumeFailed)
     };
     (palette_note, window_note)
 }
@@ -854,9 +919,9 @@ fn reset_failed(err: impl std::fmt::Display) -> String {
 fn reset_notes(
     slot: HotkeySlot,
     default_name: &str,
-    note: Option<String>,
-    window_note: Option<String>,
-) -> (Option<String>, Option<String>) {
+    note: Option<HotkeyNote>,
+    window_note: Option<HotkeyNote>,
+) -> (Option<HotkeyNote>, Option<HotkeyNote>) {
     match slot {
         HotkeySlot::Palette => (note_for(Some(default_name)), window_note),
         HotkeySlot::Window => (note, None),
@@ -873,8 +938,8 @@ fn plan_reset<R: KeyRegistrar>(
     active: &mut ActiveKeys,
     suspended: &mut Option<ActiveKeys>,
     slot: HotkeySlot,
-    note: Option<String>,
-    window_note: Option<String>,
+    note: Option<HotkeyNote>,
+    window_note: Option<HotkeyNote>,
 ) -> Result<HotkeySnapshot, String> {
     match suspended.take() {
         Some(old) => plan_reset_suspended(reg, active, old, slot, note, window_note),
@@ -887,8 +952,8 @@ fn plan_reset_active<R: KeyRegistrar>(
     reg: &mut R,
     active: &mut ActiveKeys,
     slot: HotkeySlot,
-    note: Option<String>,
-    window_note: Option<String>,
+    note: Option<HotkeyNote>,
+    window_note: Option<HotkeyNote>,
 ) -> Result<HotkeySnapshot, String> {
     let old_key = active.get(slot);
     let (default, default_name) = match slot {
@@ -933,8 +998,8 @@ fn plan_reset_suspended<R: KeyRegistrar>(
     active: &mut ActiveKeys,
     old: ActiveKeys,
     slot: HotkeySlot,
-    note: Option<String>,
-    window_note: Option<String>,
+    note: Option<HotkeyNote>,
+    window_note: Option<HotkeyNote>,
 ) -> Result<HotkeySnapshot, String> {
     let other = old.other(slot);
     if let Some(other_key) = other {
@@ -1015,7 +1080,7 @@ pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
             display_name(hotkey),
             hotkey.id()
         ),
-        None => log::error!("全局热键不可用({UNAVAILABLE_NOTE})"),
+        None => log::error!("全局热键不可用({})", HotkeyNote::Unavailable.text()),
     }
     match plan.active.window {
         Some(hotkey) => log::info!(
@@ -1026,10 +1091,10 @@ pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
         None => log::warn!("完整窗口快捷键未注册(入口仍有托盘与悬浮条 ⌥↵)"),
     }
     if let Some(note) = &plan.note {
-        log::warn!("唤起快捷键回退提示:{note}");
+        log::warn!("唤起快捷键回退提示:{}", note.text());
     }
     if let Some(note) = &plan.window_note {
-        log::warn!("完整窗口快捷键回退提示:{note}");
+        log::warn!("完整窗口快捷键回退提示:{}", note.text());
     }
 
     *lock_active(&active) = plan.active;
@@ -1303,10 +1368,10 @@ mod tests {
             Some(HotKey::new(Some(wmods), wcode)),
             "完整窗口键回落 ⌥⇧F"
         );
-        let note = plan.note.expect("唤起键失败须留提示");
+        let note = plan.note.expect("唤起键失败须留提示").text();
         assert!(note.contains("保存的唤起快捷键"), "{note}");
         assert!(note.contains("已回落默认 ⌥Space"), "{note}");
-        let window_note = plan.window_note.expect("完整窗口键失败须留提示");
+        let window_note = plan.window_note.expect("完整窗口键失败须留提示").text();
         assert!(
             window_note.contains("保存的完整窗口快捷键"),
             "{window_note}"
@@ -1333,7 +1398,7 @@ mod tests {
         let (mods, code, _) = candidates()[0];
         assert_eq!(plan.active.palette, Some(HotKey::new(Some(mods), code)));
         assert!(!reg.registered.contains(&invalid), "越界键不得注册");
-        let note = plan.note.expect("越界键须提示");
+        let note = plan.note.expect("越界键须提示").text();
         assert!(note.contains("保存的唤起快捷键"), "{note}");
     }
 
@@ -1378,7 +1443,7 @@ mod tests {
             "第二槽回落默认"
         );
         assert_eq!(plan.note, None, "唤起槽正常无悬浮条提示");
-        let window_note = plan.window_note.expect("冲突须提示");
+        let window_note = plan.window_note.expect("冲突须提示").text();
         assert!(
             window_note.contains("保存的完整窗口快捷键"),
             "{window_note}"
@@ -1395,16 +1460,16 @@ mod tests {
                 palette: Some(palette),
                 window: None,
             },
-            Some("唤醒提示".to_string()),
-            Some("窗口提示".to_string()),
+            Some(HotkeyNote::Unavailable),
+            Some(HotkeyNote::ResumeFailed),
         );
 
         assert_eq!(snapshot.palette, Some(palette));
         assert_eq!(snapshot.window, None);
         assert_eq!(snapshot.palette_keys, ["⌥", "Space"]);
         assert!(snapshot.window_keys.is_empty());
-        assert_eq!(snapshot.note.as_deref(), Some("唤醒提示"));
-        assert_eq!(snapshot.window_note.as_deref(), Some("窗口提示"));
+        assert_eq!(snapshot.note, Some(HotkeyNote::Unavailable));
+        assert_eq!(snapshot.window_note, Some(HotkeyNote::ResumeFailed));
     }
 
     /// 提交:只替换目标槽,另一槽保持注册;成功后清空启动回退提示。
@@ -1866,7 +1931,7 @@ mod tests {
         assert!(reg.registered.contains(&window));
     }
 
-    /// resume 失败按槽留提示:成功槽保留原提示,失败槽用 RESUME_FAILED_NOTE。
+    /// resume 失败按槽留提示:成功槽保留原提示,失败槽用 `HotkeyNote::ResumeFailed`。
     #[test]
     fn resume_failure_marks_slot_note() {
         let palette = alt_space();
@@ -1902,25 +1967,30 @@ mod tests {
         );
         assert!(suspended.is_none());
 
+        let palette_note = HotkeyNote::Unavailable;
+        let old_window_note = HotkeyNote::Fallback {
+            default: "⌥Space".into(),
+            used: "⌃⌥K".into(),
+        };
         let (note, window_note) = resume_notes(
-            Some("原唤起提示".to_string()),
-            Some("原窗口提示".to_string()),
+            Some(palette_note.clone()),
+            Some(old_window_note.clone()),
             outcome,
         );
-        assert_eq!(note.as_deref(), Some("原唤起提示"), "成功槽保留原提示");
+        assert_eq!(note, Some(palette_note.clone()), "成功槽保留原提示");
         assert_eq!(
-            window_note.as_deref(),
-            Some(RESUME_FAILED_NOTE),
+            window_note,
+            Some(HotkeyNote::ResumeFailed),
             "失败槽提示恢复失败"
         );
 
         let (note, window_note) = resume_notes(
-            Some("原唤起提示".to_string()),
-            Some("原窗口提示".to_string()),
+            Some(palette_note.clone()),
+            Some(old_window_note.clone()),
             ResumeOutcome::ALL_RESTORED,
         );
-        assert_eq!(note.as_deref(), Some("原唤起提示"));
-        assert_eq!(window_note.as_deref(), Some("原窗口提示"));
+        assert_eq!(note, Some(palette_note));
+        assert_eq!(window_note, Some(old_window_note));
     }
 
     /// 启动:唤起槽默认降级链全失败 → 唤起提示不可用;无自定义窗口键保持旧行为。
@@ -1937,7 +2007,7 @@ mod tests {
         let plan = register_initial(&mut reg, &SettingsFile::default());
 
         assert_eq!(plan.active, ActiveKeys::default());
-        assert_eq!(plan.note.as_deref(), Some(UNAVAILABLE_NOTE));
+        assert_eq!(plan.note, Some(HotkeyNote::Unavailable));
         assert_eq!(
             plan.window_note, None,
             "无自定义窗口键时保持旧行为(只留日志,不加提示)"
@@ -1960,7 +2030,7 @@ mod tests {
 
         assert!(plan.active.window.is_none());
         assert_eq!(plan.note, None, "唤起槽默认正常,悬浮条不得出现提示");
-        let note = plan.window_note.expect("窗口槽须留提示");
+        let note = plan.window_note.expect("窗口槽须留提示").text();
         assert!(note.contains("保存的完整窗口快捷键"), "{note}");
     }
 
@@ -2015,19 +2085,40 @@ mod tests {
         assert_eq!(poll_action(&runtime), None, "取尽不再重复");
     }
 
+    /// 持久提示在绘制时按当前语言渲染(语言切换后快照无需重建)。
+    #[test]
+    fn hotkey_note_text_is_localized() {
+        let note = HotkeyNote::Fallback {
+            default: "⌥Space".into(),
+            used: "⌃⌥K".into(),
+        };
+        assert_eq!(note.text(), "⌥Space 不可用,已改用 ⌃⌥K");
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(note.text(), "⌥Space unavailable; using ⌃⌥K instead");
+        });
+        assert_eq!(HotkeyNote::Unavailable.text(), "快捷键不可用,可从托盘唤起");
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                HotkeyNote::Unavailable.text(),
+                "Shortcut unavailable; use the menu bar instead"
+            );
+        });
+    }
+
     /// 提示文案:默认键正常不打扰;降级提示改用键;全失败提示托盘兜底。
     #[test]
     fn note_maps_registration_outcome() {
+        let text = |note: Option<HotkeyNote>| note.as_ref().map(HotkeyNote::text);
         assert_eq!(note_for(Some("⌥Space")), None, "默认键正常 = 无提示");
         assert_eq!(
-            note_for(Some("⌥⇧Space")).as_deref(),
+            text(note_for(Some("⌥⇧Space"))).as_deref(),
             Some("⌥Space 不可用,已改用 ⌥⇧Space")
         );
         assert_eq!(
-            note_for(Some("⌃⌥⇧Space")).as_deref(),
+            text(note_for(Some("⌃⌥⇧Space"))).as_deref(),
             Some("⌥Space 不可用,已改用 ⌃⌥⇧Space")
         );
-        assert_eq!(note_for(None).as_deref(), Some(UNAVAILABLE_NOTE));
+        assert_eq!(note_for(None), Some(HotkeyNote::Unavailable));
     }
 
     fn palette_default() -> HotKey {
@@ -2060,8 +2151,8 @@ mod tests {
             &mut active,
             &mut suspended,
             HotkeySlot::Palette,
-            Some("旧唤起提示".to_string()),
-            Some("窗口提示".to_string()),
+            Some(HotkeyNote::Unavailable),
+            Some(HotkeyNote::ResumeFailed),
         )
         .expect("默认键应注册成功");
 
@@ -2080,8 +2171,8 @@ mod tests {
         assert_eq!(snapshot.window, Some(window));
         assert_eq!(snapshot.note, None, "默认键正常须清空唤起槽提示");
         assert_eq!(
-            snapshot.window_note.as_deref(),
-            Some("窗口提示"),
+            snapshot.window_note,
+            Some(HotkeyNote::ResumeFailed),
             "另一槽提示保留"
         );
     }
@@ -2106,8 +2197,8 @@ mod tests {
             &mut active,
             &mut suspended,
             HotkeySlot::Window,
-            Some("唤起提示".to_string()),
-            Some("旧窗口提示".to_string()),
+            Some(HotkeyNote::ResumeFailed),
+            Some(HotkeyNote::Unavailable),
         )
         .expect("⌥⇧F 应注册成功");
 
@@ -2116,7 +2207,11 @@ mod tests {
         assert!(!reg.registered.contains(&old));
         assert!(reg.registered.contains(&window_default()));
         assert_eq!(snapshot.window, Some(window_default()));
-        assert_eq!(snapshot.note.as_deref(), Some("唤起提示"), "唤起槽提示保留");
+        assert_eq!(
+            snapshot.note,
+            Some(HotkeyNote::ResumeFailed),
+            "唤起槽提示保留"
+        );
         assert_eq!(snapshot.window_note, None, "窗口槽提示清空");
     }
 
@@ -2216,7 +2311,7 @@ mod tests {
         assert_eq!(active.palette, Some(fallback));
         assert!(reg.registered.contains(&fallback));
         assert!(!reg.registered.contains(&old));
-        let note = snapshot.note.expect("降级须提示");
+        let note = snapshot.note.expect("降级须提示").text();
         assert!(note.contains(name), "{note}");
         assert!(note.contains("不可用,已改用"), "{note}");
     }

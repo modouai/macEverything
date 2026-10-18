@@ -416,7 +416,7 @@ impl App {
         // 否则窗口可能停在一帧空白内容,点一下才恢复(2026-10-18 实机反馈)。
         platform::install_space_repaint(cc.egui_ctx.clone());
         let hotkey_snapshot = hotkey.snapshot();
-        let hotkey_note = hotkey.note().map(str::to_string);
+        let hotkey_note = hotkey.note().cloned();
         let shared = Arc::new(Mutex::new(Shared {
             palette: palette::PaletteState::new(
                 cc.egui_ctx.clone(),

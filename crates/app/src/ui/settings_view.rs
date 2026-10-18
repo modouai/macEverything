@@ -13,7 +13,7 @@
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 
-use crate::hotkey::{self, HotkeySlot, HotkeySnapshot};
+use crate::hotkey::{self, HotkeyNote, HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
 use crate::ui::{
@@ -250,11 +250,11 @@ fn draw_general_group(
     // 快捷键行：内联错误（校验/重复/注册/保存）+ 运行时回落提示（按槽拆分）
     // + 录制中的可见 Esc/点击别处提示（plan §H3 Step 2）。
     let palette_error = hotkey_error_for(data, HotkeySlot::Palette);
-    let palette_note = data.hotkeys.note.as_deref();
+    let palette_note = data.hotkeys.note.as_ref().map(HotkeyNote::text);
     let palette_hint =
         (data.recording == Some(HotkeySlot::Palette)).then_some(i18n::s().recording_hint);
     let window_error = hotkey_error_for(data, HotkeySlot::Window);
-    let window_note = data.hotkeys.window_note.as_deref();
+    let window_note = data.hotkeys.window_note.as_ref().map(HotkeyNote::text);
     let window_hint =
         (data.recording == Some(HotkeySlot::Window)).then_some(i18n::s().recording_hint);
 
@@ -277,24 +277,24 @@ fn draw_general_group(
             kind: RowKind::PaletteKeys,
             spec: RowSpec::new(ROW_H).with_extra(hotkey_messages_extra(
                 palette_error,
-                palette_note,
+                palette_note.as_deref(),
                 palette_hint,
                 extra_h,
             )),
             error: palette_error,
-            note: palette_note,
+            note: palette_note.as_deref(),
             hint: palette_hint,
         },
         GroupRow {
             kind: RowKind::WindowKeys,
             spec: RowSpec::new(ROW_H).with_extra(hotkey_messages_extra(
                 window_error,
-                window_note,
+                window_note.as_deref(),
                 window_hint,
                 extra_h,
             )),
             error: window_error,
-            note: window_note,
+            note: window_note.as_deref(),
             hint: window_hint,
         },
     ];
@@ -1382,7 +1382,7 @@ fn draw_remove_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hotkey::{HotkeySlot, HotkeySnapshot};
+    use crate::hotkey::{HotkeyNote, HotkeySlot, HotkeySnapshot};
     use crate::ui::font as ui_font_module;
     use crate::ui::settings_tokens::{SETTINGS_H, SETTINGS_W};
     use global_hotkey::hotkey::{Code, Modifiers};
@@ -2493,22 +2493,24 @@ mod tests {
         let baseline_index = text_center(find_text(&all_texts(&baseline), "索引")).y;
 
         let mut data = layout_test_data();
-        data.hotkeys.note = Some("唤起槽回落提示".into());
+        data.hotkeys.note = Some(HotkeyNote::Unavailable);
         let out = run_body(&data);
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
-        assert!(labels.iter().any(|text| text == "唤起槽回落提示"));
+        let palette_note = HotkeyNote::Unavailable.text();
+        assert!(labels.iter().any(|text| text == &palette_note));
         let with_note_index = text_center(find_text(&texts, "索引")).y;
         assert!(
             with_note_index > baseline_index + 10.0,
             "唤起槽提示必须增高行:基线 {baseline_index},提示 {with_note_index}"
         );
 
-        data.hotkeys.window_note = Some("窗口槽回落提示".into());
+        data.hotkeys.window_note = Some(HotkeyNote::ResumeFailed);
         let out = run_body(&data);
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
-        assert!(labels.iter().any(|text| text == "窗口槽回落提示"));
+        let window_note = HotkeyNote::ResumeFailed.text();
+        assert!(labels.iter().any(|text| text == &window_note));
         let both_index = text_center(find_text(&texts, "索引")).y;
         assert!(
             both_index > with_note_index + 10.0,
@@ -2517,12 +2519,12 @@ mod tests {
 
         let mut data = layout_test_data();
         data.hotkey_error = Some((HotkeySlot::Palette, "错误行".into()));
-        data.hotkeys.note = Some("提示行".into());
+        data.hotkeys.note = Some(HotkeyNote::Unavailable);
         let out = run_body(&data);
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         assert!(labels.iter().any(|text| text == "错误行"));
-        assert!(labels.iter().any(|text| text == "提示行"));
+        assert!(labels.iter().any(|text| text == &palette_note));
         let error_note_index = text_center(find_text(&texts, "索引")).y;
         let mut error_only = layout_test_data();
         error_only.hotkey_error = Some((HotkeySlot::Palette, "错误行".into()));

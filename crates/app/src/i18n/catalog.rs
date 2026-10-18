@@ -81,6 +81,34 @@ catalog! {
     autostart_status_requires_approval: "已注册,待用户在系统设置「登录项」中允许" / "Registered. Awaiting approval in System Settings > Login Items",
     autostart_status_not_registered: "未注册(已关闭)" / "Not registered (off)",
     autostart_status_not_found: "未找到条目(注册尚未生效)" / "Entry not found (registration not yet effective)",
+    // 悬浮条
+    search_placeholder: "搜索文件…" / "Search files…",
+    open_in_full_window: "在完整窗口中打开（⌥↵）" / "Open in Full Window (⌥↵)",
+    empty_start: "输入关键词开始搜索" / "Type to search",
+    empty_start_sub: "可搜文件名，也可搜路径" / "Search file names or paths",
+    empty_no_match: "无匹配项" / "No matches",
+    empty_no_match_sub: "换个关键词试试" / "Try a different keyword",
+    // 角标
+    badge_building: "建索引中 {n}" / "Building index {n}",
+    badge_reconciling: "补齐中" / "Reconciling",
+    badge_rescanning: "重扫中" / "Rescanning",
+    badge_offline_index: "离线索引" / "Offline index",
+    badge_engine_not_running: "引擎未运行" / "Engine not running",
+    badge_building_index: "索引构建中" / "Building index",
+    badge_query_failed: "查询失败" / "Query failed",
+    // 热键提示（持久）
+    hotkey_unavailable: "快捷键不可用,可从托盘唤起" / "Shortcut unavailable; use the menu bar instead",
+    hotkey_unavailable_reason: "可从托盘唤起" / "use the menu bar instead",
+    window_hotkey_unavailable_reason: "可从托盘打开" / "open it from the menu bar",
+    hotkey_resume_failed: "快捷键恢复失败,请重新录制" / "Failed to restore shortcut; please record it again",
+    hotkey_fallback: "{default} 不可用,已改用 {name}" / "{default} unavailable; using {name} instead",
+    hotkey_saved_palette_default: "保存的唤起快捷键 {custom} 不可用,已回落默认 {name}" / "Saved Quick Search shortcut {custom} is unavailable; reverted to default {name}",
+    hotkey_saved_palette_other: "保存的唤起快捷键 {custom} 不可用,已改用 {name}" / "Saved Quick Search shortcut {custom} is unavailable; using {name} instead",
+    hotkey_saved_palette_unavailable: "保存的唤起快捷键 {custom} 不可用,{reason}" / "Saved Quick Search shortcut {custom} is unavailable; {reason}",
+    hotkey_saved_window_conflict_default: "保存的完整窗口快捷键 {custom} 与唤起键冲突,已回落默认 {name}" / "Saved Full Window shortcut {custom} conflicts with the Quick Search shortcut; reverted to default {name}",
+    hotkey_saved_window_default: "保存的完整窗口快捷键 {custom} 不可用,已回落默认 {name}" / "Saved Full Window shortcut {custom} is unavailable; reverted to default {name}",
+    hotkey_saved_window_conflict_unavailable: "保存的完整窗口快捷键 {custom} 与唤起键冲突,{reason}" / "Saved Full Window shortcut {custom} conflicts with the Quick Search shortcut; {reason}",
+    hotkey_saved_window_unavailable: "保存的完整窗口快捷键 {custom} 不可用,{reason}" / "Saved Full Window shortcut {custom} is unavailable; {reason}",
 }
 
 #[cfg(test)]

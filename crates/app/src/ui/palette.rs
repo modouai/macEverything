@@ -34,6 +34,8 @@ use eframe::egui;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::hotkey::HotkeyNote;
+use crate::i18n;
 use crate::platform;
 use crate::session::{Fire, Session, SortKey, State};
 use crate::ui::font as ui_font;
@@ -175,32 +177,64 @@ pub struct EngineStatus {
     pub built_at: u64,
 }
 
+/// 角标文案（绘制时按当前语言渲染；`Raw` 为外部原始错误，不翻译）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BadgeText {
+    Building(u64),
+    Reconciling,
+    Rescanning,
+    OfflineIndex,
+    EngineNotRunning,
+    Warming,
+    QueryFailed,
+    Raw(String),
+}
+
+impl BadgeText {
+    fn text(&self) -> String {
+        let s = i18n::s();
+        match self {
+            Self::Building(n) => {
+                let n = n.to_string();
+                i18n::fill(s.badge_building, &[("n", n.as_str())])
+            }
+            Self::Reconciling => s.badge_reconciling.to_owned(),
+            Self::Rescanning => s.badge_rescanning.to_owned(),
+            Self::OfflineIndex => s.badge_offline_index.to_owned(),
+            Self::EngineNotRunning => s.badge_engine_not_running.to_owned(),
+            Self::Warming => s.badge_building_index.to_owned(),
+            Self::QueryFailed => s.badge_query_failed.to_owned(),
+            Self::Raw(text) => text.clone(),
+        }
+    }
+}
+
 /// 状态角标（visual.md §2.6）：文案 + 强调度（决定底色与文字色）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Badge {
-    pub text: String,
+    pub text: BadgeText,
     pub tone: BadgeTone,
 }
 
 impl Badge {
-    fn neutral(text: impl Into<String>) -> Self {
+    fn neutral(text: BadgeText) -> Self {
         Self {
-            text: text.into(),
+            text,
             tone: BadgeTone::Neutral,
         }
     }
 
-    fn warning(text: impl Into<String>) -> Self {
+    fn warning(text: BadgeText) -> Self {
         Self {
-            text: text.into(),
+            text,
             tone: BadgeTone::Warning,
         }
     }
 
     /// 瞬时错误（打开失败等；非索引态映射）。
-    fn error(text: impl Into<String>) -> Self {
+    fn error(text: BadgeText) -> Self {
         Self {
-            text: text.into(),
+            text,
             tone: BadgeTone::Error,
         }
     }
@@ -251,7 +285,7 @@ pub struct PaletteState {
     /// 状态角标（§2.6 六态映射 + 强调度；打开失败等瞬时提示用 `Badge::error`）。
     pub status_note: Option<Badge>,
     /// 热键提示(降级/不可用;Task 15)。常驻:不随唤起复位、不被查询结果覆盖。
-    pub hotkey_note: Option<String>,
+    pub hotkey_note: Option<HotkeyNote>,
     /// 列表渲染行数(初始 20,滚到底 +20,至 `results.len()`)。
     pub visible_rows: usize,
     /// ⌥↵ 置位:完整窗口待带入的查询词(`ui::draw_palette` 转交 `ResultsState::set_query`)。
@@ -335,7 +369,7 @@ impl PaletteState {
         egui_ctx: egui::Context,
         paths: DaemonPaths,
         viewport: egui::ViewportId,
-        hotkey_note: Option<String>,
+        hotkey_note: Option<HotkeyNote>,
     ) -> Self {
         let mut st = Self::with_icons(
             egui_ctx.clone(),
@@ -357,7 +391,7 @@ impl PaletteState {
         egui_ctx: egui::Context,
         paths: DaemonPaths,
         viewport: egui::ViewportId,
-        hotkey_note: Option<String>,
+        hotkey_note: Option<HotkeyNote>,
     ) -> Self {
         Self::with_icons(
             egui_ctx,
@@ -374,7 +408,7 @@ impl PaletteState {
         egui_ctx: egui::Context,
         paths: DaemonPaths,
         viewport: egui::ViewportId,
-        hotkey_note: Option<String>,
+        hotkey_note: Option<HotkeyNote>,
         icons: icons::IconCache,
         mascot: mascot::Mascot,
     ) -> Self {
@@ -649,7 +683,7 @@ impl PaletteState {
             let ft = Instant::now();
             ui.fonts_mut(|f| {
                 let _ = f.layout_no_wrap(
-                    "搜索文件…".to_owned(),
+                    i18n::s().search_placeholder.to_owned(),
                     font(FONT_INPUT),
                     egui::Color32::WHITE,
                 );
@@ -740,7 +774,7 @@ impl PaletteState {
         let panel_stroke = egui::Stroke::new(1.0, t.panel_stroke);
 
         let note = self.status_note.clone();
-        let hotkey_note = self.hotkey_note.clone();
+        let hotkey_note = self.hotkey_note.as_ref().map(HotkeyNote::text);
         // 页脚所需（借 `self.input` 可变之前取值，避免与闭包内的 `self` 借用冲突）
         let has_query = !self.input.is_empty();
         let total = self.total;
@@ -789,7 +823,9 @@ impl PaletteState {
                                 fill,
                             );
                             draw_open_full_icon(ui.painter(), btn_rect, t.btn_icon);
-                            if btn_resp.on_hover_text("在完整窗口中打开（⌥↵）").clicked()
+                            if btn_resp
+                                .on_hover_text(i18n::s().open_in_full_window)
+                                .clicked()
                             {
                                 btn_full = true;
                             }
@@ -808,7 +844,8 @@ impl PaletteState {
                             if let Some(badge) = &note {
                                 let chip_max_w = search_row_badge_max_w(panel_w);
                                 let text_max_w = (chip_max_w - 2.0 * tk::KEYCAP_PAD.1).max(0.0);
-                                let text = badge_text_fit(ui, &badge.text, text_max_w);
+                                let badge_text = badge.text.text();
+                                let text = badge_text_fit(ui, &badge_text, text_max_w);
                                 let w = (text_w(ui, &text, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1)
                                     .min(chip_max_w);
                                 #[cfg(test)]
@@ -894,7 +931,7 @@ impl PaletteState {
                 if let Some(note) = &hotkey_note {
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(note)
+                        egui::RichText::new(note.as_str())
                             .size(ui_font::size(FONT_META))
                             .color(ui.visuals().warn_fg_color),
                     );
@@ -906,9 +943,9 @@ impl PaletteState {
                 if self.results.is_empty() {
                     // 空态两屏（§2.7）：空词 / 无匹配项；区高 72、纵向居中、主副间距 4
                     let (primary, secondary) = if matches!(self.session.state, State::Empty) {
-                        ("无匹配项", "换个关键词试试")
+                        (i18n::s().empty_no_match, i18n::s().empty_no_match_sub)
                     } else {
-                        ("输入关键词开始搜索", "可搜文件名，也可搜路径")
+                        (i18n::s().empty_start, i18n::s().empty_start_sub)
                     };
                     // 先按 EMPTY_H 精确占位，再在块内居中放两行——`allocate_ui_with_layout`
                     // 只按内容实际用量推进游标（实测只占 51px），页脚会整体上移、下方留白。
@@ -1296,7 +1333,7 @@ impl PaletteState {
             Ok(()) => Some(Action::Hide),
             Err(msg) => {
                 // 边界(product §边界):文件已删/打开失败 → 提示,不隐藏、不静默
-                self.status_note = Some(Badge::error(msg));
+                self.status_note = Some(Badge::error(BadgeText::Raw(msg)));
                 None
             }
         }
@@ -1516,21 +1553,23 @@ fn badge_note(state: &State, engine: Option<&EngineStatus>) -> Option<Badge> {
     if let Some(eng) = engine {
         match eng.state.as_str() {
             client::state::BUILDING => {
-                return Some(Badge::neutral(format!("建索引中 {}", eng.entry_count)));
+                return Some(Badge::neutral(BadgeText::Building(u64::from(
+                    eng.entry_count,
+                ))));
             }
             // 就绪不占位；但查询级错误不得被 ready 吞掉（落到会话态 → 「查询失败」）。
             client::state::READY if !matches!(state, State::Error(_)) => return None,
-            client::state::RECONCILING => return Some(Badge::warning("补齐中")),
-            client::state::DEGRADED => return Some(Badge::warning("重扫中")),
-            client::state::OFFLINE => return Some(Badge::warning("离线索引")),
+            client::state::RECONCILING => return Some(Badge::warning(BadgeText::Reconciling)),
+            client::state::DEGRADED => return Some(Badge::warning(BadgeText::Rescanning)),
+            client::state::OFFLINE => return Some(Badge::warning(BadgeText::OfflineIndex)),
             _ => {} // 未知引擎态：落到会话态
         }
     }
     match state {
-        State::EngineStarting => Some(Badge::error("引擎未运行")),
-        State::Warming => Some(Badge::neutral("索引构建中")),
-        State::Offline => Some(Badge::warning("离线索引")),
-        State::Error(_) => Some(Badge::error("查询失败")),
+        State::EngineStarting => Some(Badge::error(BadgeText::EngineNotRunning)),
+        State::Warming => Some(Badge::neutral(BadgeText::Warming)),
+        State::Offline => Some(Badge::warning(BadgeText::OfflineIndex)),
+        State::Error(_) => Some(Badge::error(BadgeText::QueryFailed)),
         State::Idle | State::Searching | State::Empty => None,
     }
 }
@@ -2423,10 +2462,10 @@ mod tests {
         for _ in 0..2 {
             probe_frame(&ctx, &mut st, vec![]);
         }
-        st.status_note = Some(Badge::error(format!(
+        st.status_note = Some(Badge::error(BadgeText::Raw(format!(
             "打开失败:{}",
             "文件路径不存在或已被移动".repeat(8)
-        )));
+        ))));
         probe_frame(&ctx, &mut st, vec![]);
         let probe = st.search_probe.expect("搜索行布局探针应已记录");
         let max_chip_w = search_row_badge_max_w(PANEL_MIN_W);
@@ -2469,10 +2508,10 @@ mod tests {
                 probe_frame(&ctx, &mut st, vec![]);
             }
             // 超长错误文案：角标占满可用宽（搜索行最紧）。
-            st.status_note = Some(Badge::error(format!(
+            st.status_note = Some(Badge::error(BadgeText::Raw(format!(
                 "打开失败:{}",
                 "文件路径不存在或已被移动".repeat(8)
-            )));
+            ))));
             probe_frame(&ctx, &mut st, vec![]);
             let p = st.search_probe.expect("搜索行探针应已记录");
             assert!(p.content_right >= p.input_right - 0.01);
@@ -2686,7 +2725,7 @@ mod tests {
         };
         // 角标形态 = (文案, 强调度)；ready / 空态无角标。
         let note = |state: &State, engine: Option<&EngineStatus>| {
-            badge_note(state, engine).map(|b| (b.text, b.tone))
+            badge_note(state, engine).map(|b| (b.text.text(), b.tone))
         };
         let some = |text: &str, tone: BadgeTone| Some((text.to_string(), tone));
         // —— 引擎六态（引擎优先，会话态无关）——

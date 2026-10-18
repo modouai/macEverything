@@ -53,6 +53,15 @@ impl<'de> Deserialize<'de> for LanguageSetting {
 
 static LANG_BITS: AtomicU8 = AtomicU8::new(Lang::ZhHans as u8);
 
+/// 模板填充：`{name}` 形式占位符；缺参数时保留原样（由目录单测保证成对）。
+pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = template.to_owned();
+    for (key, value) in args {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    out
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_LANG: std::cell::Cell<Option<Lang>> = const { std::cell::Cell::new(None) };
