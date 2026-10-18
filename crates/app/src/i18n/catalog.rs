@@ -175,6 +175,8 @@ catalog! {
     hotkey_unsupported: "不支持该键" / "Unsupported key",
     hotkey_register_failed: "注册失败(可能被系统或其他应用占用)" / "Registration failed (it may be in use by the system or another app)",
     hotkey_reset_failed: "恢复默认快捷键失败(可能被系统或其他应用占用)" / "Failed to restore the default shortcut (it may be in use by the system or another app)",
+    hotkey_global_unavailable: "全局热键不可用" / "Global shortcuts unavailable",
+    hotkey_restore_other_failed: "恢复另一快捷键 {name} 失败(可能被占用)" / "Failed to restore the other shortcut {name} (it may be in use)",
     hotkey_duplicate: "该快捷键已用于另一个功能" / "This shortcut is already used for another feature",
     hotkey_saved_but_save_failed: "快捷键已生效,但设置保存失败" / "Shortcut applied, but settings could not be saved",
     hotkey_reset_but_save_failed: "快捷键已恢复默认,但设置保存失败" / "Default shortcut restored, but settings could not be saved",

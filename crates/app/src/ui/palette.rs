@@ -196,9 +196,6 @@ impl OpenError {
 }
 
 /// 角标文案（绘制时按当前语言渲染）。
-///
-/// `Raw` 只用于真正外部/技术的原文（有意不翻译）；应用自产的打开失败走
-/// [`BadgeText::Open`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BadgeText {
     Building(u64),
@@ -209,10 +206,6 @@ pub(crate) enum BadgeText {
     Warming,
     QueryFailed,
     Open(OpenError),
-    /// 外部/技术原文（有意不翻译）。当前打开失败已改用 [`Self::Open`]；
-    /// 保留给未来真正的外部错误直出。
-    #[allow(dead_code)]
-    Raw(String),
 }
 
 impl BadgeText {
@@ -230,7 +223,6 @@ impl BadgeText {
             Self::Warming => s.badge_building_index.to_owned(),
             Self::QueryFailed => s.badge_query_failed.to_owned(),
             Self::Open(err) => err.text(),
-            Self::Raw(text) => text.clone(),
         }
     }
 }
@@ -2493,9 +2485,8 @@ mod tests {
         for _ in 0..2 {
             probe_frame(&ctx, &mut st, vec![]);
         }
-        st.status_note = Some(Badge::error(BadgeText::Raw(format!(
-            "打开失败:{}",
-            "文件路径不存在或已被移动".repeat(8)
+        st.status_note = Some(Badge::error(BadgeText::Open(OpenError::Failed(
+            "文件路径不存在或已被移动".repeat(8),
         ))));
         probe_frame(&ctx, &mut st, vec![]);
         let probe = st.search_probe.expect("搜索行布局探针应已记录");
@@ -2539,9 +2530,8 @@ mod tests {
                 probe_frame(&ctx, &mut st, vec![]);
             }
             // 超长错误文案：角标占满可用宽（搜索行最紧）。
-            st.status_note = Some(Badge::error(BadgeText::Raw(format!(
-                "打开失败:{}",
-                "文件路径不存在或已被移动".repeat(8)
+            st.status_note = Some(Badge::error(BadgeText::Open(OpenError::Failed(
+                "文件路径不存在或已被移动".repeat(8),
             ))));
             probe_frame(&ctx, &mut st, vec![]);
             let p = st.search_probe.expect("搜索行探针应已记录");

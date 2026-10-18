@@ -636,7 +636,7 @@ impl HotkeyRuntime {
         let manager = self
             .manager
             .as_ref()
-            .ok_or_else(|| "全局热键不可用".to_string())?;
+            .ok_or_else(|| i18n::s().hotkey_global_unavailable.to_owned())?;
         let mut active = *lock_active(&self.active);
         let result = plan_commit(
             &mut ManagerRegistrar(manager),
@@ -673,7 +673,7 @@ impl HotkeyRuntime {
         let manager = self
             .manager
             .as_ref()
-            .ok_or_else(|| "全局热键不可用".to_string())?;
+            .ok_or_else(|| i18n::s().hotkey_global_unavailable.to_owned())?;
         let mut active = *lock_active(&self.active);
         let result = plan_reset(
             &mut ManagerRegistrar(manager),
@@ -846,9 +846,13 @@ fn plan_commit<R: KeyRegistrar>(
                 // 录制期两槽都已注销:先把另一槽旧键注册回来,再注册新键。
                 if let Some(other_key) = other {
                     reg.register(other_key).map_err(|err| {
+                        let name = display_name(other_key);
                         format!(
-                            "恢复另一快捷键 {} 失败(可能被占用): {err}",
-                            display_name(other_key)
+                            "{}: {err}",
+                            i18n::fill(
+                                i18n::s().hotkey_restore_other_failed,
+                                &[("name", name.as_str())]
+                            )
                         )
                     })?;
                     other_registered = true;
@@ -1000,9 +1004,13 @@ fn plan_reset_suspended<R: KeyRegistrar>(
         if let Err(err) = reg.register(other_key) {
             // 另一槽旧键都恢复不了:退出挂起,尽力恢复两个旧键。
             *active = restore_old_keys(reg, old, None);
+            let name = display_name(other_key);
             return Err(format!(
-                "恢复另一快捷键 {} 失败(可能被占用): {err}",
-                display_name(other_key)
+                "{}: {err}",
+                i18n::fill(
+                    i18n::s().hotkey_restore_other_failed,
+                    &[("name", name.as_str())]
+                )
             ));
         }
     }
@@ -1917,7 +1925,15 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("恢复另一快捷键"), "{err}");
+        let name = display_name(palette);
+        let expected = format!(
+            "{}: 被占用",
+            i18n::fill(
+                i18n::s().hotkey_restore_other_failed,
+                &[("name", name.as_str())]
+            )
+        );
+        assert_eq!(err, expected);
         assert!(suspended.is_none(), "失败须退出挂起");
         assert_eq!(
             active,
@@ -1929,6 +1945,26 @@ mod tests {
         );
         assert!(!reg.registered.contains(&new_window), "新键不得残留");
         assert!(reg.registered.contains(&window));
+
+        // 同一路径的英文文案（含 {name} 占位符替换）。
+        i18n::with_lang(i18n::Lang::En, || {
+            let mut active = ActiveKeys::default();
+            let mut suspended = Some(old);
+            let mut reg = FakeRegistrar::failing(&[palette]);
+            let err = plan_commit(
+                &mut reg,
+                &mut active,
+                &mut suspended,
+                HotkeySlot::Window,
+                new_window,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!("Failed to restore the other shortcut {name} (it may be in use): 被占用")
+            );
+            assert!(suspended.is_none(), "失败须退出挂起");
+        });
     }
 
     /// resume 失败按槽留提示:成功槽保留原提示,失败槽用 `HotkeyNote::ResumeFailed`。
@@ -2055,10 +2091,25 @@ mod tests {
             !runtime.resume().fully_restored(),
             "非挂起态重复恢复也不得视为完整恢复"
         );
-        assert!(
-            runtime.reset_slot(HotkeySlot::Palette).is_err(),
-            "无 manager 时恢复默认必须如实报错"
-        );
+        for (lang, expected) in [
+            (i18n::Lang::ZhHans, "全局热键不可用"),
+            (i18n::Lang::En, "Global shortcuts unavailable"),
+        ] {
+            i18n::with_lang(lang, || {
+                assert_eq!(
+                    runtime.reset_slot(HotkeySlot::Palette).unwrap_err(),
+                    expected,
+                    "无 manager 时恢复默认必须如实报错"
+                );
+                assert_eq!(
+                    runtime
+                        .commit(HotkeySlot::Palette, alt_space())
+                        .unwrap_err(),
+                    expected,
+                    "无 manager 时提交必须如实报错"
+                );
+            });
+        }
     }
 
     /// 兜底队列:空 = None;入列动作按先进先出逐条消费,取尽不再重复。
