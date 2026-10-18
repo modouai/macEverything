@@ -1673,14 +1673,14 @@ fn action_hint(is_dir: bool) -> &'static str {
     }
 }
 
-/// 页脚四组键位提示（右→左：隐藏 / 完整窗口 / 访达 / 打开；随语言切换）。
+/// 页脚四组键位提示（视觉序左→右：打开 / 访达 / 完整窗口 / 隐藏；随语言切换）。
 fn footer_groups() -> [(&'static str, &'static str); 4] {
     let s = i18n::s();
     [
-        (s.palette_footer_hide, "esc"),
-        (s.palette_footer_full_window, "⌥↵"),
-        (s.palette_footer_finder, "⌘↵"),
         (s.palette_action_open, "↵"),
+        (s.palette_footer_finder, "⌘↵"),
+        (s.palette_footer_full_window, "⌥↵"),
+        (s.palette_footer_hide, "esc"),
     ]
 }
 
@@ -1749,7 +1749,12 @@ fn draw_result_row(
     };
     // 文本列（左对齐；`Ui::put` 是居中布局，不能用——改用定宽子 Ui 顶部左排）
     let tx = icon_rect.max.x + tk::ROW_INNER_GAP;
-    let hint_w = if is_sel { tk::ACTION_HINT_W } else { 0.0 };
+    let hint = action_hint(e.is_dir);
+    let hint_w = if is_sel {
+        text_w(ui, hint, FONT_META).max(tk::ACTION_HINT_W)
+    } else {
+        0.0
+    };
     let right = rect.max.x - tk::ROW_PAD_X - hint_w - 6.0;
     let col = egui::Rect::from_min_max(
         egui::pos2(tx, rect.center().y - 18.0),
@@ -1784,7 +1789,7 @@ fn draw_result_row(
         row_ui.painter().text(
             egui::pos2(rect.max.x - tk::ROW_PAD_X, rect.center().y),
             egui::Align2::RIGHT_CENTER,
-            action_hint(e.is_dir),
+            hint,
             font(FONT_META),
             t.action_hint,
         );
@@ -1792,9 +1797,23 @@ fn draw_result_row(
     resp
 }
 
+/// 能放下的页脚组数（按视觉序前缀；至少保留首组「打开」）。
+fn footer_visible_count(widths: &[f32], available: f32, gap: f32) -> usize {
+    let mut used = 0.0;
+    let mut count = 0;
+    for (i, w) in widths.iter().enumerate() {
+        let extra = if i == 0 { *w } else { *w + gap };
+        if count > 0 && used + extra > available {
+            break;
+        }
+        used += extra;
+        count += 1;
+    }
+    count.max(1) // always keep Open
+}
+
 /// 页脚（§2.5）：高 38 / 内边距 16；左结果计数（空词隐藏），右四组键位提示
-/// （右→左：隐藏 / 完整窗口 / 访达 / 打开；窄屏按「隐藏 > 完整窗口 > 访达」裁减，
-/// 至少保留「打开」）。
+/// （左→右：打开 / 访达 / 完整窗口 / 隐藏；按可用宽保留前缀，打开必保留）。
 fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), tk::FOOTER_H),
@@ -1807,16 +1826,28 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
         .as_deref()
         .map_or(0.0, |text| text_w(ui, text, FONT_META));
     let groups = footer_groups();
+    let widths: Vec<f32> = groups
+        .iter()
+        .map(|(label, key)| {
+            text_w(ui, label, FONT_META)
+                + tk::KEYCAP_GAP
+                + text_w(ui, key, FONT_KEYCAP)
+                + 2.0 * tk::KEYCAP_PAD.1
+        })
+        .collect();
+    // 计数优先保留；无可放组时仍保留「打开」（helper 的 count.max(1)）。
+    let count_reserve = if has_query {
+        count_w + tk::FOOTER_GAP
+    } else {
+        0.0
+    };
+    let available = rect.width() - 2.0 * tk::FOOTER_PAD_X - count_reserve;
+    let selected = footer_visible_count(&widths, available, tk::FOOTER_GAP);
+    // 右缘向左按选中组反序绘制：隐藏在最右，「打开」在最左。
     let mut cursor = rect.max.x - tk::FOOTER_PAD_X;
-    for (gi, (label, key)) in groups.iter().enumerate() {
+    for i in (0..selected).rev() {
+        let (label, key) = groups[i];
         let kw = text_w(ui, key, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
-        let lw = text_w(ui, label, FONT_META);
-        let gw = lw + tk::KEYCAP_GAP + kw;
-        let last = gi == groups.len() - 1;
-        // 窄屏裁减：按左端计数实测宽预留；「打开」无论如何保留
-        if !last && cursor - gw < rect.min.x + tk::FOOTER_PAD_X + count_w + tk::FOOTER_GAP {
-            break;
-        }
         let chip = egui::Rect::from_center_size(
             egui::pos2(cursor - kw / 2.0, rect.center().y),
             egui::vec2(kw, tk::KEYCAP_H),
@@ -1829,18 +1860,18 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
         p.text(
             chip.center(),
             egui::Align2::CENTER_CENTER,
-            *key,
+            key,
             font(FONT_KEYCAP),
             t.keycap_text,
         );
         p.text(
             egui::pos2(cursor - kw - tk::KEYCAP_GAP, rect.center().y),
             egui::Align2::RIGHT_CENTER,
-            *label,
+            label,
             font(FONT_META),
             t.footer_label,
         );
-        cursor -= gw + tk::FOOTER_GAP;
+        cursor -= widths[i] + tk::FOOTER_GAP;
     }
     // 左：结果计数（空词隐藏；无匹配项显示「共 0 项」）
     if let Some(count_text) = &count_text {
@@ -1893,17 +1924,17 @@ mod tests {
         });
     }
 
-    /// 页脚四组提示随语言切换，键位不变。
+    /// 页脚四组提示随语言切换，键位不变；视觉序固定左→右。
     #[test]
     fn footer_groups_are_localized() {
         i18n::with_lang(i18n::Lang::ZhHans, || {
             assert_eq!(
                 footer_groups(),
                 [
-                    ("隐藏", "esc"),
-                    ("完整窗口", "⌥↵"),
-                    ("访达", "⌘↵"),
                     ("打开", "↵"),
+                    ("访达", "⌘↵"),
+                    ("完整窗口", "⌥↵"),
+                    ("隐藏", "esc"),
                 ]
             );
         });
@@ -1911,69 +1942,106 @@ mod tests {
             assert_eq!(
                 footer_groups(),
                 [
-                    ("Hide", "esc"),
-                    ("Full Window", "⌥↵"),
-                    ("Finder", "⌘↵"),
                     ("Open", "↵"),
+                    ("Finder", "⌘↵"),
+                    ("Full Window", "⌥↵"),
+                    ("Hide", "esc"),
                 ]
             );
         });
     }
 
-    /// 英文尺寸回归：动作提示不超预留宽；页脚计数与组在最小/最大面板宽内放得下。
+    /// 页脚布局模型：真实 Ui 实测组宽/计数宽 + 与 draw_footer 同一前缀选择；
+    /// 中英在最小/最大面板宽下计数与最左组均不得相交。
     #[test]
-    fn english_footer_and_action_hint_fit_widths() {
-        i18n::with_lang(i18n::Lang::En, || {
-            let ctx = egui::Context::default();
-            let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(PANEL_W, 200.0),
-                )),
-                ..Default::default()
-            };
-            let mut out = ctx.run_ui(raw, |ui| {
-                let hint_w = text_w(ui, action_hint(true), FONT_META);
-                assert!(
-                    hint_w <= tk::ACTION_HINT_W,
-                    "动作提示宽 {hint_w} 超过预留 {}",
-                    tk::ACTION_HINT_W
-                );
+    fn footer_layout_never_overlaps_in_zh_and_en() {
+        for lang in [i18n::Lang::ZhHans, i18n::Lang::En] {
+            i18n::with_lang(lang, || {
+                for panel_w in [PANEL_MIN_W, PANEL_W] {
+                    let ctx = egui::Context::default();
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(panel_w, 200.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let mut out = ctx.run_ui(raw, |ui| {
+                        let groups = footer_groups();
+                        let open_label = i18n::s().palette_action_open;
+                        assert_eq!(groups[0].0, open_label, "视觉序首组必须是「打开」");
 
-                // 与 draw_footer 同口径的组宽（标签 + 间距 + 键帽 + 内边距）。
-                let groups = footer_groups();
-                let widths: Vec<f32> = groups
-                    .iter()
-                    .map(|(label, key)| {
-                        text_w(ui, label, FONT_META)
-                            + tk::KEYCAP_GAP
-                            + text_w(ui, key, FONT_KEYCAP)
-                            + 2.0 * tk::KEYCAP_PAD.1
-                    })
-                    .collect();
-                let count = i18n::format::total_items(2);
-                let count_w = text_w(ui, &count, FONT_META);
+                        let widths: Vec<f32> = groups
+                            .iter()
+                            .map(|(label, key)| {
+                                text_w(ui, label, FONT_META)
+                                    + tk::KEYCAP_GAP
+                                    + text_w(ui, key, FONT_KEYCAP)
+                                    + 2.0 * tk::KEYCAP_PAD.1
+                            })
+                            .collect();
+                        let count = i18n::format::total_items(2);
+                        let count_w = text_w(ui, &count, FONT_META);
+                        let available = panel_w - 2.0 * tk::FOOTER_PAD_X - count_w - tk::FOOTER_GAP;
+                        let selected = footer_visible_count(&widths, available, tk::FOOTER_GAP);
 
-                // 窄屏：计数 + 最后一组（「Open」）+ 两侧内边距 + 组前间距，
-                // 即 draw_footer 的裁减阈值（不写死像素）。
-                let min_needed =
-                    count_w + widths[widths.len() - 1] + 2.0 * tk::FOOTER_PAD_X + tk::FOOTER_GAP;
-                assert!(
-                    min_needed <= PANEL_MIN_W,
-                    "最小宽放不下计数 + 最后一组: {min_needed} > {PANEL_MIN_W}"
-                );
+                        assert!(selected >= 1, "「打开」必须始终保留");
+                        assert_eq!(
+                            groups[..selected][0].0,
+                            open_label,
+                            "选中前缀必须包含「打开」"
+                        );
+                        if panel_w == PANEL_W {
+                            assert_eq!(selected, 4, "最大宽应容纳全部四组");
+                        }
 
-                // 最大宽：计数 + 四组 + 组间距 + 两侧内边距。
-                let max_needed = count_w
-                    + widths.iter().sum::<f32>()
-                    + (groups.len() as f32 - 1.0) * tk::FOOTER_GAP
-                    + 2.0 * tk::FOOTER_PAD_X;
-                assert!(
-                    max_needed <= PANEL_W,
-                    "最大宽放不下计数 + 四组: {max_needed} > {PANEL_W}"
-                );
+                        // 与 draw_footer 同口径：组区从右缘向左排，计数在左。
+                        let used = widths[..selected].iter().sum::<f32>()
+                            + selected.saturating_sub(1) as f32 * tk::FOOTER_GAP;
+                        let count_right = tk::FOOTER_PAD_X + count_w;
+                        let leftmost_group_left = panel_w - tk::FOOTER_PAD_X - used;
+                        assert!(
+                            count_right < leftmost_group_left,
+                            "panel {panel_w}: 计数右缘 {count_right} 与最左组左缘 \
+                             {leftmost_group_left} 重叠 (selected={selected})"
+                        );
+                    });
+                    out.textures_delta.clear();
+                }
             });
-            out.textures_delta.clear();
+        }
+    }
+
+    /// 动作提示按实测宽动态预留：Normal / Large 倍率下都覆盖文案宽。
+    #[test]
+    fn action_hint_width_covers_supported_scales() {
+        i18n::with_lang(i18n::Lang::En, || {
+            for scale in [1.0, 1.15] {
+                ui_font::with_test_scale(scale, || {
+                    let ctx = egui::Context::default();
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(PANEL_W, 200.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let mut out = ctx.run_ui(raw, |ui| {
+                        let measured = text_w(ui, action_hint(true), FONT_META);
+                        // 与 draw_result_row 同口径的动态预留。
+                        let reserved = measured.max(tk::ACTION_HINT_W);
+                        assert!(
+                            measured <= reserved,
+                            "scale {scale}: 提示实测宽 {measured} 超过预留 {reserved}"
+                        );
+                        assert!(
+                            reserved >= tk::ACTION_HINT_W,
+                            "scale {scale}: 预留不得低于固定下限"
+                        );
+                    });
+                    out.textures_delta.clear();
+                });
+            }
         });
     }
 
