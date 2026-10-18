@@ -1023,10 +1023,10 @@ git commit -m "feat(app): 设置页语言下拉与即时切换"
     hotkey_saved_palette_default: "保存的唤起快捷键 {custom} 不可用,已回落默认 {name}" / "Saved Quick Search shortcut {custom} is unavailable; reverted to default {name}",
     hotkey_saved_palette_other: "保存的唤起快捷键 {custom} 不可用,已改用 {name}" / "Saved Quick Search shortcut {custom} is unavailable; using {name} instead",
     hotkey_saved_palette_unavailable: "保存的唤起快捷键 {custom} 不可用,{reason}" / "Saved Quick Search shortcut {custom} is unavailable; {reason}",
-    hotkey_saved_window_conflict_default: "保存的完整窗口快捷键 {custom} 与唤起键冲突,已回落默认 {name}" / "Saved Full Window shortcut {custom} conflicts with the Quick Search shortcut; reverted to default {name}",
-    hotkey_saved_window_default: "保存的完整窗口快捷键 {custom} 不可用,已回落默认 {name}" / "Saved Full Window shortcut {custom} is unavailable; reverted to default {name}",
-    hotkey_saved_window_conflict_unavailable: "保存的完整窗口快捷键 {custom} 与唤起键冲突,{reason}" / "Saved Full Window shortcut {custom} conflicts with the Quick Search shortcut; {reason}",
-    hotkey_saved_window_unavailable: "保存的完整窗口快捷键 {custom} 不可用,{reason}" / "Saved Full Window shortcut {custom} is unavailable; {reason}",
+    hotkey_saved_window_conflict_default: "保存的完整窗口快捷键 {custom} 与唤起键冲突,已回落默认 {name}" / "Full Window shortcut {custom} conflicts with Quick Search; reverted to default {name}",
+    hotkey_saved_window_default: "保存的完整窗口快捷键 {custom} 不可用,已回落默认 {name}" / "Full Window shortcut {custom} is unavailable; reverted to default {name}",
+    hotkey_saved_window_conflict_unavailable: "保存的完整窗口快捷键 {custom} 与唤起键冲突,{reason}" / "Full Window shortcut {custom} conflicts; {reason}",
+    hotkey_saved_window_unavailable: "保存的完整窗口快捷键 {custom} 不可用,{reason}" / "Full Window shortcut {custom} is unavailable; {reason}",
 ```
 
 - [ ] **Step 2: 写失败测试（HotkeyNote 文案）**
@@ -1130,10 +1130,31 @@ impl HotkeyNote {
 ```rust
 /// 模板填充：`{name}` 形式占位符；缺参数时保留原样（由目录单测保证成对）。
 pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
-    let mut out = template.to_owned();
-    for (key, value) in args {
-        out = out.replace(&format!("{{{key}}}"), value);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('}') {
+            Some(end) => {
+                let key = &after[..end];
+                match args.iter().find(|(k, _)| *k == key) {
+                    Some((_, value)) => out.push_str(value),
+                    None => {
+                        out.push('{');
+                        out.push_str(key);
+                        out.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
     }
+    out.push_str(rest);
     out
 }
 ```
@@ -1725,6 +1746,7 @@ git commit -m "feat(app): 托盘与原生层双语"
 - Modify: `crates/app/src/engine_launcher.rs`
 - Modify: `crates/app/src/hotkey.rs`
 - Modify: `crates/app/src/ui/hotkey_keys.rs`
+- Modify: `crates/app/src/ui/palette.rs`（悬浮条打开失败文案）
 - Modify: `crates/app/src/i18n/catalog.rs`
 - Modify: `crates/app/src/i18n/format.rs`
 
@@ -1745,6 +1767,9 @@ git commit -m "feat(app): 托盘与原生层双语"
     hotkey_duplicate: "该快捷键已用于另一个功能" / "This shortcut is already used for another feature",
     hotkey_saved_but_save_failed: "快捷键已生效,但设置保存失败" / "Shortcut applied, but settings could not be saved",
     hotkey_reset_but_save_failed: "快捷键已恢复默认,但设置保存失败" / "Default shortcut restored, but settings could not be saved",
+    // 悬浮条打开失败（应用自产）
+    palette_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
+    palette_open_failed: "打开失败" / "Failed to open",
 ```
 
 - [ ] **Step 2: 热键校验错误类型化**
@@ -1839,12 +1864,44 @@ RestartOutcome::Err(format!("{}: {err}", i18n::s().engine_restart_failed))
 
 > 调用方展示 `{err:#}` 的位置改为 `{err}` 以走本地化 `Display`；日志保留 `{err:#}`。
 
-- [ ] **Step 5: 跑测试并修断言**
+- [ ] **Step 5: 悬浮条打开失败文案**
 
-Run: `cargo test -p macEverything-app engine_launcher hotkey_keys hotkey`
+`crates/app/src/ui/palette.rs`：
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenError {
+    FileMissing,
+    Failed(String),
+}
+
+impl OpenError {
+    fn text(&self) -> String {
+        match self {
+            Self::FileMissing => i18n::s().palette_file_missing.to_owned(),
+            Self::Failed(detail) => {
+                format!("{}: {detail}", i18n::s().palette_open_failed)
+            }
+        }
+    }
+}
+```
+
+- `BadgeText` 增加 `Open(OpenError)`；`BadgeText::text` 映射到 `error.text()`。
+- `open_path` 返回 `Result<(), OpenError>`（文件不存在 → `FileMissing`；启动失败 → `Failed(detail)`），
+  `open_selected` 改为 `Badge::error(BadgeText::Open(err))`。
+- `BadgeText::Raw` 只保留给真正外部/技术文本；更新其文档注释。
+- 测试：`with_lang(En)` 下 `FileMissing` 文案为 `File not found; the index may be out of date`；
+  中文默认下为「文件不存在,索引可能待更新」。
+
+- [ ] **Step 6: 跑测试并修断言**
+
+Run: `cargo test -p macEverything-app engine_launcher`
+Run: `cargo test -p macEverything-app hotkey_keys`
+Run: `cargo test -p macEverything-app hotkey`
 Expected: 默认中文断言保持通过；英文用例用 `with_lang` 新增断言。
 
-- [ ] **Step 6: 全量验证并提交**
+- [ ] **Step 7: 全量验证并提交**
 
 ```bash
 cargo fmt --check
@@ -1853,7 +1910,7 @@ cargo test --workspace
 ```
 
 ```bash
-git add crates/app/src/engine_launcher.rs crates/app/src/hotkey.rs crates/app/src/ui/hotkey_keys.rs crates/app/src/ui/mod.rs crates/app/src/i18n
+git add crates/app/src/engine_launcher.rs crates/app/src/hotkey.rs crates/app/src/ui/hotkey_keys.rs crates/app/src/ui/palette.rs crates/app/src/ui/mod.rs crates/app/src/i18n
 git commit -m "feat(app): 剩余自产消息双语"
 ```
 
