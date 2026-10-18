@@ -1311,16 +1311,13 @@ git commit -m "feat(app): 热键提示类型化与悬浮条双语"
     col_path: "路径" / "Path",
     settings_tooltip: "设置" / "Settings",
     // 状态栏
-    status_zero_items: "0 项" / "0 items",
     status_sorting: "排序中…" / "Sorting…",
-    status_gaps: "{n} 个目录未收录" / "{n} folders not indexed",
     engine_outdated_sort: "引擎版本过旧,排序未生效" / "Engine is outdated; sorting is unavailable",
     restarting: "重启中…" / "Restarting…",
     restart_engine: "重启引擎" / "Restart Engine",
     status_engine_not_ready: "引擎未就绪" / "Engine not ready",
     status_query_failed: "查询失败" / "Query failed",
     // 缺口面板
-    gaps_panel_header: "权限缺口({n} 个目录,未收录):" / "Permission Gaps ({n} folders not indexed):",
     gaps_more: "… 其余 {n} 个" / "… {n} more",
     // 索引状态
     index_building_count: "索引构建中({n} 条)" / "Building index ({n} entries)",
@@ -1442,7 +1439,8 @@ fn counts_text_pluralizes_in_english() {
 
 - [ ] **Step 4: 跑测试确认失败**
 
-Run: `cargo test -p macEverything-app empty_state_text_is_localized counts_text_pluralizes_in_english`
+Run: `cargo test -p macEverything-app empty_state_text_is_localized`
+Run: `cargo test -p macEverything-app counts_text_pluralizes_in_english`
 Expected: FAIL（英文文案未接入）。
 
 - [ ] **Step 5: `StatusNote` 类型化**
