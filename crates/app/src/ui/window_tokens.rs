@@ -162,6 +162,8 @@ pub const DIVIDER_H: f32 = 1.0;
 pub const SORT_ARROW: f32 = 12.0;
 /// 表头文字与排序箭头的间距（§4.5：6）。
 pub const SORT_ARROW_GAP: f32 = 6.0;
+/// 表头列间竖线的上下内缩（§3.4，2026-10-18：不顶头）。
+pub const HEADER_SEP_INSET_Y: f32 = 8.0;
 
 // —— 状态栏（§3.6）——
 pub const STATUS_H: f32 = 28.0;

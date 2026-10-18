@@ -113,6 +113,9 @@ pub struct ResultsState {
     pub input: String,
     /// 瞬时提示(打开失败/查询失败;显示于状态栏)。
     pub status_note: Option<String>,
+    /// 提示是否为错误态(决定状态栏用错误红还是中性文本色)。
+    /// 齿轮 v2.1 提示属信息态:说「设置暂未提供」不是失败。
+    pub status_note_is_error: bool,
     /// 齿轮 v2.1 提示的到期时刻(只对 `GEAR_PENDING_NOTE` 生效,其他提示不设 TTL)。
     status_note_until: Option<Instant>,
     /// 引擎状态快照(status 面;状态栏「索引状态」段)。
@@ -174,6 +177,7 @@ impl ResultsState {
             gaps_open: false,
             input: String::new(),
             status_note: None,
+            status_note_is_error: false,
             status_note_until: None,
             engine: None,
             engine_known: false,
@@ -200,6 +204,7 @@ impl ResultsState {
         self.status_refresh_pending = true;
         // 每次唤起从干净状态开始:上次会话的齿轮提示不得跨唤起驻留。
         self.status_note = None;
+        self.status_note_is_error = false;
         self.status_note_until = None;
     }
 
@@ -221,6 +226,7 @@ impl ResultsState {
         self.selection.clear();
         self.anchor = None;
         self.status_note = None;
+        self.status_note_is_error = false;
         self.sorting_inflight = false;
         self.sort_stale = false; // 旧结果作废 → 排序警示随旧结果清
         if !q.is_empty() {
@@ -237,6 +243,7 @@ impl ResultsState {
         if self.status_note.as_deref() == Some(GEAR_PENDING_NOTE) {
             if self.status_note_until.is_some_and(|until| now >= until) {
                 self.status_note = None;
+                self.status_note_is_error = false;
                 self.status_note_until = None;
             }
         } else {
@@ -324,6 +331,7 @@ impl ResultsState {
                 self.selection.clear();
                 self.anchor = None;
                 self.status_note = None;
+                self.status_note_is_error = false;
                 // sort_echo 校验(tech 定案):请求了非 relevance 键而回显为空
                 // (旧 daemon 忽略 sort)或异键 → 本响应排序未生效,不静默展示。
                 // 离线路径恒回 relevance,请求列排序时同落此分支(重启引擎即修复,
@@ -347,6 +355,7 @@ impl ResultsState {
                 if engine_down {
                     self.session.mark_engine_starting();
                     self.status_note = Some("引擎未就绪".into());
+                    self.status_note_is_error = true;
                 } else {
                     // 错误码分流(tech 六态表):warming = 索引未挂载 → 占位态,
                     // 红字换中性(状态栏索引状态段与空态提示承担呈现)。
@@ -355,6 +364,7 @@ impl ResultsState {
                         State::Warming => None,
                         _ => Some("查询失败".into()),
                     };
+                    self.status_note_is_error = self.status_note.is_some();
                 }
             }
         }
@@ -667,6 +677,7 @@ impl ResultsState {
                 self.selection.clear();
                 self.anchor = None;
                 self.status_note = None;
+                self.status_note_is_error = false;
                 self.sort_stale = false;
             } else {
                 ctx.request_repaint_after(palette::DEBOUNCE);
@@ -691,6 +702,7 @@ impl ResultsState {
     /// 齿轮点击的 v2.1 提示:`status_note` + 到期时刻(由 tick 清除)。
     fn show_gear_note(&mut self, now: Instant) {
         self.status_note = Some(GEAR_PENDING_NOTE.into());
+        self.status_note_is_error = false; // 信息提示,不套错误红
         self.status_note_until = Some(now + GEAR_NOTE_TTL);
     }
 
@@ -763,7 +775,10 @@ impl ResultsState {
                 self.ctx
                     .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
             }
-            RestartOutcome::Err(msg) => self.status_note = Some(msg),
+            RestartOutcome::Err(msg) => {
+                self.status_note = Some(msg);
+                self.status_note_is_error = true;
+            }
         }
     }
 
@@ -807,7 +822,10 @@ impl ResultsState {
             Some(tag) => match menu_actions::MenuAction::from_tag(tag) {
                 Some(action) => match menu_actions::execute(action, &paths) {
                     Ok(()) => log::info!("右键菜单:执行 {action:?}({} 项)", paths.len()),
-                    Err(err) => self.status_note = Some(err.to_string()),
+                    Err(err) => {
+                        self.status_note = Some(err.to_string());
+                        self.status_note_is_error = true;
+                    }
                 },
                 None => log::warn!("右键菜单:未知 tag {tag},忽略"),
             },
@@ -823,6 +841,7 @@ impl ResultsState {
         };
         if let Err(msg) = palette::open_path(&entry.path, false) {
             self.status_note = Some(msg);
+            self.status_note_is_error = true;
         }
     }
 
@@ -1120,6 +1139,23 @@ fn draw_header(
             );
             draw_sort_arrow(&painter, arrow_rect, up, palette.sort_arrow);
         }
+    }
+    // 表头列间竖线(2026-10-18 需求):1px、取 divider token,居中于列间距;
+    // 上下各内缩 8(不顶头),只画在表头行内,结果行不画。
+    let sep_y = (
+        header.top() + window_tokens::HEADER_SEP_INSET_Y,
+        header.bottom() - window_tokens::HEADER_SEP_INSET_Y,
+    );
+    for col in cols.iter().take(COLUMNS.len() - 1) {
+        let x = area.left() + col.0 + col.1 + window_tokens::COLUMN_GAP / 2.0;
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x - window_tokens::DIVIDER_H / 2.0, sep_y.0),
+                egui::pos2(x + window_tokens::DIVIDER_H / 2.0, sep_y.1),
+            ),
+            egui::CornerRadius::ZERO,
+            palette.divider,
+        );
     }
     // 拖拽热区:居中于列间 16px 空隙(与列头点击区不重叠,拖拽不会误触排序)。
     let boundaries = [
@@ -1643,6 +1679,12 @@ fn draw_status_row(
         "重启引擎"
     });
     let note = st.status_note.as_deref();
+    // 信息提示(齿轮 v2.1)走中性文本色;打开/查询失败才用错误红。
+    let note_color = if st.status_note_is_error {
+        error
+    } else {
+        palette.status_text
+    };
 
     // 缺口徽标(右侧,绝对定位):文本 + 自绘警示三角。先量宽,左侧状态区
     // 只使用剩余宽,保证长状态不会伸进徽标区。
@@ -1702,9 +1744,9 @@ fn draw_status_row(
             action.restart_clicked = resp.clicked();
         }
     }
-    // 瞬时提示(打开失败/查询失败/齿轮 v2.1):错误色,11pt,按左区剩余宽截断。
+    // 瞬时提示(打开失败/查询失败/齿轮 v2.1):11pt,按左区剩余宽截断。
     if let (Some(rect), Some(note)) = (layout.note, note) {
-        draw_status_text(ui, rect, note, error);
+        draw_status_text(ui, rect, note, note_color);
     }
 
     // 徽标绝对定位后注册(命中优先于左侧内容;几何上两者已不重叠)。
@@ -2376,6 +2418,70 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// 表头列间竖线（2026-10-18 需求）：仅表头行内 3 条 1px 竖线，取 divider
+    /// token，居中于列边界；上下内缩 8（不顶头），结果区不出现。
+    #[test]
+    fn header_column_separators_only_in_header_row() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(1200.0, 800.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        let palette = window_tokens::dark();
+        let header_top =
+            window_tokens::TITLEBAR_H + window_tokens::SEARCH_ROW_H + window_tokens::DIVIDER_H;
+        let sep_h = window_tokens::HEADER_H - 2.0 * window_tokens::HEADER_SEP_INSET_Y;
+        let mut separators: Vec<egui::Rect> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == palette.divider
+                        && (r.rect.width() - window_tokens::DIVIDER_H).abs() < 0.01
+                        && (r.rect.height() - sep_h).abs() < 0.01 =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        separators.sort_by(|a, b| a.center().x.partial_cmp(&b.center().x).unwrap());
+        let cols = col_layout(
+            1200.0,
+            [
+                window_tokens::COL_SIZE_W,
+                window_tokens::COL_MTIME_W,
+                window_tokens::COL_PATH_W,
+            ],
+        );
+        let expected: Vec<f32> = (0..3)
+            .map(|i| cols[i].0 + cols[i].1 + window_tokens::COLUMN_GAP / 2.0)
+            .collect();
+        let expected_top = header_top + window_tokens::HEADER_SEP_INSET_Y;
+        let expected_bottom =
+            header_top + window_tokens::HEADER_H - window_tokens::HEADER_SEP_INSET_Y;
+        assert_eq!(separators.len(), 3, "仅表头 3 条列间竖线");
+        for (rect, want_x) in separators.iter().zip(expected.iter()) {
+            assert!(
+                (rect.center().x - want_x).abs() < 0.51,
+                "竖线 x={} 期望 {want_x}",
+                rect.center().x
+            );
+            assert!(
+                (rect.top() - expected_top).abs() < 0.01
+                    && (rect.bottom() - expected_bottom).abs() < 0.01,
+                "竖线上下内缩 8、只出现在表头行(实际 {:?})",
+                rect
+            );
+        }
+        out.textures_delta.clear();
+    }
+
     /// 表头拖拽接线(窄窗):720 宽 + stored 超预算时,在名称/大小边界右拖 10px,
     /// `draw_impl` 必须按投影宽归一化且边界跟手(守 call site 不退回 stored 起算)。
     #[test]
@@ -2866,6 +2972,7 @@ mod tests {
             "错误码分流到 Warming"
         );
         assert_eq!(st.status_note, None, "warming 占位非错误:不给红字");
+        assert!(!st.status_note_is_error);
     }
 
     /// 重启动作落地:成功 → 清红字 + 按当前列/方向同串重查;失败 → 红字保留 + 提示原因。
@@ -2908,6 +3015,7 @@ mod tests {
         assert!(st.sort_stale, "失败不清红字(排序仍未生效)");
         assert!(!st.engine_restarting);
         assert_eq!(st.status_note.as_deref(), Some("引擎重启失败:x"));
+        assert!(st.status_note_is_error, "重启失败是错误态");
     }
 
     /// 齿轮 v2.1 提示:3s 到期由 tick 清除;窗口重新唤起立即清除;其他提示不被 TTL 误清。
@@ -2918,6 +3026,7 @@ mod tests {
         let t0 = Instant::now();
         st.show_gear_note(t0);
         assert_eq!(st.status_note.as_deref(), Some(GEAR_PENDING_NOTE));
+        assert!(!st.status_note_is_error, "齿轮提示是信息态,不套错误红");
         assert_eq!(st.status_note_until, Some(t0 + GEAR_NOTE_TTL));
 
         // 未到期:保留
@@ -2927,19 +3036,23 @@ mod tests {
         // 到期:tick 清除
         st.tick(t0 + GEAR_NOTE_TTL);
         assert_eq!(st.status_note, None);
+        assert!(!st.status_note_is_error);
         assert_eq!(st.status_note_until, None);
 
         // 重新唤起:立即清除,不等 TTL
         st.show_gear_note(t0);
         st.on_window_shown();
         assert_eq!(st.status_note, None);
+        assert!(!st.status_note_is_error);
         assert_eq!(st.status_note_until, None);
 
         // 其他状态提示(非齿轮文案)不受 TTL 影响:到期点被丢弃,文案保留到业务清除
         st.status_note = Some("查询失败".into());
+        st.status_note_is_error = true;
         st.status_note_until = Some(t0); // 模拟遗留到期点
         st.tick(t0 + GEAR_NOTE_TTL * 2);
         assert_eq!(st.status_note.as_deref(), Some("查询失败"));
+        assert!(st.status_note_is_error, "错误提示保持错误态");
         assert_eq!(st.status_note_until, None);
     }
 
@@ -3111,6 +3224,7 @@ mod tests {
         st.stat_ms = 12.0;
         st.sort_stale = true;
         st.status_note = Some("查询失败:无法连接引擎,请稍后重试并检查索引状态是否正常".into());
+        st.status_note_is_error = true;
         st.engine = Some(EngineStatus {
             state: client::state::READY.into(),
             entry_count: 3,
