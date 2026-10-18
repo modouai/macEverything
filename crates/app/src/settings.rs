@@ -37,15 +37,6 @@ impl FontSize {
             Self::Large => 1.15,
         }
     }
-
-    /// 分段控件显示文案。
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Small => "小",
-            Self::Standard => "标准",
-            Self::Large => "大",
-        }
-    }
 }
 
 /// `settings.toml` 的完整内容（未知键忽略，缺字段取默认——前向兼容）。
@@ -156,9 +147,6 @@ mod tests {
         assert_eq!(FontSize::Small.scale(), 0.9);
         assert_eq!(FontSize::Standard.scale(), 1.0);
         assert_eq!(FontSize::Large.scale(), 1.15);
-        assert_eq!(FontSize::Small.label(), "小");
-        assert_eq!(FontSize::Standard.label(), "标准");
-        assert_eq!(FontSize::Large.label(), "大");
 
         // serde kebab-case（settings.toml 的存储口径）。
         let text = toml::to_string(&SettingsFile {

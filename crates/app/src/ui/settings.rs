@@ -21,6 +21,7 @@ use global_hotkey::hotkey::HotKey;
 
 use crate::autostart::{self, Status};
 use crate::hotkey::{HotkeySlot, HotkeySnapshot};
+use crate::i18n::{self, LanguageSetting};
 use crate::platform;
 use crate::settings::{self as store, FontSize, SettingsFile};
 use crate::ui::{
@@ -74,6 +75,88 @@ pub(crate) enum HotkeyCommand {
     Reset(HotkeySlot),
 }
 
+/// 设置保存失败（原始细节在构造处进日志，界面显示本地化文案）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SettingsError {
+    SaveFailed,
+}
+
+impl SettingsError {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::SaveFailed => i18n::s().settings_save_failed.to_owned(),
+        }
+    }
+}
+
+/// 语言保存失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LanguageError {
+    SaveFailed,
+}
+
+impl LanguageError {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::SaveFailed => i18n::s().language_save_failed.to_owned(),
+        }
+    }
+}
+
+/// 开机自启相关错误（原始细节在构造处进日志）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutostartError {
+    ReadFailed,
+    NotEffective(Status),
+    SetFailed,
+}
+
+impl AutostartError {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::ReadFailed => i18n::s().autostart_read_failed.to_owned(),
+            Self::NotEffective(status) => {
+                format!(
+                    "{}: {}",
+                    i18n::s().autostart_not_effective,
+                    status_text(*status)
+                )
+            }
+            Self::SetFailed => i18n::s().autostart_set_failed.to_owned(),
+        }
+    }
+}
+
+/// 自启状态说明（设置页行内错误使用；日志仍走 `Status::note()` 中文）。
+pub(crate) fn status_text(status: Status) -> &'static str {
+    match status {
+        Status::Enabled => i18n::s().autostart_status_enabled,
+        Status::RequiresApproval => i18n::s().autostart_status_requires_approval,
+        Status::NotRegistered => i18n::s().autostart_status_not_registered,
+        Status::NotFound => i18n::s().autostart_status_not_found,
+    }
+}
+
+/// 排除目录错误（daemon 原始错误原样展示，其余本地化）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExcludeError {
+    Daemon(String),
+    NoReason,
+    WorkerExited,
+    StartFailed,
+}
+
+impl ExcludeError {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Daemon(detail) => detail.clone(),
+            Self::NoReason => i18n::s().exclude_failed_no_reason.to_owned(),
+            Self::WorkerExited => i18n::s().exclude_worker_exited.to_owned(),
+            Self::StartFailed => i18n::s().exclude_worker_start_failed.to_owned(),
+        }
+    }
+}
+
 /// 排除目录后台操作的一次回投结果（工作线程 → 设置 pass）。
 ///
 /// `error = Some` 时 `entries` 无意义（保持旧列表）；只有 `error = None`
@@ -81,7 +164,7 @@ pub(crate) enum HotkeyCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExcludeResult {
     pub(crate) entries: Vec<String>,
-    pub(crate) error: Option<String>,
+    pub(crate) error: Option<ExcludeError>,
 }
 
 /// `client::exclude` 结果 → UI 结果：仅 ok=true 覆盖列表；失败/离线保留旧列表。
@@ -93,16 +176,19 @@ fn exclude_result(outcome: anyhow::Result<client::ExcludeOutcome>) -> ExcludeRes
         },
         Ok(outcome) => ExcludeResult {
             entries: Vec::new(),
-            error: Some(
-                outcome
-                    .message
-                    .unwrap_or_else(|| "排除目录操作失败(daemon 未给出原因)".to_owned()),
-            ),
+            error: Some(match outcome.message {
+                Some(message) => ExcludeError::Daemon(message),
+                None => ExcludeError::NoReason,
+            }),
         },
-        Err(err) => ExcludeResult {
-            entries: Vec::new(),
-            error: Some(format!("{err:#}")),
-        },
+        Err(err) => {
+            let detail = format!("{err:#}");
+            log::warn!("排除目录 daemon 调用失败: {detail}");
+            ExcludeResult {
+                entries: Vec::new(),
+                error: Some(ExcludeError::Daemon(detail)),
+            }
+        }
     }
 }
 
@@ -122,9 +208,13 @@ pub struct SettingsState {
     pub(crate) autostart: Option<bool>,
     /// 已注册但等待系统「登录项」允许（`RequiresApproval`）：显示关态 + 行内提示。
     pub(crate) autostart_approval: bool,
-    pub(crate) autostart_error: Option<String>,
+    pub(crate) autostart_error: Option<AutostartError>,
     /// 字号保存失败的内联错误（已应用的字号不因保存失败回退）。
-    pub(crate) font_error: Option<String>,
+    pub(crate) font_error: Option<SettingsError>,
+    /// 语言保存失败的内联错误（语言已即时应用，仅落盘失败时留痕）。
+    pub(crate) language_error: Option<LanguageError>,
+    /// 语言切换后待 App 刷新的托盘文案标记。
+    pub(crate) tray_relabel_pending: bool,
     /// 排除目录（daemon 响应为唯一真源；首次成功 list 响应前为引擎默认种子，
     /// 失败/离线时保留旧列表或种子）。
     pub(crate) excluded: Vec<String>,
@@ -136,7 +226,7 @@ pub struct SettingsState {
     ///
     /// add/remove/reset 开始即清；自动 list 刷新**保留**（否则刚收到的失败文案
     /// 会被重开触发的刷新立刻吞掉），仅成功 list 响应清空。
-    pub(crate) exclude_error: Option<String>,
+    pub(crate) exclude_error: Option<ExcludeError>,
     /// 最近一次排除 worker 是否产生了终态结果（含 daemon 列表响应成功/失败，
     /// 以及 client 离线错误）；线程启动失败/无结果退出不算，保持 false。
     pub(crate) exclude_loaded: bool,
@@ -178,6 +268,8 @@ impl SettingsState {
             autostart_approval: false,
             autostart_error: None,
             font_error: None,
+            language_error: None,
+            tray_relabel_pending: false,
             excluded: engine::config::default_config().excluded,
             exclude_busy: false,
             exclude_busy_list: false,
@@ -261,11 +353,12 @@ impl SettingsState {
     /// 工作线程无法启动：清 busy/通道并落内联错误（旧列表保留）。
     ///
     /// 未拿到 daemon 响应，`exclude_loaded` 保持 false（种子语义不变）。
-    pub(crate) fn exclude_spawn_failed(&mut self, message: String) {
+    pub(crate) fn exclude_spawn_failed(&mut self, detail: String) {
+        log::warn!("排除目录工作线程启动失败:{detail}");
         self.exclude_busy = false;
         self.exclude_busy_list = false;
         self.exclude_rx = None;
-        self.exclude_error = Some(message);
+        self.exclude_error = Some(ExcludeError::StartFailed);
         self.exclude_loaded = false;
     }
 
@@ -291,9 +384,10 @@ impl SettingsState {
             }
             Err(TryRecvError::Empty) => self.exclude_rx = Some(rx),
             Err(TryRecvError::Disconnected) => {
+                log::warn!("排除目录工作线程异常退出(无结果)");
                 self.exclude_busy = false;
                 self.exclude_busy_list = false;
-                self.exclude_error = Some("排除目录工作线程异常退出(无结果)".to_owned());
+                self.exclude_error = Some(ExcludeError::WorkerExited);
                 self.exclude_loaded = false;
             }
         }
@@ -417,9 +511,10 @@ impl SettingsState {
                 self.apply_autostart_status(false, status);
             }
             Err(err) => {
+                log::warn!("读取开机自启状态失败: {err}");
                 self.autostart = None;
                 self.autostart_approval = false;
-                self.autostart_error = Some(err);
+                self.autostart_error = Some(AutostartError::ReadFailed);
             }
         }
     }
@@ -455,7 +550,7 @@ impl SettingsState {
         self.autostart = Some(enabled);
         self.autostart_approval = status == Status::RequiresApproval;
         self.autostart_error = if !enabled && status != Status::RequiresApproval && desired {
-            Some(format!("开机自启未生效:{}", status.note()))
+            Some(AutostartError::NotEffective(status))
         } else {
             None
         };
@@ -474,8 +569,9 @@ impl SettingsState {
         match result {
             Ok(status) => self.apply_autostart_status(desired, status),
             Err(message) => {
+                log::warn!("开机自启设置失败: {message}");
                 self.autostart_approval = false;
-                self.autostart_error = Some(format!("开机自启设置失败:{message}"));
+                self.autostart_error = Some(AutostartError::SetFailed);
                 AutostartUpdate {
                     enabled: self.autostart.unwrap_or(false),
                     confirmed: false,
@@ -486,9 +582,40 @@ impl SettingsState {
 
     /// 字号选择的状态落地（纯状态；调用方已完成 `font::set_scale` 与保存）。
     /// 保存失败也更新选中态——界面须与已应用的全局倍率一致。
-    pub(crate) fn set_font_size_result(&mut self, size: FontSize, save_error: Option<String>) {
+    pub(crate) fn set_font_size_result(
+        &mut self,
+        size: FontSize,
+        save_error: Option<SettingsError>,
+    ) {
         self.file.font_size = size;
         self.font_error = save_error;
+    }
+
+    /// 语言选择的状态落地（纯状态；调用方已完成全局切换与保存）。
+    /// 保存失败也更新选中态——界面须与已生效的语言一致。
+    pub(crate) fn set_language_result(
+        &mut self,
+        setting: LanguageSetting,
+        save_error: Option<LanguageError>,
+    ) {
+        self.file.language = setting;
+        self.language_error = save_error;
+    }
+
+    /// 语言切换后请求 App 刷新托盘文案（App::logic 消费）。
+    pub(crate) fn request_tray_relabel(&mut self) {
+        self.tray_relabel_pending = true;
+    }
+
+    /// 取走托盘文案刷新标记（App::logic 消费；接入点在后续托盘文案任务）。
+    #[allow(dead_code)]
+    pub(crate) fn take_tray_relabel_pending(&mut self) -> bool {
+        std::mem::take(&mut self.tray_relabel_pending)
+    }
+
+    /// 语言切换时清掉一次性错误（跨帧常驻状态使用类型化文案，不清）。
+    pub(crate) fn clear_transient_messages(&mut self) {
+        self.hotkey_error = None;
     }
 
     /// 取走待同步给托盘的自启值（App::logic 每帧 drain）。
@@ -523,7 +650,8 @@ impl SettingsData {
             autostart_approval: state.autostart_approval,
             autostart_error: state.autostart_error.clone(),
             font_error: state.font_error.clone(),
-            language: settings_view::LANGUAGE_LABEL,
+            language: state.file.language,
+            language_error: state.language_error.clone(),
             hotkeys: state.hotkey_snapshot.clone(),
             recording: state.recording,
             hotkey_error: state.hotkey_error.clone(),
@@ -644,17 +772,12 @@ fn consume_close_shortcut(ctx: &egui::Context) -> bool {
     ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
 }
 
-/// 恢复默认排除目录：原生确认弹窗文案（取消是默认按钮，破坏性动作须显式点选）。
-const RESET_CONFIRM_TITLE: &str = "恢复默认排除目录？";
-const RESET_CONFIRM_MESSAGE: &str =
-    "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。";
-const RESET_CONFIRM_ACTION: &str = "恢复默认";
-
 /// 落地一条设置动作（已出共享锁）。
 fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: SettingsAction) {
     match action {
         SettingsAction::SetFontSize(size) => apply_font_size(shared, ctx, size),
         SettingsAction::SetAutostart(enabled) => apply_autostart(shared, ctx, enabled),
+        SettingsAction::SetLanguage(setting) => apply_language(shared, ctx, setting),
         SettingsAction::BeginHotkeyRecord(slot) => {
             enqueue_hotkey_command(shared, ctx, HotkeyCommand::BeginRecord(slot))
         }
@@ -676,9 +799,9 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             // 原生模态:主线程调用且不持共享锁(与目录选择器同纪律)。取消 = 无状态
             // 变化;确认后才启动既有 reset worker(一次重扫)。
             if platform::confirm_action(
-                RESET_CONFIRM_TITLE,
-                RESET_CONFIRM_MESSAGE,
-                RESET_CONFIRM_ACTION,
+                i18n::s().reset_confirm_title,
+                i18n::s().reset_confirm_message,
+                i18n::s().reset_confirm_action,
             ) {
                 spawn_exclude(ctx, shared, "reset", None);
             } else {
@@ -752,7 +875,7 @@ fn spawn_exclude(
                 arg.as_deref(),
             ));
             match &result.error {
-                Some(error) => log::warn!("排除目录 {op} 失败:{error}"),
+                Some(error) => log::warn!("排除目录 {op} 失败:{error:?}"),
                 None => log::info!("排除目录 {op} 完成({} 条)", result.entries.len()),
             }
             if let Err(err) = tx.send(result) {
@@ -761,10 +884,9 @@ fn spawn_exclude(
             thread_ctx.request_repaint_of(viewport_id());
         });
     if let Err(err) = spawned {
-        log::warn!("排除目录工作线程启动失败:{err}");
         lock_shared(shared)
             .settings
-            .exclude_spawn_failed(format!("无法启动排除目录工作线程:{err}"));
+            .exclude_spawn_failed(err.to_string());
         ctx.request_repaint_of(viewport_id());
     }
     true
@@ -800,9 +922,9 @@ fn apply_font_size(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, size: FontS
 
     // 3. 原子保存；失败只留内联错误，不回退已应用字号。
     let save_error = store::save(&data_dir, &file).err().map(|err| {
-        let message = format!("设置保存失败:{err:#}");
-        log::warn!("字号 {size:?} 已应用,但{message}");
-        message
+        let detail = format!("{err:#}");
+        log::warn!("字号 {size:?} 已应用,但设置保存失败:{detail}");
+        SettingsError::SaveFailed
     });
 
     // 4. 设置快照/选中态与运行期倍率一致。
@@ -813,6 +935,41 @@ fn apply_font_size(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, size: FontS
     log::info!("设置字号 → {:?}(scale {:.2})", size, size.scale());
 
     // 5. ROOT + 悬浮条 + 设置页全部重绘（两个窗口文字即时变化）。
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    ctx.request_repaint_of(crate::ui::palette_viewport_id());
+    ctx.request_repaint_of(viewport_id());
+}
+
+/// 语言即时生效：解析 → 全局切换 → 落盘（失败仅内联留痕）→ 重绘三窗 + 托盘刷新标记。
+fn apply_language(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, setting: LanguageSetting) {
+    let preferred = platform::preferred_languages().unwrap_or_else(|err| {
+        log::warn!("读取系统语言失败,按简体中文: {err}");
+        Vec::new()
+    });
+    let lang = crate::i18n::resolve_language(setting, &preferred);
+    crate::i18n::set_lang(lang);
+
+    let (mut file, data_dir) = {
+        let s = lock_shared(shared);
+        (s.settings.file.clone(), s.settings.data_dir.clone())
+    };
+    file.language = setting;
+
+    let save_error = store::save(&data_dir, &file).err().map(|err| {
+        let detail = format!("{err:#}");
+        log::warn!("语言 {setting:?} 已应用,但设置保存失败:{detail}");
+        LanguageError::SaveFailed
+    });
+
+    {
+        let mut s = lock_shared(shared);
+        s.settings.set_language_result(setting, save_error);
+        s.settings.clear_transient_messages();
+        s.settings.request_tray_relabel();
+        s.results.clear_transient_messages();
+    }
+    log::info!("设置语言 → {setting:?}({lang:?})");
+
     ctx.request_repaint_of(egui::ViewportId::ROOT);
     ctx.request_repaint_of(crate::ui::palette_viewport_id());
     ctx.request_repaint_of(viewport_id());
@@ -922,6 +1079,8 @@ mod tests {
         assert!(!state.autostart_approval);
         assert!(state.autostart_error.is_none());
         assert!(state.font_error.is_none());
+        assert!(state.language_error.is_none());
+        assert!(!state.tray_relabel_pending);
         assert_eq!(state.excluded, engine::config::default_config().excluded);
         assert!(!state.exclude_busy);
         assert!(!state.exclude_busy_list);
@@ -1019,15 +1178,19 @@ mod tests {
         let tx = begin_fake_exclude(&mut state, true);
         tx.send(ExcludeResult {
             entries: Vec::new(),
-            error: Some("daemon 未在运行;排除变更需引擎在线".into()),
+            error: Some(ExcludeError::Daemon(
+                "daemon 未在运行;排除变更需引擎在线".into(),
+            )),
         })
         .unwrap();
         state.tick_exclude();
 
         assert_eq!(state.excluded, seeded, "失败不得清空/覆盖旧列表");
         assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("daemon 未在运行;排除变更需引擎在线")
+            state.exclude_error,
+            Some(ExcludeError::Daemon(
+                "daemon 未在运行;排除变更需引擎在线".into()
+            ))
         );
         assert!(!state.exclude_busy);
         assert!(state.exclude_loaded);
@@ -1070,12 +1233,15 @@ mod tests {
             let tx = begin_fake_exclude(&mut state, false);
             tx.send(ExcludeResult {
                 entries: Vec::new(),
-                error: Some(message.to_owned()),
+                error: Some(ExcludeError::Daemon(message.to_owned())),
             })
             .unwrap();
             state.tick_exclude();
             assert_eq!(state.excluded, before, "{label} 失败须保留旧列表");
-            assert_eq!(state.exclude_error.as_deref(), Some(message));
+            assert_eq!(
+                state.exclude_error,
+                Some(ExcludeError::Daemon(message.to_owned()))
+            );
             assert!(!state.exclude_busy);
         }
     }
@@ -1083,12 +1249,12 @@ mod tests {
     /// 原生确认弹窗文案是行为契约的一部分（标题/正文/破坏性按钮），变更须同步文档。
     #[test]
     fn reset_native_confirmation_copy_matches_contract() {
-        assert_eq!(RESET_CONFIRM_TITLE, "恢复默认排除目录？");
+        assert_eq!(i18n::s().reset_confirm_title, "恢复默认排除目录？");
         assert_eq!(
-            RESET_CONFIRM_MESSAGE,
+            i18n::s().reset_confirm_message,
             "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。"
         );
-        assert_eq!(RESET_CONFIRM_ACTION, "恢复默认");
+        assert_eq!(i18n::s().reset_confirm_action, "恢复默认");
     }
 
     /// reset worker 成功：响应三条默认覆盖旧列表、清错、结束 busy。
@@ -1096,7 +1262,7 @@ mod tests {
     fn exclude_reset_success_replaces_entries_with_defaults() {
         let mut state = test_state();
         state.excluded = vec!["/custom/a".into(), "node_modules".into()];
-        state.exclude_error = Some("旧错误".into());
+        state.exclude_error = Some(ExcludeError::Daemon("旧错误".into()));
         let tx = begin_fake_exclude(&mut state, false);
         assert!(
             state.exclude_busy && !state.exclude_busy_list,
@@ -1126,15 +1292,19 @@ mod tests {
         let tx = begin_fake_exclude(&mut state, false);
         tx.send(ExcludeResult {
             entries: Vec::new(),
-            error: Some("配置保存失败(磁盘只读),排除目录未改变".into()),
+            error: Some(ExcludeError::Daemon(
+                "配置保存失败(磁盘只读),排除目录未改变".into(),
+            )),
         })
         .unwrap();
         state.tick_exclude();
 
         assert_eq!(state.excluded, before, "失败不得覆盖旧列表");
         assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("配置保存失败(磁盘只读),排除目录未改变")
+            state.exclude_error,
+            Some(ExcludeError::Daemon(
+                "配置保存失败(磁盘只读),排除目录未改变".into()
+            ))
         );
         assert!(!state.exclude_busy, "失败也须结束 busy");
     }
@@ -1159,7 +1329,7 @@ mod tests {
     #[test]
     fn exclude_begin_clears_previous_error() {
         let mut state = test_state();
-        state.exclude_error = Some("旧错误".into());
+        state.exclude_error = Some(ExcludeError::Daemon("旧错误".into()));
         let _tx = begin_fake_exclude(&mut state, false);
         assert!(state.exclude_error.is_none());
     }
@@ -1174,21 +1344,21 @@ mod tests {
         let add = begin_fake_exclude(&mut state, false);
         add.send(ExcludeResult {
             entries: Vec::new(),
-            error: Some("路径不在扫描根内: /etc".into()),
+            error: Some(ExcludeError::Daemon("路径不在扫描根内: /etc".into())),
         })
         .unwrap();
         state.tick_exclude();
         assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("路径不在扫描根内: /etc")
+            state.exclude_error,
+            Some(ExcludeError::Daemon("路径不在扫描根内: /etc".into()))
         );
 
         // 重开触发自动刷新：list 开始不得清掉刚展示的失败文案。
         state.exclude_refresh_pending = true;
         let refresh = begin_fake_exclude(&mut state, true);
         assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("路径不在扫描根内: /etc"),
+            state.exclude_error,
+            Some(ExcludeError::Daemon("路径不在扫描根内: /etc".into())),
             "自动 list 刷新不得吞掉终端错误"
         );
         assert!(state.exclude_busy_list);
@@ -1197,17 +1367,20 @@ mod tests {
         refresh
             .send(ExcludeResult {
                 entries: Vec::new(),
-                error: Some("daemon 未在运行".into()),
+                error: Some(ExcludeError::Daemon("daemon 未在运行".into())),
             })
             .unwrap();
         state.tick_exclude();
-        assert_eq!(state.exclude_error.as_deref(), Some("daemon 未在运行"));
+        assert_eq!(
+            state.exclude_error,
+            Some(ExcludeError::Daemon("daemon 未在运行".into()))
+        );
 
         // 成功 list 才清错误并覆盖列表。
         let refresh = begin_fake_exclude(&mut state, true);
         assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("daemon 未在运行"),
+            state.exclude_error,
+            Some(ExcludeError::Daemon("daemon 未在运行".into())),
             "失败文案仍保留到成功响应前"
         );
         refresh
@@ -1285,14 +1458,7 @@ mod tests {
             "未拿到 daemon 响应,loaded 保持 false"
         );
         assert_eq!(state.excluded, before);
-        assert!(
-            state
-                .exclude_error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("无法启动")),
-            "{:?}",
-            state.exclude_error
-        );
+        assert_eq!(state.exclude_error, Some(ExcludeError::StartFailed));
     }
 
     /// 工作线程无结果退出：不得让 busy 永久卡住；按失败展示并保留列表。
@@ -1306,14 +1472,7 @@ mod tests {
         assert!(!state.exclude_busy);
         assert!(!state.exclude_loaded, "无结果退出不算 daemon 响应");
         assert_eq!(state.excluded, before);
-        assert!(
-            state
-                .exclude_error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("异常退出")),
-            "{:?}",
-            state.exclude_error
-        );
+        assert_eq!(state.exclude_error, Some(ExcludeError::WorkerExited));
     }
 
     /// 只有自动 list 保留错误；add/remove/reset 开始即清旧提示（pass 级接线钉）。
@@ -1351,17 +1510,27 @@ mod tests {
             message: Some("路径不在扫描根内".into()),
         }));
         assert!(rejected.entries.is_empty(), "失败不得携带可覆盖列表");
-        assert_eq!(rejected.error.as_deref(), Some("路径不在扫描根内"));
+        assert_eq!(
+            rejected.error,
+            Some(ExcludeError::Daemon("路径不在扫描根内".into()))
+        );
+
+        let no_reason = exclude_result(Ok(client::ExcludeOutcome {
+            ok: false,
+            excluded: Vec::new(),
+            message: None,
+        }));
+        assert_eq!(no_reason.error, Some(ExcludeError::NoReason));
 
         let offline = exclude_result(Err(anyhow::anyhow!(
             "daemon 未在运行;排除变更需引擎在线,先执行 macEverything start"
         )));
         assert!(offline.entries.is_empty());
         assert!(
-            offline
-                .error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("daemon 未在运行")),
+            matches!(
+                &offline.error,
+                Some(ExcludeError::Daemon(detail)) if detail.contains("daemon 未在运行")
+            ),
             "{:?}",
             offline.error
         );
@@ -1751,13 +1920,13 @@ mod tests {
             HotkeySnapshot::default(),
         );
 
-        state.set_font_size_result(FontSize::Large, Some("设置保存失败:磁盘只读".into()));
+        state.set_font_size_result(FontSize::Large, Some(SettingsError::SaveFailed));
         assert_eq!(
             state.file.font_size,
             FontSize::Large,
             "已应用字号须反映到选中态"
         );
-        assert_eq!(state.font_error.as_deref(), Some("设置保存失败:磁盘只读"));
+        assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
         assert_eq!(
             crate::settings::load(dir.path()).font_size,
             FontSize::Standard,
@@ -1781,10 +1950,7 @@ mod tests {
         state.autostart = Some(true);
         state.autostart_loaded(Err("读取开机自启状态失败".into()));
         assert_eq!(state.autostart, None, "查询失败按未知，开关显示关态");
-        assert_eq!(
-            state.autostart_error.as_deref(),
-            Some("读取开机自启状态失败")
-        );
+        assert_eq!(state.autostart_error, Some(AutostartError::ReadFailed));
 
         state.autostart_loaded(Ok(Status::Enabled));
         assert_eq!(state.autostart, Some(true));
@@ -1831,13 +1997,10 @@ mod tests {
         assert!(!update.enabled && update.confirmed);
         assert_eq!(state.autostart, Some(false));
         assert!(!state.autostart_approval);
-        assert!(
-            state
-                .autostart_error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("开机自启未生效")),
-            "启用后未注册须落内联错误:{:?}",
-            state.autostart_error
+        assert_eq!(
+            state.autostart_error,
+            Some(AutostartError::NotEffective(Status::NotFound)),
+            "启用后未注册须落内联错误"
         );
         assert_eq!(state.take_tray_autostart_sync(false), Some(false));
 
@@ -1847,11 +2010,9 @@ mod tests {
         assert!(!update.confirmed);
         assert_eq!(state.autostart, Some(true), "失败必须保持旧状态");
         assert!(!state.autostart_approval);
-        assert!(
-            state
-                .autostart_error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("未打包")),
+        assert_eq!(
+            state.autostart_error,
+            Some(AutostartError::SetFailed),
             "失败须落内联错误"
         );
         assert_eq!(
@@ -1913,10 +2074,12 @@ mod tests {
     fn snapshot_copies_state_for_painting() {
         let mut state = test_state();
         state.file.font_size = FontSize::Large;
+        state.file.language = LanguageSetting::En;
         state.autostart = Some(false);
         state.autostart_approval = true;
-        state.autostart_error = Some("未打包".into());
-        state.font_error = Some("保存失败".into());
+        state.autostart_error = Some(AutostartError::SetFailed);
+        state.font_error = Some(SettingsError::SaveFailed);
+        state.language_error = Some(LanguageError::SaveFailed);
         state.hotkey_snapshot.palette_keys = vec!["⌃".into(), "⌥".into(), "K".into()];
         state.hotkey_snapshot.window_keys = vec!["⇧".into(), "⌘".into(), "J".into()];
         state.recording = Some(HotkeySlot::Window);
@@ -1924,15 +2087,16 @@ mod tests {
         state.excluded = vec!["node_modules".into()];
         state.exclude_busy = true;
         state.exclude_busy_list = true;
-        state.exclude_error = Some("daemon 未在运行".into());
+        state.exclude_error = Some(ExcludeError::Daemon("daemon 未在运行".into()));
 
         let data = SettingsData::from_state(&state);
         assert_eq!(data.font_size, FontSize::Large);
         assert!(!data.autostart, "审批中显示为关");
         assert!(data.autostart_approval);
-        assert_eq!(data.autostart_error.as_deref(), Some("未打包"));
-        assert_eq!(data.font_error.as_deref(), Some("保存失败"));
-        assert_eq!(data.language, "简体中文");
+        assert_eq!(data.autostart_error, Some(AutostartError::SetFailed));
+        assert_eq!(data.font_error, Some(SettingsError::SaveFailed));
+        assert_eq!(data.language, LanguageSetting::En);
+        assert_eq!(data.language_error, Some(LanguageError::SaveFailed));
         assert_eq!(
             data.hotkeys, state.hotkey_snapshot,
             "键帽展示唯一真源 = 快照"
@@ -1947,7 +2111,46 @@ mod tests {
         assert_eq!(data.excluded, vec!["node_modules".to_owned()]);
         assert!(data.exclude_busy);
         assert!(data.exclude_busy_list);
-        assert_eq!(data.exclude_error.as_deref(), Some("daemon 未在运行"));
+        assert_eq!(
+            data.exclude_error,
+            Some(ExcludeError::Daemon("daemon 未在运行".into()))
+        );
+    }
+
+    /// 语言落地：更新设置快照 + 错误；切换清一次性快捷键错误并挂起托盘刷新。
+    #[test]
+    fn language_state_updates_file_clears_transient_and_queues_tray_relabel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SettingsState::new(
+            SettingsFile::default(),
+            dir.path().to_path_buf(),
+            HotkeySnapshot::default(),
+        );
+        state.hotkey_error = Some((HotkeySlot::Palette, "旧错误".into()));
+
+        state.set_language_result(LanguageSetting::En, Some(LanguageError::SaveFailed));
+        assert_eq!(
+            state.file.language,
+            LanguageSetting::En,
+            "即时切换须反映到设置快照"
+        );
+        assert_eq!(state.language_error, Some(LanguageError::SaveFailed));
+        assert_eq!(
+            crate::settings::load(dir.path()).language,
+            LanguageSetting::System,
+            "纯状态转换不落盘"
+        );
+
+        state.clear_transient_messages();
+        assert_eq!(state.hotkey_error, None, "语言切换清一次性错误");
+
+        state.request_tray_relabel();
+        assert!(state.take_tray_relabel_pending(), "须挂起一次托盘文案刷新");
+        assert!(!state.take_tray_relabel_pending(), "取走即清");
+
+        state.set_language_result(LanguageSetting::ZhHans, None);
+        assert_eq!(state.file.language, LanguageSetting::ZhHans);
+        assert!(state.language_error.is_none(), "保存成功须清错误");
     }
 
     fn key_w(modifiers: egui::Modifiers) -> egui::RawInput {

@@ -204,6 +204,12 @@ impl ResultsState {
         self.status_note_is_error = false;
     }
 
+    /// 语言切换时清掉一次性状态栏消息（重查/下次操作会重建）。
+    pub fn clear_transient_messages(&mut self) {
+        self.status_note = None;
+        self.status_note_is_error = false;
+    }
+
     /// 消费齿轮的「打开设置」请求(置位发生在结果绘制内,开窗放在共享锁释放后)。
     pub fn take_settings_request(&mut self) -> bool {
         std::mem::take(&mut self.settings_requested)

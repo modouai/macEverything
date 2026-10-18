@@ -14,9 +14,11 @@ use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 
 use crate::hotkey::{self, HotkeySlot, HotkeySnapshot};
+use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
 use crate::ui::{
     font as ui_font, hotkey_keys,
+    settings::{AutostartError, ExcludeError, LanguageError, SettingsError},
     settings_layout::{card_height, take_row, RowSpec},
     settings_tokens::{
         self, SettingsPalette, ADD_BUTTON_FONT, ADD_BUTTON_H, ADD_BUTTON_PAD_X, ADD_BUTTON_RADIUS,
@@ -30,30 +32,6 @@ use crate::ui::{
         SWITCH_RADIUS, SWITCH_SIZE, TITLEBAR_H,
     },
 };
-
-/// 添加目录按钮文案（宽度测量与绘制共用）。
-const ADD_DIR_LABEL: &str = "＋ 添加目录…";
-/// 「恢复默认」文字按钮（点击后由设置 pass 弹原生确认弹窗）。
-const RESET_LABEL: &str = "恢复默认";
-/// 语言禁用值（本期仅简中；快照构造也复用）。
-pub(crate) const LANGUAGE_LABEL: &str = "简体中文";
-/// 语言禁用态提示。
-const LANGUAGE_TOOLTIP: &str = "暂仅支持简体中文，语言切换将在后续版本提供";
-/// 排除目录空态文案（列表为空时显示；加载/错误支持行可与之并存）。
-const EXCLUDED_EMPTY: &str = "未排除任何目录";
-/// 打开设置页/重开时的列表加载提示。
-const EXCLUDE_LOADING: &str = "加载中…";
-/// add/remove 触发 daemon 重扫期间的提示。
-const EXCLUDE_RESCANNING: &str = "重扫中…";
-/// 已注册但等待系统「登录项」允许的行内提示（`RequiresApproval`）。
-const AUTOSTART_APPROVAL_NOTE: &str = "已注册,待系统设置「登录项」允许";
-/// 录制中的字段文案（App 已同步挂起全局热键）。
-const RECORDING_PROMPT: &str = "按下快捷键…";
-/// 录制中的行内可见提示（Esc/点击别处取消；Backspace 恢复内置默认）。
-///
-/// macOS 上 ⌥Space 可能不以 `Event::Key` 到达（释放版实测无法录制），恢复默认是
-/// 回到内置 ⌥Space 的可靠路径，故提示必须明确写出。
-const RECORDING_HINT: &str = "按 Esc 或点击别处取消,Backspace 恢复默认";
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -70,9 +48,10 @@ pub(crate) struct SettingsData {
     pub(crate) autostart: bool,
     /// 已注册但等待系统「登录项」允许（显示关态 + 行内提示）。
     pub(crate) autostart_approval: bool,
-    pub(crate) autostart_error: Option<String>,
-    pub(crate) font_error: Option<String>,
-    pub(crate) language: &'static str,
+    pub(crate) autostart_error: Option<AutostartError>,
+    pub(crate) font_error: Option<SettingsError>,
+    pub(crate) language: LanguageSetting,
+    pub(crate) language_error: Option<LanguageError>,
     /// 热键快照（键帽展示/查重的唯一真源；两键帽字段直接读它）。
     pub(crate) hotkeys: HotkeySnapshot,
     /// 当前录制槽；`None` = 空闲（App 挂起同步完成，出现即就绪）。
@@ -84,8 +63,8 @@ pub(crate) struct SettingsData {
     pub(crate) exclude_busy: bool,
     /// 在途操作为列表加载（「加载中…」；否则「重扫中…」）。
     pub(crate) exclude_busy_list: bool,
-    /// 排除目录加载/变更失败原因（daemon/离线文案原样显示）。
-    pub(crate) exclude_error: Option<String>,
+    /// 排除目录加载/变更失败原因（daemon 原始文案原样显示，其余本地化）。
+    pub(crate) exclude_error: Option<ExcludeError>,
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
@@ -96,6 +75,8 @@ pub(crate) struct SettingsData {
 pub(crate) enum SettingsAction {
     /// 字号分段点击（立即应用 + 落盘）。
     SetFontSize(FontSize),
+    /// 语言下拉选择（立即应用 + 落盘）。
+    SetLanguage(LanguageSetting),
     /// 开机自启开关点击（目标态）。
     SetAutostart(bool),
     /// 点击键帽字段：开始录制该槽（正在录制另一槽时先取消）。
@@ -228,7 +209,8 @@ fn draw_appearance_group(
     extra_h: f32,
     actions: &mut Vec<SettingsAction>,
 ) {
-    let error = data.font_error.as_deref();
+    let font_error = data.font_error.as_ref().map(SettingsError::text);
+    let error = font_error.as_deref();
     let rows = [GroupRow {
         kind: RowKind::FontSize,
         spec: RowSpec::new(ROW_H).with_extra(extra_for(error.is_some(), extra_h)),
@@ -236,7 +218,15 @@ fn draw_appearance_group(
         note: None,
         hint: None,
     }];
-    draw_card(ui, full_w, "外观", &rows, data, palette, actions);
+    draw_card(
+        ui,
+        full_w,
+        i18n::s().group_appearance,
+        &rows,
+        data,
+        palette,
+        actions,
+    );
 }
 
 /// 通用组：四行卡片（自启 / 语言 / 两个快捷键）。
@@ -248,9 +238,10 @@ fn draw_general_group(
     extra_h: f32,
     actions: &mut Vec<SettingsAction>,
 ) {
-    let autostart_error = data.autostart_error.as_deref();
+    let autostart_error = data.autostart_error.as_ref().map(AutostartError::text);
+    let language_error = data.language_error.as_ref().map(LanguageError::text);
     let autostart_note = if autostart_error.is_none() && data.autostart_approval {
-        Some(AUTOSTART_APPROVAL_NOTE)
+        Some(i18n::s().autostart_approval_note)
     } else {
         None
     };
@@ -260,23 +251,25 @@ fn draw_general_group(
     // + 录制中的可见 Esc/点击别处提示（plan §H3 Step 2）。
     let palette_error = hotkey_error_for(data, HotkeySlot::Palette);
     let palette_note = data.hotkeys.note.as_deref();
-    let palette_hint = (data.recording == Some(HotkeySlot::Palette)).then_some(RECORDING_HINT);
+    let palette_hint =
+        (data.recording == Some(HotkeySlot::Palette)).then_some(i18n::s().recording_hint);
     let window_error = hotkey_error_for(data, HotkeySlot::Window);
     let window_note = data.hotkeys.window_note.as_deref();
-    let window_hint = (data.recording == Some(HotkeySlot::Window)).then_some(RECORDING_HINT);
+    let window_hint =
+        (data.recording == Some(HotkeySlot::Window)).then_some(i18n::s().recording_hint);
 
     let rows = [
         GroupRow {
             kind: RowKind::Autostart,
             spec: RowSpec::new(ROW_H).with_extra(extra_for(has_message, extra_h)),
-            error: autostart_error,
+            error: autostart_error.as_deref(),
             note: autostart_note,
             hint: None,
         },
         GroupRow {
             kind: RowKind::Language,
-            spec: RowSpec::new(ROW_H),
-            error: None,
+            spec: RowSpec::new(ROW_H).with_extra(extra_for(language_error.is_some(), extra_h)),
+            error: language_error.as_deref(),
             note: None,
             hint: None,
         },
@@ -305,7 +298,15 @@ fn draw_general_group(
             hint: window_hint,
         },
     ];
-    draw_card(ui, full_w, "通用", &rows, data, palette, actions);
+    draw_card(
+        ui,
+        full_w,
+        i18n::s().group_general,
+        &rows,
+        data,
+        palette,
+        actions,
+    );
 }
 
 /// 索引组：Header 52（排除目录 + 添加按钮）+ 目录行 40；列表空时一行空态。
@@ -319,11 +320,12 @@ fn draw_index_group(
     actions: &mut Vec<SettingsAction>,
 ) {
     let busy_label = data.exclude_busy.then_some(if data.exclude_busy_list {
-        EXCLUDE_LOADING
+        i18n::s().exclude_loading
     } else {
-        EXCLUDE_RESCANNING
+        i18n::s().exclude_rescanning
     });
-    let error = data.exclude_error.as_deref();
+    let exclude_error = data.exclude_error.as_ref().map(ExcludeError::text);
+    let error = exclude_error.as_deref();
     let extra = extra_for(error.is_some(), extra_h) + extra_for(busy_label.is_some(), extra_h);
     let mut rows = vec![GroupRow {
         kind: RowKind::ExcludeHeader,
@@ -354,7 +356,15 @@ fn draw_index_group(
                 }),
         );
     }
-    draw_card(ui, full_w, "索引", &rows, data, palette, actions);
+    draw_card(
+        ui,
+        full_w,
+        i18n::s().group_index,
+        &rows,
+        data,
+        palette,
+        actions,
+    );
 }
 
 /// 卡片：分组标题 + 底色；行高度与绘制共用同一行模型，末尾校对游标。
@@ -438,7 +448,13 @@ fn draw_row_body(
 ) {
     match *kind {
         RowKind::FontSize => {
-            let control = draw_row_label(ui, body, "字号", egui::vec2(SEG_W, SEG_H), palette);
+            let control = draw_row_label(
+                ui,
+                body,
+                i18n::s().row_font_size,
+                egui::vec2(SEG_W, SEG_H),
+                palette,
+            );
             if let Some(size) = draw_segmented(ui, control, data.font_size, palette) {
                 actions.push(SettingsAction::SetFontSize(size));
             }
@@ -447,7 +463,7 @@ fn draw_row_body(
             let control = draw_row_label(
                 ui,
                 body,
-                "开机自启",
+                i18n::s().row_autostart,
                 egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1),
                 palette,
             );
@@ -456,14 +472,20 @@ fn draw_row_body(
             }
         }
         RowKind::Language => {
-            let control = draw_row_label(ui, body, "语言", egui::vec2(FIELD.0, FIELD.1), palette);
-            draw_language_field(ui, control, data.language, palette);
+            let control = draw_row_label(
+                ui,
+                body,
+                i18n::s().row_language,
+                egui::vec2(FIELD.0, FIELD.1),
+                palette,
+            );
+            draw_language_field(ui, control, data.language, palette, actions);
         }
         RowKind::PaletteKeys => {
             let control = draw_row_label(
                 ui,
                 body,
-                "唤起快捷键",
+                i18n::s().row_palette_hotkey,
                 egui::vec2(FIELD.0, FIELD.1),
                 palette,
             );
@@ -481,7 +503,7 @@ fn draw_row_body(
             let control = draw_row_label(
                 ui,
                 body,
-                "完整窗口快捷键",
+                i18n::s().row_window_hotkey,
                 egui::vec2(FIELD.0, FIELD.1),
                 palette,
             );
@@ -580,6 +602,15 @@ fn draw_row_label(
     control
 }
 
+/// 字号档位文案（目录随语言切换）。
+fn font_label(size: FontSize) -> &'static str {
+    match size {
+        FontSize::Small => i18n::s().font_small,
+        FontSize::Standard => i18n::s().font_standard,
+        FontSize::Large => i18n::s().font_large,
+    }
+}
+
 /// 字号三段控件（180×28、圆角 7、pad 2、gap 2；段圆角 6、12pt）。
 /// 返回被点击的档位（选中段仍可点击——可重试上次失败的保存）。
 fn draw_segmented(
@@ -637,7 +668,7 @@ fn draw_segmented(
         painter.text(
             item.center(),
             egui::Align2::CENTER_CENTER,
-            option.label(),
+            font_label(option),
             ui_font::id(SEG_FONT),
             text_color,
         );
@@ -691,18 +722,27 @@ fn draw_switch(ui: &mut egui::Ui, rect: egui::Rect, on: bool, palette: &Settings
     response.clicked()
 }
 
-/// 语言下拉（152×28、圆角 7；禁用态「简体中文」+ chevron + tooltip）。
-/// 文字/chevron 用次要色区分禁用态；点击不改变值（本期仅简中）。
+/// 语言设置项文案（当前值显示与下拉选项共用）。
+fn language_label(setting: LanguageSetting) -> &'static str {
+    match setting {
+        LanguageSetting::System => i18n::s().language_system,
+        LanguageSetting::ZhHans => i18n::s().language_zh_hans,
+        LanguageSetting::En => i18n::s().language_en,
+    }
+}
+
+/// 语言下拉（152×28、圆角 7；当前值 + chevron；点击展开三项菜单）。
 fn draw_language_field(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    language: &str,
+    current: LanguageSetting,
     palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
 ) {
     let response = ui.interact(
         rect,
         ui.scope_id().with("settings-language"),
-        egui::Sense::hover(),
+        egui::Sense::click(),
     );
     let painter = ui.painter();
     painter.rect_filled(
@@ -717,9 +757,9 @@ fn draw_language_field(
     draw_text(
         ui,
         text_rect,
-        language,
+        language_label(current),
         FIELD_FONT,
-        palette.segment_unselected_text,
+        palette.control_text,
         egui::Align2::LEFT_CENTER,
     );
     let chevron = egui::Rect::from_min_size(
@@ -729,10 +769,25 @@ fn draw_language_field(
         ),
         egui::Vec2::splat(FIELD_CHEVRON),
     );
-    draw_chevron_down(painter, chevron, palette.segment_unselected_text);
-    let _ = response
-        .on_hover_cursor(egui::CursorIcon::NotAllowed)
-        .on_hover_text(LANGUAGE_TOOLTIP);
+    draw_chevron_down(painter, chevron, palette.control_text);
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    egui::Popup::menu(&response).show(|ui| {
+        ui.set_min_width(rect.width());
+        for setting in [
+            LanguageSetting::System,
+            LanguageSetting::ZhHans,
+            LanguageSetting::En,
+        ] {
+            if ui
+                .selectable_label(current == setting, language_label(setting))
+                .clicked()
+            {
+                actions.push(SettingsAction::SetLanguage(setting));
+                ui.close();
+            }
+        }
+    });
 }
 
 /// 键帽字段在 egui 临时数据里的 id（跨帧保存几何，供点击他处判定）。
@@ -808,19 +863,19 @@ fn draw_keycap_field(
         draw_text(
             ui,
             rect.shrink2(egui::vec2(FIELD_PAD_X, 0.0)),
-            RECORDING_PROMPT,
+            i18n::s().recording_prompt,
             FIELD_FONT,
             palette.segment_selected_text,
             egui::Align2::CENTER_CENTER,
         );
         capture_recorded_key(ui, slot, data, actions);
-        let _ = response.on_hover_text("按 Esc 或点击别处取消录制,Backspace 恢复默认");
+        let _ = response.on_hover_text(i18n::s().recording_hint_hover);
     } else {
         draw_keycaps(ui, rect, keys, &painter, palette);
         let _ = response.on_hover_text(if data.recording.is_some() {
-            "点击改为录制此快捷键"
+            i18n::s().keycap_hover_rerecord
         } else {
-            "点击录制快捷键"
+            i18n::s().keycap_hover_record
         });
     }
 
@@ -1013,13 +1068,13 @@ fn draw_exclude_header_controls(
     palette: &SettingsPalette,
     actions: &mut Vec<SettingsAction>,
 ) {
-    let add_w = text_width(ui, ADD_DIR_LABEL, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X;
-    let reset_w = text_button_width(ui, RESET_LABEL);
+    let add_w = text_width(ui, i18n::s().add_folder, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X;
+    let reset_w = text_button_width(ui, i18n::s().restore_defaults);
     let group_w = reset_w + RESET_BUTTON_GAP + add_w;
     let control = draw_row_label(
         ui,
         body,
-        "排除目录",
+        i18n::s().row_excluded,
         egui::vec2(group_w, ADD_BUTTON_H),
         palette,
     );
@@ -1032,7 +1087,7 @@ fn draw_exclude_header_controls(
         ui,
         reset,
         "settings-reset-excludes",
-        RESET_LABEL,
+        i18n::s().restore_defaults,
         palette.text_secondary,
         palette.text_primary,
         !busy,
@@ -1139,7 +1194,7 @@ fn draw_add_button(
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        ADD_DIR_LABEL,
+        i18n::s().add_folder,
         ui_font::id(ADD_BUTTON_FONT),
         text_color,
     );
@@ -1218,7 +1273,7 @@ fn draw_excluded_empty(ui: &egui::Ui, row: egui::Rect, palette: &SettingsPalette
     draw_text(
         ui,
         row.shrink2(egui::vec2(ROW_PAD_X, 0.0)),
-        EXCLUDED_EMPTY,
+        i18n::s().excluded_empty,
         LABEL_FONT,
         palette.text_secondary,
         egui::Align2::CENTER_CENTER,
@@ -1351,7 +1406,8 @@ mod tests {
             autostart_approval: false,
             autostart_error: None,
             font_error: None,
-            language: LANGUAGE_LABEL,
+            language: LanguageSetting::System,
+            language_error: None,
             hotkeys,
             recording: None,
             hotkey_error: None,
@@ -1360,6 +1416,45 @@ mod tests {
             exclude_busy_list: false,
             exclude_error: None,
         }
+    }
+
+    use crate::i18n;
+
+    fn click_language(ctx: &egui::Context, data: &SettingsData, label: &str) -> BodyOutput {
+        let (out, _) = run_frame(ctx, data, Vec::new());
+        let field = keycap_field_center(&out, i18n::s().row_language);
+        let _ = click_at(ctx, data, field);
+        let (out, _) = run_frame(ctx, data, Vec::new());
+        let pos = text_center(find_text(&all_texts(&out), label));
+        click_at(ctx, data, pos)
+    }
+
+    #[test]
+    fn language_row_exposes_three_options_and_action() {
+        i18n::with_lang(i18n::Lang::En, || {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let data = layout_test_data();
+            let out = click_language(&ctx, &data, "English");
+            assert!(
+                out.actions
+                    .contains(&SettingsAction::SetLanguage(i18n::LanguageSetting::En)),
+                "点击 English 应产生 SetLanguage(En): {:?}",
+                out.actions
+            );
+        });
+    }
+
+    #[test]
+    fn language_save_error_renders_one_extra_line() {
+        let data = SettingsData {
+            language: i18n::LanguageSetting::En,
+            language_error: Some(LanguageError::SaveFailed),
+            ..layout_test_data()
+        };
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        find_text(&texts, "语言已切换,但设置保存失败");
     }
 
     /// 递归收集一帧里的全部文本形状(含 Shape::Vec 内的嵌套形状)。
@@ -1560,7 +1655,7 @@ mod tests {
             "小",
             "标准",
             "大",
-            "简体中文",
+            "跟随系统",
             "＋ 添加目录…",
         ] {
             assert!(
@@ -1604,14 +1699,15 @@ mod tests {
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(labels.contains(&"排除目录"), "空态仍须显示目录头");
         assert!(
-            labels.contains(&EXCLUDED_EMPTY),
-            "空列表须显示 {EXCLUDED_EMPTY:?};实际 {labels:?}"
+            labels.contains(&i18n::s().excluded_empty),
+            "空列表须显示 {:?};实际 {labels:?}",
+            i18n::s().excluded_empty
         );
     }
 
     /// 添加按钮中心（按钮宽随文案，文字中心即按钮中心）。
     fn add_button_center(out: &egui::FullOutput) -> egui::Pos2 {
-        text_center(find_text(&all_texts(out), ADD_DIR_LABEL))
+        text_center(find_text(&all_texts(out), i18n::s().add_folder))
     }
 
     /// 目录行右侧移除 × 中心（行几何与路径文本同排）。
@@ -1648,7 +1744,7 @@ mod tests {
         ctx.set_visuals(egui::Visuals::dark());
         let data = layout_test_data();
         let (out, _) = run_frame(&ctx, &data, Vec::new());
-        let reset = text_button_center(&out, RESET_LABEL);
+        let reset = text_button_center(&out, i18n::s().restore_defaults);
         let add = add_button_center(&out);
         assert!(
             reset.x < add.x,
@@ -1679,7 +1775,7 @@ mod tests {
         let mut data = layout_test_data();
         data.exclude_busy = true;
         let (out, _) = run_frame(&ctx, &data, Vec::new());
-        let reset = text_button_center(&out, RESET_LABEL);
+        let reset = text_button_center(&out, i18n::s().restore_defaults);
         let output = click_at(&ctx, &data, reset);
         assert!(
             output.actions.is_empty(),
@@ -1742,10 +1838,12 @@ mod tests {
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         assert!(
-            labels.iter().any(|text| text == EXCLUDE_LOADING),
+            labels.iter().any(|text| text == i18n::s().exclude_loading),
             "{labels:?}"
         );
-        assert!(!labels.iter().any(|text| text == EXCLUDE_RESCANNING));
+        assert!(!labels
+            .iter()
+            .any(|text| text == i18n::s().exclude_rescanning));
         let list_dir = text_center(find_text(&texts, "~/Library")).y;
         assert!(
             list_dir > baseline_dir + 10.0,
@@ -1757,10 +1855,12 @@ mod tests {
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         assert!(
-            labels.iter().any(|text| text == EXCLUDE_RESCANNING),
+            labels
+                .iter()
+                .any(|text| text == i18n::s().exclude_rescanning),
             "{labels:?}"
         );
-        assert!(!labels.iter().any(|text| text == EXCLUDE_LOADING));
+        assert!(!labels.iter().any(|text| text == i18n::s().exclude_loading));
         let rescan_dir = text_center(find_text(&texts, "~/Library")).y;
         assert!(rescan_dir > baseline_dir + 10.0);
     }
@@ -1772,26 +1872,34 @@ mod tests {
         let mut baseline = layout_test_data();
         baseline.excluded.clear();
         let baseline_out = run_body(&baseline);
-        let baseline_empty = text_center(find_text(&all_texts(&baseline_out), EXCLUDED_EMPTY)).y;
+        let baseline_empty = text_center(find_text(
+            &all_texts(&baseline_out),
+            i18n::s().excluded_empty,
+        ))
+        .y;
 
         let mut data = layout_test_data();
         data.excluded.clear();
         data.exclude_busy = true;
         data.exclude_busy_list = false;
-        data.exclude_error = Some("daemon 未在运行;排除变更需引擎在线".into());
+        data.exclude_error = Some(ExcludeError::Daemon(
+            "daemon 未在运行;排除变更需引擎在线".into(),
+        ));
         let out = run_body(&data);
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         assert!(
             labels.iter().any(|text| text.contains("daemon 未在运行")),
-            "错误须原样绘制:{labels:?}"
+            "daemon 原始错误须原样绘制:{labels:?}"
         );
-        assert!(labels.iter().any(|text| text == EXCLUDE_RESCANNING));
+        assert!(labels
+            .iter()
+            .any(|text| text == i18n::s().exclude_rescanning));
         assert!(
-            labels.iter().any(|text| text == EXCLUDED_EMPTY),
+            labels.iter().any(|text| text == i18n::s().excluded_empty),
             "空列表 + busy/error 仍须显示空态:{labels:?}"
         );
-        let empty_y = text_center(find_text(&texts, EXCLUDED_EMPTY)).y;
+        let empty_y = text_center(find_text(&texts, i18n::s().excluded_empty)).y;
         assert!(
             empty_y > baseline_empty + 20.0,
             "错误 + 重扫两行提示须增高 Header:基线 {baseline_empty},当前 {empty_y}"
@@ -1805,7 +1913,7 @@ mod tests {
         let baseline_general = text_center(find_text(&all_texts(&baseline), "通用")).y;
 
         let mut data = layout_test_data();
-        data.font_error = Some("设置保存失败:磁盘只读".into());
+        data.font_error = Some(SettingsError::SaveFailed);
         let with_error = run_body(&data);
         let texts = all_texts(&with_error);
         let error_general = text_center(find_text(&texts, "通用")).y;
@@ -1813,11 +1921,7 @@ mod tests {
             error_general > baseline_general + 10.0,
             "字号错误行必须增高外观卡片:基线 {baseline_general},错误 {error_general}"
         );
-        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
-        assert!(
-            labels.iter().any(|text| text.contains("磁盘只读")),
-            "错误文案须绘制:实际 {labels:?}"
-        );
+        find_text(&texts, i18n::s().settings_save_failed);
     }
 
     /// 自启错误行同理:增高通用卡片（「语言」行随之下移），错误文案须实际绘制。
@@ -1827,7 +1931,7 @@ mod tests {
         let baseline_language = text_center(find_text(&all_texts(&baseline), "语言")).y;
 
         let mut data = layout_test_data();
-        data.autostart_error = Some("未打包:开机自启仅在 .app 内可用".into());
+        data.autostart_error = Some(AutostartError::SetFailed);
         let with_error = run_body(&data);
         let texts = all_texts(&with_error);
         let error_language = text_center(find_text(&texts, "语言")).y;
@@ -1835,11 +1939,7 @@ mod tests {
             error_language > baseline_language + 10.0,
             "自启错误行必须增高通用卡片:基线 {baseline_language},错误 {error_language}"
         );
-        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
-        assert!(
-            labels.iter().any(|text| text.contains("未打包")),
-            "自启错误文案须绘制:实际 {labels:?}"
-        );
+        find_text(&texts, i18n::s().autostart_set_failed);
     }
 
     /// 待审批：开关仍为关态，行内显示「已注册,待系统设置「登录项」允许」。
@@ -1851,7 +1951,7 @@ mod tests {
         let texts = all_texts(&out);
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(
-            labels.contains(&AUTOSTART_APPROVAL_NOTE),
+            labels.contains(&i18n::s().autostart_approval_note),
             "审批提示须绘制:实际 {labels:?}"
         );
     }
@@ -2005,16 +2105,18 @@ mod tests {
         let texts = all_texts(&out);
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         assert!(
-            labels.iter().any(|text| text == RECORDING_PROMPT),
-            "录制中须显示 {RECORDING_PROMPT:?}:实际 {labels:?}"
+            labels.iter().any(|text| text == i18n::s().recording_prompt),
+            "录制中须显示 {:?}:实际 {labels:?}",
+            i18n::s().recording_prompt
         );
         assert!(
-            labels.iter().any(|text| text == RECORDING_HINT),
+            labels.iter().any(|text| text == i18n::s().recording_hint),
             "录制提示（Esc/点击别处）须可见:实际 {labels:?}"
         );
         assert!(
-            RECORDING_HINT.contains("Backspace 恢复默认"),
-            "录制提示须告知 Backspace 恢复默认:{RECORDING_HINT}"
+            i18n::s().recording_hint.contains("Backspace"),
+            "录制提示须告知 Backspace 恢复默认:{}",
+            i18n::s().recording_hint
         );
         assert!(
             !labels.iter().any(|text| text == "Space"),
@@ -2461,7 +2563,7 @@ mod tests {
             let out = run_body(&layout_test_data());
             let texts = all_texts(&out);
             let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
-            for expected in ["外观", "通用", "索引", "字号", "简体中文"] {
+            for expected in ["外观", "通用", "索引", "字号", "跟随系统"] {
                 assert!(labels.contains(&expected), "大字号缺少 {expected:?}");
             }
         });
