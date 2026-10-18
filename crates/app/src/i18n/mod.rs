@@ -11,8 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub mod catalog;
 pub mod format;
 
-// `strings`/`Strings`/`all_entries` 是目录的对外入口（后续任务与单测使用）；
-// Task 1 的生产路径只用到 `s`。
+// `s` 是绘制路径的文案入口；`strings`/`Strings`/`all_entries` 供语言切换与单测使用。
 #[allow(unused_imports)]
 pub use catalog::{all_entries, s, strings, Strings};
 

@@ -125,7 +125,6 @@ catalog! {
     // 缺口面板
     gaps_more: "… 其余 {n} 个" / "… {n} more",
     // 索引状态
-    index_building_count: "索引构建中({n} 条)" / "Building index ({n} entries)",
     index_ready: "就绪" / "Ready",
     index_reconciling: "索引补齐中(结果可能不全)" / "Reconciling index (results may be incomplete)",
     index_degraded: "索引重扫中(结果可能不全)" / "Rescanning index (results may be incomplete)",

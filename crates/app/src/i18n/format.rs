@@ -52,10 +52,91 @@ pub fn gaps_header(n: usize) -> String {
 
 /// 索引构建条目数。
 pub fn index_building_count(n: u64) -> String {
-    let n = n.to_string();
-    super::fill(s().index_building_count, &[("n", n.as_str())])
+    match lang() {
+        Lang::ZhHans => format!("索引构建中({n} 条)"),
+        Lang::En if n == 1 => "Building index (1 entry)".to_owned(),
+        Lang::En => format!("Building index ({n} entries)"),
+    }
 }
 
-fn s() -> &'static super::Strings {
-    super::s()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::with_lang;
+
+    #[test]
+    fn items_pluralizes_in_both_languages() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(items(1), "1 项");
+            assert_eq!(items(2), "2 项");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(items(1), "1 item");
+            assert_eq!(items(2), "2 items");
+        });
+    }
+
+    #[test]
+    fn gaps_pluralizes_in_both_languages() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(gaps(1), "1 个目录未收录");
+            assert_eq!(gaps(2), "2 个目录未收录");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(gaps(1), "1 folder not indexed");
+            assert_eq!(gaps(2), "2 folders not indexed");
+        });
+    }
+
+    #[test]
+    fn showing_first_matches_language() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(showing_first(1000), "展示前 1000 条");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(showing_first(1000), "Showing first 1000");
+        });
+    }
+
+    #[test]
+    fn counts_composes_with_optional_truncation() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(counts(2, 2, "2", "3"), "2 项 · 匹配 2 ms · 读取 3 ms");
+            assert_eq!(
+                counts(2, 1, "2.5", "3"),
+                "2 项 · 匹配 2.5 ms · 读取 3 ms · 展示前 1 条"
+            );
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(counts(1, 1, "2", "3"), "1 item · Match 2 ms · Read 3 ms");
+            assert_eq!(
+                counts(2, 1, "2", "3"),
+                "2 items · Match 2 ms · Read 3 ms · Showing first 1"
+            );
+        });
+    }
+
+    #[test]
+    fn gaps_header_pluralizes_in_both_languages() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(gaps_header(1), "权限缺口(1 个目录,未收录):");
+            assert_eq!(gaps_header(2), "权限缺口(2 个目录,未收录):");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(gaps_header(1), "Permission Gaps (1 folder not indexed):");
+            assert_eq!(gaps_header(2), "Permission Gaps (2 folders not indexed):");
+        });
+    }
+
+    #[test]
+    fn index_building_count_pluralizes_in_both_languages() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(index_building_count(1), "索引构建中(1 条)");
+            assert_eq!(index_building_count(2), "索引构建中(2 条)");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(index_building_count(1), "Building index (1 entry)");
+            assert_eq!(index_building_count(2), "Building index (2 entries)");
+        });
+    }
 }

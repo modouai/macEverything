@@ -76,11 +76,13 @@ const PATH_MIN_W: f32 = 120.0;
 /// 列边界拖拽热区半宽(§3.4「边界 ±4」)。
 const DRAG_HOT_ZONE: f32 = 4.0;
 
-/// 状态栏瞬时提示(绘制时按当前语言渲染;Raw 保留外部/技术细节原文)。
+/// 状态栏瞬时提示(绘制时按当前语言渲染)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusNote {
     EngineNotReady,
     QueryFailed,
+    /// 外部/技术细节原文;应用侧生成的「引擎重启失败:…」/打开失败/菜单动作
+    /// 失败等中文前缀是临时债务,待 Task 6 统一本地化。
     Raw(String),
 }
 
@@ -1116,6 +1118,7 @@ fn draw_header(
     let effective = [cols[COL_SIZE].1, cols[COL_MTIME].1, cols[COL_PATH].1];
     for (i, key) in COLUMNS.into_iter().enumerate() {
         let Some(label) = column_label(key) else {
+            debug_assert!(false, "COLUMNS 不得包含无列头的排序键:{key:?}");
             continue;
         };
         let cell = egui::Rect::from_min_size(
@@ -2838,26 +2841,30 @@ mod tests {
 
     #[test]
     fn counts_text_notes_truncation() {
-        assert_eq!(
-            counts_text(42, 42, 3.2, 1.1),
-            "42 项 · 匹配 3.2 ms · 读取 1.1 ms",
-            "未截断不加注"
-        );
-        assert_eq!(
-            counts_text(18, 18, 3.0, 12.0),
-            "18 项 · 匹配 3 ms · 读取 12 ms",
-            "整数值去 .0(原型口径)"
-        );
-        assert_eq!(
-            counts_text(8000, 1000, 12.5, 40.0),
-            "8000 项 · 匹配 12.5 ms · 读取 40 ms · 展示前 1000 条",
-            "K < total 注展示条数;非整数保留一位"
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(
+                counts_text(42, 42, 3.2, 1.1),
+                "42 项 · 匹配 3.2 ms · 读取 1.1 ms",
+                "未截断不加注"
+            );
+            assert_eq!(
+                counts_text(18, 18, 3.0, 12.0),
+                "18 项 · 匹配 3 ms · 读取 12 ms",
+                "整数值去 .0(原型口径)"
+            );
+            assert_eq!(
+                counts_text(8000, 1000, 12.5, 40.0),
+                "8000 项 · 匹配 12.5 ms · 读取 40 ms · 展示前 1000 条",
+                "K < total 注展示条数;非整数保留一位"
+            );
+        });
     }
 
     #[test]
     fn counts_text_pluralizes_in_english() {
-        assert_eq!(counts_text(1, 1, 2.0, 3.0), "1 项 · 匹配 2 ms · 读取 3 ms");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(counts_text(1, 1, 2.0, 3.0), "1 项 · 匹配 2 ms · 读取 3 ms");
+        });
         i18n::with_lang(i18n::Lang::En, || {
             assert_eq!(
                 counts_text(1, 1, 2.0, 3.0),
@@ -2872,78 +2879,162 @@ mod tests {
 
     #[test]
     fn index_note_six_states() {
-        let idle = State::Idle;
-        let eng = |s: &str, built_at: u64| EngineStatus {
-            state: s.into(),
-            entry_count: 12,
-            gaps: Vec::new(),
-            built_at,
-        };
-        assert_eq!(
-            index_note(Some(&eng(client::state::BUILDING, 0)), &idle, true).as_deref(),
-            Some("索引构建中(12 条)")
-        );
-        assert_eq!(
-            index_note(Some(&eng(client::state::READY, 0)), &idle, true).as_deref(),
-            Some("就绪")
-        );
-        assert_eq!(
-            index_note(Some(&eng(client::state::RECONCILING, 0)), &idle, true).as_deref(),
-            Some("索引补齐中(结果可能不全)")
-        );
-        assert_eq!(
-            index_note(Some(&eng(client::state::DEGRADED, 0)), &idle, true).as_deref(),
-            Some("索引重扫中(结果可能不全)")
-        );
-        // 离线带生成时刻(§7 完整窗口列「离线索引 · 生成于 …」;0 = 未取 → 占位)
-        assert_eq!(
-            index_note(Some(&eng(client::state::OFFLINE, 0)), &idle, true).as_deref(),
-            Some("离线索引 · 生成于 —")
-        );
-        assert_eq!(
-            index_note(
-                Some(&eng(client::state::OFFLINE, 1_700_000_000)),
-                &idle,
-                true
-            ),
-            Some(format!("离线索引 · 生成于 {}", fmt_mtime(1_700_000_000)))
-        );
-        assert_eq!(
-            index_note(None, &idle, true).as_deref(),
-            Some("引擎未运行"),
-            "已查过且无状态 = 未运行/无索引"
-        );
-        assert_eq!(index_note(None, &idle, false), None, "未查过不占位");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let idle = State::Idle;
+            let eng = |s: &str, built_at: u64| EngineStatus {
+                state: s.into(),
+                entry_count: 12,
+                gaps: Vec::new(),
+                built_at,
+            };
+            assert_eq!(
+                index_note(Some(&eng(client::state::BUILDING, 0)), &idle, true).as_deref(),
+                Some("索引构建中(12 条)")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::READY, 0)), &idle, true).as_deref(),
+                Some("就绪")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::RECONCILING, 0)), &idle, true).as_deref(),
+                Some("索引补齐中(结果可能不全)")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::DEGRADED, 0)), &idle, true).as_deref(),
+                Some("索引重扫中(结果可能不全)")
+            );
+            // 离线带生成时刻(§7 完整窗口列「离线索引 · 生成于 …」;0 = 未取 → 占位)
+            assert_eq!(
+                index_note(Some(&eng(client::state::OFFLINE, 0)), &idle, true).as_deref(),
+                Some("离线索引 · 生成于 —")
+            );
+            assert_eq!(
+                index_note(
+                    Some(&eng(client::state::OFFLINE, 1_700_000_000)),
+                    &idle,
+                    true
+                ),
+                Some(format!("离线索引 · 生成于 {}", fmt_mtime(1_700_000_000)))
+            );
+            assert_eq!(
+                index_note(None, &idle, true).as_deref(),
+                Some("引擎未运行"),
+                "已查过且无状态 = 未运行/无索引"
+            );
+            assert_eq!(index_note(None, &idle, false), None, "未查过不占位");
+        });
     }
 
     /// 快照缺失时会话态兜底(六态全出口:warming / 引擎拉起中 / 离线在状态栏可见)。
     #[test]
     fn index_note_falls_back_to_session_state() {
-        assert_eq!(
-            index_note(None, &State::Warming, true).as_deref(),
-            Some("索引构建中"),
-            "warming(索引未挂载)占位非错误"
-        );
-        assert_eq!(
-            index_note(None, &State::EngineStarting, true).as_deref(),
-            Some("引擎启动中")
-        );
-        assert_eq!(
-            index_note(None, &State::Offline, true).as_deref(),
-            Some("离线索引"),
-            "无快照:生成时刻不可得,只报离线"
-        );
-        // 有快照时快照优先(会话态不覆盖)
-        let eng = EngineStatus {
-            state: client::state::READY.into(),
-            entry_count: 1,
-            gaps: Vec::new(),
-            built_at: 0,
-        };
-        assert_eq!(
-            index_note(Some(&eng), &State::Warming, true).as_deref(),
-            Some("就绪")
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(
+                index_note(None, &State::Warming, true).as_deref(),
+                Some("索引构建中"),
+                "warming(索引未挂载)占位非错误"
+            );
+            assert_eq!(
+                index_note(None, &State::EngineStarting, true).as_deref(),
+                Some("引擎启动中")
+            );
+            assert_eq!(
+                index_note(None, &State::Offline, true).as_deref(),
+                Some("离线索引"),
+                "无快照:生成时刻不可得,只报离线"
+            );
+            // 有快照时快照优先(会话态不覆盖)
+            let eng = EngineStatus {
+                state: client::state::READY.into(),
+                entry_count: 1,
+                gaps: Vec::new(),
+                built_at: 0,
+            };
+            assert_eq!(
+                index_note(Some(&eng), &State::Warming, true).as_deref(),
+                Some("就绪")
+            );
+        });
+    }
+
+    /// 英文索引状态:构建条目数单复数、各快照态与会话态兜底逐项钉住。
+    #[test]
+    fn index_note_is_localized_in_english() {
+        i18n::with_lang(i18n::Lang::En, || {
+            let idle = State::Idle;
+            let eng = |state: &str, entry_count: u32, built_at: u64| EngineStatus {
+                state: state.into(),
+                entry_count,
+                gaps: Vec::new(),
+                built_at,
+            };
+            assert_eq!(
+                index_note(Some(&eng(client::state::BUILDING, 1, 0)), &idle, true).as_deref(),
+                Some("Building index (1 entry)")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::BUILDING, 2, 0)), &idle, true).as_deref(),
+                Some("Building index (2 entries)")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::READY, 2, 0)), &idle, true).as_deref(),
+                Some("Ready")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::RECONCILING, 2, 0)), &idle, true).as_deref(),
+                Some("Reconciling index (results may be incomplete)")
+            );
+            assert_eq!(
+                index_note(Some(&eng(client::state::DEGRADED, 2, 0)), &idle, true).as_deref(),
+                Some("Rescanning index (results may be incomplete)")
+            );
+            assert_eq!(
+                index_note(
+                    Some(&eng(client::state::OFFLINE, 2, 1_700_000_000)),
+                    &idle,
+                    true
+                ),
+                Some(format!(
+                    "Offline index · Generated {}",
+                    fmt_mtime(1_700_000_000)
+                ))
+            );
+            assert_eq!(
+                index_note(None, &State::Warming, true).as_deref(),
+                Some("Building index")
+            );
+            assert_eq!(
+                index_note(None, &State::EngineStarting, true).as_deref(),
+                Some("Engine starting")
+            );
+            assert_eq!(
+                index_note(None, &State::Offline, true).as_deref(),
+                Some("Offline index")
+            );
+            assert_eq!(
+                index_note(None, &idle, true).as_deref(),
+                Some("Engine not running")
+            );
+            assert_eq!(index_note(None, &idle, false), None);
+        });
+    }
+
+    /// 四列表头英文文案;relevance 是默认排序,不对应列头。
+    #[test]
+    fn column_label_is_localized() {
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(column_label(SortKey::Name), Some("Name"));
+            assert_eq!(column_label(SortKey::Size), Some("Size"));
+            assert_eq!(column_label(SortKey::Mtime), Some("Date Modified"));
+            assert_eq!(column_label(SortKey::Path), Some("Path"));
+            assert_eq!(column_label(SortKey::Relevance), None);
+        });
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(column_label(SortKey::Name), Some("名称"));
+            assert_eq!(column_label(SortKey::Size), Some("大小"));
+            assert_eq!(column_label(SortKey::Mtime), Some("修改时间"));
+            assert_eq!(column_label(SortKey::Path), Some("路径"));
+        });
     }
 
     /// sort_echo 校验表(tech 定案):缺省/relevance 不校验(旧 daemon 兼容);
@@ -3152,102 +3243,104 @@ mod tests {
     /// 右内边距 16、垂直居中;窗口内文案不带「⚠」(自绘三角替代)。
     #[test]
     fn status_bar_geometry_and_gap_chip() {
-        let ctx = egui::Context::default();
-        ctx.set_visuals(egui::Visuals::dark());
-        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
-        st.input = "报告".into();
-        st.engine = Some(EngineStatus {
-            state: client::state::READY.into(),
-            entry_count: 3,
-            gaps: vec![
-                Gap {
-                    path: "/private/a".into(),
-                    reason: "Permission denied".into(),
-                },
-                Gap {
-                    path: "/private/b".into(),
-                    reason: "Permission denied".into(),
-                },
-            ],
-            built_at: 0,
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+            st.input = "报告".into();
+            st.engine = Some(EngineStatus {
+                state: client::state::READY.into(),
+                entry_count: 3,
+                gaps: vec![
+                    Gap {
+                        path: "/private/a".into(),
+                        reason: "Permission denied".into(),
+                    },
+                    Gap {
+                        path: "/private/b".into(),
+                        reason: "Permission denied".into(),
+                    },
+                ],
+                built_at: 0,
+            });
+            st.engine_known = true;
+            let mut icons = IconCache::without_worker();
+            let screen = egui::vec2(1200.0, 800.0);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+            out.textures_delta.clear();
+            let palette = window_tokens::dark();
+
+            // 状态栏底:29 = 1 分隔线 + 28 内容,贴窗口底。
+            let fill = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == palette.status_fill => Some(r.rect),
+                    _ => None,
+                })
+                .expect("状态栏底");
+            assert_eq!(
+                fill.height(),
+                window_tokens::STATUS_H + window_tokens::DIVIDER_H
+            );
+            assert_eq!(fill.bottom(), screen.y);
+            let row_top = fill.top() + window_tokens::DIVIDER_H;
+
+            // 顶部 1px 分隔线恰在状态行上方。
+            let divider = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r)
+                        if r.fill == palette.divider
+                            && (r.rect.top() - fill.top()).abs() < 0.01
+                            && (r.rect.height() - window_tokens::DIVIDER_H).abs() < 0.01 =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .expect("状态栏顶部分隔线");
+            assert_eq!(divider.width(), screen.x);
+            assert_eq!(divider.bottom(), row_top);
+
+            // 缺口徽标:圆角 6、右内边距 16、在 28 行内垂直居中。
+            let chip = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == palette.gap_badge_fill => Some(r),
+                    _ => None,
+                })
+                .expect("缺口徽标");
+            assert_eq!(
+                chip.corner_radius,
+                egui::CornerRadius::same(window_tokens::GAP_BADGE_RADIUS)
+            );
+            assert_eq!(chip.rect.right(), screen.x - window_tokens::CONTENT_PAD_X);
+            assert_eq!(
+                chip.rect.center().y,
+                row_top + window_tokens::STATUS_H / 2.0
+            );
+            let texts: Vec<String> = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                texts.iter().any(|t| t == "2 个目录未收录"),
+                "窗口内徽标文案;实际 {texts:?}"
+            );
+            assert!(!texts.iter().any(|t| t.contains('⚠')), "不重复托盘前缀");
+            out.textures_delta.clear();
         });
-        st.engine_known = true;
-        let mut icons = IconCache::without_worker();
-        let screen = egui::vec2(1200.0, 800.0);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
-            ..Default::default()
-        };
-        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
-        out.textures_delta.clear();
-        let palette = window_tokens::dark();
-
-        // 状态栏底:29 = 1 分隔线 + 28 内容,贴窗口底。
-        let fill = out
-            .shapes
-            .iter()
-            .find_map(|s| match &s.shape {
-                egui::Shape::Rect(r) if r.fill == palette.status_fill => Some(r.rect),
-                _ => None,
-            })
-            .expect("状态栏底");
-        assert_eq!(
-            fill.height(),
-            window_tokens::STATUS_H + window_tokens::DIVIDER_H
-        );
-        assert_eq!(fill.bottom(), screen.y);
-        let row_top = fill.top() + window_tokens::DIVIDER_H;
-
-        // 顶部 1px 分隔线恰在状态行上方。
-        let divider = out
-            .shapes
-            .iter()
-            .find_map(|s| match &s.shape {
-                egui::Shape::Rect(r)
-                    if r.fill == palette.divider
-                        && (r.rect.top() - fill.top()).abs() < 0.01
-                        && (r.rect.height() - window_tokens::DIVIDER_H).abs() < 0.01 =>
-                {
-                    Some(r.rect)
-                }
-                _ => None,
-            })
-            .expect("状态栏顶部分隔线");
-        assert_eq!(divider.width(), screen.x);
-        assert_eq!(divider.bottom(), row_top);
-
-        // 缺口徽标:圆角 6、右内边距 16、在 28 行内垂直居中。
-        let chip = out
-            .shapes
-            .iter()
-            .find_map(|s| match &s.shape {
-                egui::Shape::Rect(r) if r.fill == palette.gap_badge_fill => Some(r),
-                _ => None,
-            })
-            .expect("缺口徽标");
-        assert_eq!(
-            chip.corner_radius,
-            egui::CornerRadius::same(window_tokens::GAP_BADGE_RADIUS)
-        );
-        assert_eq!(chip.rect.right(), screen.x - window_tokens::CONTENT_PAD_X);
-        assert_eq!(
-            chip.rect.center().y,
-            row_top + window_tokens::STATUS_H / 2.0
-        );
-        let texts: Vec<String> = out
-            .shapes
-            .iter()
-            .filter_map(|s| match &s.shape {
-                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            texts.iter().any(|t| t == "2 个目录未收录"),
-            "窗口内徽标文案;实际 {texts:?}"
-        );
-        assert!(!texts.iter().any(|t| t.contains('⚠')), "不重复托盘前缀");
-        out.textures_delta.clear();
     }
 
     /// 720 宽 + 长状态 + 缺口徽标:徽标先占右侧宽,左区在其左侧 16 处截止;
@@ -3307,131 +3400,135 @@ mod tests {
     /// 重启文案（完整未截断）右缘在徽标左缘 − 16 之内;徽标保持右内边距 16。
     #[test]
     fn status_row_at_720_long_state_does_not_reach_badge() {
-        let ctx = egui::Context::default();
-        ctx.set_visuals(egui::Visuals::dark());
-        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
-        st.input = "报告".into();
-        st.total = 18;
-        st.elapsed_ms = 3.0;
-        st.stat_ms = 12.0;
-        st.sort_stale = true;
-        st.status_note = Some(StatusNote::Raw(
-            "查询失败:无法连接引擎,请稍后重试并检查索引状态是否正常".into(),
-        ));
-        st.status_note_is_error = true;
-        st.engine = Some(EngineStatus {
-            state: client::state::READY.into(),
-            entry_count: 3,
-            gaps: vec![
-                Gap {
-                    path: "/private/a".into(),
-                    reason: "Permission denied".into(),
-                },
-                Gap {
-                    path: "/private/b".into(),
-                    reason: "Permission denied".into(),
-                },
-            ],
-            built_at: 0,
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+            st.input = "报告".into();
+            st.total = 18;
+            st.elapsed_ms = 3.0;
+            st.stat_ms = 12.0;
+            st.sort_stale = true;
+            st.status_note = Some(StatusNote::Raw(
+                "查询失败:无法连接引擎,请稍后重试并检查索引状态是否正常".into(),
+            ));
+            st.status_note_is_error = true;
+            st.engine = Some(EngineStatus {
+                state: client::state::READY.into(),
+                entry_count: 3,
+                gaps: vec![
+                    Gap {
+                        path: "/private/a".into(),
+                        reason: "Permission denied".into(),
+                    },
+                    Gap {
+                        path: "/private/b".into(),
+                        reason: "Permission denied".into(),
+                    },
+                ],
+                built_at: 0,
+            });
+            st.engine_known = true;
+            let mut icons = IconCache::without_worker();
+            let screen = egui::vec2(720.0, 600.0);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+            out.textures_delta.clear();
+            let palette = window_tokens::dark();
+
+            let chip = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == palette.gap_badge_fill => Some(r.rect),
+                    _ => None,
+                })
+                .expect("720 宽仍显示缺口徽标");
+            assert_eq!(chip.right(), screen.x - window_tokens::CONTENT_PAD_X);
+
+            let restart = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == "重启引擎" => {
+                        Some(t.pos.x + t.galley.size().x)
+                    }
+                    _ => None,
+                })
+                .expect("排序未生效:重启按钮文案");
+            assert!(
+                restart <= chip.left() - window_tokens::STATUS_GAP + 0.01,
+                "重启按钮右缘 {restart} 须 ≤ 徽标左缘 − 16 ({})",
+                chip.left() - window_tokens::STATUS_GAP
+            );
+
+            // 左侧状态文本(被截断)同样止于徽标左侧 16。
+            let status_right = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text().starts_with("18") => {
+                        Some(t.pos.x + t.galley.size().x)
+                    }
+                    _ => None,
+                })
+                .fold(0.0f32, f32::max);
+            assert!(status_right > 0.0, "状态文本上屏");
+            assert!(
+                status_right <= chip.left() - window_tokens::STATUS_GAP + 0.01,
+                "长状态文本不得伸进徽标区"
+            );
         });
-        st.engine_known = true;
-        let mut icons = IconCache::without_worker();
-        let screen = egui::vec2(720.0, 600.0);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
-            ..Default::default()
-        };
-        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
-        out.textures_delta.clear();
-        let palette = window_tokens::dark();
-
-        let chip = out
-            .shapes
-            .iter()
-            .find_map(|s| match &s.shape {
-                egui::Shape::Rect(r) if r.fill == palette.gap_badge_fill => Some(r.rect),
-                _ => None,
-            })
-            .expect("720 宽仍显示缺口徽标");
-        assert_eq!(chip.right(), screen.x - window_tokens::CONTENT_PAD_X);
-
-        let restart = out
-            .shapes
-            .iter()
-            .find_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.text() == "重启引擎" => {
-                    Some(t.pos.x + t.galley.size().x)
-                }
-                _ => None,
-            })
-            .expect("排序未生效:重启按钮文案");
-        assert!(
-            restart <= chip.left() - window_tokens::STATUS_GAP + 0.01,
-            "重启按钮右缘 {restart} 须 ≤ 徽标左缘 − 16 ({})",
-            chip.left() - window_tokens::STATUS_GAP
-        );
-
-        // 左侧状态文本(被截断)同样止于徽标左侧 16。
-        let status_right = out
-            .shapes
-            .iter()
-            .filter_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.text().starts_with("18") => {
-                    Some(t.pos.x + t.galley.size().x)
-                }
-                _ => None,
-            })
-            .fold(0.0f32, f32::max);
-        assert!(status_right > 0.0, "状态文本上屏");
-        assert!(
-            status_right <= chip.left() - window_tokens::STATUS_GAP + 0.01,
-            "长状态文本不得伸进徽标区"
-        );
     }
 
     /// 空态(§2.7):表头保留,主/副文案在表格区整块居中、间距 4。
     #[test]
     fn empty_state_is_centered_with_header_kept() {
-        let ctx = egui::Context::default();
-        ctx.set_visuals(egui::Visuals::dark());
-        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
-        let mut icons = IconCache::without_worker();
-        let screen = egui::vec2(1200.0, 800.0);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
-            ..Default::default()
-        };
-        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+            let mut icons = IconCache::without_worker();
+            let screen = egui::vec2(1200.0, 800.0);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
 
-        let text_shape = |needle: &str| {
-            out.shapes
-                .iter()
-                .find_map(|s| match &s.shape {
-                    egui::Shape::Text(t) if t.galley.text() == needle => Some(t),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("缺文案「{needle}」"))
-        };
-        let main = text_shape("输入关键词开始搜索");
-        let sub = text_shape("可搜文件名，也可搜路径");
-        let center_x = screen.x / 2.0;
-        assert!((main.pos.x + main.galley.size().x / 2.0 - center_x).abs() < 0.5);
-        assert!((sub.pos.x + sub.galley.size().x / 2.0 - center_x).abs() < 0.5);
-        let gap = sub.pos.y - (main.pos.y + main.galley.size().y);
-        assert!(
-            (gap - window_tokens::EMPTY_TEXT_GAP).abs() < 0.01,
-            "主副文案间距 4(实际 {gap})"
-        );
-        // 表头保留(结构不塌陷);Idle 隐藏计量,状态栏无「项」。
-        for header in ["名称", "大小", "修改时间", "路径"] {
-            let _ = text_shape(header);
-        }
-        assert!(
-            !out.shapes.iter().any(|s| matches!(&s.shape,
-                egui::Shape::Text(t) if t.galley.text().contains(" 项"))),
-            "Idle 状态栏隐藏计数"
-        );
-        out.textures_delta.clear();
+            let text_shape = |needle: &str| {
+                out.shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == needle => Some(t),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("缺文案「{needle}」"))
+            };
+            let main = text_shape("输入关键词开始搜索");
+            let sub = text_shape("可搜文件名，也可搜路径");
+            let center_x = screen.x / 2.0;
+            assert!((main.pos.x + main.galley.size().x / 2.0 - center_x).abs() < 0.5);
+            assert!((sub.pos.x + sub.galley.size().x / 2.0 - center_x).abs() < 0.5);
+            let gap = sub.pos.y - (main.pos.y + main.galley.size().y);
+            assert!(
+                (gap - window_tokens::EMPTY_TEXT_GAP).abs() < 0.01,
+                "主副文案间距 4(实际 {gap})"
+            );
+            // 表头保留(结构不塌陷);Idle 隐藏计量,状态栏无「项」。
+            for header in ["名称", "大小", "修改时间", "路径"] {
+                let _ = text_shape(header);
+            }
+            assert!(
+                !out.shapes.iter().any(|s| matches!(&s.shape,
+                    egui::Shape::Text(t) if t.galley.text().contains(" 项"))),
+                "Idle 状态栏隐藏计数"
+            );
+            out.textures_delta.clear();
+        });
     }
 
     /// 窗口内描边(Task 4):整窗最内层 1px、圆角 12,取 window_stroke token。
@@ -3570,8 +3667,10 @@ mod tests {
         assert_eq!(h.st.status_note, None, "占位非错误:不给红字");
         assert!(h.st.results.is_empty());
         // 状态栏文案:引擎快照(building)优先 → §7「索引构建中(N 条)」
-        let note = index_note(h.st.engine.as_ref(), &h.st.session.state, h.st.engine_known);
-        assert_eq!(note.as_deref(), Some("索引构建中(0 条)"));
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let note = index_note(h.st.engine.as_ref(), &h.st.session.state, h.st.engine_known);
+            assert_eq!(note.as_deref(), Some("索引构建中(0 条)"));
+        });
         h.frame(); // 文案上屏(出帧不 panic)
 
         let _ = std::fs::remove_file(&sock);
@@ -3603,42 +3702,46 @@ mod tests {
     /// Offline 无结果按 Empty;空词恒为 Idle 文案。
     #[test]
     fn empty_state_copy_maps_all_states() {
-        let idle = ("输入关键词开始搜索", "可搜文件名，也可搜路径");
-        assert_eq!(empty_state_text("", &State::Idle), idle);
-        assert_eq!(empty_state_text("", &State::Empty), idle, "空词压过会话态");
-        assert_eq!(
-            empty_state_text("报告", &State::Empty),
-            ("无匹配项", "换个关键词试试")
-        );
-        assert_eq!(
-            empty_state_text("报告", &State::Offline),
-            ("无匹配项", "换个关键词试试"),
-            "离线无结果按 Empty"
-        );
-        assert_eq!(
-            empty_state_text("报告", &State::EngineStarting),
-            ("启动引擎中", "请稍候…")
-        );
-        assert_eq!(
-            empty_state_text("报告", &State::Warming),
-            ("索引构建中", "部分结果可能暂不可见")
-        );
-        assert_eq!(
-            empty_state_text("报告", &State::Error("x".into())),
-            ("搜索失败", "请重试或检查引擎状态")
-        );
-        assert_eq!(
-            empty_state_text("报告", &State::Searching),
-            ("搜索中…", "请稍候…")
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let idle = ("输入关键词开始搜索", "可搜文件名，也可搜路径");
+            assert_eq!(empty_state_text("", &State::Idle), idle);
+            assert_eq!(empty_state_text("", &State::Empty), idle, "空词压过会话态");
+            assert_eq!(
+                empty_state_text("报告", &State::Empty),
+                ("无匹配项", "换个关键词试试")
+            );
+            assert_eq!(
+                empty_state_text("报告", &State::Offline),
+                ("无匹配项", "换个关键词试试"),
+                "离线无结果按 Empty"
+            );
+            assert_eq!(
+                empty_state_text("报告", &State::EngineStarting),
+                ("启动引擎中", "请稍候…")
+            );
+            assert_eq!(
+                empty_state_text("报告", &State::Warming),
+                ("索引构建中", "部分结果可能暂不可见")
+            );
+            assert_eq!(
+                empty_state_text("报告", &State::Error("x".into())),
+                ("搜索失败", "请重试或检查引擎状态")
+            );
+            assert_eq!(
+                empty_state_text("报告", &State::Searching),
+                ("搜索中…", "请稍候…")
+            );
+        });
     }
 
     #[test]
     fn empty_state_text_is_localized() {
-        assert_eq!(
-            empty_state_text("", &State::Idle),
-            ("输入关键词开始搜索", "可搜文件名，也可搜路径")
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(
+                empty_state_text("", &State::Idle),
+                ("输入关键词开始搜索", "可搜文件名，也可搜路径")
+            );
+        });
         i18n::with_lang(i18n::Lang::En, || {
             assert_eq!(
                 empty_state_text("", &State::Idle),
@@ -3655,55 +3758,101 @@ mod tests {
     /// Empty 只报「0 项」;截断注「展示前 K 条」。
     #[test]
     fn status_text_idle_empty_and_connectors() {
-        assert_eq!(
-            status_text(true, 42, 42, 3.2, 1.1, Some("就绪"), true),
-            "就绪",
-            "Idle 隐藏计量与排序中,只留索引状态"
-        );
-        assert_eq!(
-            status_text(true, 0, 0, 0.0, 0.0, None, false),
-            "",
-            "Idle 且状态未回:不占位"
-        );
-        assert_eq!(
-            status_text(false, 0, 0, 0.0, 0.0, Some("就绪"), false),
-            "0 项 · 就绪",
-            "Empty 只报 0 项"
-        );
-        let normal = status_text(false, 42, 42, 3.2, 1.1, Some("就绪"), false);
-        assert_eq!(normal, "42 项 · 匹配 3.2 ms · 读取 1.1 ms · 就绪");
-        assert!(normal.contains(" · "), "段间用「 · 」连接");
-        assert!(!normal.contains('|'), "不用「|」分隔条");
-        assert_eq!(
-            status_text(false, 8000, 1000, 12.5, 40.0, Some("就绪"), true),
-            "8000 项 · 匹配 12.5 ms · 读取 40 ms · 展示前 1000 条 · 排序中… · 就绪"
-        );
-        assert_eq!(
-            status_text(
-                false,
-                5,
-                5,
-                1.0,
-                2.0,
-                Some("离线索引 · 生成于 2026-10-16 09:03"),
-                false
-            ),
-            "5 项 · 匹配 1 ms · 读取 2 ms · 离线索引 · 生成于 2026-10-16 09:03",
-            "离线生成时刻并入索引段"
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(
+                status_text(true, 42, 42, 3.2, 1.1, Some("就绪"), true),
+                "就绪",
+                "Idle 隐藏计量与排序中,只留索引状态"
+            );
+            assert_eq!(
+                status_text(true, 0, 0, 0.0, 0.0, None, false),
+                "",
+                "Idle 且状态未回:不占位"
+            );
+            assert_eq!(
+                status_text(false, 0, 0, 0.0, 0.0, Some("就绪"), false),
+                "0 项 · 就绪",
+                "Empty 只报 0 项"
+            );
+            let normal = status_text(false, 42, 42, 3.2, 1.1, Some("就绪"), false);
+            assert_eq!(normal, "42 项 · 匹配 3.2 ms · 读取 1.1 ms · 就绪");
+            assert!(normal.contains(" · "), "段间用「 · 」连接");
+            assert!(!normal.contains('|'), "不用「|」分隔条");
+            assert_eq!(
+                status_text(false, 8000, 1000, 12.5, 40.0, Some("就绪"), true),
+                "8000 项 · 匹配 12.5 ms · 读取 40 ms · 展示前 1000 条 · 排序中… · 就绪"
+            );
+            assert_eq!(
+                status_text(
+                    false,
+                    5,
+                    5,
+                    1.0,
+                    2.0,
+                    Some("离线索引 · 生成于 2026-10-16 09:03"),
+                    false
+                ),
+                "5 项 · 匹配 1 ms · 读取 2 ms · 离线索引 · 生成于 2026-10-16 09:03",
+                "离线生成时刻并入索引段"
+            );
+        });
+    }
+
+    /// 英文状态栏组合:Idle 只留索引段;计数/截断/排序中各段连接。
+    #[test]
+    fn status_text_is_localized_in_english() {
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                status_text(true, 42, 42, 3.2, 1.1, Some("Ready"), true),
+                "Ready",
+                "Idle 隐藏计量与排序中,只留索引状态"
+            );
+            assert_eq!(
+                status_text(false, 0, 0, 0.0, 0.0, Some("Ready"), false),
+                "0 items · Ready"
+            );
+            assert_eq!(
+                status_text(false, 2, 1, 2.0, 3.0, Some("Ready"), true),
+                "2 items · Match 2 ms · Read 3 ms · Showing first 1 · Sorting… · Ready"
+            );
+        });
     }
 
     /// 缺口徽标文案:窗口内不带「⚠」(自绘三角替代),与托盘文案同源。
     #[test]
     fn gap_badge_text_has_no_warning_glyph() {
-        assert_eq!(gap_badge_text(3), "3 个目录未收录");
-        assert_eq!(gap_badge_text(1), "1 个目录未收录");
-        assert!(!gap_badge_text(12).contains('⚠'), "窗口内重复「⚠」即失格");
-        assert_eq!(
-            format!("⚠ {}", gap_badge_text(3)),
-            crate::tray::gaps_label(3),
-            "与托盘项文案同源(product §2/§3)"
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(gap_badge_text(3), "3 个目录未收录");
+            assert_eq!(gap_badge_text(1), "1 个目录未收录");
+            assert!(!gap_badge_text(12).contains('⚠'), "窗口内重复「⚠」即失格");
+            assert_eq!(
+                format!("⚠ {}", gap_badge_text(3)),
+                crate::tray::gaps_label(3),
+                "与托盘项文案同源(product §2/§3)"
+            );
+        });
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(gap_badge_text(1), "1 folder not indexed");
+            assert_eq!(gap_badge_text(2), "2 folders not indexed");
+            assert!(!gap_badge_text(12).contains('⚠'));
+        });
+    }
+
+    /// 状态栏提示:类型化变体按当前语言渲染,Raw 原样保留外部/技术细节。
+    #[test]
+    fn status_note_text_is_localized() {
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(StatusNote::EngineNotReady.text(), "Engine not ready");
+            assert_eq!(StatusNote::QueryFailed.text(), "Query failed");
+            assert_eq!(
+                StatusNote::Raw("引擎重启失败:x".into()).text(),
+                "引擎重启失败:x"
+            );
+        });
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(StatusNote::EngineNotReady.text(), "引擎未就绪");
+            assert_eq!(StatusNote::QueryFailed.text(), "查询失败");
+        });
     }
 
     #[test]
@@ -3940,11 +4089,13 @@ mod tests {
             "离线直读落盘索引应有命中(total={})",
             h.st.total
         );
-        let note = index_note(h.st.engine.as_ref(), &h.st.session.state, h.st.engine_known)
-            .expect("状态栏索引状态段");
-        assert!(note.starts_with("离线索引"), "离线文案:{note}");
-        assert!(note.contains("生成于"), "§7 离线列带生成时刻:{note}");
-        println!("[实机] 状态栏索引段:{note}");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let note = index_note(h.st.engine.as_ref(), &h.st.session.state, h.st.engine_known)
+                .expect("状态栏索引状态段");
+            assert!(note.starts_with("离线索引"), "离线文案:{note}");
+            assert!(note.contains("生成于"), "§7 离线列带生成时刻:{note}");
+            println!("[实机] 状态栏索引段:{note}");
+        });
     }
 
     /// 真机全链路:真实引擎查高频词 → 表格落数(draw 全渲染无 panic)→
