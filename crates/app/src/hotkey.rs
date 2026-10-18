@@ -2159,7 +2159,7 @@ mod tests {
                     custom: "⌥D".into(),
                 },
                 "保存的完整窗口快捷键 ⌥D 与唤起键冲突,可从托盘打开",
-                "Full Window shortcut ⌥D conflicts; open it from the menu bar",
+                "Full Window shortcut ⌥D conflicts with Quick Search; open it from the menu bar",
             ),
             (
                 HotkeyNote::SavedWindowUnavailable {
