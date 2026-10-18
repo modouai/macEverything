@@ -1,6 +1,6 @@
 # 设置功能（v2.1 第一期）— 设计
 
-**Status:** Phase A 已实现（2026-10-18：窗口 / 字号 / 自启 / 语言占位）；快捷键与排除目录待独立计划
+**Status:** Phase A 已实现（2026-10-18：窗口 / 字号 / 自启 / 语言占位）；快捷键 H1–H3 已实现（映射/运行时/设置页录制与持久化，2026-10-18）；排除目录待独立计划
 **范围:** 设置窗口 + 非语言项（字号 / 开机自启 / 两个全局快捷键 / 排除目录）
 **视觉依据:** `docs/specs/floatbar-visual/settings-visual.md`（下称 `visual`）
 **不交付:** i18n（语言项先占位）、设置窗口的恢复默认/侧边栏/快捷键冲突弹窗、排除目录的定向增量重扫
@@ -65,9 +65,10 @@ enum SettingsAction {
 }
 ```
 
-> 本期（Task 5）只落地字号/自启：自启不经该枚举，成功时置
-> `settings.tray_autostart_sync` 由 `App::logic` 同步托盘（§7）；`SettingsAction`
-> 的录制项留给 `plan-hotkeys.md`。字号在绘制回调收集动作后锁外立即应用。
+> Task 5 先落地字号/自启：自启不经该枚举，成功时置
+> `settings.tray_autostart_sync` 由 `App::logic` 同步托盘（§7）；字号在绘制回调
+> 收集动作后锁外立即应用。H3 已完成录制项：`SettingsAction` 的快捷键动作只入
+> `SettingsState.hotkey_commands`，`App::logic` 锁外执行运行时调用（§6.4）。
 >
 > **动作所有权（2026-10-18 定案）：** `settings_view::SettingsAction` 是
 > `Copy` 的即时视图动作（字号/自启），由设置 pass 在绘制后立即落地，不跨帧。
@@ -215,6 +216,33 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
 - 修饰键：`command→SUPER`、`ctrl→CONTROL`、`alt→ALT`、`shift→SHIFT`。
 - 不支持/未映射的键：忽略并提示「该键不支持」。
 - 纯逻辑（映射、校验、显示格式化）单测钉住。
+
+### 6.4 实现状态（2026-10-18）
+
+- 设置页动作：`SettingsAction::{BeginHotkeyRecord, CancelHotkeyRecord, CommitHotkey,
+  HotkeyError}`（已去掉 `Copy`，可携带 `HotKey`/错误文案）；设置 pass 只把前三个
+  翻译为 `HotkeyCommand` 入 `SettingsState.hotkey_commands`，并请求 ROOT + 设置页
+  重绘；`HotkeyError` 只落共享态错误并重绘设置页。
+- `App::logic` 先 drain 命令（短锁取走），在共享锁外执行
+  `suspend/resume/commit`，再短锁写回 `recording` / `recording_ready` /
+  `hotkey_snapshot` / `hotkey_error`；设置文件保存在锁外。`Begin` 在窗口已关闭时
+  丢弃（关闭路径另发取消，避免挂起后无人恢复）。
+- 录制 UI：空闲点击开始；准备期「准备录制…」；挂起完成后「按下快捷键…」；
+  Esc / 再次点击字段 / 点击字段外 / ⌘W/红点关闭取消；纯修饰键（⇧⌃⌥⌘）按下被消费
+  但不报错；所有按下事件被消费，不触发其它 UI。
+- 错误与提示按槽显示：`hotkey_error: Option<(HotkeySlot, String)>`；回落提示
+  `note`/`window_note` 也显示在对应行下；错误 + 提示各占一行，`RowSpec.extra` 随
+  消息条数增高（卡片底/分隔线仍由同一游标推进）。
+- 偏差：视图侧校验/查重错误**不退出录制**（可直接重按或 Esc）；运行时 `commit`
+  失败退出录制（H2 已恢复旧键）；保存失败不回退键，只显示「快捷键已生效,但设置
+  保存失败」，内存 `SettingsFile` 保留新键供后续保存补写。
+- 默认展示完全来自 `HotkeyRuntime::snapshot()`（设置态不再硬编码键帽）；
+  `PaletteState.hotkey_note` 随 begin/cancel/commit 后的快照同步。
+- 已知限制：eframe/egui-winit 默认把「仅 Command」的 ⌘C / ⌘X / ⌘V 转成
+  Copy/Cut/Paste 事件（不产生 `Event::Key`），故录制层暂不能录入这三组；运行时
+  注册与手工编辑 `settings.toml` 不受影响，带额外修饰的组合（如 ⌘⇧C）可正常录制。
+- 自动化覆盖纯状态/命令队列/headless 视图/文件持久化；真实 Carbon 注册、系统占用、
+  跨重启与实机点击需手动验收（清单见 `plan-hotkeys.md` H4）。
 
 ---
 

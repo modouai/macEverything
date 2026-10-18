@@ -22,16 +22,16 @@
 //! 未配置(默认)时行为与旧版一致。两个槽的当前键存于 `Arc<Mutex<ActiveKeys>>`,
 //! 事件泵每次事件读取**当前** id(不再捕获固定键);因此 [`HotkeyRuntime::commit`]
 //! 换键后泵立即生效。注册/注销必须回主线程执行:install / `App::logic` 之外的
-//! 设置 UI 不得直接调用 `suspend`/`resume`/`commit`(H3 通过命令队列交给 App)。
+//! 设置 UI 不得直接调用 `suspend`/`resume`/`commit`(设置页通过命令队列交给 App)。
 //!
-//! ## 录制期与提交回滚(H3 依赖的语义)
+//! ## 录制期与提交回滚(设置页录制的语义)
 //!
 //! - [`HotkeyRuntime::suspend`][]:注销两槽并记住旧键(`suspended`),泵读到的 active
 //!   为空 → 录制按键不会触发旧动作;快照仍显示旧键(设置页录制中仍可看到另一槽)。
 //! - [`HotkeyRuntime::resume`][]:取消录制,重新注册旧键;尽力恢复,失败留提示。
 //! - [`HotkeyRuntime::commit`][]:校验白名单 + 拒绝与另一槽重复,再注册新键。
 //!   - 挂起态(正常录制路径):**任何**错误(校验/重复/注册失败)都尽力恢复两个
-//!     旧键并**退出挂起**(`suspended = None`);H3 失败后直接结束录制、旧键仍可用。
+//!     旧键并**退出挂起**(`suspended = None`);设置页失败后直接结束录制、旧键仍可用。
 //!   - 非挂起态:同键提交 = 幂等成功;否则旧键保持注册,直接注册新键,成功后注销
 //!     该槽旧键,失败不动旧键。
 //!     成功统一清空两槽启动回退提示(执行提交即视为用户已确认当前键位)。
@@ -112,9 +112,10 @@ pub const UNAVAILABLE_NOTE: &str = "快捷键不可用,可从托盘唤起";
 const WINDOW_UNAVAILABLE_NOTE: &str = "完整窗口快捷键不可用,可从托盘打开";
 
 /// 录制取消后旧键恢复失败提示(键可能已被其他应用抢占)。
-// H3 录制命令接入前,resume 在非测试构建里无调用点;临时 allow,接入后删除。
-#[allow(dead_code)]
 const RESUME_FAILED_NOTE: &str = "快捷键恢复失败,请重新录制";
+
+/// 两槽使用同一组合的本地拒绝文案(录制视图先行查重,运行时兜底;文案须一致)。
+pub(crate) const DUPLICATE_HOTKEY_MESSAGE: &str = "该快捷键已用于另一个功能";
 
 /// 热键动作(直调回调与兜底队列共用;ui 层按此分派到同一份实现)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +126,7 @@ pub enum Action {
     OpenResults,
 }
 
-/// 可配置的两个热键槽(设置页录制与提交按此定位;H3 命令队列使用)。
-// H3 命令队列接入前非测试构建无调用点;临时 allow,接入后删除。
-#[allow(dead_code)]
+/// 可配置的两个热键槽(设置页录制与提交按此定位)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HotkeySlot {
     /// 唤起/隐藏悬浮条。
@@ -143,8 +142,6 @@ struct ActiveKeys {
     window: Option<HotKey>,
 }
 
-// 仅被 H2 运行时规划器（H3 接线前无外部调用点）与测试使用；临时 allow。
-#[allow(dead_code)]
 impl ActiveKeys {
     fn get(self, slot: HotkeySlot) -> Option<HotKey> {
         match slot {
@@ -169,7 +166,7 @@ impl ActiveKeys {
     }
 }
 
-/// 设置页展示/录制用的热键快照(纯数据;H3 消费)。
+/// 设置页展示/录制用的热键快照(纯数据;设置页消费)。
 ///
 /// `palette_keys` / `window_keys` 是 macOS 键帽符号(⌃⌥⇧⌘ + 键名),槽位未注册时
 /// 为空 `Vec`。回退提示按槽拆分:`note` = 唤起槽(悬浮条常驻警告只读它),
@@ -214,8 +211,6 @@ pub type DispatchFn = Arc<dyn Fn(Action) -> bool + Send + Sync + 'static>;
 
 /// 注册/注销抽象:生产实现包 `GlobalHotKeyManager`,单测用假实现验证纯规划
 /// (不创建 manager、不碰系统热键,CI/无头环境可跑)。
-// unregister 仅由挂起/提交路径（H3 接线前无外部调用点）使用；临时 allow。
-#[allow(dead_code)]
 trait KeyRegistrar {
     fn register(&mut self, hotkey: HotKey) -> Result<(), String>;
     fn unregister(&mut self, hotkey: HotKey) -> Result<(), String>;
@@ -437,16 +432,12 @@ fn lock_active(active: &Arc<Mutex<ActiveKeys>>) -> MutexGuard<'_, ActiveKeys> {
 /// manager drop 即注销全部热键,须与进程同寿。
 pub struct HotkeyRuntime {
     /// 注册状态的宿主;创建失败时为 None(热键不可用,其余功能照常)。
-    // H3 录制命令接线前,suspend/resume/commit 无调用点;以下三字段暂标记 allow。
-    #[allow(dead_code)]
     manager: Option<GlobalHotKeyManager>,
     /// 当前注册键(事件泵每事件读取此份;重配置后立即生效)。
-    #[allow(dead_code)]
     active: Arc<Mutex<ActiveKeys>>,
     /// 当前快照(设置页种子;commit/suspend 后更新)。
     snapshot: HotkeySnapshot,
     /// 录制期挂起的旧键(Some = 已注销、等待 resume/commit)。
-    #[allow(dead_code)]
     suspended: Option<ActiveKeys>,
     /// 主队列直调目标(ui 层启动期回填;未回填时按下走兜底队列)。
     on_action: Arc<OnceLock<DispatchFn>>,
@@ -467,7 +458,7 @@ impl HotkeyRuntime {
         self.snapshot.note.as_deref()
     }
 
-    /// 当前热键快照(设置页展示/录制用;H3 消费)。
+    /// 当前热键快照(设置页展示/录制用)。
     pub fn snapshot(&self) -> HotkeySnapshot {
         self.snapshot.clone()
     }
@@ -482,8 +473,6 @@ impl HotkeyRuntime {
     /// 进入录制:注销两槽并记住旧键(主线程;幂等)。
     ///
     /// 快照保持不变——设置页录制期间仍显示旧键,另一槽的键帽不消失。
-    // H3 命令队列尚未接线;临时 allow,接入后删除。
-    #[allow(dead_code)]
     pub fn suspend(&mut self) {
         let Some(manager) = self.manager.as_ref() else {
             return;
@@ -504,7 +493,6 @@ impl HotkeyRuntime {
     /// 取消录制:重新注册挂起的旧键(主线程;无挂起 = 无操作)。
     ///
     /// 恢复失败按槽留提示(唤起槽进悬浮条警告,完整窗口槽仅设置页展示)。
-    #[allow(dead_code)]
     pub fn resume(&mut self) {
         let Some(manager) = self.manager.as_ref() else {
             return;
@@ -524,11 +512,10 @@ impl HotkeyRuntime {
         self.snapshot = HotkeySnapshot::from_active(active, note, window_note);
     }
 
-    /// 提交录制结果(主线程;H3 命令队列调用)。
+    /// 提交录制结果(主线程;设置页命令队列调用)。
     ///
     /// 校验失败/与另一槽重复/系统注册失败 → `Err`(中文文案,可直接内联展示),
     /// 旧键保持可用;成功 → 更新快照并清空启动回退提示。
-    #[allow(dead_code)]
     pub fn commit(&mut self, slot: HotkeySlot, hotkey: HotKey) -> Result<HotkeySnapshot, String> {
         let manager = self
             .manager
@@ -549,7 +536,7 @@ impl HotkeyRuntime {
                 Ok(self.snapshot.clone())
             }
             Err(err) => {
-                // 状态已按回滚语义落定(H3 失败后退回 Idle,旧键为 active 真源);
+                // 状态已按回滚语义落定(设置页失败后退回 Idle,旧键为 active 真源);
                 // 保留各槽启动回退提示,错误单独经 Err 展示。
                 self.snapshot = HotkeySnapshot::from_active(
                     active,
@@ -563,8 +550,6 @@ impl HotkeyRuntime {
 }
 
 /// 注销两槽并挂起(纯状态;测试可复用)。
-// 仅由 runtime.suspend（H3 接线前无调用点）与测试调用;临时 allow。
-#[allow(dead_code)]
 fn suspend_with<R: KeyRegistrar>(
     reg: &mut R,
     active: &mut ActiveKeys,
@@ -603,7 +588,6 @@ impl ResumeOutcome {
 }
 
 /// 恢复挂起的旧键;失败槽仍尽力恢复其余。
-#[allow(dead_code)]
 fn resume_with<R: KeyRegistrar>(
     reg: &mut R,
     active: &mut ActiveKeys,
@@ -674,9 +658,8 @@ fn restore_old_keys<R: KeyRegistrar>(
 /// 提交规划器(纯逻辑;注册器可注入)。
 ///
 /// 挂起态（录制中）的**任何**错误——校验、与另一槽重复、系统注册失败——都会尽力
-/// 恢复两个旧键、清空 `suspended` 并以旧键为 active 返回 `Err`(H3 直接退出录制,
+/// 恢复两个旧键、清空 `suspended` 并以旧键为 active 返回 `Err`(设置页直接退出录制,
 /// 不会额外 resume)。非挂起态错误保留旧键注册。
-#[allow(dead_code)]
 fn plan_commit<R: KeyRegistrar>(
     reg: &mut R,
     active: &mut ActiveKeys,
@@ -698,7 +681,7 @@ fn plan_commit<R: KeyRegistrar>(
             reg,
             active,
             old,
-            "该快捷键已用于另一个功能".to_string(),
+            DUPLICATE_HOTKEY_MESSAGE.to_string(),
         ));
     }
 
@@ -819,7 +802,7 @@ pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
     *lock_active(&active) = plan.active;
     let snapshot = HotkeySnapshot::from_active(plan.active, plan.note, plan.window_note);
 
-    // manager 存在就起泵:即使启动时两槽都未注册,H3 之后仍可 commit 新键。
+    // manager 存在就起泵:即使启动时两槽都未注册,设置页录制后仍可 commit 新键。
     spawn_event_pump(
         ctx.clone(),
         Arc::clone(&active),
@@ -1261,7 +1244,7 @@ mod tests {
             }
         );
 
-        // 挂起态同样以旧键查重;拒绝时恢复旧键并退出挂起(H3 直接结束录制)。
+        // 挂起态同样以旧键查重;拒绝时恢复旧键并退出挂起(设置页直接结束录制)。
         let mut reg = FakeRegistrar::default(); // 挂起 = 两键均已注销
         let mut active = ActiveKeys::default();
         let mut suspended = Some(ActiveKeys {
@@ -1435,7 +1418,7 @@ mod tests {
         assert_eq!(snapshot.palette, Some(new_palette));
     }
 
-    /// 提交(挂起态)失败:退出挂起并尽力恢复两个旧键(H3 期望旧键仍可用)。
+    /// 提交(挂起态)失败:退出挂起并尽力恢复两个旧键(设置页期望旧键仍可用)。
     #[test]
     fn commit_while_suspended_failure_restores_old_keys() {
         let old_palette = alt_space();

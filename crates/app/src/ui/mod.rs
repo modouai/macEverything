@@ -81,6 +81,7 @@ pub mod tokens;
 pub mod window_tokens;
 
 use eframe::egui;
+use global_hotkey::hotkey::HotKey;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -89,6 +90,7 @@ use crate::autostart;
 use crate::engine_launcher;
 use crate::hotkey;
 use crate::platform;
+use crate::settings as store;
 use crate::single_instance::Incoming;
 use crate::tray::{self, TrayMsg};
 use crate::window_state::{self, SizeUpdate, WindowSize, WindowSizeTracker};
@@ -651,6 +653,130 @@ impl App {
         }
         tray_toggled_autostart
     }
+
+    /// 消费设置页排队的快捷键命令（主线程；运行时调用一律在共享锁外）。
+    ///
+    /// 设置 pass 只入队（Carbon manager 只能主线程），命令按 FIFO 在此落地。
+    /// `Begin` 在窗口已关闭时丢弃：关闭路径另发取消信号，不能先挂起再无处取消。
+    fn drain_hotkey_commands(&mut self, ctx: &egui::Context) {
+        let commands = self.shared().settings.take_hotkey_commands();
+        for command in commands {
+            match command {
+                settings::HotkeyCommand::BeginRecord(slot) => {
+                    self.begin_hotkey_recording(ctx, slot)
+                }
+                settings::HotkeyCommand::CancelRecord => {
+                    self.cancel_hotkey_recording(ctx, "取消录制")
+                }
+                settings::HotkeyCommand::Commit { slot, hotkey } => {
+                    self.commit_hotkey(ctx, slot, hotkey)
+                }
+            }
+        }
+    }
+
+    /// 开始/切换录制：首槽 suspend；切槽时运行时保持挂起（旧键仍在 `suspended`）。
+    fn begin_hotkey_recording(&mut self, ctx: &egui::Context, slot: hotkey::HotkeySlot) {
+        let (open, already) = {
+            let s = self.shared();
+            (s.settings.open, s.settings.recording)
+        };
+        if !open {
+            log::info!("快捷键录制开始被忽略:设置窗口已关闭");
+            return;
+        }
+        if already == Some(slot) {
+            return; // 重复 Begin（视图对同槽点击只发 Cancel）
+        }
+        if already.is_none() {
+            self.hotkey.suspend();
+            log::info!("快捷键录制开始({slot:?}):已挂起全局热键");
+        } else {
+            log::info!("快捷键录制切槽({already:?} → {slot:?}):热键保持挂起");
+        }
+        let snapshot = self.hotkey.snapshot();
+        {
+            let mut s = self.shared();
+            s.settings.begin_recording(slot, snapshot);
+            s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
+        }
+        request_hotkey_repaint(ctx);
+    }
+
+    /// 取消录制并恢复旧键（Esc/点击他处/窗口关闭共用；未录制 = no-op）。
+    fn cancel_hotkey_recording(&mut self, ctx: &egui::Context, reason: &str) {
+        let recording = self.shared().settings.recording;
+        let Some(slot) = recording else {
+            log::info!("{reason}:当前未录制快捷键(忽略)");
+            return;
+        };
+        self.hotkey.resume();
+        let snapshot = self.hotkey.snapshot();
+        {
+            let mut s = self.shared();
+            s.settings.end_recording(snapshot);
+            s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
+        }
+        log::info!("{reason}:快捷键录制结束({slot:?}),旧热键已恢复");
+        request_hotkey_repaint(ctx);
+    }
+
+    /// 提交录制结果：注册成功 → 写设置文件（锁外保存）→ 刷新快照；
+    /// 失败时运行时已回滚旧键并退出挂起 → 结束录制 + 按槽内联错误。
+    fn commit_hotkey(&mut self, ctx: &egui::Context, slot: hotkey::HotkeySlot, hotkey: HotKey) {
+        // 同一帧若先取消后提交（点击他处 + 按键），以取消为准：不得在非录制态换键。
+        let recording = self.shared().settings.recording;
+        if recording != Some(slot) {
+            log::warn!("快捷键提交被忽略({slot:?}):当前录制槽为 {recording:?}");
+            return;
+        }
+        let readable = hotkey_keys::display_keys(hotkey).concat();
+        match self.hotkey.commit(slot, hotkey) {
+            Ok(snapshot) => {
+                let (file, data_dir) = {
+                    let mut s = self.shared();
+                    let file = s.settings.commit_recorded_hotkey(slot, hotkey, snapshot);
+                    s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
+                    (file, s.settings.data_dir.clone())
+                };
+                // 保存与运行时调用都不持共享锁；失败只留内联错误，键保持生效。
+                let save_error = store::save(&data_dir, &file).err().map(|err| {
+                    let message = format!("快捷键已生效,但设置保存失败:{err:#}");
+                    log::warn!("{message}");
+                    message
+                });
+                let saved = save_error.is_none();
+                if let Some(message) = save_error {
+                    let mut s = self.shared();
+                    s.settings.hotkey_save_failed(slot, message);
+                }
+                log::info!(
+                    "快捷键 {readable} 已注册({slot:?};设置已保存:{})",
+                    if saved { "是" } else { "否" }
+                );
+                request_hotkey_repaint(ctx);
+            }
+            Err(message) => {
+                // 运行时失败已恢复旧键并退出挂起(H2 语义);这里只结束录制展示错误。
+                let snapshot = self.hotkey.snapshot();
+                {
+                    let mut s = self.shared();
+                    s.settings.recording_failed(slot, message.clone(), snapshot);
+                    s.palette.hotkey_note = s.settings.hotkey_snapshot.note.clone();
+                }
+                log::warn!("快捷键提交失败({slot:?}):{message}");
+                request_hotkey_repaint(ctx);
+            }
+        }
+    }
+}
+
+/// 快捷键状态变化后唤醒设置页与根视口（命令由 ROOT 帧的 `logic` 消费）；
+/// 悬浮条常驻警告可能随快照变化，一并重绘（隐藏期由 eframe 节流）。
+fn request_hotkey_repaint(ctx: &egui::Context) {
+    ctx.request_repaint_of(settings::viewport_id());
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    ctx.request_repaint_of(palette_viewport_id());
 }
 
 impl eframe::App for App {
@@ -714,10 +840,13 @@ impl eframe::App for App {
                 log::info!("设置页自启:同步托盘勾选 {desired}");
             }
         }
-        // 设置窗口关闭/⌘W：录制取消挂起消费点（快捷键 plan 接入后在此恢复旧热键；
-        // 当前无录制状态，仅留痕，避免标志跨帧残留）。
+        // 快捷键录制命令(设置页 → App):挂起/恢复/提交只能主线程执行。
+        // 先 drain 再消费关闭信号:关闭当帧排队的 Begin 会因 open=false 被丢弃，
+        // 已在录制中的状态则由紧随其后的关闭取消恢复旧键。
+        self.drain_hotkey_commands(ctx);
+        // 设置窗口关闭/⌘W：录制中恢复旧热键（未录制 = no-op，信号取走即清）。
         if self.shared().settings.take_cancel_recording_pending() {
-            log::info!("设置窗口已关闭:取消录制挂起(快捷键 plan 接入时恢复旧热键)");
+            self.cancel_hotkey_recording(ctx, "设置窗口关闭");
         }
         if let Some(tray) = &mut self.tray {
             tray.sync();

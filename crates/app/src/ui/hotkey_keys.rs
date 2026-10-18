@@ -38,9 +38,6 @@ const UNSUPPORTED_KEY: HotkeyError = HotkeyError("不支持该键");
 /// `key` 必须是**非修饰键**的实际按键，修饰键只从 `mods` 读取。白名单外的键
 /// （纯修饰键、F13+、媒体键、未列入的标点等）→「不支持该键」；白名单键但
 /// 未按任何修饰键 →「需包含修饰键」。
-// H3 录制层尚未接线，本函数在非测试构建里暂无调用点；allow 是临时哨兵，
-// 接入后删除（validate/display_keys 已由 H2 运行时使用）。
-#[allow(dead_code)]
 pub fn from_egui(key: egui::Key, mods: egui::Modifiers) -> Result<HotKey, HotkeyError> {
     let code = code_from_egui(key)?;
 
@@ -176,7 +173,6 @@ const SUPPORTED_KEYS: &[(egui::Key, Code)] = &[
 ];
 
 /// egui 逻辑键 → keyboard-types 物理键位（白名单查表）。
-#[allow(dead_code)]
 fn code_from_egui(key: egui::Key) -> Result<Code, HotkeyError> {
     SUPPORTED_KEYS
         .iter()
@@ -193,7 +189,6 @@ fn is_supported_code(code: Code) -> bool {
 
 /// `Code` → 键帽可读名。白名单外的键（持久化文件陈旧/手工编辑）回落到
 /// keyboard-types 的规范名，保证展示不丢键。
-#[allow(dead_code)]
 fn code_label(code: Code) -> String {
     let label = match code {
         Code::KeyA => "A",

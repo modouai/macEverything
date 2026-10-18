@@ -1,16 +1,20 @@
 //! 设置页纯视图：快照数据 → 分组/卡片/行控制绘制（不读 `Shared`、不执行动作）。
 //!
 //! 行为编排在 `ui/settings.rs`：它短暂持锁构造 [`SettingsData`]，出锁绘制，最后
-//! 消费 [`SettingsAction`]（字号/自启）。本文件只负责视觉与点击收集。
+//! 消费 [`SettingsAction`]（字号/自启/快捷键命令）。本文件只负责视觉与点击/按键
+//! 收集；录制期的 suspend/commit 一律由命令队列交给 App（主线程 manager）。
 //!
-//! 行模型：[`RowSpec`] 同时决定卡片高度与绘制游标；行内错误行（字号保存失败 /
-//! 自启未打包）通过 `with_extra` 增高，卡片底与分隔线随之走同一游标。
+//! 行模型：[`RowSpec`] 同时决定卡片高度与绘制游标；行内错误/提示行（字号保存失败 /
+//! 自启未打包 / 快捷键回落或失败）通过 `with_extra` 增高，卡片底与分隔线随之走同一
+//! 游标。快捷键行可同时显示一条错误 + 一条回落提示（各占一行高度）。
 
 use eframe::egui;
+use global_hotkey::hotkey::HotKey;
 
+use crate::hotkey::{self, HotkeySlot, HotkeySnapshot};
 use crate::settings::FontSize;
 use crate::ui::{
-    font as ui_font,
+    font as ui_font, hotkey_keys,
     settings_layout::{card_height, take_row, RowSpec},
     settings_tokens::{
         self, SettingsPalette, ADD_BUTTON_FONT, ADD_BUTTON_H, ADD_BUTTON_PAD_X, ADD_BUTTON_RADIUS,
@@ -34,6 +38,10 @@ const LANGUAGE_TOOLTIP: &str = "暂仅支持简体中文，语言切换将在后
 const EXCLUDED_EMPTY: &str = "未排除任何目录";
 /// 已注册但等待系统「登录项」允许的行内提示（`RequiresApproval`）。
 const AUTOSTART_APPROVAL_NOTE: &str = "已注册,待系统设置「登录项」允许";
+/// 录制中等待 App 挂起全局热键时的占位文案。
+const RECORDING_PREPARING: &str = "准备录制…";
+/// 已挂起、等待用户按键的文案。
+const RECORDING_PROMPT: &str = "按下快捷键…";
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -55,16 +63,35 @@ pub(crate) struct SettingsData {
     pub(crate) language: &'static str,
     pub(crate) palette_keys: Vec<String>,
     pub(crate) window_keys: Vec<String>,
+    /// 热键快照（键帽展示/查重的唯一真源；两键帽字段由它填充）。
+    pub(crate) hotkeys: HotkeySnapshot,
+    /// 当前录制槽；`None` = 空闲。
+    pub(crate) recording: Option<HotkeySlot>,
+    /// App 已挂起热键、可接收按键。
+    pub(crate) recording_ready: bool,
+    /// 按槽定位的快捷键内联错误。
+    pub(crate) hotkey_error: Option<(HotkeySlot, String)>,
     pub(crate) excluded: Vec<String>,
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 快捷键动作只描述意图：设置 pass 把它们翻译成共享态命令队列，
+/// 真正的 `suspend`/`resume`/`commit` 由主线程 `App::logic` 执行。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SettingsAction {
     /// 字号分段点击（立即应用 + 落盘）。
     SetFontSize(FontSize),
     /// 开机自启开关点击（目标态）。
     SetAutostart(bool),
+    /// 点击键帽字段：开始录制该槽（正在录制另一槽时先取消）。
+    BeginHotkeyRecord(HotkeySlot),
+    /// 点击录制中的字段 / Esc / 点击他处：取消录制并恢复旧键。
+    CancelHotkeyRecord,
+    /// 录制到合法组合：提交给 App 校验/注册/落盘。
+    CommitHotkey { slot: HotkeySlot, hotkey: HotKey },
+    /// 录制组合非法或与另一槽重复：仅显示内联错误（录制继续）。
+    HotkeyError { slot: HotkeySlot, message: String },
 }
 
 /// 一帧绘制结果：动作队列（通常为空或单条）。
@@ -93,6 +120,11 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
     body.spacing_mut().scroll.floating = true;
 
     let mut actions = Vec::new();
+    // 点击别处取消录制：按下帧先于所有控件动作入列，保证「取消旧录制 → 开始新槽」
+    // 的顺序；点击录制字段本身由字段在抬起时取消（避免按下/抬起跨帧重复开始）。
+    if click_away_cancels_recording(ui, data) {
+        actions.push(SettingsAction::CancelHotkeyRecord);
+    }
     egui::ScrollArea::vertical()
         .id_salt("settings-body")
         .auto_shrink([false, false])
@@ -124,8 +156,20 @@ fn extra_for(has_message: bool, extra_h: f32) -> f32 {
     }
 }
 
+/// 快捷键行的按槽错误（错误优先于回落提示，但两者可同时绘制）。
+fn hotkey_error_for(data: &SettingsData, slot: HotkeySlot) -> Option<&str> {
+    data.hotkey_error
+        .as_ref()
+        .and_then(|(error_slot, message)| (*error_slot == slot).then_some(message.as_str()))
+}
+
+/// 快捷键行额外高：错误与回落提示各占一行（可同时存在）。
+fn hotkey_messages_extra(error: Option<&str>, note: Option<&str>, extra_h: f32) -> f32 {
+    extra_for(error.is_some(), extra_h) + extra_for(note.is_some(), extra_h)
+}
+
 /// 分组行模型：`kind` 决定控件，`spec` 同时驱动高度与游标；
-/// `error`（红色）/ `note`（次要色）二选一显示在行下方。
+/// `error`（红色）在上、`note`（次要色）在下，可同时显示在行下方。
 struct GroupRow<'a> {
     kind: RowKind<'a>,
     spec: RowSpec,
@@ -179,6 +223,13 @@ fn draw_general_group(
         None
     };
     let has_message = autostart_error.is_some() || autostart_note.is_some();
+
+    // 快捷键行：内联错误（校验/重复/注册/保存）+ 运行时回落提示（按槽拆分）。
+    let palette_error = hotkey_error_for(data, HotkeySlot::Palette);
+    let palette_note = data.hotkeys.note.as_deref();
+    let window_error = hotkey_error_for(data, HotkeySlot::Window);
+    let window_note = data.hotkeys.window_note.as_deref();
+
     let rows = [
         GroupRow {
             kind: RowKind::Autostart,
@@ -194,15 +245,23 @@ fn draw_general_group(
         },
         GroupRow {
             kind: RowKind::PaletteKeys,
-            spec: RowSpec::new(ROW_H),
-            error: None,
-            note: None,
+            spec: RowSpec::new(ROW_H).with_extra(hotkey_messages_extra(
+                palette_error,
+                palette_note,
+                extra_h,
+            )),
+            error: palette_error,
+            note: palette_note,
         },
         GroupRow {
             kind: RowKind::WindowKeys,
-            spec: RowSpec::new(ROW_H),
-            error: None,
-            note: None,
+            spec: RowSpec::new(ROW_H).with_extra(hotkey_messages_extra(
+                window_error,
+                window_note,
+                extra_h,
+            )),
+            error: window_error,
+            note: window_note,
         },
     ];
     draw_card(ui, full_w, "通用", &rows, data, palette, actions);
@@ -265,11 +324,7 @@ fn draw_card(
                 .rect_filled(divider, egui::CornerRadius::ZERO, palette.divider);
         }
         draw_row_body(ui, rects.body, &row.kind, data, palette, actions);
-        if let Some(error) = row.error {
-            draw_support_line(ui, rects.extra, error, palette.error_text);
-        } else if let Some(note) = row.note {
-            draw_support_line(ui, rects.extra, note, palette.text_secondary);
-        }
+        draw_support_lines(ui, rects.extra, row.error, row.note, palette);
     }
     debug_assert!(
         (y - card.bottom()).abs() < 0.01,
@@ -359,7 +414,15 @@ fn draw_row_body(
                 egui::vec2(FIELD.0, FIELD.1),
                 palette,
             );
-            draw_keycap_field(ui, control, &data.palette_keys, "palette", palette);
+            draw_keycap_field(
+                ui,
+                control,
+                HotkeySlot::Palette,
+                &data.palette_keys,
+                data,
+                palette,
+                actions,
+            );
         }
         RowKind::WindowKeys => {
             let control = draw_row_label(
@@ -369,7 +432,15 @@ fn draw_row_body(
                 egui::vec2(FIELD.0, FIELD.1),
                 palette,
             );
-            draw_keycap_field(ui, control, &data.window_keys, "window", palette);
+            draw_keycap_field(
+                ui,
+                control,
+                HotkeySlot::Window,
+                &data.window_keys,
+                data,
+                palette,
+                actions,
+            );
         }
         RowKind::ExcludeHeader => {
             let button_w = text_width(ui, ADD_DIR_LABEL, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X;
@@ -387,21 +458,44 @@ fn draw_row_body(
     }
 }
 
-/// 行内提示（辅助字号、左对齐；错误红 / 审批提示次要色）。
-/// 高度已计入行模型。
-fn draw_support_line(ui: &egui::Ui, extra: egui::Rect, text: &str, color: egui::Color32) {
-    let rect = egui::Rect::from_min_max(
-        egui::pos2(extra.left() + ROW_PAD_X, extra.top() + LABEL_SUPPORT_GAP),
-        egui::pos2(extra.right() - ROW_PAD_X, extra.bottom()),
-    );
-    draw_text(
-        ui,
-        rect,
-        text,
-        SUPPORT_FONT,
-        color,
-        egui::Align2::LEFT_CENTER,
-    );
+/// 行内提示（辅助字号、左对齐；错误红 / 提示次要色）。
+/// 错误在上、提示在下，各占 `extra` 的等分之一（高度已计入行模型）。
+fn draw_support_lines(
+    ui: &egui::Ui,
+    extra: egui::Rect,
+    error: Option<&str>,
+    note: Option<&str>,
+    palette: &SettingsPalette,
+) {
+    let messages = [
+        error.map(|text| (text, palette.error_text)),
+        note.map(|text| (text, palette.text_secondary)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if messages.is_empty() || extra.height() <= 0.0 {
+        return;
+    }
+    let line_h = extra.height() / messages.len() as f32;
+    for (index, (text, color)) in messages.into_iter().enumerate() {
+        let line = egui::Rect::from_min_size(
+            egui::pos2(extra.left(), extra.top() + index as f32 * line_h),
+            egui::vec2(extra.width(), line_h),
+        );
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(line.left() + ROW_PAD_X, line.top() + LABEL_SUPPORT_GAP),
+            egui::pos2(line.right() - ROW_PAD_X, line.bottom()),
+        );
+        draw_text(
+            ui,
+            rect,
+            text,
+            SUPPORT_FONT,
+            color,
+            egui::Align2::LEFT_CENTER,
+        );
+    }
 }
 
 /// 行标签（13pt 主要色，左内边距 16）+ 右对齐控件几何。
@@ -590,22 +684,66 @@ fn draw_language_field(
         .on_hover_text(LANGUAGE_TOOLTIP);
 }
 
+/// 键帽字段在 egui 临时数据里的 id（跨帧保存几何，供点击他处判定）。
+fn keycap_field_id(slot: HotkeySlot) -> egui::Id {
+    egui::Id::unique(("settings-keycap-field", slot))
+}
+
+/// 点击录制字段之外的左键 → 取消录制（纯输入判定）。
+///
+/// 录制字段的按下不算「点外」——同字段的取消在抬起时由字段自身处理，
+/// 避免按下/抬起跨帧时先取消、抬起又被当成新一次录制。无上帧几何时保守取消。
+fn click_away_cancels_recording(ui: &egui::Ui, data: &SettingsData) -> bool {
+    let Some(slot) = data.recording else {
+        return false;
+    };
+    if !ui.input(|i| i.pointer.primary_pressed()) {
+        return false;
+    }
+    let origin = ui.input(|i| i.pointer.press_origin());
+    let field = ui
+        .ctx()
+        .data(|d| d.get_temp::<egui::Rect>(keycap_field_id(slot)));
+    match (origin, field) {
+        (Some(origin), Some(field)) => !field.contains(origin),
+        (None, _) => false,
+        (Some(_), None) => true,
+    }
+}
+
 /// 快捷键键帽字段（152×28、圆角 7；键帽高 20、圆角 4、11pt）。
-/// 键帽组在字段内**水平居中**（原型 §2.4）。点击不进入录制（后续 plan）。
+///
+/// 键帽组在字段内**水平居中**（原型 §2.4）。空闲点击 → 开始录制；
+/// 录制本槽显示「准备录制…/按下快捷键…」，再次点击取消；录制另一槽时点击切换。
+/// 就绪后本字段消费按键（Esc 取消 / 合法组合提交 / 非法或重复显示内联错误）。
 fn draw_keycap_field(
     ui: &mut egui::Ui,
     rect: egui::Rect,
+    slot: HotkeySlot,
     keys: &[String],
-    id_salt: &'static str,
+    data: &SettingsData,
     palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
 ) {
-    // 两行快捷键字段同帧并存:交互 id 必须按行区分(否则 hover 命中互相覆盖)。
+    // 两行字段同帧并存:交互 id 按槽区分(否则 hover 命中互相覆盖);几何留到下帧。
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(keycap_field_id(slot), rect));
+    let recording = data.recording == Some(slot);
     let response = ui.interact(
         rect,
-        ui.scope_id().with(("settings-keycaps", id_salt)),
+        ui.scope_id().with(("settings-keycaps", slot)),
         egui::Sense::click(),
     );
-    let fill = if response.is_pointer_button_down_on() {
+    let clicked = response.clicked();
+    let fill = if recording {
+        if response.is_pointer_button_down_on() {
+            palette.segment_selected_fill.gamma_multiply(0.8)
+        } else if response.hovered() {
+            palette.segment_selected_fill.gamma_multiply(0.9)
+        } else {
+            palette.segment_selected_fill
+        }
+    } else if response.is_pointer_button_down_on() {
         palette.control_fill.gamma_multiply(2.0)
     } else if response.hovered() {
         palette.control_fill.gamma_multiply(1.5)
@@ -615,6 +753,50 @@ fn draw_keycap_field(
     let painter = ui.painter().clone();
     painter.rect_filled(rect, egui::CornerRadius::same(FIELD_RADIUS), fill);
 
+    if recording {
+        let prompt = if data.recording_ready {
+            RECORDING_PROMPT
+        } else {
+            RECORDING_PREPARING
+        };
+        draw_text(
+            ui,
+            rect.shrink2(egui::vec2(FIELD_PAD_X, 0.0)),
+            prompt,
+            FIELD_FONT,
+            palette.segment_selected_text,
+            egui::Align2::CENTER_CENTER,
+        );
+        if data.recording_ready {
+            capture_recorded_key(ui, slot, data, actions);
+        }
+        let _ = response.on_hover_text("按 Esc 取消录制");
+    } else {
+        draw_keycaps(ui, rect, keys, &painter, palette);
+        let _ = response.on_hover_text(if data.recording.is_some() {
+            "点击改为录制此快捷键"
+        } else {
+            "点击录制快捷键"
+        });
+    }
+
+    if clicked {
+        actions.push(if recording {
+            SettingsAction::CancelHotkeyRecord
+        } else {
+            SettingsAction::BeginHotkeyRecord(slot)
+        });
+    }
+}
+
+/// 键帽组绘制（字段内水平居中；过宽时从左截断）。
+fn draw_keycaps(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    keys: &[String],
+    painter: &egui::Painter,
+    palette: &SettingsPalette,
+) {
     let widths: Vec<f32> = keys
         .iter()
         .map(|key| text_width(ui, key, KEYCAP_FONT) + 2.0 * KEYCAP_PAD_X)
@@ -645,6 +827,87 @@ fn draw_keycap_field(
             palette.keycap_text,
         );
         x += width + KEYCAP_GAP;
+    }
+}
+
+/// 录制就绪时取本帧第一个非修饰按键；所有按下事件一律消费。
+///
+/// 纯修饰键（⇧⌃⌥⌘）只更新修饰态，不当作一次录制结果；重复事件忽略。
+/// Esc 由调用方解释为取消；其余键经 `hotkey_keys::from_egui` 翻译。
+fn take_recorded_key(ui: &egui::Ui) -> Option<(egui::Key, egui::Modifiers)> {
+    ui.input_mut(|input| {
+        let mut captured = None;
+        let mut retained = Vec::with_capacity(input.events.len());
+        for event in input.events.drain(..) {
+            match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    if !repeat && captured.is_none() && !is_modifier_key(key) {
+                        captured = Some((key, modifiers));
+                    }
+                }
+                other => retained.push(other),
+            }
+        }
+        input.events = retained;
+        captured
+    })
+}
+
+/// 纯修饰键：录制期只改修饰态，不产生「不支持该键」。
+fn is_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
+}
+
+/// 另一槽当前注册键（重复校验；录制挂起期快照仍是旧键）。
+fn other_slot_hotkey(data: &SettingsData, slot: HotkeySlot) -> Option<HotKey> {
+    match slot {
+        HotkeySlot::Palette => data.hotkeys.window,
+        HotkeySlot::Window => data.hotkeys.palette,
+    }
+}
+
+/// 一次按键 → 动作（Esc 取消 / 非法与重复错误 / 合法提交）。
+fn capture_recorded_key(
+    ui: &egui::Ui,
+    slot: HotkeySlot,
+    data: &SettingsData,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let Some((key, modifiers)) = take_recorded_key(ui) else {
+        return;
+    };
+    if key == egui::Key::Escape {
+        actions.push(SettingsAction::CancelHotkeyRecord);
+        return;
+    }
+    match hotkey_keys::from_egui(key, modifiers) {
+        Ok(hotkey) if other_slot_hotkey(data, slot) == Some(hotkey) => {
+            actions.push(SettingsAction::HotkeyError {
+                slot,
+                message: hotkey::DUPLICATE_HOTKEY_MESSAGE.to_owned(),
+            });
+        }
+        Ok(hotkey) => actions.push(SettingsAction::CommitHotkey { slot, hotkey }),
+        Err(err) => actions.push(SettingsAction::HotkeyError {
+            slot,
+            message: err.to_string(),
+        }),
     }
 }
 
@@ -837,11 +1100,24 @@ fn draw_remove_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hotkey::{HotkeySlot, HotkeySnapshot};
     use crate::ui::font as ui_font_module;
     use crate::ui::settings_tokens::{SETTINGS_H, SETTINGS_W};
+    use global_hotkey::hotkey::{Code, Modifiers};
 
-    /// headless 布局数据:默认键帽 + 三项目录（不触 Shared）。
+    /// headless 布局数据:默认键帽（经快照填充） + 三项目录（不触 Shared）。
     fn layout_test_data() -> SettingsData {
+        let hotkeys = HotkeySnapshot {
+            palette: Some(HotKey::new(Some(Modifiers::ALT), Code::Space)),
+            window: Some(HotKey::new(
+                Some(Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyF,
+            )),
+            palette_keys: vec!["⌥".into(), "Space".into()],
+            window_keys: vec!["⌥".into(), "⇧".into(), "F".into()],
+            note: None,
+            window_note: None,
+        };
         SettingsData {
             font_size: FontSize::Standard,
             autostart: false,
@@ -849,8 +1125,12 @@ mod tests {
             autostart_error: None,
             font_error: None,
             language: LANGUAGE_LABEL,
-            palette_keys: vec!["⌥".into(), "Space".into()],
-            window_keys: vec!["⌥".into(), "⇧".into(), "F".into()],
+            palette_keys: hotkeys.palette_keys.clone(),
+            window_keys: hotkeys.window_keys.clone(),
+            hotkeys,
+            recording: None,
+            recording_ready: false,
+            hotkey_error: None,
             excluded: vec!["~/Library".into(), "node_modules".into(), ".git".into()],
         }
     }
@@ -932,6 +1212,55 @@ mod tests {
             vec![egui::Event::PointerMoved(pos), pointer_button(pos, false)],
         )
         .1
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// 跑一帧按键事件；返回动作 + 帧末是否仍有按键事件（消费断言）。
+    fn run_key(ctx: &egui::Context, data: &SettingsData, event: egui::Event) -> (BodyOutput, bool) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SETTINGS_W, SETTINGS_H),
+            )),
+            events: vec![event],
+            ..Default::default()
+        };
+        let mut body = None;
+        let mut leftover = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            body = Some(draw_body(ui, data));
+            leftover = ui.ctx().input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { .. }))
+            });
+        });
+        out.textures_delta.clear();
+        (body.expect("draw_body 未运行"), leftover)
+    }
+
+    /// 键帽字段中心（字段固定宽 152，右对齐；y = 同行标签中心）。
+    fn keycap_field_center(out: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        let texts = all_texts(out);
+        let label = find_text(&texts, label);
+        egui::pos2(
+            SETTINGS_W - CONTENT_PAD.1 - ROW_PAD_X - FIELD.0 / 2.0,
+            text_center(label).y,
+        )
+    }
+
+    fn click_keycap(ctx: &egui::Context, data: &SettingsData, label: &str) -> BodyOutput {
+        let (out, _) = run_frame(ctx, data, Vec::new());
+        click_at(ctx, data, keycap_field_center(&out, label))
     }
 
     fn all_texts(out: &egui::FullOutput) -> Vec<egui::epaint::TextShape> {
@@ -1203,6 +1532,325 @@ mod tests {
         );
         let output = click_at(&ctx, &data, switch);
         assert_eq!(output.actions, vec![SettingsAction::SetAutostart(true)]);
+    }
+
+    fn recording_data(slot: HotkeySlot) -> SettingsData {
+        let mut data = layout_test_data();
+        data.recording = Some(slot);
+        data.recording_ready = true;
+        data
+    }
+
+    /// 空闲点击两个键帽字段 → 各槽 Begin（字段 id 按槽区分，不互相抢占）。
+    #[test]
+    fn keycap_click_emits_begin_for_each_slot() {
+        let data = layout_test_data();
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        assert_eq!(
+            click_keycap(&ctx, &data, "唤起快捷键").actions,
+            vec![SettingsAction::BeginHotkeyRecord(HotkeySlot::Palette)]
+        );
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        assert_eq!(
+            click_keycap(&ctx, &data, "完整窗口快捷键").actions,
+            vec![SettingsAction::BeginHotkeyRecord(HotkeySlot::Window)]
+        );
+    }
+
+    /// 录制本槽：准备阶段显示「准备录制…」，就绪显示「按下快捷键…」；旧键帽隐藏。
+    #[test]
+    fn recording_field_shows_prompts_and_hides_old_keycaps() {
+        let mut data = layout_test_data();
+        data.recording = Some(HotkeySlot::Palette);
+        data.recording_ready = false;
+        let out = run_body(&data);
+        let labels: Vec<String> = all_texts(&out)
+            .iter()
+            .map(|text| text.galley.text().to_owned())
+            .collect();
+        assert!(
+            labels.iter().any(|text| text == RECORDING_PREPARING),
+            "准备阶段须显示 {RECORDING_PREPARING:?}:实际 {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|text| text == "Space"),
+            "录制中不得再画本槽旧键帽（另一槽仍显示）:实际 {labels:?}"
+        );
+
+        data.recording_ready = true;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(
+            labels.iter().any(|text| text == RECORDING_PROMPT),
+            "就绪后须显示 {RECORDING_PROMPT:?}:实际 {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|text| text == "Space"),
+            "录制中不得再画本槽旧键帽"
+        );
+    }
+
+    /// 点击录制中的字段 = 取消；按下帧不提前取消（同一操作只产生一条取消）。
+    #[test]
+    fn recording_click_cancels_only_on_release() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Palette);
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let field = keycap_field_center(&out, "唤起快捷键");
+
+        let pressed = run_frame(
+            &ctx,
+            &data,
+            vec![
+                egui::Event::PointerMoved(field),
+                pointer_button(field, true),
+            ],
+        )
+        .1;
+        assert!(
+            pressed.actions.is_empty(),
+            "录制字段按下不得提前取消（抬起时统一取消）:{:?}",
+            pressed.actions
+        );
+
+        let released = run_frame(
+            &ctx,
+            &data,
+            vec![
+                egui::Event::PointerMoved(field),
+                pointer_button(field, false),
+            ],
+        )
+        .1;
+        assert_eq!(released.actions, vec![SettingsAction::CancelHotkeyRecord]);
+    }
+
+    /// 点击录制槽之外 → 取消；点击另一键帽字段 → 开始新槽（设置 pass 先取消旧槽）。
+    #[test]
+    fn click_away_cancels_and_other_field_starts_new_slot() {
+        let data = recording_data(HotkeySlot::Palette);
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        run_frame(&ctx, &data, Vec::new());
+        let away = egui::pos2(120.0, 300.0);
+        let pressed = run_frame(
+            &ctx,
+            &data,
+            vec![egui::Event::PointerMoved(away), pointer_button(away, true)],
+        )
+        .1;
+        assert_eq!(
+            pressed.actions,
+            vec![SettingsAction::CancelHotkeyRecord],
+            "点击录制字段之外须取消"
+        );
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        assert_eq!(
+            click_keycap(&ctx, &data, "完整窗口快捷键").actions,
+            vec![SettingsAction::BeginHotkeyRecord(HotkeySlot::Window)],
+            "另一字段点击应开始该槽录制（取消由设置 pass 补入队）"
+        );
+    }
+
+    /// 就绪录制：⌥K → 提交动作；按键事件被消费。
+    #[test]
+    fn recorded_key_commits_and_is_consumed() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Palette);
+        let (output, leftover) =
+            run_key(&ctx, &data, key_event(egui::Key::K, egui::Modifiers::ALT));
+        let expected = hotkey_keys::from_egui(egui::Key::K, egui::Modifiers::ALT).unwrap();
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CommitHotkey {
+                slot: HotkeySlot::Palette,
+                hotkey: expected,
+            }]
+        );
+        assert!(!leftover, "录制按键必须被消费，不得触发其它 UI");
+    }
+
+    /// Esc → 取消；按键事件被消费。
+    #[test]
+    fn escape_cancels_recording_and_is_consumed() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Window);
+        let (output, leftover) = run_key(
+            &ctx,
+            &data,
+            key_event(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+        assert_eq!(output.actions, vec![SettingsAction::CancelHotkeyRecord]);
+        assert!(!leftover, "Esc 须被录制消费");
+    }
+
+    /// 无修饰键 → 内联错误（录制继续，不提交）；事件同样被消费。
+    #[test]
+    fn invalid_recorded_key_reports_inline_error() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Palette);
+        let (output, leftover) =
+            run_key(&ctx, &data, key_event(egui::Key::K, egui::Modifiers::NONE));
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::HotkeyError {
+                slot: HotkeySlot::Palette,
+                message: "需包含修饰键".to_owned(),
+            }]
+        );
+        assert!(!leftover);
+    }
+
+    /// 纯修饰键按下只更新修饰态：不报错、不提交，被消费。
+    #[test]
+    fn modifier_press_is_ignored_during_recording() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = recording_data(HotkeySlot::Palette);
+        let (output, leftover) = run_key(
+            &ctx,
+            &data,
+            key_event(egui::Key::ShiftLeft, egui::Modifiers::SHIFT),
+        );
+        assert!(output.actions.is_empty(), "{:?}", output.actions);
+        assert!(!leftover, "修饰键事件也应被录制消费");
+    }
+
+    /// 与另一槽相同 → 本地拒绝（内联错误），不产生提交。
+    #[test]
+    fn duplicate_with_other_slot_is_rejected_inline() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut data = recording_data(HotkeySlot::Palette);
+        data.hotkeys.window = Some(HotKey::new(Some(Modifiers::ALT), Code::KeyK));
+        let (output, _) = run_key(&ctx, &data, key_event(egui::Key::K, egui::Modifiers::ALT));
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::HotkeyError {
+                slot: HotkeySlot::Palette,
+                message: hotkey::DUPLICATE_HOTKEY_MESSAGE.to_owned(),
+            }]
+        );
+    }
+
+    /// App 尚未 suspend（ready=false）时不抢按键，也不产生动作。
+    #[test]
+    fn capture_waits_until_recording_ready() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut data = recording_data(HotkeySlot::Palette);
+        data.recording_ready = false;
+        let (output, leftover) =
+            run_key(&ctx, &data, key_event(egui::Key::K, egui::Modifiers::ALT));
+        assert!(output.actions.is_empty(), "{:?}", output.actions);
+        assert!(leftover, "未就绪不得消费按键");
+    }
+
+    /// 行内错误：增高快捷键行、绘制错误文案，并位于该行与下一行之间。
+    #[test]
+    fn hotkey_error_row_adds_height_and_draws_text() {
+        let baseline = run_body(&layout_test_data());
+        let baseline_window = text_center(find_text(&all_texts(&baseline), "完整窗口快捷键")).y;
+
+        let mut data = layout_test_data();
+        data.hotkey_error = Some((HotkeySlot::Palette, "需包含修饰键".into()));
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let window_y = text_center(find_text(&texts, "完整窗口快捷键")).y;
+        assert!(
+            window_y > baseline_window + 10.0,
+            "快捷键错误必须增高行:基线 {baseline_window},错误 {window_y}"
+        );
+        let palette_y = text_center(find_text(&texts, "唤起快捷键")).y;
+        let error_y = text_center(find_text(&texts, "需包含修饰键")).y;
+        assert!(
+            error_y > palette_y && error_y < window_y,
+            "错误须显示在唤起快捷键行下方(palette {palette_y}, error {error_y}, window {window_y})"
+        );
+    }
+
+    /// 回落提示按槽绘制：`note` 增高唤起行，`window_note` 增高完整窗口行；
+    /// 错误与提示同时存在时各占一行。
+    #[test]
+    fn hotkey_notes_add_height_and_are_drawn_per_slot() {
+        let baseline = run_body(&layout_test_data());
+        let baseline_index = text_center(find_text(&all_texts(&baseline), "索引")).y;
+
+        let mut data = layout_test_data();
+        data.hotkeys.note = Some("唤起槽回落提示".into());
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(labels.iter().any(|text| text == "唤起槽回落提示"));
+        let with_note_index = text_center(find_text(&texts, "索引")).y;
+        assert!(
+            with_note_index > baseline_index + 10.0,
+            "唤起槽提示必须增高行:基线 {baseline_index},提示 {with_note_index}"
+        );
+
+        data.hotkeys.window_note = Some("窗口槽回落提示".into());
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(labels.iter().any(|text| text == "窗口槽回落提示"));
+        let both_index = text_center(find_text(&texts, "索引")).y;
+        assert!(
+            both_index > with_note_index + 10.0,
+            "窗口槽提示必须再增高一行:单提示 {with_note_index},双提示 {both_index}"
+        );
+
+        let mut data = layout_test_data();
+        data.hotkey_error = Some((HotkeySlot::Palette, "错误行".into()));
+        data.hotkeys.note = Some("提示行".into());
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(labels.iter().any(|text| text == "错误行"));
+        assert!(labels.iter().any(|text| text == "提示行"));
+        let error_note_index = text_center(find_text(&texts, "索引")).y;
+        let mut error_only = layout_test_data();
+        error_only.hotkey_error = Some((HotkeySlot::Palette, "错误行".into()));
+        let out = run_body(&error_only);
+        let error_only_index = text_center(find_text(&all_texts(&out), "索引")).y;
+        assert!(
+            error_note_index > error_only_index + 10.0,
+            "错误 + 提示须各占一行:仅错误 {error_only_index},两者 {error_note_index}"
+        );
+    }
+
+    /// 键帽展示以快照为准（不再有硬编码默认键）。
+    #[test]
+    fn keycap_display_comes_from_snapshot() {
+        let mut data = layout_test_data();
+        data.hotkeys.palette = Some(HotKey::new(
+            Some(Modifiers::CONTROL | Modifiers::ALT),
+            Code::KeyK,
+        ));
+        data.hotkeys.palette_keys = vec!["⌃".into(), "⌥".into(), "K".into()];
+        data.palette_keys = data.hotkeys.palette_keys.clone();
+
+        let out = run_body(&data);
+        let labels: Vec<String> = all_texts(&out)
+            .iter()
+            .map(|text| text.galley.text().to_owned())
+            .collect();
+        assert!(labels.iter().any(|text| text == "K"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|text| text == "Space"),
+            "展示须来自快照而非硬编码默认:{labels:?}"
+        );
     }
 
     /// 大字号冒烟:文本仍齐全、布局不 panic（可能整页滚动）。

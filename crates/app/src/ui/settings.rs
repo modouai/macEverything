@@ -3,18 +3,21 @@
 //! 第三个 deferred 视口（与悬浮条同模式：隐藏走 `Visible(false)`，窗口保留不销毁）。
 //! 本文件负责视口/运行期状态/行为编排：`draw` 短暂持锁取快照 → 锁外绘制
 //! （`ui/settings_view.rs` 纯视图）→ 锁外落地字号/自启动作（保存与 SMAppService
-//! 调用不持共享锁）。标题栏固定，内容区整页纵向滚动。
+//! 调用不持共享锁）；快捷键动作只入共享态命令队列，由主线程 `App::logic`
+//! 调 `HotkeyRuntime`（Carbon manager 只能主线程）。标题栏固定，内容区整页纵向滚动。
 //!
 //! 窗口交互：标题栏可拖拽（左侧预留原生交通灯）、红点/⌘W = 隐藏（不退出 App）。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui;
+use global_hotkey::hotkey::HotKey;
 
 use crate::autostart::{self, Status};
-use crate::hotkey::HotkeySnapshot;
+use crate::hotkey::{HotkeySlot, HotkeySnapshot};
 use crate::platform;
 use crate::settings::{self as store, FontSize, SettingsFile};
 use crate::ui::{
@@ -52,6 +55,20 @@ pub fn builder() -> egui::ViewportBuilder {
         .with_visible(false)
 }
 
+/// 设置页 → App 的快捷键命令（录制 / 取消 / 提交）。
+///
+/// 设置 pass 只入队；注册/注销必须在主线程由 `App::logic` 调
+/// `HotkeyRuntime`（Carbon manager 约束），因此命令跨帧存放在共享态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotkeyCommand {
+    /// 点击键帽字段进入录制（App 侧挂起全局热键）。
+    BeginRecord(HotkeySlot),
+    /// 取消录制（App 侧恢复旧键）。
+    CancelRecord,
+    /// 提交录制结果（App 侧校验/注册/落盘；失败退出录制并回滚旧键）。
+    Commit { slot: HotkeySlot, hotkey: HotKey },
+}
+
 /// 设置窗口运行期真源：开合 + 设置快照 + 自启/字号错误 + 渲染数据。
 ///
 /// 本结构持有运行期数据（不每帧重建 `engine::config::default_config()`）；
@@ -59,9 +76,9 @@ pub fn builder() -> egui::ViewportBuilder {
 /// 真实 daemon 列表由 Task 8 接入。
 pub struct SettingsState {
     pub(crate) open: bool,
-    /// 已加载的 `settings.toml` 快照（字号写入在此更新）。
+    /// 已加载的 `settings.toml` 快照（字号/快捷键写入在此更新）。
     pub(crate) file: SettingsFile,
-    /// 设置文件所在数据目录（保存字号用）。
+    /// 设置文件所在数据目录（保存字号/快捷键用）。
     pub(crate) data_dir: PathBuf,
     /// 实际自启态（仅 `Status::Enabled` 为 true）；`None` = 尚未查询或查询失败。
     pub(crate) autostart: Option<bool>,
@@ -72,20 +89,21 @@ pub struct SettingsState {
     pub(crate) font_error: Option<String>,
     /// 排除目录（Task 8 前为引擎默认值，仅种一次）。
     pub(crate) excluded: Vec<String>,
-    /// 唤起快捷键键帽（内置默认；快捷键 plan 接入后更新）。
-    pub(crate) palette_keys: Vec<String>,
-    /// 完整窗口快捷键键帽（内置默认）。
-    pub(crate) window_keys: Vec<String>,
-    /// 全局热键运行时快照（H2 启动种子；H3 录制/展示真源）。
-    // H3 设置页消费前仅有写入;临时 allow,接入后删除。
-    #[allow(dead_code)]
+    /// 全局热键运行时快照（H2 启动种子；键帽展示/查重的唯一真源）。
     pub(crate) hotkey_snapshot: HotkeySnapshot,
+    /// 当前录制槽（None = 未录制）；录制期全局热键已挂起。
+    pub(crate) recording: Option<HotkeySlot>,
+    /// App 已完成 suspend、可以开始接收按键（准备期显示「准备录制…」）。
+    pub(crate) recording_ready: bool,
+    /// 最近一条快捷键内联错误（按槽定位：校验/冲突/注册失败/保存失败）。
+    pub(crate) hotkey_error: Option<(HotkeySlot, String)>,
+    /// 待 `App::logic` 消费的快捷键命令（FIFO；设置 pass 不碰运行时）。
+    pub(crate) hotkey_commands: VecDeque<HotkeyCommand>,
     /// 设置页切换自启成功后待同步给托盘的值（App::logic 消费）。
     pub(crate) tray_autostart_sync: Option<bool>,
     /// 首次打开已完成定位决策：之后重开只置前，保留用户拖动后的位置。
     pub(crate) positioned_once: bool,
-    /// 关闭/⌘W 后待消费的「取消录制」信号（快捷键 plan 接入；当前无录制状态，
-    /// `App::logic` 取走并留痕，避免标志跨帧残留）。
+    /// 关闭/⌘W 后待消费的「取消录制」信号；`App::logic` 取走并在录制中恢复旧键。
     pub(crate) cancel_recording_pending: bool,
 }
 
@@ -106,9 +124,11 @@ impl SettingsState {
             autostart_error: None,
             font_error: None,
             excluded: engine::config::default_config().excluded,
-            palette_keys: vec!["⌥".to_owned(), "Space".to_owned()],
-            window_keys: vec!["⌥".to_owned(), "⇧".to_owned(), "F".to_owned()],
             hotkey_snapshot,
+            recording: None,
+            recording_ready: false,
+            hotkey_error: None,
+            hotkey_commands: VecDeque::new(),
             tray_autostart_sync: None,
             positioned_once: false,
             cancel_recording_pending: false,
@@ -135,9 +155,90 @@ impl SettingsState {
         self.cancel_recording_pending = true;
     }
 
-    /// 取走录制取消挂起（`App::logic` 消费；快捷键 plan 接入后在此恢复旧热键）。
+    /// 取走录制取消挂起（`App::logic` 消费；录制中由它恢复旧热键）。
     pub(crate) fn take_cancel_recording_pending(&mut self) -> bool {
         std::mem::take(&mut self.cancel_recording_pending)
+    }
+
+    /// 入队一条快捷键命令（设置 pass；纯状态，运行时调用仍在 App）。
+    ///
+    /// 切换槽位录制时补一条 `CancelRecord`：App 先恢复旧键再重新挂起，
+    /// 保证「先 resume 再 suspend」的明确语义（幂等，不会丢键）。
+    /// 已在录制目标槽时忽略重复 Begin（视图对同槽点击发的是 Cancel）。
+    pub(crate) fn queue_hotkey_command(&mut self, command: HotkeyCommand) {
+        match command {
+            HotkeyCommand::BeginRecord(slot) => {
+                if self.recording == Some(slot) {
+                    return;
+                }
+                if self.recording.is_some() {
+                    self.hotkey_commands.push_back(HotkeyCommand::CancelRecord);
+                }
+                self.hotkey_commands.push_back(command);
+            }
+            other => self.hotkey_commands.push_back(other),
+        }
+    }
+
+    /// 取走全部待处理命令（App::logic 在共享锁外逐条执行；FIFO）。
+    pub(crate) fn take_hotkey_commands(&mut self) -> Vec<HotkeyCommand> {
+        self.hotkey_commands.drain(..).collect()
+    }
+
+    /// App `suspend()` 完成后进入录制：切槽、可接收按键、清旧错误。
+    pub(crate) fn begin_recording(&mut self, slot: HotkeySlot, snapshot: HotkeySnapshot) {
+        self.recording = Some(slot);
+        self.recording_ready = true;
+        self.hotkey_error = None;
+        self.hotkey_snapshot = snapshot;
+    }
+
+    /// 取消录制/恢复旧键完成后落地：清录制态与错误，刷新快照。
+    pub(crate) fn end_recording(&mut self, snapshot: HotkeySnapshot) {
+        self.recording = None;
+        self.recording_ready = false;
+        self.hotkey_error = None;
+        self.hotkey_snapshot = snapshot;
+    }
+
+    /// 提交成功（运行时已注册新键）后落地：结束录制、写设置文件快照并返回待落盘副本。
+    ///
+    /// 保存由调用方在共享锁外执行；失败只回填内联错误，不回退已注册的键。
+    pub(crate) fn commit_recorded_hotkey(
+        &mut self,
+        slot: HotkeySlot,
+        hotkey: HotKey,
+        snapshot: HotkeySnapshot,
+    ) -> SettingsFile {
+        self.end_recording(snapshot);
+        match slot {
+            HotkeySlot::Palette => self.file.palette_hotkey = Some(hotkey),
+            HotkeySlot::Window => self.file.window_hotkey = Some(hotkey),
+        }
+        self.file.clone()
+    }
+
+    /// 提交失败（运行时已回滚旧键并退出挂起）后落地：结束录制 + 按槽内联错误。
+    pub(crate) fn recording_failed(
+        &mut self,
+        slot: HotkeySlot,
+        message: String,
+        snapshot: HotkeySnapshot,
+    ) {
+        self.recording = None;
+        self.recording_ready = false;
+        self.hotkey_error = Some((slot, message));
+        self.hotkey_snapshot = snapshot;
+    }
+
+    /// 提交成功但设置保存失败：键已生效，仅按槽落内联错误。
+    pub(crate) fn hotkey_save_failed(&mut self, slot: HotkeySlot, message: String) {
+        self.hotkey_error = Some((slot, message));
+    }
+
+    /// 视图侧校验/查重失败：录制继续，仅按槽显示错误（Esc/下次按键可重试）。
+    pub(crate) fn hotkey_rejected(&mut self, slot: HotkeySlot, message: String) {
+        self.hotkey_error = Some((slot, message));
     }
 
     /// 打开设置页的自启查询结果：成功按**真实状态**落地（审批中 → 关态 + 提示），
@@ -255,8 +356,12 @@ impl SettingsData {
             autostart_error: state.autostart_error.clone(),
             font_error: state.font_error.clone(),
             language: settings_view::LANGUAGE_LABEL,
-            palette_keys: state.palette_keys.clone(),
-            window_keys: state.window_keys.clone(),
+            palette_keys: state.hotkey_snapshot.palette_keys.clone(),
+            window_keys: state.hotkey_snapshot.window_keys.clone(),
+            hotkeys: state.hotkey_snapshot.clone(),
+            recording: state.recording,
+            recording_ready: state.recording_ready,
+            hotkey_error: state.hotkey_error.clone(),
             excluded: state.excluded.clone(),
         }
     }
@@ -357,7 +462,35 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
     match action {
         SettingsAction::SetFontSize(size) => apply_font_size(shared, ctx, size),
         SettingsAction::SetAutostart(enabled) => apply_autostart(shared, ctx, enabled),
+        SettingsAction::BeginHotkeyRecord(slot) => {
+            enqueue_hotkey_command(shared, ctx, HotkeyCommand::BeginRecord(slot))
+        }
+        SettingsAction::CancelHotkeyRecord => {
+            enqueue_hotkey_command(shared, ctx, HotkeyCommand::CancelRecord)
+        }
+        SettingsAction::CommitHotkey { slot, hotkey } => {
+            enqueue_hotkey_command(shared, ctx, HotkeyCommand::Commit { slot, hotkey })
+        }
+        SettingsAction::HotkeyError { slot, message } => {
+            // 视图侧校验/查重错误只落共享态；录制保持（下次按键可重试）。
+            lock_shared(shared).settings.hotkey_rejected(slot, message);
+            ctx.request_repaint_of(viewport_id());
+        }
     }
+}
+
+/// 快捷键命令入队（设置 pass 的唯一动作路径；不调用运行时 manager）。
+///
+/// 注册/注销只能在主线程 `App::logic` 执行，这里只入队并唤醒根视口消费；
+/// 根窗可能隐藏，repaint 有 ≥100ms 节流但设置页操作可接受（design §2.3）。
+fn enqueue_hotkey_command(
+    shared: &Arc<Mutex<Shared>>,
+    ctx: &egui::Context,
+    command: HotkeyCommand,
+) {
+    lock_shared(shared).settings.queue_hotkey_command(command);
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    ctx.request_repaint_of(viewport_id());
 }
 
 /// 字号即时生效：全局倍率 → 重装基础样式 → 落盘（失败仅内联留痕）→ 更新状态 → 重绘。
@@ -428,14 +561,14 @@ fn apply_autostart(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bo
 
 /// 隐藏设置窗口（红点关闭 / ⌘W 共用）：开合态置 false + 挂起录制取消 + 下发隐藏命令。
 /// 命令只入 egui 队列，不销毁视口——再次打开仍是同一实例。
-/// 录制取消挂起由 `App::logic` 消费（快捷键 plan 接入点，当前无录制状态）。
+/// 录制取消挂起由 `App::logic` 消费：录制中恢复旧热键，未录制则无操作。
 fn hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
     hide_with_command(&mut lock_shared(shared).settings, ctx);
     log::info!("设置窗口隐藏(open=false;录制取消挂起)");
 }
 
 /// 隐藏的状态 + egui 命令（纯粘合，headless 测）：开合态/录制取消挂起 +
-/// `Visible(false)` + 唤醒根视口消费挂起（无录制态时仅留痕）。
+/// `Visible(false)` + 唤醒根视口消费挂起（录制中恢复旧热键）。
 fn hide_with_command(state: &mut SettingsState, ctx: &egui::Context) {
     state.mark_hidden();
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -446,6 +579,7 @@ fn hide_with_command(state: &mut SettingsState, ctx: &egui::Context) {
 mod tests {
     use super::*;
     use crate::settings::{FontSize, SettingsFile};
+    use global_hotkey::hotkey::{Code, Modifiers};
 
     fn test_state() -> SettingsState {
         SettingsState::new(
@@ -453,6 +587,38 @@ mod tests {
             PathBuf::from("/tmp/mace-everything-settings-test"),
             HotkeySnapshot::default(),
         )
+    }
+
+    fn hotkey(mods: Modifiers, code: Code) -> HotKey {
+        HotKey::new(Some(mods), code)
+    }
+
+    fn alt_space() -> HotKey {
+        hotkey(Modifiers::ALT, Code::Space)
+    }
+
+    fn alt_shift_f() -> HotKey {
+        hotkey(Modifiers::ALT | Modifiers::SHIFT, Code::KeyF)
+    }
+
+    fn alt_k() -> HotKey {
+        hotkey(Modifiers::ALT, Code::KeyK)
+    }
+
+    /// 构造展示键帽与键位一致的快照（避免测试自己拼 ⌥/Space 文案）。
+    fn hotkey_snapshot(palette: Option<HotKey>, window: Option<HotKey>) -> HotkeySnapshot {
+        HotkeySnapshot {
+            palette_keys: palette
+                .map(crate::ui::hotkey_keys::display_keys)
+                .unwrap_or_default(),
+            window_keys: window
+                .map(crate::ui::hotkey_keys::display_keys)
+                .unwrap_or_default(),
+            palette,
+            window,
+            note: None,
+            window_note: None,
+        }
     }
 
     /// 运行期真源只种一次默认值：排除目录 = 引擎默认、默认键帽、自启未知。
@@ -466,17 +632,16 @@ mod tests {
         assert!(state.autostart_error.is_none());
         assert!(state.font_error.is_none());
         assert_eq!(state.excluded, engine::config::default_config().excluded);
-        assert_eq!(state.palette_keys, vec!["⌥".to_owned(), "Space".to_owned()]);
-        assert_eq!(
-            state.window_keys,
-            vec!["⌥".to_owned(), "⇧".to_owned(), "F".to_owned()]
-        );
         assert_eq!(state.tray_autostart_sync, None);
         assert_eq!(
             state.hotkey_snapshot,
             HotkeySnapshot::default(),
             "快照由 App::new 植入,构造时为默认空值"
         );
+        assert_eq!(state.recording, None);
+        assert!(!state.recording_ready);
+        assert_eq!(state.hotkey_error, None);
+        assert!(state.hotkey_commands.is_empty());
         assert!(!state.positioned_once, "首开前未定位");
         assert!(!state.cancel_recording_pending);
     }
@@ -544,6 +709,209 @@ mod tests {
             "隐藏须下发 Visible(false)"
         );
         out.textures_delta.clear();
+    }
+
+    /// 队列顺序：切槽先补取消；同槽重复 Begin 忽略；Commit/Cancel 保持 FIFO。
+    #[test]
+    fn hotkey_commands_queue_in_order() {
+        let mut state = test_state();
+
+        // 正在录制唤起槽时切到完整窗口槽 → App 先 resume 再 suspend。
+        state.recording = Some(HotkeySlot::Palette);
+        state.queue_hotkey_command(HotkeyCommand::BeginRecord(HotkeySlot::Window));
+        assert_eq!(
+            state.take_hotkey_commands(),
+            vec![
+                HotkeyCommand::CancelRecord,
+                HotkeyCommand::BeginRecord(HotkeySlot::Window)
+            ],
+            "切换录制槽必须先取消旧槽"
+        );
+
+        // 已在录制该槽：重复 Begin 忽略（视图对同槽点击发 Cancel）。
+        state.recording = Some(HotkeySlot::Window);
+        state.queue_hotkey_command(HotkeyCommand::BeginRecord(HotkeySlot::Window));
+        assert!(state.hotkey_commands.is_empty(), "同槽重复 Begin 不得入队");
+
+        state.queue_hotkey_command(HotkeyCommand::Commit {
+            slot: HotkeySlot::Window,
+            hotkey: alt_k(),
+        });
+        state.queue_hotkey_command(HotkeyCommand::CancelRecord);
+        assert_eq!(
+            state.take_hotkey_commands(),
+            vec![
+                HotkeyCommand::Commit {
+                    slot: HotkeySlot::Window,
+                    hotkey: alt_k()
+                },
+                HotkeyCommand::CancelRecord
+            ],
+            "命令须 FIFO 落地"
+        );
+        assert!(state.hotkey_commands.is_empty(), "取走即清");
+    }
+
+    /// 进入录制：清旧错误、置 ready、快照保持运行时真源；结束录制清全部录制态。
+    #[test]
+    fn begin_and_end_recording_transitions() {
+        let mut state = test_state();
+        let before = hotkey_snapshot(Some(alt_space()), Some(alt_shift_f()));
+        state.hotkey_error = Some((HotkeySlot::Palette, "旧错误".into()));
+
+        state.begin_recording(HotkeySlot::Palette, before.clone());
+        assert_eq!(state.recording, Some(HotkeySlot::Palette));
+        assert!(state.recording_ready, "App suspend 完成后即可接收按键");
+        assert_eq!(state.hotkey_error, None, "新录制清旧错误");
+        assert_eq!(state.hotkey_snapshot, before, "挂起期快照仍显示旧键");
+
+        let after = hotkey_snapshot(Some(alt_space()), None);
+        state.hotkey_error = Some((HotkeySlot::Window, "提示".into()));
+        state.end_recording(after.clone());
+        assert_eq!(state.recording, None);
+        assert!(!state.recording_ready);
+        assert_eq!(state.hotkey_error, None);
+        assert_eq!(state.hotkey_snapshot, after);
+    }
+
+    /// 提交成功：结束录制、目标槽写入设置文件并原子落盘；另一槽不变。
+    #[test]
+    fn commit_success_updates_file_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SettingsState::new(
+            SettingsFile::default(),
+            dir.path().to_path_buf(),
+            hotkey_snapshot(Some(alt_space()), Some(alt_shift_f())),
+        );
+        state.begin_recording(HotkeySlot::Palette, state.hotkey_snapshot.clone());
+
+        let committed = alt_k();
+        let next = hotkey_snapshot(Some(committed), Some(alt_shift_f()));
+        let file = state.commit_recorded_hotkey(HotkeySlot::Palette, committed, next.clone());
+
+        assert_eq!(state.recording, None);
+        assert!(!state.recording_ready);
+        assert_eq!(state.hotkey_error, None);
+        assert_eq!(state.hotkey_snapshot, next, "提交成功须刷新展示快照");
+        assert_eq!(state.file.palette_hotkey, Some(committed));
+        assert_eq!(state.file.window_hotkey, None, "未提交的槽不得被写入默认键");
+        assert_eq!(file, state.file, "返回副本供锁外保存");
+
+        crate::settings::save(dir.path(), &file).unwrap();
+        let loaded = crate::settings::load(dir.path());
+        assert_eq!(loaded.palette_hotkey, Some(committed), "重启后读回");
+        assert_eq!(loaded.window_hotkey, None);
+    }
+
+    /// 提交失败：运行时已恢复旧键 → 结束录制、按槽落内联错误、文件不变。
+    #[test]
+    fn commit_failure_ends_recording_and_keeps_old_key() {
+        let mut state = test_state();
+        let old = hotkey_snapshot(Some(alt_space()), None);
+        state.begin_recording(HotkeySlot::Palette, old.clone());
+
+        state.recording_failed(
+            HotkeySlot::Palette,
+            "注册失败(可能被系统或其他应用占用): 被占用".into(),
+            old.clone(),
+        );
+
+        assert_eq!(state.recording, None, "失败退出录制（旧键已恢复）");
+        assert!(!state.recording_ready);
+        assert_eq!(state.hotkey_snapshot, old, "回滚后的快照 = 旧键");
+        assert_eq!(
+            state.hotkey_error,
+            Some((
+                HotkeySlot::Palette,
+                "注册失败(可能被系统或其他应用占用): 被占用".to_owned()
+            ))
+        );
+        assert_eq!(state.file.palette_hotkey, None, "失败不得落盘新键");
+    }
+
+    /// 保存失败：键已注册/展示，仅按槽留内联错误；内存设置文件保留新键。
+    #[test]
+    fn save_failure_keeps_registered_key_and_reports_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SettingsState::new(
+            SettingsFile::default(),
+            dir.path().to_path_buf(),
+            hotkey_snapshot(Some(alt_space()), None),
+        );
+        // 目标路径被目录占用 → rename 失败（与 settings::save 的失败测同法）。
+        std::fs::create_dir(crate::settings::path(dir.path())).unwrap();
+
+        state.begin_recording(HotkeySlot::Palette, state.hotkey_snapshot.clone());
+        let committed = alt_k();
+        let next = hotkey_snapshot(Some(committed), None);
+        let file = state.commit_recorded_hotkey(HotkeySlot::Palette, committed, next.clone());
+        let err = crate::settings::save(&state.data_dir, &file).unwrap_err();
+        state.hotkey_save_failed(
+            HotkeySlot::Palette,
+            format!("快捷键已生效,但设置保存失败:{err:#}"),
+        );
+
+        assert_eq!(
+            state.hotkey_snapshot.palette,
+            Some(committed),
+            "保存失败不得回退已注册键"
+        );
+        assert_eq!(state.file.palette_hotkey, Some(committed));
+        assert_eq!(state.recording, None);
+        assert!(
+            state.hotkey_error.as_ref().is_some_and(|(slot, message)| {
+                *slot == HotkeySlot::Palette && message.contains("设置保存失败")
+            }),
+            "保存失败须落内联错误:{:?}",
+            state.hotkey_error
+        );
+    }
+
+    /// 视图侧校验/查重错误不结束录制（用户可重按或 Esc）。
+    #[test]
+    fn rejected_key_keeps_recording_with_inline_error() {
+        let mut state = test_state();
+        state.begin_recording(HotkeySlot::Palette, HotkeySnapshot::default());
+        state.hotkey_rejected(HotkeySlot::Palette, "需包含修饰键".into());
+        assert_eq!(state.recording, Some(HotkeySlot::Palette));
+        assert!(state.recording_ready);
+        assert_eq!(
+            state.hotkey_error,
+            Some((HotkeySlot::Palette, "需包含修饰键".to_owned()))
+        );
+    }
+
+    /// 关闭/⌘W：挂起信号在录制中消费 = App 恢复旧键并结束录制；未录制作 no-op。
+    #[test]
+    fn close_cancel_signal_resolves_recording_only_when_active() {
+        let mut state = test_state();
+        state.request_open();
+        state.recording = Some(HotkeySlot::Window);
+        state.recording_ready = true;
+        state.hotkey_error = Some((HotkeySlot::Window, "错误".into()));
+        state.mark_hidden();
+
+        assert!(!state.open);
+        assert!(state.take_cancel_recording_pending(), "关闭须挂起取消");
+        assert_eq!(
+            state.recording,
+            Some(HotkeySlot::Window),
+            "状态清理由 App resume 后调用 end_recording"
+        );
+
+        let restored = hotkey_snapshot(Some(alt_space()), Some(alt_shift_f()));
+        state.end_recording(restored.clone());
+        assert_eq!(state.recording, None);
+        assert!(!state.recording_ready);
+        assert_eq!(state.hotkey_error, None);
+        assert_eq!(state.hotkey_snapshot, restored);
+
+        // 未录制：信号仍被取走（不跨帧残留），App 分支为 no-op。
+        let mut state = test_state();
+        state.mark_hidden();
+        assert!(state.take_cancel_recording_pending());
+        assert_eq!(state.recording, None);
+        assert!(!state.take_cancel_recording_pending(), "不得重复消费");
     }
 
     /// 字号纯状态：保存失败也更新 file.font_size + 留内联错误；成功清错误。
@@ -714,7 +1082,7 @@ mod tests {
         assert_eq!(state.take_tray_autostart_sync(false), Some(true));
     }
 
-    /// 快照与运行期真源一致（语言/键帽/目录/错误/审批均复制）。
+    /// 快照与运行期真源一致（语言/键帽/目录/错误/审批/录制态均复制）。
     #[test]
     fn snapshot_copies_state_for_painting() {
         let mut state = test_state();
@@ -723,7 +1091,11 @@ mod tests {
         state.autostart_approval = true;
         state.autostart_error = Some("未打包".into());
         state.font_error = Some("保存失败".into());
-        state.palette_keys.push("K".into());
+        state.hotkey_snapshot.palette_keys = vec!["⌃".into(), "⌥".into(), "K".into()];
+        state.hotkey_snapshot.window_keys = vec!["⇧".into(), "⌘".into(), "J".into()];
+        state.recording = Some(HotkeySlot::Window);
+        state.recording_ready = true;
+        state.hotkey_error = Some((HotkeySlot::Palette, "需包含修饰键".into()));
         state.excluded = vec!["node_modules".into()];
 
         let data = SettingsData::from_state(&state);
@@ -733,7 +1105,15 @@ mod tests {
         assert_eq!(data.autostart_error.as_deref(), Some("未打包"));
         assert_eq!(data.font_error.as_deref(), Some("保存失败"));
         assert_eq!(data.language, "简体中文");
-        assert_eq!(data.palette_keys, state.palette_keys);
+        assert_eq!(data.palette_keys, vec!["⌃", "⌥", "K"]);
+        assert_eq!(data.window_keys, vec!["⇧", "⌘", "J"]);
+        assert_eq!(data.hotkeys, state.hotkey_snapshot, "键帽展示真源 = 快照");
+        assert_eq!(data.recording, Some(HotkeySlot::Window));
+        assert!(data.recording_ready);
+        assert_eq!(
+            data.hotkey_error,
+            Some((HotkeySlot::Palette, "需包含修饰键".to_owned()))
+        );
         assert_eq!(data.excluded, vec!["node_modules".to_owned()]);
     }
 
