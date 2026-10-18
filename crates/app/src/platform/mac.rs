@@ -463,6 +463,82 @@ pub fn show_root_window() -> Result<()> {
     Ok(())
 }
 
+/// 设置窗口首次打开居中 + 置前(原生)。
+///
+/// - `center = true`(仅首次打开):按**鼠标所在屏**的 `visibleFrame`(已扣菜单栏/
+///   Dock)居中,四周 clamp 到 `EDGE_MARGIN`;窗口大于可见区时优先左上留白
+///   (与悬浮条同语义,无法两全时允许溢出);
+/// - 一律 `NSApp.activate()` + `orderFrontRegardless()` + `makeKeyWindow()`:
+///   ROOT 隐藏或设置窗位于其他 Space 时也能带到前台(与 `show_root_window` 同法,
+///   设置窗不需要 main 语义)。
+///
+/// 窗口按标题定位(eframe 不暴露子视口原生窗回取 API);未创建/非主线程 → Err,
+/// 调用方退回 egui `Visible(true)` + `Focus`。原生调用可能被 winit 同步派发
+/// (重入一帧),故本函数不持任何共享状态借用——调用方须在 `Shared` 锁外调用。
+pub fn show_settings_window(center: bool) -> Result<()> {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return Err(anyhow!("show_settings_window 非主线程调用"));
+    };
+    // 重入安全(同 show_root_window):状态短借用取出,AppKit 调用全在借用外。
+    let root = PALETTE.with(|cell| cell.borrow().root.clone());
+    let win = find_window_by_title(mtm, root.as_deref(), SETTINGS_TITLE)
+        .ok_or_else(|| anyhow!("设置窗口未就绪(视口尚未创建)"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.activate();
+    if center {
+        let visible = screen_with_point(mtm, NSEvent::mouseLocation())
+            .map(|s| s.visibleFrame())
+            .unwrap_or_else(|| {
+                // 理论不可达(至少一屏):退化主屏可见区,仍给确定位置。
+                log::warn!("设置窗口居中:鼠标所在屏查不到,退化主屏可见区");
+                NSScreen::mainScreen(mtm)
+                    .map(|s| s.visibleFrame())
+                    .unwrap_or_else(|| {
+                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0))
+                    })
+            });
+        let frame = win.frame();
+        let origin = settings_origin(visible, frame.size.width, frame.size.height);
+        win.setFrameOrigin(origin);
+        log::info!(
+            "设置窗口首次居中:visible=({:.0},{:.0} {:.0}x{:.0}) 窗口={:.0}x{:.0} origin=({:.0},{:.0})",
+            visible.origin.x,
+            visible.origin.y,
+            visible.size.width,
+            visible.size.height,
+            frame.size.width,
+            frame.size.height,
+            origin.x,
+            origin.y
+        );
+    }
+    win.orderFrontRegardless();
+    win.makeKeyWindow();
+    let f = win.frame();
+    log::info!(
+        "设置窗口唤起:center={center} isVisible={} isKey={} frame={:.0}x{:.0}@({:.0},{:.0})",
+        win.isVisible(),
+        win.isKeyWindow(),
+        f.size.width,
+        f.size.height,
+        f.origin.x,
+        f.origin.y
+    );
+    Ok(())
+}
+
+/// 设置窗口左上角(AppKit 坐标;纯函数,单测钉住):可见区内居中并 clamp
+/// (四周留 `EDGE_MARGIN`)。窗口大于可见区时 clamp 到左上留白线(无法两全时溢出)。
+fn settings_origin(visible: NSRect, w: f64, h: f64) -> NSPoint {
+    let min_x = visible.origin.x + EDGE_MARGIN;
+    let max_x = (visible.origin.x + visible.size.width - w - EDGE_MARGIN).max(min_x);
+    let x = (visible.origin.x + (visible.size.width - w) / 2.0).clamp(min_x, max_x);
+    let min_y = visible.origin.y + EDGE_MARGIN;
+    let max_y = (visible.origin.y + visible.size.height - h - EDGE_MARGIN).max(min_y);
+    let y = (visible.origin.y + (visible.size.height - h) / 2.0).clamp(min_y, max_y);
+    NSPoint::new(x, y)
+}
+
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。
 ///
 /// `items` = (标题, tag);返回所选项的 tag(None = 取消/Esc/未选中)。
@@ -984,11 +1060,17 @@ fn find_window_by_title(
         if root.is_some_and(|r| std::ptr::eq(r, &*win)) {
             continue;
         }
-        if win.title().to_string() == title {
+        if window_title_matches(&win.title().to_string(), title) {
             return Some(win);
         }
     }
     None
+}
+
+/// 窗口标题精确匹配(纯函数,单测):空目标不匹配任何窗口
+/// (防止把无标题窗误当成设置/悬浮条窗)。
+fn window_title_matches(actual: &str, expected: &str) -> bool {
+    !expected.is_empty() && actual == expected
 }
 
 /// 换类:NSWindow → `MacePalettePanel`(实例大小须一致,否则拒绝)。
@@ -1439,5 +1521,46 @@ mod tests {
         let p = tray_menu_anchor(2662.0, vis(), 110.0, 31.0);
         assert_eq!(p.x, 2662.0, "x 不受栏高影响");
         assert_eq!(p.y, -65.0 + 1080.0 - 31.0);
+    }
+
+    /// 设置窗首次居中:可见区(已扣菜单栏/Dock)中心 = 620×600 窗口原点;
+    /// 副屏负坐标同样以该屏可见区为基准。
+    #[test]
+    fn settings_origin_centers_in_visible_frame() {
+        let main = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1055.0));
+        let p = settings_origin(main, 620.0, 600.0);
+        assert_eq!(p.x, (1920.0 - 620.0) / 2.0);
+        assert_eq!(p.y, (1055.0 - 600.0) / 2.0);
+        assert!(p.x >= main.origin.x + EDGE_MARGIN);
+        assert!(p.x + 620.0 <= main.origin.x + main.size.width - EDGE_MARGIN);
+        assert!(p.y >= main.origin.y + EDGE_MARGIN);
+        assert!(p.y + 600.0 <= main.origin.y + main.size.height - EDGE_MARGIN);
+
+        // 副屏(AppKit 坐标可为负):先按该屏可见区中心落点。
+        let secondary = NSRect::new(NSPoint::new(-1280.0, -200.0), NSSize::new(1280.0, 777.0));
+        let p = settings_origin(secondary, 620.0, 600.0);
+        assert_eq!(p.x, -1280.0 + (1280.0 - 620.0) / 2.0);
+        assert_eq!(p.y, -200.0 + (777.0 - 600.0) / 2.0);
+    }
+
+    /// 可见区放不下 620×600:clamp 到左上留白线,不产生反向/NaN 坐标
+    /// (窗口溢出可见区是既定的「无法两全」语义)。
+    #[test]
+    fn settings_origin_clamps_when_window_larger_than_visible_frame() {
+        let tiny = NSRect::new(NSPoint::new(100.0, 60.0), NSSize::new(500.0, 400.0));
+        let p = settings_origin(tiny, 620.0, 600.0);
+        assert_eq!(p.x, tiny.origin.x + EDGE_MARGIN);
+        assert_eq!(p.y, tiny.origin.y + EDGE_MARGIN);
+        assert!(p.x.is_finite() && p.y.is_finite());
+    }
+
+    /// 标题查找安全性:精确匹配且目标非空(空标题/不同窗口/仅前缀均不得命中)。
+    #[test]
+    fn window_title_lookup_requires_exact_nonempty_match() {
+        assert!(window_title_matches(SETTINGS_TITLE, SETTINGS_TITLE));
+        assert!(!window_title_matches(PALETTE_TITLE, SETTINGS_TITLE));
+        assert!(!window_title_matches("", SETTINGS_TITLE));
+        assert!(!window_title_matches("设置窗口", SETTINGS_TITLE));
+        assert!(!window_title_matches("", ""), "空目标不得匹配无标题窗");
     }
 }

@@ -249,6 +249,24 @@ pub fn show_root_window() -> anyhow::Result<()> {
     }
 }
 
+/// 设置窗口首次打开居中 + 置前（原生；仅 macOS）。
+///
+/// `center = true` 只在首次打开传入：按光标所在屏 `visibleFrame` 居中 620×600；
+/// 之后传 false 仅激活 app + `orderFrontRegardless` + `makeKeyWindow`，保留用户
+/// 拖动位置。窗口未就绪（视口尚未创建）/ 非 macOS → Err，调用方退回 egui
+/// `Visible(true)` + `Focus`。
+pub fn show_settings_window(center: bool) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::show_settings_window(center)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = center;
+        Err(anyhow::anyhow!("非 macOS:设置窗口原生定位/置前不可用"))
+    }
+}
+
 /// 高度变化时重锚(顶边钉住;悬浮条每次 pass 调用)。
 pub fn reanchor() {
     #[cfg(target_os = "macos")]

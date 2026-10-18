@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use eframe::egui;
 
@@ -22,7 +23,7 @@ use crate::ui::{
         TRAFFIC_LIGHTS_RESERVE, WINDOW_RADIUS, WINDOW_STROKE,
     },
     settings_view::{self, SettingsAction, SettingsData},
-    Shared,
+    theme, Shared,
 };
 
 /// 设置视口 id（注册与命令定向同一处，勿散落）。
@@ -75,6 +76,11 @@ pub struct SettingsState {
     pub(crate) window_keys: Vec<String>,
     /// 设置页切换自启成功后待同步给托盘的值（App::logic 消费）。
     pub(crate) tray_autostart_sync: Option<bool>,
+    /// 首次打开已完成定位决策：之后重开只置前，保留用户拖动后的位置。
+    pub(crate) positioned_once: bool,
+    /// 关闭/⌘W 后待消费的「取消录制」信号（快捷键 plan 接入；当前无录制状态，
+    /// `App::logic` 取走并留痕，避免标志跨帧残留）。
+    pub(crate) cancel_recording_pending: bool,
 }
 
 impl SettingsState {
@@ -92,7 +98,34 @@ impl SettingsState {
             palette_keys: vec!["⌥".to_owned(), "Space".to_owned()],
             window_keys: vec!["⌥".to_owned(), "⇧".to_owned(), "F".to_owned()],
             tray_autostart_sync: None,
+            positioned_once: false,
+            cancel_recording_pending: false,
         }
+    }
+
+    /// 标记打开（纯状态）：返回 true = 本次为首次打开，调用方应做原生居中。
+    ///
+    /// 首次打开即记账（`positioned_once`）：即使原生窗口未就绪、退回 egui 默认
+    /// 位置，后续重开也只置前——不把用户拖动过的窗口再拉回中央。
+    pub(crate) fn request_open(&mut self) -> bool {
+        let was_open = self.open;
+        self.open = true;
+        let first_open = !was_open && !self.positioned_once;
+        if first_open {
+            self.positioned_once = true;
+        }
+        first_open
+    }
+
+    /// 标记隐藏（红点 / ⌘W 共用，纯状态）：清开合态并挂起录制取消。
+    pub(crate) fn mark_hidden(&mut self) {
+        self.open = false;
+        self.cancel_recording_pending = true;
+    }
+
+    /// 取走录制取消挂起（`App::logic` 消费；快捷键 plan 接入后在此恢复旧热键）。
+    pub(crate) fn take_cancel_recording_pending(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_recording_pending)
     }
 
     /// 打开设置页的自启查询结果：成功按**真实状态**落地（审批中 → 关态 + 提示），
@@ -125,7 +158,7 @@ impl SettingsState {
     }
 
     /// 托盘切换：与设置页共用同一策略更新显示；托盘勾选由调用方按返回结果校准
-    ///（失败时复原为点击前值）。
+    ///（失败时优先按已加载的实际态；未知则复原点击前值）。
     pub(crate) fn autostart_changed_externally(
         &mut self,
         desired: bool,
@@ -220,13 +253,29 @@ impl SettingsData {
 /// 设置视口 pass（deferred 回调）。
 pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
+    let now = Instant::now();
 
     // 关闭=隐藏：红点（close_requested）与 ⌘W 同一路径。子视口须自行消费关闭请求
     //（根视口的 ⌘W 处理器不会为它运行）；隐藏不销毁视口，也不退出 App。
     let close_requested = ctx.input(|i| i.viewport().close_requested());
-    let cmd_w = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W));
+    let cmd_w = consume_close_shortcut(&ctx);
     if close_requested || cmd_w {
         hide(shared, &ctx);
+    }
+
+    // 可见期跟随系统外观：根窗与悬浮条都隐藏时，设置 pass 是唯一驱动点。
+    // 与 palette/root 同模式——`maybe_apply` 按 CHECK_INTERVAL 节流探测；
+    // 应用后本视口立即重绘，并在本 pass 末尾排下一帧（隐藏后不排，守 L4）。
+    let (data, open, theme_changed) = {
+        let mut s = lock_shared(shared);
+        let open = s.settings.open;
+        let theme_changed = open && s.theme.maybe_apply(&ctx, now);
+        let data = SettingsData::from_state(&s.settings);
+        (data, open, theme_changed)
+    };
+    if theme_changed {
+        // `set_theme` 只改偏好；显式排一帧让本视口按新主题出图。
+        ctx.request_repaint_of(viewport_id());
     }
 
     // 整窗底色（标题栏与内容同底；原生交通灯浮于其上）。
@@ -264,11 +313,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         palette.text_primary,
     );
 
-    // 快照在锁内复制，绘制与动作执行都在锁外（自启/保存/装样式不持共享锁）。
-    let data = {
-        let s = lock_shared(shared);
-        SettingsData::from_state(&s.settings)
-    };
+    // 快照已在锁内复制，绘制与动作执行都在锁外（自启/保存/装样式不持共享锁）。
     let actions = settings_view::draw_body(ui, &data).actions;
 
     // 窗口内 1px 描边（原生窗口负责圆角裁剪与投影；内容层按同半径内侧补线）。
@@ -282,6 +327,17 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     for action in actions {
         apply_action(shared, &ctx, action);
     }
+
+    // 开窗期排下一帧（主题跟随节流上限）；隐藏后不再排帧（L4 隐藏零帧）。
+    if open {
+        ctx.request_repaint_after(theme::CHECK_INTERVAL);
+    }
+}
+
+/// ⌘W 关闭快捷键（消费；返回 true = 本 pass 应隐藏设置窗）。
+/// 红点关闭走 `ViewportInfo::close_requested`，两者在 `draw` 汇合。
+fn consume_close_shortcut(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
 }
 
 /// 落地一条设置动作（已出共享锁）。
@@ -358,12 +414,15 @@ fn apply_autostart(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bo
     }
 }
 
-/// 隐藏设置窗口（红点关闭 / ⌘W 共用）：开合态置 false + 下发隐藏命令。
+/// 隐藏设置窗口（红点关闭 / ⌘W 共用）：开合态置 false + 挂起录制取消 + 下发隐藏命令。
 /// 命令只入 egui 队列，不销毁视口——再次打开仍是同一实例。
+/// 录制取消挂起由 `App::logic` 消费（快捷键 plan 接入点，当前无录制状态）。
 fn hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
-    lock_shared(shared).settings.open = false;
+    lock_shared(shared).settings.mark_hidden();
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-    log::info!("设置窗口隐藏(open=false)");
+    // 唤醒根视口消费取消录制挂起（根窗隐藏时也尽力排一帧；无录制态时仅留痕）。
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    log::info!("设置窗口隐藏(open=false;录制取消挂起)");
 }
 
 #[cfg(test)]
@@ -395,6 +454,42 @@ mod tests {
             vec!["⌥".to_owned(), "⇧".to_owned(), "F".to_owned()]
         );
         assert_eq!(state.tray_autostart_sync, None);
+        assert!(!state.positioned_once, "首开前未定位");
+        assert!(!state.cancel_recording_pending);
+    }
+
+    /// 首次打开居中记账一次；已打开/关闭后重开只置前（保留用户拖动位置）。
+    #[test]
+    fn first_open_centers_once_then_keeps_user_position() {
+        let mut state = test_state();
+        assert!(state.request_open(), "首次打开须请求原生居中");
+        assert!(state.open);
+        assert!(state.positioned_once);
+        assert!(!state.request_open(), "窗口已打开时再点入口只置前");
+
+        state.mark_hidden();
+        assert!(!state.open);
+        assert!(
+            !state.request_open(),
+            "关闭后重开不得重新居中（保留用户位置）"
+        );
+        assert!(state.positioned_once);
+    }
+
+    /// 关闭/⌘W 挂钩：置取消录制挂起，`App::logic` 取走即清（快捷键 plan 接入点）。
+    #[test]
+    fn hide_queues_recording_cancel_for_hotkey_plan() {
+        let mut state = test_state();
+        state.request_open();
+        state.mark_hidden();
+        assert!(!state.open);
+        assert!(state.cancel_recording_pending, "关闭须挂起取消录制");
+        assert!(state.take_cancel_recording_pending());
+        assert!(!state.cancel_recording_pending, "取走即清");
+        assert!(
+            !state.take_cancel_recording_pending(),
+            "不得跨帧残留重复消费"
+        );
     }
 
     /// 字号纯状态：保存失败也更新 file.font_size + 留内联错误；成功清错误。
@@ -514,6 +609,22 @@ mod tests {
         );
     }
 
+    /// 关闭自启成功（操作后 `NotRegistered`）：显示关、无错误，托盘同步 OFF。
+    #[test]
+    fn autostart_disable_success_lands_off_and_syncs_tray() {
+        let mut state = test_state();
+        state.autostart = Some(true);
+        state.autostart_approval = true;
+
+        let update = state.autostart_toggled(false, Ok(Status::NotRegistered));
+        assert!(update.confirmed);
+        assert!(!update.enabled);
+        assert_eq!(state.autostart, Some(false));
+        assert!(!state.autostart_approval);
+        assert!(state.autostart_error.is_none(), "正常关闭不是错误");
+        assert_eq!(state.take_tray_autostart_sync(false), Some(false));
+    }
+
     /// 托盘侧使用同一策略，但不排队托盘同步（勾选由托盘调用方校准）。
     #[test]
     fn autostart_external_change_shares_policy() {
@@ -566,6 +677,40 @@ mod tests {
         assert_eq!(data.language, "简体中文");
         assert_eq!(data.palette_keys, state.palette_keys);
         assert_eq!(data.excluded, vec!["node_modules".to_owned()]);
+    }
+
+    fn key_w(modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SETTINGS_W, SETTINGS_H),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// ⌘W 被消费且同帧只消费一次；裸 W 不触发隐藏（设置窗 headless 快捷键路径）。
+    #[test]
+    fn close_shortcut_consumes_cmd_w_only() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(key_w(egui::Modifiers::COMMAND), |ui| {
+            assert!(consume_close_shortcut(ui.ctx()), "⌘W 应触发隐藏");
+            assert!(!consume_close_shortcut(ui.ctx()), "同帧二次消费应为 false");
+        });
+        out.textures_delta.clear();
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(key_w(egui::Modifiers::NONE), |ui| {
+            assert!(!consume_close_shortcut(ui.ctx()), "裸 W 不得隐藏设置窗");
+        });
+        out.textures_delta.clear();
     }
 
     #[test]

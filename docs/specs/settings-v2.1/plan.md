@@ -621,9 +621,13 @@ Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 复核**（本轮未实机验证托盘勾选）。
 
 ```bash
-git add crates/app/src/ui/settings.rs crates/app/src/ui/settings_view.rs crates/app/src/ui/settings_layout.rs crates/app/src/ui/mod.rs crates/app/src/tray.rs crates/app/src/settings.rs crates/app/src/ui/settings_tokens.rs docs/specs/settings-v2.1
+git add crates/app/src/ui/settings.rs crates/app/src/ui/settings_view.rs crates/app/src/ui/settings_layout.rs crates/app/src/ui/mod.rs crates/app/src/autostart.rs crates/app/src/settings.rs crates/app/src/ui/settings_tokens.rs .gitignore docs/specs/settings-v2.1
 git commit -m "feat(app): 设置页字号与开机自启"
 ```
+
+> 2026-10-18 修正：本条 `git add` 已更新为实际改动面——补 `autostart.rs`
+>（`apply_user_choice` 返回真实 `Status`）与 `.gitignore`（`.claude/`），
+> 移除未改动的 `tray.rs`。
 
 **前置重构（Task 4 review → Task 5，2026-10-18）：**
 - `ui/settings.rs` 拆为：`settings.rs`（视口 builder / `SettingsState` / 快照→锁外绘制→动作落地 / 隐藏）；
@@ -666,12 +670,75 @@ git commit -m "feat(app): 设置页字号与开机自启"
 
 ## Task 6: 收尾与文档
 
-- [ ] 设置窗口居中（首次打开按光标所在屏）与置前；单实例。
-- [ ] 关闭时取消录制（后续 hotkey plan 接入点），保持隐藏。
-- [ ] 深浅色切换时设置窗口即时跟随（设置 pass 驱动 `ThemeFollow`）。
-- [ ] 更新 `settings-visual.md` §3.1/§3.2 的实现状态；`design.md` 偏差回填。
-- [ ] 实机清单（辉哥）逐项走查。
-- [ ] 提交。
+**Files:**
+- Modify: `crates/app/src/platform/{mod,mac}.rs`（设置窗原生居中/置前）
+- Modify: `crates/app/src/ui/settings.rs`（首次定位记账/关闭取消录制 hook/主题跟随）
+- Modify: `crates/app/src/ui/mod.rs`（开窗原生接线/托盘失败按实际值校准/关闭 hook 消费）
+- Modify: `docs/specs/settings-v2.1/{plan,design}.md`、`docs/specs/floatbar-visual/settings-visual.md`
+
+- [x] **Step 1: 原生居中/置前（仅首次）**
+  - `platform::show_settings_window(center)`：按 `platform::SETTINGS_TITLE` 定位设置
+    NSWindow；`center=true`（首次）按鼠标所在屏 `NSScreen.visibleFrame`（已扣菜单栏/
+    Dock）居中 620×600，四周 clamp 8pt；一律 `NSApp.activate` +
+    `orderFrontRegardless` + `makeKeyWindow`。
+  - `SettingsState::request_open()` 首开返回 true 并记账 `positioned_once`；已打开/
+    关闭后重开只置前，保留用户拖动位置。
+  - 原生调用在 `Shared` 锁外；窗口未就绪 → 留痕并退回既有 egui `Visible(true)` +
+    `Focus`；非 macOS facade 返回错误（同样走退回路径）。
+  - 纯单测：`settings_origin`（主屏/副屏负坐标/小屏 clamp）、窗口标题精确匹配。
+
+- [x] **Step 2: 主题跟随（设置窗单独可见）**
+  - 设置 pass 在 `settings.open` 时驱动 `Shared.theme.maybe_apply`，应用后立即重绘
+    本视口，并按 `CHECK_INTERVAL` 排下一帧；隐藏后不排帧（L4）。
+  - `open_settings` 在隐藏→显示时锁外探测 `theme::current_theme()` 并
+    `check_now_with`，设置窗打开即用当前系统外观。
+
+- [x] **Step 3: 关闭/录制 hook（不实现快捷键）**
+  - 红点 / ⌘W → `SettingsState::mark_hidden()`：`open=false` +
+    `cancel_recording_pending=true`；`App::logic` 取走并留痕。
+  - headless 测试：⌘W 被消费/同帧只消费一次、裸 W 不触发；隐藏状态纯转换。
+
+- [x] **Step 4: Task 5 review 可选加固**
+  - 自启关闭成功（`desired=false, Ok(NotRegistered)`）单测：关态、无错误、托盘同步 OFF。
+  - 托盘同帧切换失败：勾选改按 `SettingsState` 实际值（`update.enabled`）校准，
+    不再用点击前值——修复「设置页排队同步被仲裁丢弃后，托盘勾选停在旧态」。
+  - Task 5 的 `git add` 命令已修正（补 `autostart.rs`/`.gitignore`，移除 `tray.rs`）。
+
+- [x] **Step 5: 文档**
+  - 本文下方实机记录与验收清单；`settings-visual.md` 状态/已知说明；
+    `design.md` §5.1 居中/主题跟随与子视口标题栏 PoC 结论。
+
+- [x] **Step 6: 验证与提交**
+  - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings &&
+    cargo test --workspace` 全绿。
+  - 提交 `feat(app): 设置窗口收尾（居中/主题/文档）`。
+
+### 实机结果（controller，2026-10-18）
+
+- 字号：**Large 即时应用并重启保持**；随后已恢复 **Standard**。
+- 开机自启：开 / 关均生效（系统「登录项」条目增加 / 移除）；`autostart-off`
+  用户意图标记写入后已恢复。
+- 关闭：设置窗口 **⌘W 隐藏**（App 不退出）。
+- 托盘「开机自启」勾选视觉：**仍待 controller 复核**（沿用 Task 5 缺口）。
+
+### 手动验收清单（controller）
+
+- [ ] 首次打开（齿轮或托盘「设置…」）：设置窗在**鼠标所在屏**居中（可见区，扣菜单栏/
+  Dock），且置前成 key；ROOT 在别的 Space 时设置窗出现在当前 Space。
+- [ ] 已打开时再点入口：同一实例置前，不新建、不重置位置。
+- [ ] 关闭后（可先拖动窗口）再打开：保留上次位置，只有首次打开居中。
+- [ ] 系统浅色 ↔ 深色：设置窗口 2s 内跟随；ROOT/悬浮条都隐藏时同样生效。
+- [x] 字号 小/标准/大：设置窗与另两窗即时变化、重启保持（Large 已验，Standard 已恢复）。
+- [x] 开机自启开/关：设置页与托盘勾选一致；系统「登录项」增加/移除（已验）。
+  审批态（若系统要求）显示关态 +「已注册,待系统设置「登录项」允许」。
+- [x] 红点 / ⌘W：隐藏设置窗、App 不退出；再次打开同一实例（⌘W 已验）。
+- [ ] 大字号（Large）：整页可滚动、标题栏固定、内容无裁切。
+- [ ]（待复核）托盘「开机自启」勾选视觉与设置页一致。
+
+**验证记录（2026-10-18）：** `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` 全绿。新增测试：
+`settings_origin` 2 个、标题精确匹配 1 个、首开定位/关闭取消录制/⌘W 各 1 个、
+自启关闭成功 1 个、托盘失败勾选校准 1 个。
 
 ---
 

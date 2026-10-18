@@ -1,6 +1,6 @@
 # 设置功能（v2.1 第一期）— 设计
 
-**Status:** 设计已确认（2026-10-18），待实现
+**Status:** Phase A 已实现（2026-10-18：窗口 / 字号 / 自启 / 语言占位）；快捷键与排除目录待独立计划
 **范围:** 设置窗口 + 非语言项（字号 / 开机自启 / 两个全局快捷键 / 排除目录）
 **视觉依据:** `docs/specs/floatbar-visual/settings-visual.md`（下称 `visual`）
 **不交付:** i18n（语言项先占位）、设置窗口的恢复默认/侧边栏/快捷键冲突弹窗、排除目录的定向增量重扫
@@ -130,8 +130,23 @@ window_hotkey = "shift+alt+KeyF" # 缺省 = 内置默认（⌥⇧F）
 
 - deferred viewport builder：620×600、不可缩放、标题「设置」、透明标题栏 + fullsize content、原生交通灯、阴影。
 - 内容层每帧铺 `window_fill`；内描边 1px 圆角 12。
-- 首次打开居中于光标所在屏；再次打开只置前，不改位置。
-- 设置窗口独立跟随系统深浅色；可见期由设置 pass 驱动主题探测（复用 `ThemeFollow`）。
+- **首次打开居中 + 置前（2026-10-18 实现）**：平台层按 `platform::SETTINGS_TITLE` 定位
+  设置 NSWindow，在**鼠标所在屏**的 `NSScreen.visibleFrame`（已扣菜单栏 / Dock）内居中
+  620×600，四周 clamp 8pt；`NSApp.activate()` + `orderFrontRegardless()` +
+  `makeKeyWindow()`，ROOT 隐藏或位于其他 Space 时也能带到前台。
+- **只居中一次**：`SettingsState::request_open()` 首次打开返回居中请求并记账
+  `positioned_once`；再次打开只置前，保留用户拖动后的位置。首次原生窗口未就绪时
+  退回 egui `Visible(true)` + `Focus`，同样不再重试居中。
+- **主题跟随**：设置窗口独立跟随系统深浅色；`settings.open` 期间由设置 pass 驱动
+  `ThemeFollow::maybe_apply` 并按 `CHECK_INTERVAL` 排帧（ROOT/悬浮条都隐藏时是唯一
+  驱动点），应用后立即重绘本视口；打开时锁外探测当前外观并 `check_now_with`，
+  隐藏后停止排帧（L4）。
+- **子视口标题栏 PoC（已验证）**：eframe deferred 子视口 + `with_titlebar_shown(false)`
+  + `with_title_shown(false)` + `with_fullsize_content_view(true)` 下原生交通灯正常浮于
+  自绘 44px 标题栏，标题栏拖拽 / 红点 / ⌘W 均可用；**无偏差**，不回落原生标题栏。
+- **偏差记录**：首次打开若原生窗口尚未创建（视口首帧前，实际不可达），退回 egui
+  默认位置且不重试居中——优先「不抢回用户拖动后的位置」。设置窗口位置不跨进程
+  持久化（重启后首次打开重新居中），与本期范围一致。
 
 ### 5.2 内容
 

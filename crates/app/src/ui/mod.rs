@@ -46,8 +46,9 @@
 //!
 //! ## 排帧纪律(L4)
 //!
-//! 只在窗可见期排帧:悬浮条 pass 与根视口 `logic` 各自按 `CHECK_INTERVAL` 上限
-//! 自排主题跟随检查(根视口仅在可见时排;全窗单独可见也须跟随系统外观);
+//! 只在窗可见期排帧:悬浮条 pass、根视口 `logic` 与设置 pass 各自按
+//! `CHECK_INTERVAL` 上限自排主题跟随检查(根视口仅在可见时排;任一窗单独可见也须
+//! 跟随系统外观——设置窗单独可见时由设置 pass 驱动);
 //! 全隐藏期不排帧(隐藏态 CPU 0% 红线);唤起时 `ThemeFollow::check_now_with`
 //! 立即应用锁外探测到的外观。
 //!
@@ -262,33 +263,56 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     }
 }
 
+/// 托盘自启切换失败后的勾选值（纯函数，单测）：
+/// 设置页已加载过实际态 → 用它（同帧同步值可能已被仲裁丢弃）；
+/// 未知（设置页从未打开）→ 保持点击前值，避免把托盘安装时读到的真实态误改。
+fn autostart_check_after_failure(known: Option<bool>, checked_after_click: bool) -> bool {
+    known.unwrap_or(!checked_after_click)
+}
+
 /// 打开设置窗口(完整窗口齿轮/托盘「设置…」共用):置开合态 → (首次显示时)
-/// 查询自启真源 → 命令显示/聚焦 + 排设置视口与 ROOT 两帧。
+/// 查询自启真源与当前外观 → 原生居中(仅首次)/置前 → 失败退回 egui 命令。
 ///
 /// 查询只在隐藏→显示时进行:窗口已打开时再次点入口不得覆盖失败切换的行内错误。
-/// `autostart::status()` 是原生调用:在共享锁外查询(锁纪律见「悬浮条显隐」段);
-/// 查询失败按未知态 + 内联错误(设置页显示关态)。命令只入 egui 队列,可短锁内发。
+/// `autostart::status()`/`theme::current_theme()`/`show_settings_window` 都是原生
+/// 调用:一律在共享锁外执行(锁纪律见「悬浮条显隐」段),锁内只写状态。
+/// 窗口未就绪(视口尚未创建)时退回既有 `Visible(true)` + `Focus` 命令。
 fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
-    let was_open = {
+    let (was_open, center) = {
         let mut s = lock_shared(shared);
         let was_open = s.settings.open;
-        s.settings.open = true;
-        was_open
+        let center = s.settings.request_open(); // 首次打开 true 并记账
+        (was_open, center)
     };
     if !was_open {
+        // 锁外原生查询/探测。
         let autostart = autostart::status().map_err(|err| format!("读取开机自启状态失败:{err:#}"));
-        lock_shared(shared).settings.autostart_loaded(autostart);
+        let detected = theme::current_theme();
+        let mut s = lock_shared(shared);
+        s.settings.autostart_loaded(autostart);
+        // 设置窗打开即用当前系统外观(与 results_open 同法;隐藏期可能切过外观)。
+        s.theme.check_now_with(ctx, detected);
     }
-    ctx.send_viewport_cmd_to(
-        settings::viewport_id(),
-        egui::ViewportCommand::Visible(true),
-    );
-    ctx.send_viewport_cmd_to(settings::viewport_id(), egui::ViewportCommand::Focus);
+    // 原生居中/置前:ROOT 隐藏或位于其他 Space 时也能把设置窗带到前台。
+    // 首次打开居中,之后只置前(保留用户拖动位置);失败退回 egui 命令。
+    if let Err(err) = platform::show_settings_window(center) {
+        log::warn!("设置窗口原生定位/置前失败,退回 egui 命令:{err}");
+        ctx.send_viewport_cmd_to(
+            settings::viewport_id(),
+            egui::ViewportCommand::Visible(true),
+        );
+        ctx.send_viewport_cmd_to(settings::viewport_id(), egui::ViewportCommand::Focus);
+    }
     ctx.request_repaint_of(settings::viewport_id());
     ctx.request_repaint_of(egui::ViewportId::ROOT);
     log::info!(
-        "打开设置窗口(此前{})",
-        if was_open { "已打开" } else { "隐藏" }
+        "打开设置窗口(此前{};{})",
+        if was_open { "已打开" } else { "隐藏" },
+        if center {
+            "首次居中"
+        } else {
+            "保持位置/置前"
+        }
     );
 }
 
@@ -552,10 +576,12 @@ impl App {
                         Ok(status) => log::info!("托盘:开机自启 → {}", status.note()),
                         Err(err) => log::warn!("托盘:开机自启设置失败: {err}"),
                     }
-                    let (update, open) = {
+                    let (update, open, known_autostart) = {
                         let mut s = self.shared();
                         let update = s.settings.autostart_changed_externally(checked, result);
-                        (update, s.settings.open)
+                        // 失败分支 `autostart` 保持切换前值；None = 设置页从未加载过
+                        // 真源（此时不能拿 `unwrap_or(false)` 当实际值）。
+                        (update, s.settings.open, s.settings.autostart)
                     };
                     if let Some(tray) = &self.tray {
                         if update.confirmed {
@@ -567,8 +593,17 @@ impl App {
                                 );
                             }
                         } else {
-                            // 注册/状态查询失败:复原为点击前值。
-                            tray.set_autostart_checked(!checked);
+                            // 注册/状态查询失败:设置页已加载过真源 → 按该实际值校准
+                            //（同帧设置页排队的同步值会被本轮托盘动作仲裁丢弃；
+                            // 用点击前值会留下与设置页不一致的勾选）。
+                            // 真源未知（设置页从未打开）→ 保持点击前值，避免把
+                            // 托盘安装时读到的已启用态误改成关。
+                            let actual = autostart_check_after_failure(known_autostart, checked);
+                            tray.set_autostart_checked(actual);
+                            log::warn!(
+                                "托盘:自启设置失败,勾选校准为 {actual}(点击前 {};设置页实际 {known_autostart:?})",
+                                !checked
+                            );
                         }
                     }
                     if open {
@@ -671,6 +706,11 @@ impl eframe::App for App {
                 tray.set_autostart_checked(desired);
                 log::info!("设置页自启:同步托盘勾选 {desired}");
             }
+        }
+        // 设置窗口关闭/⌘W：录制取消挂起消费点（快捷键 plan 接入后在此恢复旧热键；
+        // 当前无录制状态，仅留痕，避免标志跨帧残留）。
+        if self.shared().settings.take_cancel_recording_pending() {
+            log::info!("设置窗口已关闭:取消录制挂起(快捷键 plan 接入时恢复旧热键)");
         }
         if let Some(tray) = &mut self.tray {
             tray.sync();
@@ -1007,5 +1047,27 @@ mod tests {
             "裸 W 不得隐藏根窗"
         );
         out.textures_delta.clear();
+    }
+
+    /// 托盘自启切换失败：已知实际态优先（修复同帧同步被仲裁丢弃后的旧勾选）；
+    /// 未知态保持点击前值（托盘安装时可能已读到真实启用态）。
+    #[test]
+    fn autostart_tray_failure_reconciles_known_state_or_reverts() {
+        assert!(
+            autostart_check_after_failure(Some(true), false),
+            "设置页实际为开 → 勾选"
+        );
+        assert!(
+            !autostart_check_after_failure(Some(false), true),
+            "设置页实际为关 → 取消勾选"
+        );
+        assert!(
+            autostart_check_after_failure(None, false),
+            "未知 → 保持点击前值（开）"
+        );
+        assert!(
+            !autostart_check_after_failure(None, true),
+            "未知 → 保持点击前值（关）"
+        );
     }
 }
