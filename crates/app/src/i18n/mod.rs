@@ -53,12 +53,34 @@ impl<'de> Deserialize<'de> for LanguageSetting {
 
 static LANG_BITS: AtomicU8 = AtomicU8::new(Lang::ZhHans as u8);
 
-/// 模板填充：`{name}` 形式占位符；缺参数时保留原样（由目录单测保证成对）。
+/// 模板填充（单趟扫描）：`{name}` 形式占位符；缺参数时保留原样，
+/// 替换值中的花括号不会被再次展开（由目录单测保证中英占位符成对）。
 pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
-    let mut out = template.to_owned();
-    for (key, value) in args {
-        out = out.replace(&format!("{{{key}}}"), value);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('}') {
+            Some(end) => {
+                let key = &after[..end];
+                match args.iter().find(|(k, _)| *k == key) {
+                    Some((_, value)) => out.push_str(value),
+                    None => {
+                        out.push('{');
+                        out.push_str(key);
+                        out.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
     }
+    out.push_str(rest);
     out
 }
 
@@ -159,5 +181,33 @@ mod tests {
         assert_eq!(lang(), Lang::ZhHans);
         with_lang(Lang::En, || assert_eq!(lang(), Lang::En));
         assert_eq!(lang(), Lang::ZhHans);
+    }
+
+    #[test]
+    fn fill_substitutes_all_args() {
+        assert_eq!(
+            fill(
+                "{default} 不可用,已改用 {name}",
+                &[("default", "⌥Space"), ("name", "⌃⌥K"),]
+            ),
+            "⌥Space 不可用,已改用 ⌃⌥K"
+        );
+    }
+
+    #[test]
+    fn fill_does_not_resubstitute_values() {
+        assert_eq!(fill("{a}", &[("a", "{b}")]), "{b}");
+        assert_eq!(fill("{a}-{b}", &[("a", "{b}"), ("b", "x")]), "{b}-x");
+    }
+
+    #[test]
+    fn fill_keeps_missing_placeholder() {
+        assert_eq!(fill("前缀 {missing} 后缀", &[]), "前缀 {missing} 后缀");
+    }
+
+    #[test]
+    fn fill_keeps_unmatched_open_brace_tail() {
+        assert_eq!(fill("前缀 {未闭合", &[]), "前缀 {未闭合");
+        assert_eq!(fill("{a} 后缀 {未闭合", &[("a", "值")]), "值 后缀 {未闭合");
     }
 }

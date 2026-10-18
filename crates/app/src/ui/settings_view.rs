@@ -2536,6 +2536,33 @@ mod tests {
         );
     }
 
+    /// 最长的英文窗口提示在 Large 字号下仍须完整落在支持行内
+    /// （540 = 620 窗宽 − 2×24 内容内边距 − 2×16 行内边距）。
+    #[test]
+    fn english_hotkey_window_conflict_note_fits_support_line() {
+        use crate::hotkey::HotkeyNote;
+        use crate::i18n;
+        let note = HotkeyNote::SavedWindowConflictDefault {
+            custom: "⌃⌥⇧K".into(),
+            default: "⌥⇧F".into(),
+        };
+        i18n::with_lang(i18n::Lang::En, || {
+            ui_font_module::with_test_scale(1.15, || {
+                let mut data = layout_test_data();
+                data.hotkeys.note = Some(note.clone());
+                let out = run_body(&data);
+                let expected = note.text();
+                let texts = all_texts(&out);
+                let text = find_text(&texts, &expected);
+                assert!(
+                    text.galley.size().x <= 540.0,
+                    "英文热键提示超宽: {:?}",
+                    text.galley.size()
+                );
+            });
+        });
+    }
+
     /// 键帽展示以快照为准（不再有硬编码默认键）。
     #[test]
     fn keycap_display_comes_from_snapshot() {

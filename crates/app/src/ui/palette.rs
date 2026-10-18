@@ -177,7 +177,10 @@ pub struct EngineStatus {
     pub built_at: u64,
 }
 
-/// 角标文案（绘制时按当前语言渲染；`Raw` 为外部原始错误，不翻译）。
+/// 角标文案（绘制时按当前语言渲染）。
+///
+/// `Raw` 用于外部/技术原文，有意不翻译；应用自编的悬浮条打开错误文案
+/// 留待后续任务本地化。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BadgeText {
     Building(u64),
@@ -187,6 +190,7 @@ pub(crate) enum BadgeText {
     EngineNotRunning,
     Warming,
     QueryFailed,
+    /// 外部/技术原文（有意不翻译）。
     Raw(String),
 }
 
@@ -942,11 +946,7 @@ impl PaletteState {
                 // 目标变化次数）；行数变化由窗内平滑过渡（模块头注「面板高度」）。
                 if self.results.is_empty() {
                     // 空态两屏（§2.7）：空词 / 无匹配项；区高 72、纵向居中、主副间距 4
-                    let (primary, secondary) = if matches!(self.session.state, State::Empty) {
-                        (i18n::s().empty_no_match, i18n::s().empty_no_match_sub)
-                    } else {
-                        (i18n::s().empty_start, i18n::s().empty_start_sub)
-                    };
+                    let (primary, secondary) = empty_text(&self.session.state);
                     // 先按 EMPTY_H 精确占位，再在块内居中放两行——`allocate_ui_with_layout`
                     // 只按内容实际用量推进游标（实测只占 51px），页脚会整体上移、下方留白。
                     let (empty_rect, _) = ui.allocate_exact_size(
@@ -1638,6 +1638,15 @@ fn draw_open_full_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32
     p.line_segment([c + egui::vec2(1.0, -1.0), c + egui::vec2(-5.0, 5.0)], s);
     p.line_segment([c + egui::vec2(-1.0, 5.0), c + egui::vec2(-5.0, 5.0)], s);
     p.line_segment([c + egui::vec2(-5.0, 1.0), c + egui::vec2(-5.0, 5.0)], s);
+}
+
+/// 空态两屏文案（空词 / 无匹配项；随语言切换）。
+fn empty_text(state: &State) -> (&'static str, &'static str) {
+    if matches!(state, State::Empty) {
+        (i18n::s().empty_no_match, i18n::s().empty_no_match_sub)
+    } else {
+        (i18n::s().empty_start, i18n::s().empty_start_sub)
+    }
 }
 
 /// 选中行动作提示（§2.4）：文件「打开」、目录「进入」。
@@ -2717,75 +2726,151 @@ mod tests {
 
     #[test]
     fn badge_note_maps_six_states() {
-        let eng = |s: &str| EngineStatus {
-            state: s.into(),
-            entry_count: 12,
-            gaps: Vec::new(),
-            built_at: 0,
-        };
-        // 角标形态 = (文案, 强调度)；ready / 空态无角标。
-        let note = |state: &State, engine: Option<&EngineStatus>| {
-            badge_note(state, engine).map(|b| (b.text.text(), b.tone))
-        };
-        let some = |text: &str, tone: BadgeTone| Some((text.to_string(), tone));
-        // —— 引擎六态（引擎优先，会话态无关）——
-        assert_eq!(
-            note(&State::Searching, Some(&eng("building"))),
-            some("建索引中 12", BadgeTone::Neutral)
-        );
-        assert_eq!(
-            note(&State::Searching, Some(&eng("ready"))),
-            None,
-            "就绪不占位"
-        );
-        // 就绪时非错误的会话态角标照样被抑制（证明 ready 分支起效）。
-        assert_eq!(
-            note(&State::EngineStarting, Some(&eng("ready"))),
-            None,
-            "就绪时不得显示会话态角标"
-        );
-        // 就绪但查询报错：错误不得被 ready 吞掉。
-        assert_eq!(
-            note(&State::Error("query".into()), Some(&eng("ready"))),
-            some("查询失败", BadgeTone::Error)
-        );
-        assert_eq!(
-            note(&State::Searching, Some(&eng("reconciling"))),
-            some("补齐中", BadgeTone::Warning)
-        );
-        assert_eq!(
-            note(&State::Searching, Some(&eng("degraded"))),
-            some("重扫中", BadgeTone::Warning)
-        );
-        assert_eq!(
-            note(&State::Searching, Some(&eng("offline"))),
-            some("离线索引", BadgeTone::Warning)
-        );
-        // —— 引擎态取不到（或未知）→ 会话态兜底 ——
-        assert_eq!(
-            note(&State::EngineStarting, None),
-            some("引擎未运行", BadgeTone::Error)
-        );
-        assert_eq!(
-            note(&State::Warming, None),
-            some("索引构建中", BadgeTone::Neutral)
-        );
-        assert_eq!(
-            note(&State::Offline, None),
-            some("离线索引", BadgeTone::Warning)
-        );
-        assert_eq!(
-            note(&State::Error("query".into()), None),
-            some("查询失败", BadgeTone::Error)
-        );
-        assert_eq!(note(&State::Idle, None), None);
-        assert_eq!(note(&State::Searching, None), None);
-        assert_eq!(note(&State::Empty, None), None);
-        // 未知引擎态落到会话态（不误报 ready）。
-        assert_eq!(
-            note(&State::Warming, Some(&eng("unknown"))),
-            some("索引构建中", BadgeTone::Neutral)
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let eng = |s: &str| EngineStatus {
+                state: s.into(),
+                entry_count: 12,
+                gaps: Vec::new(),
+                built_at: 0,
+            };
+            // 角标形态 = (文案, 强调度)；ready / 空态无角标。
+            let note = |state: &State, engine: Option<&EngineStatus>| {
+                badge_note(state, engine).map(|b| (b.text.text(), b.tone))
+            };
+            let some = |text: &str, tone: BadgeTone| Some((text.to_string(), tone));
+            // —— 引擎六态（引擎优先，会话态无关）——
+            assert_eq!(
+                note(&State::Searching, Some(&eng("building"))),
+                some("建索引中 12", BadgeTone::Neutral)
+            );
+            assert_eq!(
+                note(&State::Searching, Some(&eng("ready"))),
+                None,
+                "就绪不占位"
+            );
+            // 就绪时非错误的会话态角标照样被抑制（证明 ready 分支起效）。
+            assert_eq!(
+                note(&State::EngineStarting, Some(&eng("ready"))),
+                None,
+                "就绪时不得显示会话态角标"
+            );
+            // 就绪但查询报错：错误不得被 ready 吞掉。
+            assert_eq!(
+                note(&State::Error("query".into()), Some(&eng("ready"))),
+                some("查询失败", BadgeTone::Error)
+            );
+            assert_eq!(
+                note(&State::Searching, Some(&eng("reconciling"))),
+                some("补齐中", BadgeTone::Warning)
+            );
+            assert_eq!(
+                note(&State::Searching, Some(&eng("degraded"))),
+                some("重扫中", BadgeTone::Warning)
+            );
+            assert_eq!(
+                note(&State::Searching, Some(&eng("offline"))),
+                some("离线索引", BadgeTone::Warning)
+            );
+            // —— 引擎态取不到（或未知）→ 会话态兜底 ——
+            assert_eq!(
+                note(&State::EngineStarting, None),
+                some("引擎未运行", BadgeTone::Error)
+            );
+            assert_eq!(
+                note(&State::Warming, None),
+                some("索引构建中", BadgeTone::Neutral)
+            );
+            assert_eq!(
+                note(&State::Offline, None),
+                some("离线索引", BadgeTone::Warning)
+            );
+            assert_eq!(
+                note(&State::Error("query".into()), None),
+                some("查询失败", BadgeTone::Error)
+            );
+            assert_eq!(note(&State::Idle, None), None);
+            assert_eq!(note(&State::Searching, None), None);
+            assert_eq!(note(&State::Empty, None), None);
+            // 未知引擎态落到会话态（不误报 ready）。
+            assert_eq!(
+                note(&State::Warming, Some(&eng("unknown"))),
+                some("索引构建中", BadgeTone::Neutral)
+            );
+        });
+    }
+
+    /// 英文角标:各状态文案逐条钉住(含会话态兜底),占位符不得残留。
+    #[test]
+    fn badge_note_is_localized_in_english() {
+        i18n::with_lang(i18n::Lang::En, || {
+            let eng = |s: &str| EngineStatus {
+                state: s.into(),
+                entry_count: 12,
+                gaps: Vec::new(),
+                built_at: 0,
+            };
+            let note = |state: &State, engine: Option<&EngineStatus>| {
+                badge_note(state, engine).map(|b| b.text.text())
+            };
+            let cases = [
+                (
+                    &State::Searching,
+                    Some(eng("building")),
+                    Some("Building index 12"),
+                ),
+                (
+                    &State::Searching,
+                    Some(eng("reconciling")),
+                    Some("Reconciling"),
+                ),
+                (&State::Searching, Some(eng("degraded")), Some("Rescanning")),
+                (
+                    &State::Searching,
+                    Some(eng("offline")),
+                    Some("Offline index"),
+                ),
+                (&State::EngineStarting, None, Some("Engine not running")),
+                (&State::Warming, None, Some("Building index")),
+                (&State::Offline, None, Some("Offline index")),
+                (&State::Error("query".into()), None, Some("Query failed")),
+            ];
+            for (state, engine, expected) in &cases {
+                let got = note(state, engine.as_ref());
+                assert_eq!(got.as_deref(), *expected, "英文角标不符: {state:?}");
+                if let Some(text) = &got {
+                    assert!(!text.contains('{'), "未替换占位符: {text}");
+                }
+            }
+        });
+    }
+
+    /// 空态两屏中英文案(悬浮条绘制与测试共用 `empty_text`)。
+    #[test]
+    fn empty_state_text_is_localized() {
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                empty_text(&State::Empty),
+                ("No matches", "Try a different keyword")
+            );
+            assert_eq!(
+                empty_text(&State::Idle),
+                ("Type to search", "Search file names or paths")
+            );
+        });
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(empty_text(&State::Empty), ("无匹配项", "换个关键词试试"));
+            assert_eq!(
+                empty_text(&State::Idle),
+                ("输入关键词开始搜索", "可搜文件名，也可搜路径")
+            );
+        });
+    }
+
+    #[test]
+    fn full_window_tooltip_is_localized() {
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(i18n::s().open_in_full_window, "Open in Full Window (⌥↵)");
+        });
     }
 
     /// 超长角标文案按实测宽截断：chip 宽 ≤ 上限且以「…」结尾；短文本原样。

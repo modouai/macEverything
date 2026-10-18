@@ -1080,7 +1080,7 @@ pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
             display_name(hotkey),
             hotkey.id()
         ),
-        None => log::error!("全局热键不可用({})", HotkeyNote::Unavailable.text()),
+        None => log::error!("全局热键不可用({:?})", HotkeyNote::Unavailable),
     }
     match plan.active.window {
         Some(hotkey) => log::info!(
@@ -1091,10 +1091,10 @@ pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
         None => log::warn!("完整窗口快捷键未注册(入口仍有托盘与悬浮条 ⌥↵)"),
     }
     if let Some(note) = &plan.note {
-        log::warn!("唤起快捷键回退提示:{}", note.text());
+        log::warn!("唤起快捷键回退提示:{note:?}");
     }
     if let Some(note) = &plan.window_note {
-        log::warn!("完整窗口快捷键回退提示:{}", note.text());
+        log::warn!("完整窗口快捷键回退提示:{note:?}");
     }
 
     *lock_active(&active) = plan.active;
@@ -1368,19 +1368,21 @@ mod tests {
             Some(HotKey::new(Some(wmods), wcode)),
             "完整窗口键回落 ⌥⇧F"
         );
-        let note = plan.note.expect("唤起键失败须留提示").text();
-        assert!(note.contains("保存的唤起快捷键"), "{note}");
-        assert!(note.contains("已回落默认 ⌥Space"), "{note}");
-        let window_note = plan.window_note.expect("完整窗口键失败须留提示").text();
-        assert!(
-            window_note.contains("保存的完整窗口快捷键"),
-            "{window_note}"
-        );
-        assert!(window_note.contains("已回落默认 ⌥⇧F"), "{window_note}");
-        assert!(
-            !note.contains("完整窗口"),
-            "窗口提示不得混入悬浮条警告: {note}"
-        );
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let note = plan.note.expect("唤起键失败须留提示").text();
+            assert!(note.contains("保存的唤起快捷键"), "{note}");
+            assert!(note.contains("已回落默认 ⌥Space"), "{note}");
+            let window_note = plan.window_note.expect("完整窗口键失败须留提示").text();
+            assert!(
+                window_note.contains("保存的完整窗口快捷键"),
+                "{window_note}"
+            );
+            assert!(window_note.contains("已回落默认 ⌥⇧F"), "{window_note}");
+            assert!(
+                !note.contains("完整窗口"),
+                "窗口提示不得混入悬浮条警告: {note}"
+            );
+        });
     }
 
     /// 启动:文件里持久化的越界键(Escape)不注册,回落默认 + 提示(H1 校验联动)。
@@ -1398,8 +1400,10 @@ mod tests {
         let (mods, code, _) = candidates()[0];
         assert_eq!(plan.active.palette, Some(HotKey::new(Some(mods), code)));
         assert!(!reg.registered.contains(&invalid), "越界键不得注册");
-        let note = plan.note.expect("越界键须提示").text();
-        assert!(note.contains("保存的唤起快捷键"), "{note}");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let note = plan.note.expect("越界键须提示").text();
+            assert!(note.contains("保存的唤起快捷键"), "{note}");
+        });
     }
 
     /// 启动:无自定义键 → 旧默认行为(⌥Space + ⌥⇧F),无提示。
@@ -1443,12 +1447,14 @@ mod tests {
             "第二槽回落默认"
         );
         assert_eq!(plan.note, None, "唤起槽正常无悬浮条提示");
-        let window_note = plan.window_note.expect("冲突须提示").text();
-        assert!(
-            window_note.contains("保存的完整窗口快捷键"),
-            "{window_note}"
-        );
-        assert!(window_note.contains("与唤起键冲突"), "{window_note}");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let window_note = plan.window_note.expect("冲突须提示").text();
+            assert!(
+                window_note.contains("保存的完整窗口快捷键"),
+                "{window_note}"
+            );
+            assert!(window_note.contains("与唤起键冲突"), "{window_note}");
+        });
     }
 
     /// 快照:注册键转 macOS 键帽;未注册槽为空 vec;提示按槽保留。
@@ -2030,8 +2036,10 @@ mod tests {
 
         assert!(plan.active.window.is_none());
         assert_eq!(plan.note, None, "唤起槽默认正常,悬浮条不得出现提示");
-        let note = plan.window_note.expect("窗口槽须留提示").text();
-        assert!(note.contains("保存的完整窗口快捷键"), "{note}");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let note = plan.window_note.expect("窗口槽须留提示").text();
+            assert!(note.contains("保存的完整窗口快捷键"), "{note}");
+        });
     }
 
     /// 无 manager:挂起/恢复如实报告不可用,不得让调用方误记「已挂起/已恢复」。
@@ -2085,40 +2093,109 @@ mod tests {
         assert_eq!(poll_action(&runtime), None, "取尽不再重复");
     }
 
-    /// 持久提示在绘制时按当前语言渲染(语言切换后快照无需重建)。
+    /// 持久提示在绘制时按当前语言渲染；全变体逐条钉住中英文案与占位符替换。
     #[test]
     fn hotkey_note_text_is_localized() {
-        let note = HotkeyNote::Fallback {
-            default: "⌥Space".into(),
-            used: "⌃⌥K".into(),
-        };
-        assert_eq!(note.text(), "⌥Space 不可用,已改用 ⌃⌥K");
-        i18n::with_lang(i18n::Lang::En, || {
-            assert_eq!(note.text(), "⌥Space unavailable; using ⌃⌥K instead");
-        });
-        assert_eq!(HotkeyNote::Unavailable.text(), "快捷键不可用,可从托盘唤起");
-        i18n::with_lang(i18n::Lang::En, || {
-            assert_eq!(
-                HotkeyNote::Unavailable.text(),
-                "Shortcut unavailable; use the menu bar instead"
-            );
-        });
+        let cases = [
+            (
+                HotkeyNote::Fallback {
+                    default: "⌥Space".into(),
+                    used: "⌃⌥K".into(),
+                },
+                "⌥Space 不可用,已改用 ⌃⌥K",
+                "⌥Space unavailable; using ⌃⌥K instead",
+            ),
+            (
+                HotkeyNote::Unavailable,
+                "快捷键不可用,可从托盘唤起",
+                "Shortcut unavailable; use the menu bar instead",
+            ),
+            (
+                HotkeyNote::ResumeFailed,
+                "快捷键恢复失败,请重新录制",
+                "Failed to restore shortcut; please record it again",
+            ),
+            (
+                HotkeyNote::SavedPaletteDefault {
+                    custom: "⌥D".into(),
+                    default: "⌥Space".into(),
+                },
+                "保存的唤起快捷键 ⌥D 不可用,已回落默认 ⌥Space",
+                "Saved Quick Search shortcut ⌥D is unavailable; reverted to default ⌥Space",
+            ),
+            (
+                HotkeyNote::SavedPaletteOther {
+                    custom: "⌥D".into(),
+                    used: "⌃⌥K".into(),
+                },
+                "保存的唤起快捷键 ⌥D 不可用,已改用 ⌃⌥K",
+                "Saved Quick Search shortcut ⌥D is unavailable; using ⌃⌥K instead",
+            ),
+            (
+                HotkeyNote::SavedPaletteUnavailable {
+                    custom: "⌥D".into(),
+                },
+                "保存的唤起快捷键 ⌥D 不可用,可从托盘唤起",
+                "Saved Quick Search shortcut ⌥D is unavailable; use the menu bar instead",
+            ),
+            (
+                HotkeyNote::SavedWindowConflictDefault {
+                    custom: "⌥D".into(),
+                    default: "⌥Space".into(),
+                },
+                "保存的完整窗口快捷键 ⌥D 与唤起键冲突,已回落默认 ⌥Space",
+                "Full Window shortcut ⌥D conflicts with Quick Search; reverted to default ⌥Space",
+            ),
+            (
+                HotkeyNote::SavedWindowDefault {
+                    custom: "⌥D".into(),
+                    default: "⌥Space".into(),
+                },
+                "保存的完整窗口快捷键 ⌥D 不可用,已回落默认 ⌥Space",
+                "Full Window shortcut ⌥D is unavailable; reverted to default ⌥Space",
+            ),
+            (
+                HotkeyNote::SavedWindowConflictUnavailable {
+                    custom: "⌥D".into(),
+                },
+                "保存的完整窗口快捷键 ⌥D 与唤起键冲突,可从托盘打开",
+                "Full Window shortcut ⌥D conflicts; open it from the menu bar",
+            ),
+            (
+                HotkeyNote::SavedWindowUnavailable {
+                    custom: "⌥D".into(),
+                },
+                "保存的完整窗口快捷键 ⌥D 不可用,可从托盘打开",
+                "Full Window shortcut ⌥D is unavailable; open it from the menu bar",
+            ),
+        ];
+        assert_eq!(cases.len(), 10, "须覆盖 HotkeyNote 全部变体");
+        for (note, zh, en) in &cases {
+            let zh_text = i18n::with_lang(i18n::Lang::ZhHans, || note.text());
+            assert_eq!(&zh_text, zh);
+            assert!(!zh_text.contains('{'), "未替换占位符: {zh_text}");
+            let en_text = i18n::with_lang(i18n::Lang::En, || note.text());
+            assert_eq!(&en_text, en);
+            assert!(!en_text.contains('{'), "未替换占位符: {en_text}");
+        }
     }
 
     /// 提示文案:默认键正常不打扰;降级提示改用键;全失败提示托盘兜底。
     #[test]
     fn note_maps_registration_outcome() {
-        let text = |note: Option<HotkeyNote>| note.as_ref().map(HotkeyNote::text);
-        assert_eq!(note_for(Some("⌥Space")), None, "默认键正常 = 无提示");
-        assert_eq!(
-            text(note_for(Some("⌥⇧Space"))).as_deref(),
-            Some("⌥Space 不可用,已改用 ⌥⇧Space")
-        );
-        assert_eq!(
-            text(note_for(Some("⌃⌥⇧Space"))).as_deref(),
-            Some("⌥Space 不可用,已改用 ⌃⌥⇧Space")
-        );
-        assert_eq!(note_for(None), Some(HotkeyNote::Unavailable));
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let text = |note: Option<HotkeyNote>| note.as_ref().map(HotkeyNote::text);
+            assert_eq!(note_for(Some("⌥Space")), None, "默认键正常 = 无提示");
+            assert_eq!(
+                text(note_for(Some("⌥⇧Space"))).as_deref(),
+                Some("⌥Space 不可用,已改用 ⌥⇧Space")
+            );
+            assert_eq!(
+                text(note_for(Some("⌃⌥⇧Space"))).as_deref(),
+                Some("⌥Space 不可用,已改用 ⌃⌥⇧Space")
+            );
+            assert_eq!(note_for(None), Some(HotkeyNote::Unavailable));
+        });
     }
 
     fn palette_default() -> HotKey {
@@ -2311,9 +2388,11 @@ mod tests {
         assert_eq!(active.palette, Some(fallback));
         assert!(reg.registered.contains(&fallback));
         assert!(!reg.registered.contains(&old));
-        let note = snapshot.note.expect("降级须提示").text();
-        assert!(note.contains(name), "{note}");
-        assert!(note.contains("不可用,已改用"), "{note}");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let note = snapshot.note.expect("降级须提示").text();
+            assert!(note.contains(name), "{note}");
+            assert!(note.contains("不可用,已改用"), "{note}");
+        });
     }
 
     /// 已在该槽生效的默认键:reset 幂等成功,不重复注册(系统会判重复)。
