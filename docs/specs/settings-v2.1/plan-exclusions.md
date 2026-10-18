@@ -1,6 +1,6 @@
 # 设置 · 排除目录实现计划
 
-**Status:** E1–E5 已实现（2026-10-18）；E4 文案/注释已完成，实机验收待屏幕解锁。
+**Status:** E1–E5 已实现；E5「恢复默认」实机通过（2026-10-18）；E4 其余实机清单待补。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps `- [ ]`.
 
@@ -147,8 +147,12 @@
   - Headless：恢复默认点击 → Request；确认/取消点击动作；busy 禁用；确认说明
     文本/行高（目录行下移）；添加/移除既有测试保持通过。
 - [x] **Step 6: 文档 + fmt/clippy/test；提交** `feat(app): 排除目录恢复默认`.
-  - 实机（待办）：自定义排除若干 → 恢复默认 → 确认 → 一次重扫后仅剩三条；
-    取消不改变列表；引擎离线/旧 daemon 显示错误且列表不变。
+  - [x] 实机（2026-10-18 controller）：移除 `.git`（CLI）→ 设置页两步确认恢复默认
+    → 列表与 `config.toml` 回到 `~/Library`、`node_modules`、`.git`；引擎已用新
+    CLI 停/启以支持 `ExcludeReset`；取消/离线/旧 daemon 分支由状态/单测与 socket
+    桩覆盖，未逐一手工复跑。
+  - 已知残留：exclude 操作串行化后，排队操作可能叠加既有 30s 客户端读超时；
+    大索引下若出现，按 30s 超时限制记录后续处理。
 
 ## 验证命令
 
