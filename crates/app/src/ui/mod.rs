@@ -66,6 +66,7 @@
 //! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
 
 pub mod font;
+pub mod hotkey_keys;
 pub mod icons;
 pub mod mascot;
 pub mod menu_actions;
