@@ -152,8 +152,9 @@
 - [x] **Step 6: 文档 + fmt/clippy/test；提交** `feat(app): 排除目录恢复默认`.
   - [x] Controller 验证（2026-10-18）：reset worker 可用，列表与 `config.toml`
     回到三条默认；引擎已用新 CLI 停/启以支持 `ExcludeReset`。内联两步确认因
-    UX 反馈已替换为原生 `NSAlert`；原生弹窗实机点击验收待下一轮（弹窗为唯一
-    手工路径，取消/离线/旧 daemon 分支由状态/单测与 socket 桩覆盖）。
+    UX 反馈已替换为原生 `NSAlert`；弹窗已由 controller 实机验证（标题/说明正确，
+    Return=取消不改列表，显式点击「恢复默认」后列表/config 回到三条并完成重扫）；
+    取消/离线/旧 daemon 分支由状态/单测与 socket 桩覆盖。
   - 已知残留：exclude 操作串行化后，排队操作可能叠加既有 30s 客户端读超时；
     大索引下若出现，按 30s 超时限制记录后续处理。
 

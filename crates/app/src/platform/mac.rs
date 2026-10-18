@@ -626,7 +626,9 @@ pub fn pick_directory() -> Option<PathBuf> {
 /// ② `NSAlert` 第一个按钮「取消」:AppKit 给首按钮默认 Return 键等价,故按回车
 ///    只会取消;第二个破坏性按钮显式清空 Return 键等价,必须鼠标点选；
 /// ③ `runModal()` 阻塞到用户选择；仅响应码为第二按钮时返回 true。
-/// 取消/Esc/中止/非主线程均返回 false（宁可不执行破坏性操作）。
+/// 取消/关闭/中止/非主线程均返回 false（宁可不执行破坏性操作）。
+/// 注：AppKit 只自动给标题恰为 "Cancel" 的按钮绑定 Esc；中文「取消」不触发 Esc，
+/// 因此 Esc 在本弹窗里没有显式动作（不会误确认）。
 pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         log::warn!("确认弹窗:非主线程调用,按取消处理");

@@ -181,8 +181,8 @@ $ macEverything exclude add /Users/you/Videos
 daemon 未运行时此命令报错(需引擎在线)。
 
 `reset` 无参数：清空自定义条目并恢复内置默认三条（`~/Library`、`node_modules`、
-`.git`），保存配置后一次重扫生效。设置页对应「恢复默认」需两步确认。旧 daemon
-不认识该请求，须先 `macEverything stop && macEverything start` 换用新 CLI。
+`.git`），保存配置后一次重扫生效。设置页对应「恢复默认」使用原生确认弹窗
+（默认按钮为「取消」）。旧 daemon 不认识该请求，须先 `macEverything stop && macEverything start` 换用新 CLI。
 
 ## 搜索语法
 
