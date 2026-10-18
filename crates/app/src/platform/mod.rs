@@ -183,6 +183,21 @@ pub fn custom_icon_rgba(path: &str) -> Option<Vec<u8>> {
 }
 
 /// 记录根窗句柄(创建期一次)。
+/// 安装 Space 变更后的悬浮条重绘钩子(`App::new` 调用一次)。
+///
+/// 切到他人全屏 Space 时 eframe 可能不主动跑悬浮条视口;通知回调经此唤醒重绘,
+/// 并在主队列恢复面板/垫窗层级(见 mac.rs `refresh_palette_after_space_change`)。
+pub fn install_space_repaint(ctx: eframe::egui::Context) {
+    #[cfg(target_os = "macos")]
+    {
+        mac::install_space_repaint(ctx);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx;
+    }
+}
+
 pub fn attach_root(cc: &eframe::CreationContext<'_>) {
     #[cfg(target_os = "macos")]
     mac::attach_root(cc);

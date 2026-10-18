@@ -322,6 +322,9 @@ impl App {
         log::info!("启动外观:{theme:?}");
         // 平台层:记录根窗句柄(悬浮条窗与根窗同为 NSApp.windows() 成员,须区分)。
         platform::attach_root(cc);
+        // 切 Space(尤其进他人全屏)后主动唤醒悬浮条重绘并恢复层级:
+        // 否则窗口可能停在一帧空白内容,点一下才恢复(2026-10-18 实机反馈)。
+        platform::install_space_repaint(cc.egui_ctx.clone());
         let hotkey_note = hotkey.note().map(str::to_string);
         let shared = Arc::new(Mutex::new(Shared {
             palette: palette::PaletteState::new(

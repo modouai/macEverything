@@ -35,6 +35,7 @@ use std::cell::RefCell;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
+use eframe::egui;
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
@@ -127,6 +128,20 @@ impl SpaceObserver {
 /// 最近一次 Space 变更(全局:通知投递线程不预设为主线程,故不走 thread_local)。
 static SPACE_CHANGE: Mutex<Option<SpaceChange>> = Mutex::new(None);
 
+/// Space 变更后的重绘钩子(egui Context 线程安全;通知回调线程直接请求重绘)。
+/// 切到他人全屏 Space 时 eframe 可能不主动跑悬浮条视口,窗口会停留在一帧空白内容;
+/// 通知到达后主动唤醒视口(并延迟再补两帧,覆盖窗口服务器完成 Space 切换的时序)。
+static SPACE_REPAINT: Mutex<Option<egui::Context>> = Mutex::new(None);
+
+/// 安装 Space 变更重绘钩子(App::new 调用一次;后装覆盖前装)。
+pub fn install_space_repaint(ctx: egui::Context) {
+    let mut slot = match SPACE_REPAINT.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(ctx);
+}
+
 /// 记录一次 Space 变更(通知回调):序号递增 + 记时刻 + 留痕(实机调参取证)。
 fn note_space_change() {
     let mut guard = match SPACE_CHANGE.lock() {
@@ -140,6 +155,55 @@ fn note_space_change() {
     });
     drop(guard);
     log::info!("Space 变更通知(第 {seq} 次;t+{}ms)", monotonic_ms());
+    // 全屏 Space 切换后 eframe 可能不跑悬浮条视口:窗口内容会停留在切 Space 前的
+    // 空帧(用户实测「全屏里悬浮条只有形象/空白,点一下才出内容」)。通知线程直接
+    // 请求重绘(Context 线程安全)+ 主队列重排垫窗/面板层级;延迟两帧覆盖窗口服务器
+    // 完成 Space 动画的时序。
+    let ctx = SPACE_REPAINT.lock().ok().and_then(|guard| guard.clone());
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        ctx.request_repaint_after(std::time::Duration::from_millis(360));
+    }
+    dispatch2::DispatchQueue::main().exec_async(refresh_palette_after_space_change);
+}
+
+/// Space 切换后恢复悬浮条窗口层级并重绘(主线程)。
+///
+/// 垫窗(NSVisualEffectView 的独立窗口)与面板同 level;窗口服务器在跨 Space 时
+/// 可能打乱同级窗顺序,垫窗会盖在面板上——表现为「悬浮条只剩顶部形象、面板内容
+/// 全白/空白,点一下才恢复」。这里把面板置前、垫窗压回面板之下,并标记重绘。
+fn refresh_palette_after_space_change() {
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return; // 主队列回调必在主线程;理论不可达
+    };
+    let (panel, blur, blur_visible) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.palette.clone(), st.blur.clone(), st.blur_visible)
+    });
+    let Some(panel) = panel else {
+        return; // 视口尚未创建
+    };
+    if !panel.isVisible() {
+        return; // 悬浮条隐藏时不抢层级
+    }
+    panel.orderFrontRegardless();
+    if blur_visible {
+        if let Some(blur) = blur {
+            // 面板先置前、垫窗再压到面板之下:跨 Space 后同级窗顺序可能已翻转。
+            blur.orderWindow_relativeTo(NSWindowOrderingMode::Below, panel.windowNumber());
+            blur.displayIfNeeded();
+        }
+    }
+    if let Some(view) = panel.contentView() {
+        view.setNeedsDisplay(true);
+    }
+    panel.displayIfNeeded();
+    log::info!(
+        "Space 变更后悬浮条重排层级/重绘:isVisible={} isKey={} blur_visible={blur_visible}",
+        panel.isVisible(),
+        panel.isKeyWindow()
+    );
 }
 
 /// 最近一次 Space 变更(facade 转发;None = 进程内从未收到)。
