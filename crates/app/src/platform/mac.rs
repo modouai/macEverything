@@ -42,11 +42,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel,
-    NSImage, NSMenu, NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
-    NSOpenPanel, NSPanel, NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType,
+    NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem,
+    NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPanel,
+    NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
@@ -616,6 +617,37 @@ pub fn pick_directory() -> Option<PathBuf> {
     }
     log::info!("目录选择器:选中 {path:?}");
     Some(path)
+}
+
+/// 破坏性操作原生确认弹窗(阻塞;仅主线程调用——调用点在设置页动作落地,
+/// 即 egui 主线程,且不得持共享锁)。
+///
+/// ① 先激活 app(设置窗可能在其他 app 之后);
+/// ② `NSAlert` 第一个按钮「取消」:AppKit 给首按钮默认 Return 键等价,故按回车
+///    只会取消;第二个破坏性按钮显式清空 Return 键等价,必须鼠标点选；
+/// ③ `runModal()` 阻塞到用户选择；仅响应码为第二按钮时返回 true。
+/// 取消/Esc/中止/非主线程均返回 false（宁可不执行破坏性操作）。
+pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::warn!("确认弹窗:非主线程调用,按取消处理");
+        return false;
+    };
+    NSApplication::sharedApplication(mtm).activate();
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    // 按钮添加顺序 = 响应码顺序:取消在前(默认 Return)。
+    let cancel = alert.addButtonWithTitle(&NSString::from_str("取消"));
+    let action = alert.addButtonWithTitle(&NSString::from_str(action_label));
+    cancel.setKeyEquivalent(&NSString::from_str("\r"));
+    action.setKeyEquivalent(&NSString::from_str(""));
+    let response = alert.runModal(); // 阻塞:嵌套 run loop,返回即弹窗关闭
+    let confirmed = response == NSAlertSecondButtonReturn;
+    log::info!(
+        "确认弹窗:{title:?}({message:?}) action={action_label:?} response={response} confirmed={confirmed}"
+    );
+    confirmed
 }
 
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。

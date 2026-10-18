@@ -57,6 +57,12 @@ objc2-app-kit = { version = "0.3", features = [
     # 连带 foundation 的 NSArray/NSURL 等。
     "NSOpenPanel",
     "NSSavePanel",
+    # E5 后续:排除目录恢复默认改用原生确认弹窗。NSAlert.addButtonWithTitle:
+    # 的 cfg 门控要求 NSButton + NSControl + NSResponder + NSView 四 feature
+    # 同时在场(后两者已列);runModal/NSAlertSecondButtonReturn 还需 NSApplication。
+    "NSAlert",
+    "NSButton",
+    "NSControl",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification

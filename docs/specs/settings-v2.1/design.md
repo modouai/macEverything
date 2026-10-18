@@ -1,6 +1,6 @@
 # 设置功能（v2.1 第一期）— 设计
 
-**Status:** Phase A 已实现（2026-10-18：窗口 / 字号 / 自启 / 语言占位）；快捷键 H1–H3 已实现（映射/运行时/设置页录制与持久化，2026-10-18）；排除目录 E1–E5 已实现（真实列表 + 异步 add/remove + 两步确认恢复默认，2026-10-18；E4 实机验收待办）
+**Status:** Phase A 已实现（2026-10-18：窗口 / 字号 / 自启 / 语言占位）；快捷键 H1–H3 已实现（映射/运行时/设置页录制与持久化，2026-10-18）；排除目录 E1–E5 已实现（真实列表 + 异步 add/remove + 原生确认恢复默认，2026-10-18；E4 实机验收待办）
 **范围:** 设置窗口 + 非语言项（字号 / 开机自启 / 两个全局快捷键 / 排除目录）
 **视觉依据:** `docs/specs/floatbar-visual/settings-visual.md`（下称 `visual`）
 **不交付:** i18n（语言项先占位）、侧边栏/快捷键冲突弹窗、排除目录的定向增量重扫
@@ -359,14 +359,19 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
   （`engine::config::default_config()`）；自定义条目全部清除。不新增名称规则输入，
   不改变默认列表。默认相对名（`.git`、`node_modules`）无法经目录选择器重新添加，
   这是本操作的直接动机。
-- **两步确认（破坏性）**：Header 右侧常规态为「恢复默认」小号文字按钮 +
-  「＋ 添加目录…」；点击「恢复默认」只展开确认，不启动 worker。确认态隐藏添加
-  按钮，显示「取消」「确认恢复」，并在 Header 下显示支持行
-  「将清空自定义排除项，恢复 ~/Library、node_modules、.git」；该行高度计入
-  `RowSpec.extra`。确认/取消/打开/关闭/开始 add/remove/reset 均收起确认；
-  请求与取消确认不清既有错误。
-- **执行**：`SettingsAction::ConfirmExcludeReset` → `client::exclude(paths, "reset", None)`
-  → daemon `Request::ExcludeReset` → `reset_excludes`。复用单操作 busy/错误管线
+- **原生确认弹窗（破坏性）**：Header 右侧为「恢复默认」小号文字按钮 +
+  「＋ 添加目录…」；点击「恢复默认」→ `SettingsAction::ResetExcludes` → 设置 pass
+  在共享锁外、主线程调用 `platform::confirm_action(title, message, action_label)`。
+  macOS 实现为 `NSAlert`（非 macOS 恒 false）：
+  - 标题：「恢复默认排除目录？」
+  - 正文：「将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。」
+  - 按钮：第一个「取消」（默认 Return），第二个「恢复默认」（显式清空 Return
+    键等价，必须显式点击）。
+  - 取消/关闭/非主线程返回 false，不改变任何状态；确认才启动 reset worker。
+  - 原生弹窗是阻塞模态，期间 egui 冻结（与目录选择器同款）；弹窗不新增内联
+    Header 确认态/支持行。
+- **执行**：确认 → `client::exclude(paths, "reset", None)` → daemon
+  `Request::ExcludeReset` → `reset_excludes`。复用单操作 busy/错误管线
   （显示「重扫中…」、禁用全部排除控件）；成功以响应列表覆盖，失败保留旧列表 +
   错误。一次 reset 只触发一次 daemon 全量重扫，不为每条默认单独变更。
 - **daemon 顺序**：先 `config::save(default_config(), config_file)`；保存失败 →

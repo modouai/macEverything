@@ -249,10 +249,11 @@ pub const ADD_BUTTON_RADIUS: u8 = 7;
 pub const ADD_BUTTON_FONT: f32 = 12.0;
 /// 添加按钮内左右内边距（§2.4 表外补充：按钮宽 = 文字宽 + 2×本值）。
 pub const ADD_BUTTON_PAD_X: f32 = 10.0;
-/// 「恢复默认」/「取消」/「确认恢复」小号文字按钮内左右内边距
+/// 「恢复默认」小号文字按钮内左右内边距
 /// （E5 实现补充：静止无底、悬停浅底；高度与添加按钮对齐）。
 pub const RESET_BUTTON_PAD_X: f32 = 6.0;
-/// 恢复默认文字按钮与添加按钮的间距（E5 实现补充：右对齐组内）。
+/// 恢复默认文字按钮与添加按钮的间距（E5 实现补充：右对齐组内；确认动作在
+/// 原生弹窗中完成，Header 不再出现第二组按钮）。
 pub const RESET_BUTTON_GAP: f32 = 12.0;
 /// 恢复默认文字按钮悬停底的圆角（E5 实现补充）。
 pub const RESET_BUTTON_RADIUS: u8 = 6;

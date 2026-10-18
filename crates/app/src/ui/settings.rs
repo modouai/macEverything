@@ -135,8 +135,7 @@ pub struct SettingsState {
     /// 最近一次排除目录加载/变更失败原因。
     ///
     /// add/remove/reset 开始即清；自动 list 刷新**保留**（否则刚收到的失败文案
-    /// 会被重开触发的刷新立刻吞掉），仅成功 list 响应清空。请求/取消恢复默认
-    /// 确认不算操作开始，不清错误。
+    /// 会被重开触发的刷新立刻吞掉），仅成功 list 响应清空。
     pub(crate) exclude_error: Option<String>,
     /// 最近一次排除 worker 是否产生了终态结果（含 daemon 列表响应成功/失败，
     /// 以及 client 离线错误）；线程启动失败/无结果退出不算，保持 false。
@@ -145,9 +144,6 @@ pub struct SettingsState {
     pub(crate) exclude_refresh_pending: bool,
     /// 在途操作的唯一回投通道（one-op；不跨操作复用）。
     pub(crate) exclude_rx: Option<Receiver<ExcludeResult>>,
-    /// 排除目录「恢复默认」两步确认已展开（破坏性操作；打开/关闭/开始任何操作
-    /// 或取消都清除，防陈旧确认跨帧残留）。
-    pub(crate) exclude_reset_confirm: bool,
     /// 全局热键运行时快照（H2 启动种子；键帽展示/查重的唯一真源）。
     pub(crate) hotkey_snapshot: HotkeySnapshot,
     /// 当前录制槽（None = 未录制）；录制期全局热键已挂起。
@@ -189,7 +185,6 @@ impl SettingsState {
             exclude_loaded: false,
             exclude_refresh_pending: false,
             exclude_rx: None,
-            exclude_reset_confirm: false,
             hotkey_snapshot,
             recording: None,
             viewport_focused: None,
@@ -212,8 +207,6 @@ impl SettingsState {
         if first_open {
             self.positioned_once = true;
         }
-        // 打开动作（含已打开时再次点入口）都收起确认，防陈旧破坏性确认残留。
-        self.exclude_reset_confirm = false;
         if !was_open {
             // 每次真正打开都重取 daemon 列表（隐藏期可能被 CLI 改动）。
             self.exclude_refresh_pending = true;
@@ -226,7 +219,6 @@ impl SettingsState {
         self.open = false;
         self.viewport_focused = None;
         self.cancel_recording_pending = true;
-        self.exclude_reset_confirm = false;
     }
 
     /// 取走录制取消挂起（`App::logic` 消费；录制中由它恢复旧热键）。
@@ -250,29 +242,11 @@ impl SettingsState {
         }
         self.exclude_busy = true;
         self.exclude_busy_list = list;
-        // 任何后台操作开始都收起两步确认（reset 自身开始、add/remove 抢占）。
-        self.exclude_reset_confirm = false;
         if clear_error {
             self.exclude_error = None;
         }
         self.exclude_rx = Some(rx);
         true
-    }
-
-    /// 「恢复默认」请求第一步：仅展开确认，不改列表/错误，也不启动 worker。
-    pub(crate) fn request_exclude_reset(&mut self) {
-        self.exclude_reset_confirm = true;
-    }
-
-    /// 取消恢复默认确认：仅收起确认，保留既有错误与列表。
-    pub(crate) fn cancel_exclude_reset(&mut self) {
-        self.exclude_reset_confirm = false;
-    }
-
-    /// 确认恢复默认：取走确认态（返回是否确实处于确认中，防陈旧动作重复触发）。
-    /// 真正的 worker 启动与 busy/错误规则仍由 `spawn_exclude("reset")` 走既有管线。
-    pub(crate) fn take_exclude_reset_confirm(&mut self) -> bool {
-        std::mem::take(&mut self.exclude_reset_confirm)
     }
 
     /// 设置 pass 的排除目录推进：非阻塞收结果，返回 true = 锁外应启动一次 list。
@@ -557,7 +531,6 @@ impl SettingsData {
             exclude_busy: state.exclude_busy,
             exclude_busy_list: state.exclude_busy_list,
             exclude_error: state.exclude_error.clone(),
-            exclude_reset_confirm: state.exclude_reset_confirm,
         }
     }
 }
@@ -671,6 +644,12 @@ fn consume_close_shortcut(ctx: &egui::Context) -> bool {
     ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
 }
 
+/// 恢复默认排除目录：原生确认弹窗文案（取消是默认按钮，破坏性动作须显式点选）。
+const RESET_CONFIRM_TITLE: &str = "恢复默认排除目录？";
+const RESET_CONFIRM_MESSAGE: &str =
+    "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。";
+const RESET_CONFIRM_ACTION: &str = "恢复默认";
+
 /// 落地一条设置动作（已出共享锁）。
 fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: SettingsAction) {
     match action {
@@ -693,29 +672,22 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             lock_shared(shared).settings.hotkey_rejected(slot, message);
             ctx.request_repaint_of(viewport_id());
         }
-        SettingsAction::RequestExcludeReset => {
-            lock_shared(shared).settings.request_exclude_reset();
-            ctx.request_repaint_of(viewport_id());
-        }
-        SettingsAction::CancelExcludeReset => {
-            lock_shared(shared).settings.cancel_exclude_reset();
-            ctx.request_repaint_of(viewport_id());
-        }
-        SettingsAction::ConfirmExcludeReset => {
-            let confirmed = lock_shared(shared).settings.take_exclude_reset_confirm();
-            if confirmed {
-                // 与 add/remove 共用 busy/错误管线；reset 无参数、一次重扫。
+        SettingsAction::ResetExcludes => {
+            // 原生模态:主线程调用且不持共享锁(与目录选择器同纪律)。取消 = 无状态
+            // 变化;确认后才启动既有 reset worker(一次重扫)。
+            if platform::confirm_action(
+                RESET_CONFIRM_TITLE,
+                RESET_CONFIRM_MESSAGE,
+                RESET_CONFIRM_ACTION,
+            ) {
                 spawn_exclude(ctx, shared, "reset", None);
+            } else {
+                log::info!("排除目录:取消恢复默认");
             }
             ctx.request_repaint_of(viewport_id());
         }
-        SettingsAction::AddExclude => {
-            // 陈旧视图动作：确认态下 add 不可达；仍按「新操作收起确认」处理。
-            lock_shared(shared).settings.cancel_exclude_reset();
-            apply_add_exclude(shared, ctx);
-        }
+        SettingsAction::AddExclude => apply_add_exclude(shared, ctx),
         SettingsAction::RemoveExclude(path) => {
-            lock_shared(shared).settings.cancel_exclude_reset();
             spawn_exclude(ctx, shared, "remove", Some(path));
             ctx.request_repaint_of(viewport_id());
         }
@@ -1108,67 +1080,15 @@ mod tests {
         }
     }
 
-    /// 两步确认纯状态：请求只展开确认（不清错误）；取消收起；take 只成功一次。
+    /// 原生确认弹窗文案是行为契约的一部分（标题/正文/破坏性按钮），变更须同步文档。
     #[test]
-    fn exclude_reset_confirmation_transitions() {
-        let mut state = test_state();
-        state.exclude_error = Some("旧错误".into());
-
-        state.request_exclude_reset();
-        assert!(state.exclude_reset_confirm, "请求应展开确认");
+    fn reset_native_confirmation_copy_matches_contract() {
+        assert_eq!(RESET_CONFIRM_TITLE, "恢复默认排除目录？");
         assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("旧错误"),
-            "仅请求确认不得清掉已有错误"
+            RESET_CONFIRM_MESSAGE,
+            "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。"
         );
-
-        state.cancel_exclude_reset();
-        assert!(!state.exclude_reset_confirm, "取消应收起确认");
-        assert_eq!(
-            state.exclude_error.as_deref(),
-            Some("旧错误"),
-            "取消确认不得清掉已有错误"
-        );
-
-        state.request_exclude_reset();
-        assert!(
-            state.take_exclude_reset_confirm(),
-            "确认应收起并放行 worker"
-        );
-        assert!(!state.exclude_reset_confirm);
-        assert!(
-            !state.take_exclude_reset_confirm(),
-            "同一确认不得重复触发 worker"
-        );
-    }
-
-    /// 打开/关闭/开始 add/remove 都清确认（防陈旧破坏性操作跨帧残留）。
-    #[test]
-    fn exclude_reset_confirmation_cleared_on_open_close_and_changes() {
-        let mut state = test_state();
-
-        state.request_exclude_reset();
-        state.request_open();
-        assert!(!state.exclude_reset_confirm, "打开须清确认");
-
-        state.request_exclude_reset();
-        state.mark_hidden();
-        assert!(!state.exclude_reset_confirm, "关闭须清确认");
-
-        for label in ["add", "remove", "reset"] {
-            let mut state = test_state();
-            state.request_exclude_reset();
-            assert!(state.exclude_reset_confirm);
-            let _tx = begin_fake_exclude(&mut state, false);
-            assert!(!state.exclude_reset_confirm, "{label} 开始须收起确认");
-        }
-
-        // 已打开时再次请求打开（点齿轮置前）同样收起确认。
-        let mut state = test_state();
-        state.request_open();
-        state.request_exclude_reset();
-        state.request_open();
-        assert!(!state.exclude_reset_confirm);
+        assert_eq!(RESET_CONFIRM_ACTION, "恢复默认");
     }
 
     /// reset worker 成功：响应三条默认覆盖旧列表、清错、结束 busy。
@@ -2005,7 +1925,6 @@ mod tests {
         state.exclude_busy = true;
         state.exclude_busy_list = true;
         state.exclude_error = Some("daemon 未在运行".into());
-        state.exclude_reset_confirm = true;
 
         let data = SettingsData::from_state(&state);
         assert_eq!(data.font_size, FontSize::Large);
@@ -2029,7 +1948,6 @@ mod tests {
         assert!(data.exclude_busy);
         assert!(data.exclude_busy_list);
         assert_eq!(data.exclude_error.as_deref(), Some("daemon 未在运行"));
-        assert!(data.exclude_reset_confirm);
     }
 
     fn key_w(modifiers: egui::Modifiers) -> egui::RawInput {

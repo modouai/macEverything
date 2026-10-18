@@ -118,6 +118,23 @@ pub fn pick_directory() -> Option<PathBuf> {
     }
 }
 
+/// 破坏性操作原生确认弹窗（主线程；取消/失败 = false）。非 macOS = false。
+///
+/// macOS 用 `NSAlert`：第一个按钮固定「取消」并持有默认 Return，破坏性
+/// `action_label` 为第二个按钮（显式清空 Return 键等价）；仅点击第二个按钮
+/// 返回 true。调用方须在主线程且不得持共享锁（模态期间 egui 冻结）。
+pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::confirm_action(title, message, action_label)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, message, action_label);
+        false
+    }
+}
+
 /// 鼠标任意键当前是否按下(「点击导致失焦」的快判信号;非 macOS 恒 false)。
 pub fn mouse_button_down() -> bool {
     #[cfg(target_os = "macos")]

@@ -4,7 +4,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps `- [ ]`.
 
-**Goal:** 设置页排除目录列表接真实引擎状态；可添加（系统目录选择器）、移除与两步确认恢复默认；变更触发重扫，异步不卡 UI；默认相对名条目可移除。
+**Goal:** 设置页排除目录列表接真实引擎状态；可添加（系统目录选择器）、移除与原生确认恢复默认；变更触发重扫，异步不卡 UI；默认相对名条目可移除。
 
 **依据:** `design.md` §8；`settings-visual.md` §2.4/§2.4.1；`client::exclude` / daemon `ExcludeAdd/Remove/List/Reset`。
 
@@ -99,12 +99,13 @@
 
 **Files:** `crates/protocol/src/lib.rs`; `crates/client/src/lib.rs`; `crates/cli/src/daemon.rs`;
 `crates/app/src/ui/settings.rs`; `crates/app/src/ui/settings_view.rs`;
-`crates/app/src/ui/settings_tokens.rs`; docs.
+`crates/app/src/ui/settings_tokens.rs`; `crates/app/src/platform/{mod,mac}.rs`;
+`crates/app/Cargo.toml`; docs.
 
 **产品决定:** 「恢复默认」把排除列表重置为内置三条 `~/Library`、`node_modules`、`.git`
-（`engine::config::default_config()`）；破坏性操作，设置页两步确认；一次 daemon
-重扫（不为每条默认单独 add/remove）。不新增自定义名称规则输入，不改默认列表。
-存在动机：默认相对名（`.git`、`node_modules`）无法经目录选择器重新添加。
+（`engine::config::default_config()`）；破坏性操作，设置页使用**原生 macOS 确认
+弹窗**；一次 daemon 重扫（不为每条默认单独 add/remove）。不新增自定义名称规则输入，
+不改默认列表。存在动机：默认相对名（`.git`、`node_modules`）无法经目录选择器重新添加。
 
 - [x] **Step 1: 协议 + client**
   - `Request::ExcludeReset { v }`（无参数；`version()` 覆盖；复用 `Response::Exclude`）。
@@ -128,29 +129,31 @@
     **原自定义排除目录内的文件在 reset 重扫后入索引**（证明重扫使用新排除集）；
     保存失败路径内存不变、状态保持原样；用 channel 证明 add/reset 在持锁期间
     阻塞、释放后完成（跨线程串行化回归）。
-- [x] **Step 3: 设置页状态与动作**
-  - `SettingsState.exclude_reset_confirm: bool`：打开/关闭/开始 add/remove/reset/
-    取消清；请求/取消确认不清既有错误；确认取走确认态后启动 `"reset"` worker。
-  - `SettingsAction::{RequestExcludeReset, CancelExcludeReset, ConfirmExcludeReset}`；
-    陈旧 add/remove 动作也会收起确认。复用单操作 busy/错误/结果管线；
-    成功以响应覆盖为三条默认，失败保留旧列表 + 错误。
-- [x] **Step 4: 视图**
-  - Header 右侧组：「恢复默认」（12pt 次要色小号文字按钮，悬停浅底）+
-    间距 + 「＋ 添加目录…」；不新增大控件。
-  - 确认态：隐藏添加按钮，显示「取消」「确认恢复」（确认红字），Header 下支持行
-    「将清空自定义排除项，恢复 ~/Library、node_modules、.git」，高度计入
-    `RowSpec.extra`；busy 时恢复默认/取消/确认与添加/移除全部禁点。
+- [x] **Step 3: 设置页状态与动作（原生确认）**
+  - `SettingsAction::ResetExcludes`：点击只回传动作；设置 pass 在共享锁外调用
+    `platform::confirm_action(title, message, action_label)`。确认 → 启动既有
+    `"reset"` worker；取消 → 不改变状态、不清错误。不保留任何内联确认状态。
+  - 复用单操作 busy/错误/结果管线；成功以响应覆盖为三条默认，失败保留旧列表 +
+    错误。
+- [x] **Step 4: 原生确认弹窗 + 视图**
+  - `platform::confirm_action`（macOS `NSAlert`；非 macOS false）：标题
+    「恢复默认排除目录？」、正文「将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。」；
+    第一按钮「取消」（默认 Return）、第二按钮「恢复默认」（显式清空 Return，
+    必须点击）；取消/关闭/非主线程 = false。主线程调用，不持共享锁。
+  - Header 右侧组不变：「恢复默认」（12pt 次要色小号文字按钮，悬停浅底）+
+    间距 + 「＋ 添加目录…」；busy 时两者均禁用。**已删除**内联确认态
+    （取消/确认恢复、支持行、`RowSpec.extra` 与相关状态/动作）。
 - [x] **Step 5: 测试**
   - 协议往返/版本；client 无 daemon 用法与未知动作帮助；daemon 成功/失败。
-  - 状态：请求/取消/确认、打开/关闭/add/remove 清确认、reset 成功覆盖默认、
-    失败保留旧列表 + 错误且 busy=false、begin 清错误标志。
-  - Headless：恢复默认点击 → Request；确认/取消点击动作；busy 禁用；确认说明
-    文本/行高（目录行下移）；添加/移除既有测试保持通过。
+  - 状态：reset 成功覆盖默认、失败保留旧列表 + 错误且 busy=false、begin 清错误。
+  - Headless：恢复默认点击 → `ResetExcludes`；busy 禁用；添加/移除既有测试
+    保持通过；内联确认测试/说明行已移除。
+  - 原生弹窗本身不自动化（需人工点击）；主线程/文案/按钮顺序由平台实现约束。
 - [x] **Step 6: 文档 + fmt/clippy/test；提交** `feat(app): 排除目录恢复默认`.
-  - [x] 实机（2026-10-18 controller）：移除 `.git`（CLI）→ 设置页两步确认恢复默认
-    → 列表与 `config.toml` 回到 `~/Library`、`node_modules`、`.git`；引擎已用新
-    CLI 停/启以支持 `ExcludeReset`；取消/离线/旧 daemon 分支由状态/单测与 socket
-    桩覆盖，未逐一手工复跑。
+  - [x] Controller 验证（2026-10-18）：reset worker 可用，列表与 `config.toml`
+    回到三条默认；引擎已用新 CLI 停/启以支持 `ExcludeReset`。内联两步确认因
+    UX 反馈已替换为原生 `NSAlert`；原生弹窗实机点击验收待下一轮（弹窗为唯一
+    手工路径，取消/离线/旧 daemon 分支由状态/单测与 socket 桩覆盖）。
   - 已知残留：exclude 操作串行化后，排队操作可能叠加既有 30s 客户端读超时；
     大索引下若出现，按 30s 超时限制记录后续处理。
 
