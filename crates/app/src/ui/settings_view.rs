@@ -45,11 +45,11 @@ const EXCLUDE_RESCANNING: &str = "重扫中…";
 const AUTOSTART_APPROVAL_NOTE: &str = "已注册,待系统设置「登录项」允许";
 /// 录制中的字段文案（App 已同步挂起全局热键）。
 const RECORDING_PROMPT: &str = "按下快捷键…";
-/// 录制中的行内可见提示（Esc/点击别处取消；Delete/Backspace 恢复内置默认）。
+/// 录制中的行内可见提示（Esc/点击别处取消；Backspace 恢复内置默认）。
 ///
 /// macOS 上 ⌥Space 可能不以 `Event::Key` 到达（释放版实测无法录制），恢复默认是
 /// 回到内置 ⌥Space 的可靠路径，故提示必须明确写出。
-const RECORDING_HINT: &str = "按 Esc 或点击别处取消,Delete 恢复默认";
+const RECORDING_HINT: &str = "按 Esc 或点击别处取消,Backspace 恢复默认";
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -100,7 +100,8 @@ pub(crate) enum SettingsAction {
     CancelHotkeyRecord,
     /// 录制到合法组合：提交给 App 校验/注册/落盘。
     CommitHotkey { slot: HotkeySlot, hotkey: HotKey },
-    /// 录制中按 Delete/Backspace：恢复该槽内置默认（App 注册默认并清空设置字段）。
+    /// 录制中按 Backspace（兼容 Forward Delete）：恢复该槽内置默认
+    ///（App 注册默认并清空设置字段）。
     ResetHotkey(HotkeySlot),
     /// 录制组合非法或与另一槽重复：仅显示内联错误（录制继续）。
     HotkeyError { slot: HotkeySlot, message: String },
@@ -817,7 +818,7 @@ fn draw_keycap_field(
             egui::Align2::CENTER_CENTER,
         );
         capture_recorded_key(ui, slot, data, actions);
-        let _ = response.on_hover_text("按 Esc 或点击别处取消录制,Delete 恢复默认");
+        let _ = response.on_hover_text("按 Esc 或点击别处取消录制,Backspace 恢复默认");
     } else {
         draw_keycaps(ui, rect, keys, &painter, palette);
         let _ = response.on_hover_text(if data.recording.is_some() {
@@ -888,8 +889,8 @@ fn draw_keycaps(
 ///   翻译为 `(Space, modifiers)`。文本事件在录制期一律消费，不进入其它控件。
 /// - 已知残留：⌘V 在剪贴板为空时 egui-winit 不产生任何事件（无法录制这一次按键）；
 ///   不全局关闭剪贴板快捷键，否则搜索框的复制/粘贴会失效。若 ⌥Space 连文本事件
-///   都不可见，录制视图的 Delete/Backspace「恢复默认」仍是可靠路径。
-/// - Esc 由调用方解释为取消，Delete/Backspace 解释为恢复默认；其余键经
+///   都不可见，录制视图的 Backspace「恢复默认」仍是可靠路径。
+/// - Esc 由调用方解释为取消，Backspace（兼容 Forward Delete）解释为恢复默认；其余键经
 ///   `hotkey_keys::from_egui` 翻译。
 fn take_recorded_key(ui: &egui::Ui) -> Option<(egui::Key, egui::Modifiers)> {
     ui.input_mut(|input| {
@@ -964,7 +965,7 @@ fn other_slot_hotkey(data: &SettingsData, slot: HotkeySlot) -> Option<HotKey> {
     }
 }
 
-/// 一次按键 → 动作（Esc 取消 / Delete 恢复默认 / 非法与重复错误 / 合法提交）。
+/// 一次按键 → 动作（Esc 取消 / Backspace 恢复默认 / 非法与重复错误 / 合法提交）。
 fn capture_recorded_key(
     ui: &egui::Ui,
     slot: HotkeySlot,
@@ -978,7 +979,8 @@ fn capture_recorded_key(
         actions.push(SettingsAction::CancelHotkeyRecord);
         return;
     }
-    // Delete/Backspace 是「恢复内置默认」手势，不作为可录制按键（不落白名单）。
+    // Backspace（兼容 Forward Delete）是「恢复内置默认」手势，不作为可录制按键
+    //（不落白名单）。
     if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
         actions.push(SettingsAction::ResetHotkey(slot));
         return;
@@ -1858,8 +1860,8 @@ mod tests {
             "录制提示（Esc/点击别处）须可见:实际 {labels:?}"
         );
         assert!(
-            RECORDING_HINT.contains("Delete 恢复默认"),
-            "录制提示须告知 Delete 恢复默认:{RECORDING_HINT}"
+            RECORDING_HINT.contains("Backspace 恢复默认"),
+            "录制提示须告知 Backspace 恢复默认:{RECORDING_HINT}"
         );
         assert!(
             !labels.iter().any(|text| text == "Space"),
@@ -1972,7 +1974,8 @@ mod tests {
         assert!(!leftover, "Esc 须被录制消费");
     }
 
-    /// Delete/Backspace 在录制中 = 恢复内置默认；不得当成可录制键报错。
+    /// Backspace（兼容 Forward Delete）在录制中 = 恢复内置默认；不得当成
+    /// 可录制键报错。
     #[test]
     fn delete_and_backspace_reset_default_and_are_consumed() {
         for key in [egui::Key::Delete, egui::Key::Backspace] {
