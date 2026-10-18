@@ -1949,9 +1949,19 @@ impl OpenError {
         }
     }
     ```
+  - **结果行动作提示动态宽度**：`hint_w = if is_sel { text_w(ui, hint, FONT_META).max(tk::ACTION_HINT_W) } else { 0.0 }`，
+    文本列右缘继续用 `hint_w`；不要只依赖固定 40px（Large 字号下 "Enter" 约 45px）。
+  - **页脚布局重写为纯选择 + 统一绘制**：
+    - 视觉序（左→右）：`[Open, Finder, Full Window, Hide]`；按此序做前缀选择，
+      计数区优先保留，`Open` 永远保留。
+    - 纯函数 `footer_visible_count(widths: &[f32], available: f32, gap: f32) -> usize`
+      返回能放下的前缀组数；`available = panel_w - 2*FOOTER_PAD_X - count_w - FOOTER_GAP`
+      （无计数时不含 count/gap）。
+    - 绘制从右缘向左按选中组反序放置；计数在左。不要在循环里只对非末组做阈值判断。
+    - 测试：用实测 `text_w` 在 `PANEL_MIN_W` 与 `PANEL_W` 下构造组宽，断言选中前缀 ≥1、
+      计数矩形右缘与最左组矩形左缘不相交；`PANEL_W` 下四组全选。中文默认与英文都要覆盖。
   - 测试：`action_hint(true/false)`、页脚标签与 `total_items(0/1/2)` 的 zh/en 文案。
-  - 英文宽度断言：`text_w(action_hint(true), FONT_META) <= ACTION_HINT_W`；页脚在 `PANEL_MIN_W` 下
-    「计数 + 最后一组」必须放得下（用实测 `text_w` 计算，不写死 120px）。
+  - 英文宽度断言：`text_w(action_hint(true), FONT_META)` 在 1.0 与 1.15 下都不得超过动态预留宽度。
   - `open_path` 文档改为「由 `OpenError::text()` 在绘制时按当前语言渲染」。
 
 - [ ] **Step 6: 跑测试并修断言**
