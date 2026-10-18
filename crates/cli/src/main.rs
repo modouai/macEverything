@@ -224,7 +224,7 @@ fn main() -> Result<()> {
                  macEverything stop            停止引擎(落盘后退出)\n  \
                  macEverything query \"关键词\"   查询(含语法:空格 AND、* ? 通配、path: case: whole:)\n  \
                  macEverything status          查看索引状态与权限缺口\n  \
-                 macEverything exclude add|remove|list [绝对路径]  管理排除目录"
+                 macEverything exclude add|remove|list [路径]  管理排除目录(add 须扫描根内绝对路径;remove 接受已有条目原文)"
             );
             std::process::exit(2);
         }

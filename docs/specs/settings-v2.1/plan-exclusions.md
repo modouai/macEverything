@@ -1,6 +1,6 @@
 # 设置 · 排除目录实现计划
 
-**Status:** E1–E3 已实现（2026-10-18）；E4 实机验收与文档收尾待办。
+**Status:** E1–E3 已实现（2026-10-18）；E4 文案/注释已完成，实机验收待屏幕解锁。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use `- [ ]`.
 
@@ -90,12 +90,10 @@
 ## Task E4: 验收与文档
 
 - [ ] 实机：打开设置加载真实列表；添加根内目录（重扫提示 → 列表更新）；移除 `node_modules`/添加的目录；越界路径错误；引擎离线提示；重扫期间 UI 不卡；大列表滚动。
-- [ ] 实机若发现新偏差，补记 `design.md` §8 / `settings-visual.md`（E1–E3 的状态与勾选已在 E3 完成）。
-- [ ] **CLI 帮助文案待修（E4）：** `crates/cli/src/main.rs` 的
-  `exclude add|remove|list [绝对路径]` 与 `docs/usage.md` §`exclude` 仍写
-  `remove` 必须绝对路径；E1 起**已存在的相对名条目**（如 `node_modules`）也可
-  移除。E4 改为「add 须扫描根内绝对路径；remove 接受已有条目原文」。
-- [ ] 全量 fmt/clippy/test；提交。
+  - **待验（2026-10-18）**：屏幕锁定/休眠，实机清单与 H4 快捷键录制清单均待解锁后补跑。
+- [x] 实机若发现新偏差，补记 `design.md` §8 / `settings-visual.md`（E1–E3 的状态与勾选已在 E3 完成；E4 文案已收口）。
+- [x] **CLI 帮助文案（E4）：** `crates/cli/src/main.rs`、`docs/usage.md`、`docs/specs/v1-core/tech.md` 已改为「add 须扫描根内绝对路径；remove 接受已有条目原文」。
+- [x] 全量 fmt/clippy/test（411 passed / 5 ignored，2026-10-18）；提交见下。
 
 ## 验证命令
 

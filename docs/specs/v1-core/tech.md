@@ -152,7 +152,7 @@ macEverything/
 
 ## daemon 通信契约(适配表 3)
 
-socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0600;协议:4 字节小端长度 + UTF-8 JSON,长度上限 1 MB(超限断连);每消息首字段 `v`(协议版本,当前 1),daemon 不识别即拒绝;`exclude.add/remove` 的 `path` 必须为扫描根内绝对路径,否则拒绝。
+socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0600;协议:4 字节小端长度 + UTF-8 JSON,长度上限 1 MB(超限断连);每消息首字段 `v`(协议版本,当前 1),daemon 不识别即拒绝;`exclude.add` 的 `path` 必须为扫描根内绝对路径,否则拒绝;`exclude.remove` 接受**已存在的条目原文**(含 `node_modules` 等相对名)。
 
 | 消息 | 方向 | 请求字段 | 响应字段 | 说明 |
 |---|---|---|---|---|

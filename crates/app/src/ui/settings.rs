@@ -108,7 +108,8 @@ fn exclude_result(outcome: anyhow::Result<client::ExcludeOutcome>) -> ExcludeRes
 ///
 /// 本结构持有运行期数据（不每帧重建 `engine::config::default_config()`）；
 /// `SettingsData` 只是出锁绘制用的复制快照。排除目录以 daemon 列表为唯一真源，
-/// 首次 list 返回前先展示引擎默认种子；后台操作同一时刻至多一个。
+/// 首次**成功** list 响应前先展示引擎默认种子（失败/离线时保留并附错误）；
+/// 后台操作同一时刻至多一个。
 pub struct SettingsState {
     pub(crate) open: bool,
     /// 已加载的 `settings.toml` 快照（字号/快捷键写入在此更新）。
@@ -122,7 +123,8 @@ pub struct SettingsState {
     pub(crate) autostart_error: Option<String>,
     /// 字号保存失败的内联错误（已应用的字号不因保存失败回退）。
     pub(crate) font_error: Option<String>,
-    /// 排除目录（daemon 响应为唯一真源；首次 list 返回前为引擎默认种子）。
+    /// 排除目录（daemon 响应为唯一真源；首次成功 list 响应前为引擎默认种子，
+    /// 失败/离线时保留旧列表或种子）。
     pub(crate) excluded: Vec<String>,
     /// 排除目录后台操作进行中（list/add/remove 同一时刻至多一个）。
     pub(crate) exclude_busy: bool,
@@ -133,8 +135,8 @@ pub struct SettingsState {
     /// add/remove 开始即清；自动 list 刷新**保留**（否则刚收到的失败文案会被
     /// 重开触发的刷新立刻吞掉），仅成功 list 响应清空。
     pub(crate) exclude_error: Option<String>,
-    /// 是否收到过 daemon 列表响应（成功或失败）；启动失败/线程无结果退出不算，
-    /// 保持 false。种子列表在首次成功列表前也可能因失败而继续展示。
+    /// 最近一次排除 worker 是否产生了终态结果（含 daemon 列表响应成功/失败，
+    /// 以及 client 离线错误）；线程启动失败/无结果退出不算，保持 false。
     pub(crate) exclude_loaded: bool,
     /// 关闭→打开时置位；设置 pass 负责启动一次 list（busy 中则等本次结束）。
     pub(crate) exclude_refresh_pending: bool,
@@ -247,8 +249,8 @@ impl SettingsState {
 
     /// 设置 pass 的排除目录推进：非阻塞收结果，返回 true = 锁外应启动一次 list。
     ///
-    /// 不在这里清 `exclude_refresh_pending`：只有工作线程真正启动（spawn 返回
-    /// 成功）后才由调用方清除，`begin_exclude` 被拒时挂起位保留待下次推进。
+    /// 不在这里清 `exclude_refresh_pending`：spawn 流程接管（含线程启动失败的
+    /// 终态处理）后才由调用方清除；busy 拒绝时挂起位保留待下次推进。
     pub(crate) fn advance_exclude(&mut self, open: bool) -> bool {
         self.tick_exclude();
         open && self.exclude_refresh_pending && !self.exclude_busy
