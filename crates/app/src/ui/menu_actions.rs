@@ -136,7 +136,7 @@ fn plan(action: MenuAction, paths: &[String]) -> Result<Vec<Step>> {
             for p in paths {
                 let parent = Path::new(p)
                     .parent()
-                    .ok_or_else(|| anyhow!("{}:{p}", i18n::s().menu_locate_failed))?;
+                    .ok_or_else(|| anyhow!("{}: {p}", i18n::s().menu_locate_failed))?;
                 let parent = parent.to_string_lossy().into_owned();
                 ensure_exists(&parent)?;
                 if !targets.contains(&parent) {

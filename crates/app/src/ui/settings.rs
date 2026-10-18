@@ -1254,6 +1254,11 @@ mod tests {
             "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。"
         );
         assert_eq!(i18n::s().reset_confirm_action, "恢复默认");
+        // 原生确认弹窗的 Cancel 按钮文案（发布门禁：中英各自钉住）。
+        assert_eq!(i18n::s().cancel, "取消");
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(i18n::s().cancel, "Cancel");
+        });
     }
 
     /// reset worker 成功：响应三条默认覆盖旧列表、清错、结束 busy。
