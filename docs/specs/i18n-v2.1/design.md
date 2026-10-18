@@ -1,8 +1,8 @@
 # i18n 中英双语（v2.1）— 设计
 
-**Status:** 设计已确认（2026-10-18），待实现
+**Status:** 已实现（2026-10-18），实机验收待辉哥（清单见 plan.md Task 7）
 **范围:** 图形界面中英双语：悬浮条 / 完整结果窗口 / 设置窗口 / 托盘菜单 / 原生右键菜单与确认弹窗 / 应用自产状态与错误文案
-**依据:** `docs/specs/v2-ui/product.md`（v2.1 交付「i18n 中英双语」）、`docs/specs/settings-v2.1/design.md`（语言项占位）、`docs/specs/floatbar-visual/settings-visual.md`（语言行形态）
+**依据:** `docs/specs/v2-ui/product.md`（v2.1 交付「i18n 中英双语」）、`docs/specs/settings-v2.1/design.md`（语言项）、`docs/specs/floatbar-visual/settings-visual.md`（语言行形态）
 **不交付:** 繁体中文/日韩等其它语言、CLI 与日志翻译、日期/数字区域化格式、引擎原始错误翻译
 
 ---
@@ -13,7 +13,7 @@
 |---|---|
 | 覆盖层 | 仅图形界面（含原生菜单/弹窗）；CLI、日志、引擎/客户端原始错误不翻译 |
 | 语言集合 | 简体中文（zh-Hans）+ English |
-| 设置项 | 语言行从禁用占位改为三选一下拉：跟随系统 / 简体中文 / English |
+| 设置项 | 语言行启用三选一下拉：跟随系统 / 简体中文 / English |
 | 默认 | `settings.toml` 无 `language` → `system`；按系统首选语言解析 |
 | 系统语言映射 | 按首选顺序取第一个受支持语言：`zh*` → 简体中文，`en*` → English；均无 → English；取不到/检测失败 → 简体中文 + 日志 |
 | 生效时机 | 立即生效；三窗重绘、托盘菜单原地更新；不清空查询/选中/滚动位置 |

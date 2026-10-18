@@ -2075,3 +2075,28 @@ git commit -m "docs(i18n): 验收记录与文档回填"
 - 原生层（托盘/右键菜单/确认弹窗/窗口标题）都有独立的刷新路径，不依赖 egui 重绘。
 - 语言切换后不残留旧语言的应用自产消息；引擎/客户端原始错误除外。
 - 提交前 `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` 全绿。
+
+---
+
+## 实现与验证记录（2026-10-18）
+
+- Task 1（i18n 核心与启动语言）：`4f1cdf6`
+- Task 2（设置页语言下拉与即时切换）：`60f8ace`
+- Task 3（热键提示类型化与悬浮条双语）：`ffca756`（修复 `659f367`、`4da1baf`）
+- Task 4（完整窗口双语与状态提示类型化）：`dc70f5a`（修复 `19c3d5d`）
+- Task 5（托盘与原生层双语）：`65afab3`（修复 `d4d9ef6`）
+- Task 6（剩余自产消息双语）：`1a641bf`、`59a31cf`、`0e08d12`、`b8df240`、`ad306cb`
+
+验证：
+
+- `cargo fmt --check`：通过。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+- `cargo test --workspace`：全绿；app 测试 **357 passed / 0 failed / 3 ignored**（含 Task 7 新增 `english_rows_fit_fixed_controls`）。
+- Task 7 Step 1 的英文行宽断言按实际标签列取 **372px**（620 窗宽 − 2×24 内容内边距 − 2×16 行内边距 − 152 控件宽 − 16 标签/控件间距），并同时断言 `Galley::elided == false`，避免截断让宽度断言失去意义。
+
+实机验收：**待辉哥**（Task 7 Step 3 清单；所有实机项均未勾选，不以 headless 结果代替实机）。
+
+已知非阻塞项（来自审查）：
+
+- 启动时 `ensure_engine` 早于 `i18n::set_lang`，仅影响 stderr 技术输出，不影响界面文案。
+- `OpenError` 未实现 `Display`，行为不受影响。

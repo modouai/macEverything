@@ -2536,6 +2536,36 @@ mod tests {
         );
     }
 
+    /// 英文行标签须完整落在固定控件的标签列内
+    /// （372 = 620 窗宽 − 2×24 内容内边距 − 2×16 行内边距 − 152 控件宽 − 16 标签/控件间距）。
+    ///
+    /// 「排除目录」行的右侧按钮组比 152 宽，其标签列更窄，故 372 是统一上界。
+    /// `Galley::size()` 在截断时会被钳制、`Galley::text()` 仍返回全文；
+    /// 必须同时断言 `elided == false`，否则测试对视觉截断无感。
+    #[test]
+    fn english_rows_fit_fixed_controls() {
+        use crate::i18n;
+        i18n::with_lang(i18n::Lang::En, || {
+            let data = layout_test_data();
+            let out = run_body(&data);
+            let texts = all_texts(&out);
+            for label in [
+                "Launch at Login",
+                "Quick Search Shortcut",
+                "Full Window Shortcut",
+                "Excluded Folders",
+            ] {
+                let text = find_text(&texts, label);
+                assert!(!text.galley.elided, "{label} 被截断");
+                assert!(
+                    text.galley.size().x <= 372.0,
+                    "{label} 超宽: {:?}",
+                    text.galley.size()
+                );
+            }
+        });
+    }
+
     /// 最长的英文窗口提示在 Large 字号下仍须完整落在支持行内
     /// （540 = 620 窗宽 − 2×24 内容内边距 − 2×16 行内边距）。
     ///
