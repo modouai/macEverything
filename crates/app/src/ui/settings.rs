@@ -46,7 +46,7 @@ pub fn viewport_id() -> egui::ViewportId {
 /// 标题与标题栏关闭 + 全尺寸内容视图 = 原生交通灯浮在自绘 44px 标题栏上。
 pub fn builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_title(platform::SETTINGS_TITLE)
+        .with_title(crate::i18n::s().settings_title)
         .with_inner_size([SETTINGS_W, SETTINGS_H])
         .with_min_inner_size([SETTINGS_W, SETTINGS_H])
         .with_max_inner_size([SETTINGS_W, SETTINGS_H])
@@ -612,7 +612,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ui.painter().text(
         bar.center(),
         egui::Align2::CENTER_CENTER,
-        platform::SETTINGS_TITLE,
+        crate::i18n::s().settings_title,
         ui_font::id(TITLE_FONT),
         palette.text_primary,
     );
@@ -1995,7 +1995,11 @@ mod tests {
     #[test]
     fn builder_matches_spec() {
         let b = builder();
-        assert_eq!(b.title.as_deref(), Some(platform::SETTINGS_TITLE));
+        assert_eq!(
+            b.title.as_deref(),
+            Some(crate::i18n::s().settings_title),
+            "设置窗标题取当前语言"
+        );
         assert_eq!(b.inner_size, Some(egui::vec2(SETTINGS_W, SETTINGS_H)));
         assert_eq!(b.min_inner_size, Some(egui::vec2(SETTINGS_W, SETTINGS_H)));
         assert_eq!(b.max_inner_size, Some(egui::vec2(SETTINGS_W, SETTINGS_H)));

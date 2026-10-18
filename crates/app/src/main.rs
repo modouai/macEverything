@@ -8,6 +8,7 @@
 mod autostart;
 mod engine_launcher;
 mod hotkey;
+mod i18n;
 mod platform;
 mod session;
 mod settings;
@@ -65,6 +66,15 @@ fn main() -> anyhow::Result<()> {
         settings.font_size,
         settings.font_size.scale()
     );
+
+    // i18n：必须在任何视口/托盘创建之前设置语言（首帧与首次安装的菜单都取当前值）。
+    let preferred = platform::preferred_languages().unwrap_or_else(|err| {
+        log::warn!("读取系统语言失败,按简体中文: {err}");
+        Vec::new()
+    });
+    let lang = i18n::resolve_language(settings.language, &preferred);
+    i18n::set_lang(lang);
+    log::info!("启动语言:{lang:?}(设置 {:?})", settings.language);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

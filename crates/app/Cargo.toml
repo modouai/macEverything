@@ -73,7 +73,19 @@ objc2-app-kit = { version = "0.3", features = [
 objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
 # NSError/NSURL(Task 5):自定义图标经 NSURL.getResourceValue_forKey_error 读
 # NSURLCustomIconKey;该方法以 Result<_, Retained<NSError>> 表达失败,两 feature 缺一不可。
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray", "NSProcessInfo", "NSObject", "NSNotification", "NSBundle", "NSError", "NSURL"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSGeometry",
+    "NSString",
+    "NSArray",
+    "NSProcessInfo",
+    "NSObject",
+    "NSNotification",
+    "NSBundle",
+    "NSError",
+    "NSURL",
+    # i18n：NSLocale.preferredLanguages() 读取系统首选语言。
+    "NSLocale",
+] }
 # Task 5 结果行真实图标:扩展名 → UTI(目录/无扩展名回落 UTCoreTypes)。
 # 0.3.2 与 objc2 0.6 / objc2-foundation 0.3 同代;UTCoreTypes 提供 UTTypeFolder/UTTypeData。
 objc2-uniform-type-identifiers = { version = "0.3.2", features = ["UTType", "UTCoreTypes"] }

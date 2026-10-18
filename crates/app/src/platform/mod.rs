@@ -98,6 +98,18 @@ impl SpaceExemptDecider {
     }
 }
 
+/// 系统首选语言列表；非 macOS 返回错误（调用方回落到简体中文）。
+pub fn preferred_languages() -> anyhow::Result<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::preferred_languages()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(anyhow::anyhow!("非 macOS:无法读取系统语言"))
+    }
+}
+
 /// 系统目录选择器（主线程；取消/失败 = None）。非 macOS = None。
 ///
 /// 原生 `NSOpenPanel` 模态面板：仅目录、单选。阻塞返回——调用方须在主线程

@@ -51,7 +51,8 @@ use objc2_app_kit::{
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
-    NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey, NSURL,
+    NSLocale, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey,
+    NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -214,6 +215,12 @@ pub fn last_space_change() -> Option<SpaceChange> {
         Ok(g) => *g,
         Err(poisoned) => *poisoned.into_inner(),
     }
+}
+
+/// 系统首选语言（按偏好顺序；macOS `NSLocale.preferredLanguages`）。
+pub fn preferred_languages() -> anyhow::Result<Vec<String>> {
+    let langs = NSLocale::preferredLanguages();
+    Ok(langs.iter().map(|s| s.to_string()).collect())
 }
 
 /// 创建并注册 Space 变更观察者(进程内一次;主线程)。

@@ -13,6 +13,8 @@ use anyhow::Context;
 use global_hotkey::hotkey::HotKey;
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::LanguageSetting;
+
 /// 文件名（模块私有；路径一律经 [`path`] 取得，防调用方自行拼接）。
 const FILE_NAME: &str = "settings.toml";
 
@@ -54,6 +56,8 @@ impl FontSize {
 pub struct SettingsFile {
     #[serde(default)]
     pub font_size: FontSize,
+    #[serde(default)]
+    pub language: LanguageSetting,
     #[serde(default)]
     pub palette_hotkey: Option<HotKey>,
     #[serde(default)]
@@ -127,6 +131,7 @@ mod tests {
         // 非默认值 + 两个热键一并往返（HotKey 以字符串序列化）。
         let custom = SettingsFile {
             font_size: FontSize::Large,
+            language: LanguageSetting::System,
             palette_hotkey: Some(HotKey::new(Some(Modifiers::ALT), Code::Space)),
             window_hotkey: Some(HotKey::new(
                 Some(Modifiers::ALT | Modifiers::SHIFT),
@@ -170,6 +175,7 @@ mod tests {
     fn hotkey_serialization_is_canonical() {
         let f = SettingsFile {
             font_size: FontSize::Standard,
+            language: LanguageSetting::System,
             palette_hotkey: Some("Alt+Space".parse().unwrap()),
             window_hotkey: Some("Alt+Shift+F".parse().unwrap()),
         };
@@ -221,5 +227,26 @@ mod tests {
             "错误须带路径上下文: {message}"
         );
         assert!(!tmp.exists(), "失败后必须清理临时文件");
+    }
+
+    #[test]
+    fn language_defaults_and_unknown_value_falls_back_to_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = path(dir.path());
+        std::fs::write(&p, "font_size = \"large\"\nlanguage = \"klingon\"\n").unwrap();
+        let f = load(dir.path());
+        assert_eq!(f.language, LanguageSetting::System);
+        assert_eq!(f.font_size, FontSize::Large, "未知语言不得拖垮其它字段");
+    }
+
+    #[test]
+    fn language_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = SettingsFile {
+            language: LanguageSetting::En,
+            ..SettingsFile::default()
+        };
+        save(dir.path(), &f).unwrap();
+        assert_eq!(load(dir.path()).language, LanguageSetting::En);
     }
 }
