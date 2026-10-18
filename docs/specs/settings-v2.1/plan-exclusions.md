@@ -1,12 +1,12 @@
 # 设置 · 排除目录实现计划
 
-**Status:** E1–E3 已实现（2026-10-18）；E4 文案/注释已完成，实机验收待屏幕解锁。
+**Status:** E1–E5 已实现（2026-10-18）；E4 文案/注释已完成，实机验收待屏幕解锁。
 
-> **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use `- [ ]`.
+> **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps `- [ ]`.
 
-**Goal:** 设置页排除目录列表接真实引擎状态；可添加（系统目录选择器）与移除；变更触发重扫，异步不卡 UI；默认相对名条目可移除。
+**Goal:** 设置页排除目录列表接真实引擎状态；可添加（系统目录选择器）、移除与两步确认恢复默认；变更触发重扫，异步不卡 UI；默认相对名条目可移除。
 
-**依据:** `design.md` §8；`settings-visual.md` §2.4；`client::exclude` / daemon `ExcludeAdd/Remove/List` 已存在。
+**依据:** `design.md` §8；`settings-visual.md` §2.4/§2.4.1；`client::exclude` / daemon `ExcludeAdd/Remove/List/Reset`。
 
 **前置:** Phase A 已完成（设置页已有排除目录卡、默认三条、滚动/空态；`SettingsState`/`settings_view`）。
 
@@ -95,6 +95,54 @@
 - [x] **CLI 帮助文案（E4）：** `crates/cli/src/main.rs`、`docs/usage.md`、`docs/specs/v1-core/tech.md` 已改为「add 须扫描根内绝对路径；remove 接受已有条目原文」。
 - [x] 全量 fmt/clippy/test（411 passed / 5 ignored，2026-10-18）；提交见下。
 
+## Task E5: 排除目录「恢复默认」
+
+**Files:** `crates/protocol/src/lib.rs`; `crates/client/src/lib.rs`; `crates/cli/src/daemon.rs`;
+`crates/app/src/ui/settings.rs`; `crates/app/src/ui/settings_view.rs`;
+`crates/app/src/ui/settings_tokens.rs`; docs.
+
+**产品决定:** 「恢复默认」把排除列表重置为内置三条 `~/Library`、`node_modules`、`.git`
+（`engine::config::default_config()`）；破坏性操作，设置页两步确认；一次 daemon
+重扫（不为每条默认单独 add/remove）。不新增自定义名称规则输入，不改默认列表。
+存在动机：默认相对名（`.git`、`node_modules`）无法经目录选择器重新添加。
+
+- [x] **Step 1: 协议 + client**
+  - `Request::ExcludeReset { v }`（无参数；`version()` 覆盖；复用 `Response::Exclude`）。
+  - **协议版本号不变。** 旧 daemon 解码未知 `exclude_reset` 变体失败并拒绝请求；
+    设置页/CLI 按错误展示。手工测试须先 `macEverything stop && start` 用新 CLI
+    重启引擎；App 不自动重启引擎。
+  - `client::exclude(paths, "reset", None)` → `ExcludeReset`；未知动作帮助文案更新为
+    `add/remove/list/reset`；CLI 用法同步。
+- [x] **Step 2: daemon `reset_excludes`**
+  - 先 `config::save(&default_config(), config_file)`；失败 → `ok=false` +
+    当前内存列表 + `配置保存失败(...)`，**不改内存、不重扫**。
+  - 保存成功 → 内存配置替换为默认三条 → `degrade_and_rescan`（一次）→
+    `ok=true` + 默认三条。
+  - 不持 `cfg` 锁跨越保存/重扫；沿用 `apply_exclude_change` 的锁纪律。
+  - 测试：自定义条目重置后内存/落盘均为三条且自定义消失，状态推进 READY；
+    保存失败路径内存不变、状态保持原样。
+- [x] **Step 3: 设置页状态与动作**
+  - `SettingsState.exclude_reset_confirm: bool`：打开/关闭/开始 add/remove/reset/
+    取消清；请求/取消确认不清既有错误；确认取走确认态后启动 `"reset"` worker。
+  - `SettingsAction::{RequestExcludeReset, CancelExcludeReset, ConfirmExcludeReset}`；
+    陈旧 add/remove 动作也会收起确认。复用单操作 busy/错误/结果管线；
+    成功以响应覆盖为三条默认，失败保留旧列表 + 错误。
+- [x] **Step 4: 视图**
+  - Header 右侧组：「恢复默认」（12pt 次要色小号文字按钮，悬停浅底）+
+    间距 + 「＋ 添加目录…」；不新增大控件。
+  - 确认态：隐藏添加按钮，显示「取消」「确认恢复」（确认红字），Header 下支持行
+    「将清空自定义排除项，恢复 ~/Library、node_modules、.git」，高度计入
+    `RowSpec.extra`；busy 时恢复默认/取消/确认与添加/移除全部禁点。
+- [x] **Step 5: 测试**
+  - 协议往返/版本；client 无 daemon 用法与未知动作帮助；daemon 成功/失败。
+  - 状态：请求/取消/确认、打开/关闭/add/remove 清确认、reset 成功覆盖默认、
+    失败保留旧列表 + 错误且 busy=false、begin 清错误标志。
+  - Headless：恢复默认点击 → Request；确认/取消点击动作；busy 禁用；确认说明
+    文本/行高（目录行下移）；添加/移除既有测试保持通过。
+- [x] **Step 6: 文档 + fmt/clippy/test；提交** `feat(app): 排除目录恢复默认`.
+  - 实机（待办）：自定义排除若干 → 恢复默认 → 确认 → 一次重扫后仅剩三条；
+    取消不改变列表；引擎离线/旧 daemon 显示错误且列表不变。
+
 ## 验证命令
 
 ```bash
@@ -105,7 +153,11 @@ cargo test --workspace
 
 ## 风险
 
-- `client::exclude` 是阻塞调用（add/remove 会触发 daemon 全量重扫），必须放工作线程；settings pass/App::logic 只 drain 结果。
+- `client::exclude` 是阻塞调用（add/remove/reset 会触发 daemon 全量重扫），必须放工作线程；settings pass/App::logic 只 drain 结果。
 - 原生目录选择器必须主线程/主队列；不能在 worker 线程调。
-- Add 仍严格校验扫描根内绝对路径；Remove 只对已存在条目放行（E1）。
-- 列表唯一真源 = daemon 响应；失败不覆盖旧列表。
+- Add 仍严格校验扫描根内绝对路径；Remove 只对已存在条目放行（E1）；Reset 无参数，
+  只恢复内置默认三条。
+- **运行中 daemon 兼容性**：`ExcludeReset` 是新增请求但协议版本不 bump；旧 daemon
+  会以解码失败拒绝。升级 CLI 后须停止/启动引擎（不自动重启），否则设置页/CLI
+  的恢复默认会显示错误。
+- 列表唯一真源 = daemon 响应；失败不覆盖旧列表。Reset 保存失败同样不猜测新列表。

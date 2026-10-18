@@ -5,7 +5,7 @@
 //! （`ui/settings_view.rs` 纯视图）→ 锁外落地字号/自启动作（保存与 SMAppService
 //! 调用不持共享锁）；快捷键动作只入共享态命令队列，由主线程 `App::logic`
 //! 调 `HotkeyRuntime`（Carbon manager 只能主线程）；排除目录的
-//! `client::exclude`（list/add/remove，add/remove 会触发全量重扫）一律在工作线程，
+//! `client::exclude`（list/add/remove/reset，后三者会触发全量重扫）一律在工作线程，
 //! 经单操作 mpsc 回投，设置 pass 非阻塞收取。标题栏固定，内容区整页纵向滚动。
 //!
 //! 窗口交互：标题栏可拖拽（左侧预留原生交通灯）、红点/⌘W = 隐藏（不退出 App）。
@@ -128,14 +128,15 @@ pub struct SettingsState {
     /// 排除目录（daemon 响应为唯一真源；首次成功 list 响应前为引擎默认种子，
     /// 失败/离线时保留旧列表或种子）。
     pub(crate) excluded: Vec<String>,
-    /// 排除目录后台操作进行中（list/add/remove 同一时刻至多一个）。
+    /// 排除目录后台操作进行中（list/add/remove/reset 同一时刻至多一个）。
     pub(crate) exclude_busy: bool,
     /// 在途操作是列表加载（「加载中…」；否则为变更重扫「重扫中…」）。
     pub(crate) exclude_busy_list: bool,
     /// 最近一次排除目录加载/变更失败原因。
     ///
-    /// add/remove 开始即清；自动 list 刷新**保留**（否则刚收到的失败文案会被
-    /// 重开触发的刷新立刻吞掉），仅成功 list 响应清空。
+    /// add/remove/reset 开始即清；自动 list 刷新**保留**（否则刚收到的失败文案
+    /// 会被重开触发的刷新立刻吞掉），仅成功 list 响应清空。请求/取消恢复默认
+    /// 确认不算操作开始，不清错误。
     pub(crate) exclude_error: Option<String>,
     /// 最近一次排除 worker 是否产生了终态结果（含 daemon 列表响应成功/失败，
     /// 以及 client 离线错误）；线程启动失败/无结果退出不算，保持 false。
@@ -144,6 +145,9 @@ pub struct SettingsState {
     pub(crate) exclude_refresh_pending: bool,
     /// 在途操作的唯一回投通道（one-op；不跨操作复用）。
     pub(crate) exclude_rx: Option<Receiver<ExcludeResult>>,
+    /// 排除目录「恢复默认」两步确认已展开（破坏性操作；打开/关闭/开始任何操作
+    /// 或取消都清除，防陈旧确认跨帧残留）。
+    pub(crate) exclude_reset_confirm: bool,
     /// 全局热键运行时快照（H2 启动种子；键帽展示/查重的唯一真源）。
     pub(crate) hotkey_snapshot: HotkeySnapshot,
     /// 当前录制槽（None = 未录制）；录制期全局热键已挂起。
@@ -185,6 +189,7 @@ impl SettingsState {
             exclude_loaded: false,
             exclude_refresh_pending: false,
             exclude_rx: None,
+            exclude_reset_confirm: false,
             hotkey_snapshot,
             recording: None,
             viewport_focused: None,
@@ -207,6 +212,8 @@ impl SettingsState {
         if first_open {
             self.positioned_once = true;
         }
+        // 打开动作（含已打开时再次点入口）都收起确认，防陈旧破坏性确认残留。
+        self.exclude_reset_confirm = false;
         if !was_open {
             // 每次真正打开都重取 daemon 列表（隐藏期可能被 CLI 改动）。
             self.exclude_refresh_pending = true;
@@ -219,6 +226,7 @@ impl SettingsState {
         self.open = false;
         self.viewport_focused = None;
         self.cancel_recording_pending = true;
+        self.exclude_reset_confirm = false;
     }
 
     /// 取走录制取消挂起（`App::logic` 消费；录制中由它恢复旧热键）。
@@ -242,11 +250,29 @@ impl SettingsState {
         }
         self.exclude_busy = true;
         self.exclude_busy_list = list;
+        // 任何后台操作开始都收起两步确认（reset 自身开始、add/remove 抢占）。
+        self.exclude_reset_confirm = false;
         if clear_error {
             self.exclude_error = None;
         }
         self.exclude_rx = Some(rx);
         true
+    }
+
+    /// 「恢复默认」请求第一步：仅展开确认，不改列表/错误，也不启动 worker。
+    pub(crate) fn request_exclude_reset(&mut self) {
+        self.exclude_reset_confirm = true;
+    }
+
+    /// 取消恢复默认确认：仅收起确认，保留既有错误与列表。
+    pub(crate) fn cancel_exclude_reset(&mut self) {
+        self.exclude_reset_confirm = false;
+    }
+
+    /// 确认恢复默认：取走确认态（返回是否确实处于确认中，防陈旧动作重复触发）。
+    /// 真正的 worker 启动与 busy/错误规则仍由 `spawn_exclude("reset")` 走既有管线。
+    pub(crate) fn take_exclude_reset_confirm(&mut self) -> bool {
+        std::mem::take(&mut self.exclude_reset_confirm)
     }
 
     /// 设置 pass 的排除目录推进：非阻塞收结果，返回 true = 锁外应启动一次 list。
@@ -531,6 +557,7 @@ impl SettingsData {
             exclude_busy: state.exclude_busy,
             exclude_busy_list: state.exclude_busy_list,
             exclude_error: state.exclude_error.clone(),
+            exclude_reset_confirm: state.exclude_reset_confirm,
         }
     }
 }
@@ -666,8 +693,29 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             lock_shared(shared).settings.hotkey_rejected(slot, message);
             ctx.request_repaint_of(viewport_id());
         }
-        SettingsAction::AddExclude => apply_add_exclude(shared, ctx),
+        SettingsAction::RequestExcludeReset => {
+            lock_shared(shared).settings.request_exclude_reset();
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::CancelExcludeReset => {
+            lock_shared(shared).settings.cancel_exclude_reset();
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::ConfirmExcludeReset => {
+            let confirmed = lock_shared(shared).settings.take_exclude_reset_confirm();
+            if confirmed {
+                // 与 add/remove 共用 busy/错误管线；reset 无参数、一次重扫。
+                spawn_exclude(ctx, shared, "reset", None);
+            }
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::AddExclude => {
+            // 陈旧视图动作：确认态下 add 不可达；仍按「新操作收起确认」处理。
+            lock_shared(shared).settings.cancel_exclude_reset();
+            apply_add_exclude(shared, ctx);
+        }
         SettingsAction::RemoveExclude(path) => {
+            lock_shared(shared).settings.cancel_exclude_reset();
             spawn_exclude(ctx, shared, "remove", Some(path));
             ctx.request_repaint_of(viewport_id());
         }
@@ -689,16 +737,16 @@ fn apply_add_exclude(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
 
 /// 操作 → `begin_exclude(list, clear_error)` 标志。
 ///
-/// 自动 list 刷新**保留**已展示的错误（失败文案不被重开吞掉）；add/remove 是
-/// 新用户操作，开始即清旧提示。
+/// 自动 list 刷新**保留**已展示的错误（失败文案不被重开吞掉）；add/remove/reset
+/// 是新用户操作，开始即清旧提示。
 fn exclude_begin_flags(op: &str) -> (bool, bool) {
     (op == "list", op != "list")
 }
 
-/// 启动一次排除目录后台操作（list/add/remove）。
+/// 启动一次排除目录后台操作（list/add/remove/reset）。
 ///
 /// 共享锁只用于落 busy/错误/回投通道与取 `data_dir`，随即释放；`client::exclude`
-/// （add/remove 会触发 daemon 全量重扫）与线程启动都在锁外。完成时工作线程
+/// （add/remove/reset 会触发 daemon 全量重扫）与线程启动都在锁外。完成时工作线程
 /// 请求设置视口重绘，`tick_exclude` 下一帧收取结果。
 ///
 /// 返回 true = 操作已开始（线程启动失败也算：失败已按终态落错误，调用方可清
@@ -1060,6 +1108,117 @@ mod tests {
         }
     }
 
+    /// 两步确认纯状态：请求只展开确认（不清错误）；取消收起；take 只成功一次。
+    #[test]
+    fn exclude_reset_confirmation_transitions() {
+        let mut state = test_state();
+        state.exclude_error = Some("旧错误".into());
+
+        state.request_exclude_reset();
+        assert!(state.exclude_reset_confirm, "请求应展开确认");
+        assert_eq!(
+            state.exclude_error.as_deref(),
+            Some("旧错误"),
+            "仅请求确认不得清掉已有错误"
+        );
+
+        state.cancel_exclude_reset();
+        assert!(!state.exclude_reset_confirm, "取消应收起确认");
+        assert_eq!(
+            state.exclude_error.as_deref(),
+            Some("旧错误"),
+            "取消确认不得清掉已有错误"
+        );
+
+        state.request_exclude_reset();
+        assert!(
+            state.take_exclude_reset_confirm(),
+            "确认应收起并放行 worker"
+        );
+        assert!(!state.exclude_reset_confirm);
+        assert!(
+            !state.take_exclude_reset_confirm(),
+            "同一确认不得重复触发 worker"
+        );
+    }
+
+    /// 打开/关闭/开始 add/remove 都清确认（防陈旧破坏性操作跨帧残留）。
+    #[test]
+    fn exclude_reset_confirmation_cleared_on_open_close_and_changes() {
+        let mut state = test_state();
+
+        state.request_exclude_reset();
+        state.request_open();
+        assert!(!state.exclude_reset_confirm, "打开须清确认");
+
+        state.request_exclude_reset();
+        state.mark_hidden();
+        assert!(!state.exclude_reset_confirm, "关闭须清确认");
+
+        for label in ["add", "remove", "reset"] {
+            let mut state = test_state();
+            state.request_exclude_reset();
+            assert!(state.exclude_reset_confirm);
+            let _tx = begin_fake_exclude(&mut state, false);
+            assert!(!state.exclude_reset_confirm, "{label} 开始须收起确认");
+        }
+
+        // 已打开时再次请求打开（点齿轮置前）同样收起确认。
+        let mut state = test_state();
+        state.request_open();
+        state.request_exclude_reset();
+        state.request_open();
+        assert!(!state.exclude_reset_confirm);
+    }
+
+    /// reset worker 成功：响应三条默认覆盖旧列表、清错、结束 busy。
+    #[test]
+    fn exclude_reset_success_replaces_entries_with_defaults() {
+        let mut state = test_state();
+        state.excluded = vec!["/custom/a".into(), "node_modules".into()];
+        state.exclude_error = Some("旧错误".into());
+        let tx = begin_fake_exclude(&mut state, false);
+        assert!(
+            state.exclude_busy && !state.exclude_busy_list,
+            "reset 须为重扫"
+        );
+
+        let defaults = engine::config::default_config().excluded;
+        tx.send(ExcludeResult {
+            entries: defaults.clone(),
+            error: None,
+        })
+        .unwrap();
+        state.tick_exclude();
+
+        assert_eq!(state.excluded, defaults, "成功须以响应覆盖为默认三条");
+        assert!(state.exclude_error.is_none(), "reset 成功须清旧错误");
+        assert!(!state.exclude_busy);
+        assert!(state.exclude_loaded);
+    }
+
+    /// reset worker 失败/离线：保留旧列表 + 原样错误，并结束 busy。
+    #[test]
+    fn exclude_reset_failure_keeps_entries_and_reports_error() {
+        let mut state = test_state();
+        state.excluded = vec!["/custom/a".into(), "node_modules".into()];
+        let before = state.excluded.clone();
+        let tx = begin_fake_exclude(&mut state, false);
+        tx.send(ExcludeResult {
+            entries: Vec::new(),
+            error: Some("配置保存失败(磁盘只读),排除目录未改变".into()),
+        })
+        .unwrap();
+        state.tick_exclude();
+
+        assert_eq!(state.excluded, before, "失败不得覆盖旧列表");
+        assert_eq!(
+            state.exclude_error.as_deref(),
+            Some("配置保存失败(磁盘只读),排除目录未改变")
+        );
+        assert!(!state.exclude_busy, "失败也须结束 busy");
+    }
+
     /// 同一时刻只允许一个操作；第二操作不得抢占 busy 类型/通道。
     #[test]
     fn exclude_single_operation_in_flight() {
@@ -1237,12 +1396,17 @@ mod tests {
         );
     }
 
-    /// 只有自动 list 保留错误；add/remove 开始即清旧提示（pass 级回归的接线钉）。
+    /// 只有自动 list 保留错误；add/remove/reset 开始即清旧提示（pass 级接线钉）。
     #[test]
     fn exclude_op_begin_flags_preserve_error_only_for_auto_list() {
         assert_eq!(exclude_begin_flags("list"), (true, false));
         assert_eq!(exclude_begin_flags("add"), (false, true));
         assert_eq!(exclude_begin_flags("remove"), (false, true));
+        assert_eq!(
+            exclude_begin_flags("reset"),
+            (false, true),
+            "reset 是变更操作：显示重扫中并清旧错误"
+        );
     }
 
     /// `ExcludeOutcome` 映射：ok=true 才给覆盖列表；ok=false/Err 只给错误。
@@ -1841,6 +2005,7 @@ mod tests {
         state.exclude_busy = true;
         state.exclude_busy_list = true;
         state.exclude_error = Some("daemon 未在运行".into());
+        state.exclude_reset_confirm = true;
 
         let data = SettingsData::from_state(&state);
         assert_eq!(data.font_size, FontSize::Large);
@@ -1864,6 +2029,7 @@ mod tests {
         assert!(data.exclude_busy);
         assert!(data.exclude_busy_list);
         assert_eq!(data.exclude_error.as_deref(), Some("daemon 未在运行"));
+        assert!(data.exclude_reset_confirm);
     }
 
     fn key_w(modifiers: egui::Modifiers) -> egui::RawInput {

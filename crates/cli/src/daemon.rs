@@ -938,6 +938,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         Request::ExcludeRemove { path, .. } => {
             exclude_response(state, paths, &path, ExcludeOp::Remove)
         }
+        Request::ExcludeReset { .. } => reset_excludes(state, paths),
     }
 }
 
@@ -966,6 +967,30 @@ fn exclude_response(
 enum ExcludeOp {
     Add,
     Remove,
+}
+
+/// 恢复内置默认排除项(设置页「恢复默认」/ CLI `exclude reset`)。
+///
+/// 顺序有语义:先落盘默认配置,成功后才替换内存并重扫。保存失败时内存配置与
+/// 索引都不变(返回当前列表 + 可操作原因)——不能先改内存再赌落盘成功。
+/// 不持 `cfg` 锁跨越保存/重扫;成功后一次全量重扫使三条默认同时生效。
+fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
+    let defaults = config::default_config();
+    if let Err(e) = config::save(&defaults, &paths.config_file()) {
+        log::error!("恢复默认排除目录:配置保存失败: {e}");
+        return Response::Exclude {
+            ok: false,
+            excluded: state.cfg.lock().unwrap().excluded.clone(),
+            message: Some(format!("配置保存失败({e}),排除目录未改变")),
+        };
+    }
+    *state.cfg.lock().unwrap() = defaults.clone();
+    degrade_and_rescan(state, paths);
+    Response::Exclude {
+        ok: true,
+        excluded: defaults.excluded,
+        message: None,
+    }
 }
 
 /// 排除路径校验(tech.md 契约):须为绝对路径且位于扫描根内,否则拒绝。
@@ -1313,6 +1338,87 @@ mod tests {
             config::load(&paths.config_file()).excluded,
             vec!["node_modules".to_string(), "/abs/x".to_string()],
             "失败不得落盘"
+        );
+    }
+
+    /// 恢复默认(E5):自定义条目清空 → 内存/落盘均为内置三条,并执行一次重扫
+    /// (新状态从 BUILDING 推进到 READY)。响应列表即三条默认。
+    #[test]
+    fn exclude_reset_restores_defaults_and_rescans() {
+        let (_tmp, state, paths) =
+            exclude_fixture(&["/Users/t/Videos", "node_modules", "/Users/t/Downloads"]);
+        config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
+
+        let resp = reset_excludes(&state, &paths);
+        let defaults = config::default_config();
+        match resp {
+            Response::Exclude {
+                ok,
+                excluded,
+                message,
+            } => {
+                assert!(ok, "恢复默认应成功:{message:?}");
+                assert_eq!(excluded, defaults.excluded);
+                assert!(message.is_none());
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+
+        let memory = state.cfg.lock().unwrap().excluded.clone();
+        assert_eq!(memory, defaults.excluded, "内存配置须恢复默认三条");
+        assert!(
+            !memory.iter().any(|e| e == "/Users/t/Videos"),
+            "自定义条目必须消失:{memory:?}"
+        );
+        assert_eq!(
+            config::load(&paths.config_file()).excluded,
+            defaults.excluded,
+            "默认配置须落盘"
+        );
+        assert!(
+            *state.state_name.lock().unwrap() == state::READY,
+            "恢复默认须完成一次重扫(状态 READY)"
+        );
+    }
+
+    /// 恢复默认先落盘:保存失败时内存配置不变、不触发重扫,并如实返回
+    /// ok=false + 当前列表 + 可操作原因。
+    #[test]
+    fn exclude_reset_save_failure_keeps_memory_and_does_not_rescan() {
+        let (_tmp, state, paths) = exclude_fixture(&["/custom/x", "node_modules"]);
+        // 目标路径被目录占用 → save 的 rename 失败(与 settings 保存失败测同法)。
+        std::fs::create_dir_all(paths.config_file()).unwrap();
+
+        let resp = reset_excludes(&state, &paths);
+        match resp {
+            Response::Exclude {
+                ok,
+                excluded,
+                message,
+            } => {
+                assert!(!ok, "保存失败不得报成功");
+                assert_eq!(
+                    excluded,
+                    vec!["/custom/x".to_string(), "node_modules".to_string()],
+                    "失败须返回当前(未改变)列表"
+                );
+                assert!(
+                    message
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with("配置保存失败(")),
+                    "失败原因须可操作:{message:?}"
+                );
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+        assert_eq!(
+            state.cfg.lock().unwrap().excluded,
+            vec!["/custom/x".to_string(), "node_modules".to_string()],
+            "保存失败不得改动内存配置"
+        );
+        assert!(
+            *state.state_name.lock().unwrap() == state::BUILDING,
+            "保存失败不得触发重扫(状态保持原样)"
         );
     }
 

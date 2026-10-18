@@ -165,7 +165,7 @@ $ macEverything status
 
 状态四态:构建中 / 就绪 / 补齐中(重放) / 重扫中(兜底)。权限缺口逐目录列出。
 
-### `macEverything exclude add|remove|list [路径]` — 排除目录
+### `macEverything exclude add|remove|list|reset [路径]` — 排除目录
 
 ```bash
 $ macEverything exclude add /Users/you/Videos
@@ -179,6 +179,10 @@ $ macEverything exclude add /Users/you/Videos
 `add` 只接受**扫描根内绝对路径**；`remove` 接受**已有条目原文**（包括
 `node_modules`、`.git` 这类相对名）。变更即时生效(引擎重扫)并写入配置文件;
 daemon 未运行时此命令报错(需引擎在线)。
+
+`reset` 无参数：清空自定义条目并恢复内置默认三条（`~/Library`、`node_modules`、
+`.git`），保存配置后一次重扫生效。设置页对应「恢复默认」需两步确认。旧 daemon
+不认识该请求，须先 `macEverything stop && macEverything start` 换用新 CLI。
 
 ## 搜索语法
 

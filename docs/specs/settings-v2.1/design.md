@@ -353,6 +353,28 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
   可再取。原生选择器路径经 `to_string_lossy()` 转协议字符串，极端非 UTF-8 路径
   可能不可用。
 
+### 8.6 恢复默认（E5，2026-10-18）
+
+- **语义**：把 `excluded` 重置为内置三条 `~/Library`、`node_modules`、`.git`
+  （`engine::config::default_config()`）；自定义条目全部清除。不新增名称规则输入，
+  不改变默认列表。默认相对名（`.git`、`node_modules`）无法经目录选择器重新添加，
+  这是本操作的直接动机。
+- **两步确认（破坏性）**：Header 右侧常规态为「恢复默认」小号文字按钮 +
+  「＋ 添加目录…」；点击「恢复默认」只展开确认，不启动 worker。确认态隐藏添加
+  按钮，显示「取消」「确认恢复」，并在 Header 下显示支持行
+  「将清空自定义排除项，恢复 ~/Library、node_modules、.git」；该行高度计入
+  `RowSpec.extra`。确认/取消/打开/关闭/开始 add/remove/reset 均收起确认；
+  请求与取消确认不清既有错误。
+- **执行**：`SettingsAction::ConfirmExcludeReset` → `client::exclude(paths, "reset", None)`
+  → daemon `Request::ExcludeReset` → `reset_excludes`。复用单操作 busy/错误管线
+  （显示「重扫中…」、禁用全部排除控件）；成功以响应列表覆盖，失败保留旧列表 +
+  错误。一次 reset 只触发一次 daemon 全量重扫，不为每条默认单独变更。
+- **daemon 顺序**：先 `config::save(default_config(), config_file)`；保存失败 →
+  `ok=false` + 当前列表 + `配置保存失败(...)`，内存与索引都不变、不重扫。保存成功
+  才替换内存配置并 `degrade_and_rescan`。不持 `cfg` 锁跨越保存/重扫。
+- **兼容性**：协议版本号不变；`exclude_reset` 是新增请求，旧 daemon 解码失败并
+  拒绝。升级后须停止/启动引擎换用新 CLI（App 不自动重启）；设置页此时按错误展示。
+
 ---
 
 ## 九、入口

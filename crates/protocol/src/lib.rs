@@ -46,6 +46,12 @@ pub enum Request {
     ExcludeList {
         v: u32,
     },
+    /// 恢复内置默认排除项(`~/Library`、`node_modules`、`.git`)。
+    /// 协议版本不变:旧 daemon 解码未知变体失败并拒绝请求,设置页按错误展示;
+    /// 使用新请求须以新 CLI 重启引擎(不自动重启)。
+    ExcludeReset {
+        v: u32,
+    },
 }
 
 impl Request {
@@ -56,7 +62,8 @@ impl Request {
             | Request::Stop { v }
             | Request::ExcludeAdd { v, .. }
             | Request::ExcludeRemove { v, .. }
-            | Request::ExcludeList { v } => *v,
+            | Request::ExcludeList { v }
+            | Request::ExcludeReset { v } => *v,
         }
     }
 }
@@ -312,6 +319,24 @@ mod tests {
         assert!(validate::exclude_path("/abs/x").is_ok());
     }
 
+    /// E5:恢复默认是纯版本化无参请求;线上 tag 固定为 `exclude_reset`,往返无损。
+    /// 旧 daemon 不认识该 tag → 解码失败并拒绝(协议版本号刻意不 bump)。
+    #[test]
+    fn exclude_reset_roundtrip_and_version() {
+        let r = Request::ExcludeReset {
+            v: PROTOCOL_VERSION,
+        };
+        let bytes = encode(&r).unwrap();
+        assert_eq!(decode_request(&bytes[4..]).unwrap(), r);
+        assert_eq!(r.version(), PROTOCOL_VERSION);
+        let body = serde_json::to_string(&r).unwrap();
+        assert!(
+            body.contains(r#""msg":"exclude_reset""#),
+            "线上 tag 应为 exclude_reset:{body}"
+        );
+        assert!(!body.contains("path"), "恢复默认不接受路径/参数:{body}");
+    }
+
     #[test]
     fn version_field_present_on_all_variants() {
         // 契约:每请求都携带版本字段(serde tag 保证变体可辨)
@@ -323,6 +348,9 @@ mod tests {
                 v: PROTOCOL_VERSION,
             },
             Request::ExcludeList {
+                v: PROTOCOL_VERSION,
+            },
+            Request::ExcludeReset {
                 v: PROTOCOL_VERSION,
             },
         ];

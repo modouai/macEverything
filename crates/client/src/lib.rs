@@ -349,10 +349,15 @@ pub struct ExcludeOutcome {
     pub message: Option<String>,
 }
 
-/// 排除目录管理(list/add/remove);变更需引擎在线,离线直接报错。
+/// 排除目录管理(list/add/remove/reset);变更需引擎在线,离线直接报错。
+/// `reset` 无参:恢复引擎内置默认三条,一次重扫生效(旧 daemon 会拒绝,
+/// 须以新 CLI 重启引擎)。
 pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<ExcludeOutcome> {
     let req = match action {
         "list" => Request::ExcludeList {
+            v: protocol::PROTOCOL_VERSION,
+        },
+        "reset" => Request::ExcludeReset {
             v: protocol::PROTOCOL_VERSION,
         },
         "add" => {
@@ -370,7 +375,7 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
                 path: p.into(),
             }
         }
-        other => bail!("未知动作 {other}(可用: add/remove/list)"),
+        other => bail!("未知动作 {other}(可用: add/remove/list/reset)"),
     };
     let Some(mut s) = connect(paths) else {
         bail!("daemon 未在运行;排除变更需引擎在线,先执行 macEverything start");
@@ -403,6 +408,26 @@ mod tests {
         let err = exclude(&paths, "remove", None).unwrap_err().to_string();
         assert!(err.contains("已存在的排除项"), "{err}");
         assert!(!err.contains("绝对路径"), "相对名条目也可移除:{err}");
+    }
+
+    /// reset 无参且无 daemon 时走连接失败路径(不是用法错误);未知动作提示
+    /// 须把 reset 列为可用动作。请求构造本身由 protocol 往返测试覆盖。
+    #[test]
+    fn exclude_reset_usage_and_unknown_action_help() {
+        let paths = DaemonPaths {
+            data_dir: PathBuf::from("/nonexistent-mace-test"),
+        };
+        let err = exclude(&paths, "reset", Some("ignored"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("daemon 未在运行"), "{err}");
+        assert!(!err.contains("未知动作"), "reset 不得被当成未知动作:{err}");
+
+        let err = exclude(&paths, "bogus", None).unwrap_err().to_string();
+        assert!(
+            err.contains("add/remove/list/reset"),
+            "未知动作帮助须包含 reset:{err}"
+        );
     }
 
     /// stat_rows 必须从同一次 metadata 同时填 size/mtime/is_dir:

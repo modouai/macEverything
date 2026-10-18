@@ -23,14 +23,22 @@ use crate::ui::{
         FIELD_FONT, FIELD_PAD_X, FIELD_RADIUS, FOLDER_ICON, FOLDER_ICON_GAP, GROUP_GAP,
         GROUP_HEADER_FONT, GROUP_HEADER_GAP, ICON_STROKE, KEYCAP_FONT, KEYCAP_GAP, KEYCAP_H,
         KEYCAP_PAD_X, KEYCAP_RADIUS, LABEL_CONTROL_GAP, LABEL_FONT, LABEL_SUPPORT_GAP, REMOVE_ICON,
-        REMOVE_ICON_STROKE, ROW_H, ROW_PAD_X, SEG_FONT, SEG_GAP, SEG_H, SEG_ITEM_RADIUS, SEG_PAD,
-        SEG_RADIUS, SEG_W, SUPPORT_FONT, SWITCH_KNOB, SWITCH_KNOB_SHADOW_OFFSET,
-        SWITCH_KNOB_SHADOW_SIZE, SWITCH_RADIUS, SWITCH_SIZE, TITLEBAR_H,
+        REMOVE_ICON_STROKE, RESET_BUTTON_GAP, RESET_BUTTON_PAD_X, RESET_BUTTON_RADIUS, ROW_H,
+        ROW_PAD_X, SEG_FONT, SEG_GAP, SEG_H, SEG_ITEM_RADIUS, SEG_PAD, SEG_RADIUS, SEG_W,
+        SUPPORT_FONT, SWITCH_KNOB, SWITCH_KNOB_SHADOW_OFFSET, SWITCH_KNOB_SHADOW_SIZE,
+        SWITCH_RADIUS, SWITCH_SIZE, TITLEBAR_H,
     },
 };
 
 /// 添加目录按钮文案（宽度测量与绘制共用）。
 const ADD_DIR_LABEL: &str = "＋ 添加目录…";
+/// 「恢复默认」文字按钮（两步确认第一步）。
+const RESET_LABEL: &str = "恢复默认";
+/// 恢复默认确认态：取消/确认。
+const RESET_CANCEL_LABEL: &str = "取消";
+const RESET_CONFIRM_LABEL: &str = "确认恢复";
+/// 恢复默认确认态的支持行（破坏性说明；三条内置默认与引擎一致）。
+const RESET_HINT: &str = "将清空自定义排除项，恢复 ~/Library、node_modules、.git";
 /// 语言禁用值（本期仅简中；快照构造也复用）。
 pub(crate) const LANGUAGE_LABEL: &str = "简体中文";
 /// 语言禁用态提示。
@@ -82,6 +90,8 @@ pub(crate) struct SettingsData {
     pub(crate) exclude_busy_list: bool,
     /// 排除目录加载/变更失败原因（daemon/离线文案原样显示）。
     pub(crate) exclude_error: Option<String>,
+    /// 「恢复默认」两步确认已展开（添加按钮隐藏，显示取消/确认）。
+    pub(crate) exclude_reset_confirm: bool,
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
@@ -109,6 +119,12 @@ pub(crate) enum SettingsAction {
     AddExclude,
     /// 点击目录行移除 ×：设置 pass 启动 remove 工作线程（原文路径）。
     RemoveExclude(String),
+    /// 点击「恢复默认」：仅展开两步确认（不启动 worker）。
+    RequestExcludeReset,
+    /// 确认态点「取消」：收起确认，列表/错误不变。
+    CancelExcludeReset,
+    /// 确认态点「确认恢复」：设置 pass 启动 reset 工作线程（一次重扫）。
+    ConfirmExcludeReset,
 }
 
 /// 一帧绘制结果：动作队列（通常为空或单条）。
@@ -318,13 +334,17 @@ fn draw_index_group(
         EXCLUDE_RESCANNING
     });
     let error = data.exclude_error.as_deref();
-    let extra = extra_for(error.is_some(), extra_h) + extra_for(busy_label.is_some(), extra_h);
+    // 两步确认提示单独占一行（与 busy/错误可并存，全部计入 RowSpec.extra）。
+    let reset_hint = data.exclude_reset_confirm.then_some(RESET_HINT);
+    let extra = extra_for(error.is_some(), extra_h)
+        + extra_for(busy_label.is_some(), extra_h)
+        + extra_for(reset_hint.is_some(), extra_h);
     let mut rows = vec![GroupRow {
         kind: RowKind::ExcludeHeader,
         spec: RowSpec::new(EXCLUDE_HEADER_H).with_extra(extra),
         error,
         note: busy_label,
-        hint: None,
+        hint: reset_hint,
     }];
     if data.excluded.is_empty() {
         rows.push(GroupRow {
@@ -490,16 +510,10 @@ fn draw_row_body(
             );
         }
         RowKind::ExcludeHeader => {
-            let button_w = text_width(ui, ADD_DIR_LABEL, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X;
-            let control = draw_row_label(
-                ui,
-                body,
-                "排除目录",
-                egui::vec2(button_w, ADD_BUTTON_H),
-                palette,
-            );
-            if let Some(action) = draw_add_button(ui, control, data.exclude_busy, palette) {
-                actions.push(action);
+            if data.exclude_reset_confirm {
+                draw_reset_confirm_controls(ui, body, data.exclude_busy, palette, actions);
+            } else {
+                draw_exclude_header_controls(ui, body, data.exclude_busy, palette, actions);
             }
         }
         RowKind::Exclusion { index, path } => {
@@ -1000,6 +1014,157 @@ fn capture_recorded_key(
     }
 }
 
+/// 文字按钮宽度 = 文案自然宽 + 左右内边距（点击区高与添加按钮对齐）。
+fn text_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    text_width(ui, label, ADD_BUTTON_FONT) + 2.0 * RESET_BUTTON_PAD_X
+}
+
+/// 排除目录 Header 常规态：右侧「恢复默认」+ 间距 +「＋ 添加目录…」。
+///
+/// 两个控件同排右对齐；文字按钮静止无底，悬停仅铺一层浅色，视觉上仍是
+/// 次要文字而非新的大按钮。
+fn draw_exclude_header_controls(
+    ui: &mut egui::Ui,
+    body: egui::Rect,
+    busy: bool,
+    palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let add_w = text_width(ui, ADD_DIR_LABEL, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X;
+    let reset_w = text_button_width(ui, RESET_LABEL);
+    let group_w = reset_w + RESET_BUTTON_GAP + add_w;
+    let control = draw_row_label(
+        ui,
+        body,
+        "排除目录",
+        egui::vec2(group_w, ADD_BUTTON_H),
+        palette,
+    );
+    let reset = egui::Rect::from_min_size(control.min, egui::vec2(reset_w, control.height()));
+    let add = egui::Rect::from_min_size(
+        egui::pos2(control.right() - add_w, control.top()),
+        egui::vec2(add_w, control.height()),
+    );
+    if draw_reset_text_button(
+        ui,
+        reset,
+        "settings-reset-excludes",
+        RESET_LABEL,
+        palette.text_secondary,
+        palette.text_primary,
+        !busy,
+        palette,
+    ) {
+        actions.push(SettingsAction::RequestExcludeReset);
+    }
+    if let Some(action) = draw_add_button(ui, add, busy, palette) {
+        actions.push(action);
+    }
+}
+
+/// 确认态：隐藏添加按钮，右侧只留「取消」+ 间距 +「确认恢复」（破坏性红字）。
+fn draw_reset_confirm_controls(
+    ui: &mut egui::Ui,
+    body: egui::Rect,
+    busy: bool,
+    palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let cancel_w = text_button_width(ui, RESET_CANCEL_LABEL);
+    let confirm_w = text_button_width(ui, RESET_CONFIRM_LABEL);
+    let group_w = cancel_w + RESET_BUTTON_GAP + confirm_w;
+    let control = draw_row_label(
+        ui,
+        body,
+        "排除目录",
+        egui::vec2(group_w, ADD_BUTTON_H),
+        palette,
+    );
+    let cancel = egui::Rect::from_min_size(control.min, egui::vec2(cancel_w, control.height()));
+    let confirm = egui::Rect::from_min_size(
+        egui::pos2(control.right() - confirm_w, control.top()),
+        egui::vec2(confirm_w, control.height()),
+    );
+    if draw_reset_text_button(
+        ui,
+        cancel,
+        "settings-reset-cancel",
+        RESET_CANCEL_LABEL,
+        palette.text_secondary,
+        palette.text_primary,
+        !busy,
+        palette,
+    ) {
+        actions.push(SettingsAction::CancelExcludeReset);
+    }
+    if draw_reset_text_button(
+        ui,
+        confirm,
+        "settings-reset-confirm",
+        RESET_CONFIRM_LABEL,
+        palette.error_text,
+        palette.error_text,
+        !busy,
+        palette,
+    ) {
+        actions.push(SettingsAction::ConfirmExcludeReset);
+    }
+}
+
+/// 小号文字按钮（12pt；静止透明、悬停浅底；busy 时置灰并禁点）。
+/// 返回 true = 本帧点击且启用。
+#[allow(clippy::too_many_arguments)]
+fn draw_reset_text_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+    label: &str,
+    color: egui::Color32,
+    hover_color: egui::Color32,
+    enabled: bool,
+    palette: &SettingsPalette,
+) -> bool {
+    let response = ui.interact(
+        rect,
+        ui.scope_id().with(id),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let hovered = enabled && response.hovered();
+    let down = enabled && response.is_pointer_button_down_on();
+    if hovered || down {
+        let fill = palette
+            .control_fill
+            .gamma_multiply(if down { 1.6 } else { 1.0 });
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(RESET_BUTTON_RADIUS), fill);
+    }
+    let text_color = if !enabled {
+        color.gamma_multiply(0.5)
+    } else if hovered || down {
+        hover_color
+    } else {
+        color
+    };
+    draw_text(
+        ui,
+        rect,
+        label,
+        ADD_BUTTON_FONT,
+        text_color,
+        egui::Align2::CENTER_CENTER,
+    );
+    if enabled {
+        response.clicked()
+    } else {
+        let _ = response.on_hover_cursor(egui::CursorIcon::NotAllowed);
+        false
+    }
+}
+
 /// 「＋ 添加目录…」按钮（高 28、圆角 7、12pt；宽随文案）。
 /// not busy 时点击 → [`SettingsAction::AddExclude`]；busy 时置灰/禁用。
 fn draw_add_button(
@@ -1260,6 +1425,7 @@ mod tests {
             exclude_busy: false,
             exclude_busy_list: false,
             exclude_error: None,
+            exclude_reset_confirm: false,
         }
     }
 
@@ -1457,6 +1623,7 @@ mod tests {
             "唤起快捷键",
             "完整窗口快捷键",
             "排除目录",
+            "恢复默认",
             "小",
             "标准",
             "大",
@@ -1523,6 +1690,11 @@ mod tests {
         )
     }
 
+    /// 文字按钮中心（文字在按钮矩形内居中，故文本中心即点击点）。
+    fn text_button_center(out: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        text_center(find_text(&all_texts(out), label))
+    }
+
     /// 点击「＋ 添加目录…」→ AddExclude（选择器/worker 由设置 pass 落地）。
     #[test]
     fn add_button_click_emits_add_exclude() {
@@ -1533,6 +1705,121 @@ mod tests {
         let pos = add_button_center(&out);
         let output = click_at(&ctx, &data, pos);
         assert_eq!(output.actions, vec![SettingsAction::AddExclude]);
+    }
+
+    /// 点击「恢复默认」→ 仅请求确认（不直接启动 worker）；按钮位于添加按钮左侧，
+    /// 点击 Header 标签等非控件区域不产生动作。
+    #[test]
+    fn reset_button_click_requests_confirmation() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let data = layout_test_data();
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let reset = text_button_center(&out, RESET_LABEL);
+        let add = add_button_center(&out);
+        assert!(
+            reset.x < add.x,
+            "恢复默认须在添加按钮左侧:reset {reset:?}, add {add:?}"
+        );
+
+        let output = click_at(&ctx, &data, reset);
+        assert_eq!(output.actions, vec![SettingsAction::RequestExcludeReset]);
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let label = text_center(find_text(&all_texts(&out), "排除目录"));
+        let output = click_at(&ctx, &data, label);
+        assert!(
+            output.actions.is_empty(),
+            "Header 标签不得产生动作:{:?}",
+            output.actions
+        );
+    }
+
+    /// 确认态：隐藏添加按钮，显示取消/确认恢复与破坏性说明；说明行计入
+    /// RowSpec.extra（目录行整体下移）。点击分别回传取消/确认动作。
+    #[test]
+    fn reset_confirmation_layout_and_actions() {
+        let baseline = run_body(&layout_test_data());
+        let baseline_dir = text_center(find_text(&all_texts(&baseline), "~/Library")).y;
+
+        let mut data = layout_test_data();
+        data.exclude_reset_confirm = true;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
+        assert!(
+            labels.iter().any(|text| text == RESET_HINT),
+            "确认态须显示破坏性说明:{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|text| text == RESET_CANCEL_LABEL),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|text| text == RESET_CONFIRM_LABEL),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|text| text == ADD_DIR_LABEL),
+            "确认态须隐藏添加按钮:{labels:?}"
+        );
+        let hint_y = text_center(find_text(&texts, RESET_HINT)).y;
+        let header_y = text_center(find_text(&texts, "排除目录")).y;
+        let dir_y = text_center(find_text(&texts, "~/Library")).y;
+        assert!(
+            hint_y > header_y && hint_y < dir_y,
+            "说明行须位于 Header 与目录行之间:header {header_y},说明 {hint_y},目录 {dir_y}"
+        );
+        assert!(
+            dir_y > baseline_dir + 10.0,
+            "说明行须增高卡片并下移目录行:基线 {baseline_dir},目录 {dir_y}"
+        );
+
+        for (label, expected) in [
+            (RESET_CANCEL_LABEL, SettingsAction::CancelExcludeReset),
+            (RESET_CONFIRM_LABEL, SettingsAction::ConfirmExcludeReset),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let (out, _) = run_frame(&ctx, &data, Vec::new());
+            let pos = text_button_center(&out, label);
+            let output = click_at(&ctx, &data, pos);
+            assert_eq!(output.actions, vec![expected], "{label} 点击动作");
+        }
+    }
+
+    /// busy 时确认态的取消/确认同样禁点；正常态的恢复默认禁点（添加/移除
+    /// 已由 `busy_disables_add_and_remove_actions` 覆盖）。
+    #[test]
+    fn busy_disables_reset_controls() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut data = layout_test_data();
+        data.exclude_busy = true;
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let reset = text_button_center(&out, RESET_LABEL);
+        let output = click_at(&ctx, &data, reset);
+        assert!(
+            output.actions.is_empty(),
+            "busy 时恢复默认不得产生动作:{:?}",
+            output.actions
+        );
+
+        data.exclude_reset_confirm = true;
+        for label in [RESET_CANCEL_LABEL, RESET_CONFIRM_LABEL] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let (out, _) = run_frame(&ctx, &data, Vec::new());
+            let pos = text_button_center(&out, label);
+            let output = click_at(&ctx, &data, pos);
+            assert!(
+                output.actions.is_empty(),
+                "busy 时 {label} 不得产生动作:{:?}",
+                output.actions
+            );
+        }
     }
 
     /// 点击目录行移除 × → RemoveExclude(原文路径)。
