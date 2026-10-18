@@ -119,6 +119,11 @@ pub struct EngineState {
     dir_map: Mutex<HashMap<PathBuf, u32>>,
     roots: Mutex<Vec<PathBuf>>,
     cfg: Mutex<config::Config>,
+    /// 排除目录跨连接变更锁:add/remove/reset 的「校验 → 内存 → 落盘 → 重扫」
+    /// 必须整体串行。`serve` 每连接一线程;没有此锁时 reset 与 CLI add/remove
+    /// 交错会写出「配置含自定义条目、内存却已重置」的错位状态,并并发全量重扫。
+    /// 只包变更序列,`ExcludeList` 读不加锁(避免被长重扫阻塞)。
+    exclude_op_lock: Mutex<()>,
 }
 
 impl EngineState {
@@ -139,6 +144,7 @@ impl EngineState {
             dir_map: Mutex::new(HashMap::new()),
             roots: Mutex::new(vec![]),
             cfg: Mutex::new(config::Config { excluded: vec![] }),
+            exclude_op_lock: Mutex::new(()),
         }
     }
 
@@ -975,6 +981,8 @@ enum ExcludeOp {
 /// 索引都不变(返回当前列表 + 可操作原因)——不能先改内存再赌落盘成功。
 /// 不持 `cfg` 锁跨越保存/重扫;成功后一次全量重扫使三条默认同时生效。
 fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
+    // 与 add/remove 共用变更锁:保存/内存替换/重扫整体串行,防配置与内存错位。
+    let _op = state.exclude_op_lock.lock().unwrap();
     let defaults = config::default_config();
     if let Err(e) = config::save(&defaults, &paths.config_file()) {
         log::error!("恢复默认排除目录:配置保存失败: {e}");
@@ -1024,6 +1032,8 @@ fn apply_exclude_change(
     path: &str,
     op: ExcludeOp,
 ) -> Result<(), String> {
+    // 跨连接串行化:校验/内存更新/落盘/重扫期间不允许另一 Exclude 变更穿插。
+    let _op = state.exclude_op_lock.lock().unwrap();
     match op {
         ExcludeOp::Add => {
             let roots = state.roots.lock().unwrap().clone();
@@ -1341,12 +1351,20 @@ mod tests {
         );
     }
 
-    /// 恢复默认(E5):自定义条目清空 → 内存/落盘均为内置三条,并执行一次重扫
-    /// (新状态从 BUILDING 推进到 READY)。响应列表即三条默认。
+    /// 恢复默认(E5):自定义条目清空 → 内存/落盘均为内置三条,并按**新排除集**
+    /// 重扫(原本被自定义条目剪枝的目录/文件重置后必须入索引)。状态从 BUILDING
+    /// 推进到 READY;单次 reset 只触发这一次全量重扫,不为每条默认单独重扫。
     #[test]
-    fn exclude_reset_restores_defaults_and_rescans() {
-        let (_tmp, state, paths) =
-            exclude_fixture(&["/Users/t/Videos", "node_modules", "/Users/t/Downloads"]);
+    fn exclude_reset_restores_defaults_and_rescans_with_new_excludes() {
+        let (_tmp, state, paths) = exclude_fixture(&["node_modules"]);
+        let root = state.roots.lock().unwrap()[0].clone();
+        // 自定义排除目录里放一个文件:重置前整棵子树被剪枝,重置后应被索引。
+        let custom_dir = root.join("custom_excluded");
+        std::fs::create_dir(&custom_dir).unwrap();
+        let hidden_file = custom_dir.join("inside.txt");
+        std::fs::write(&hidden_file, b"x").unwrap();
+        let custom = custom_dir.to_string_lossy().into_owned();
+        state.cfg.lock().unwrap().excluded.push(custom.clone());
         config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
 
         let resp = reset_excludes(&state, &paths);
@@ -1367,7 +1385,7 @@ mod tests {
         let memory = state.cfg.lock().unwrap().excluded.clone();
         assert_eq!(memory, defaults.excluded, "内存配置须恢复默认三条");
         assert!(
-            !memory.iter().any(|e| e == "/Users/t/Videos"),
+            !memory.iter().any(|e| e == &custom),
             "自定义条目必须消失:{memory:?}"
         );
         assert_eq!(
@@ -1378,6 +1396,17 @@ mod tests {
         assert!(
             *state.state_name.lock().unwrap() == state::READY,
             "恢复默认须完成一次重扫(状态 READY)"
+        );
+        let hidden_path = hidden_file.to_string_lossy().into_owned();
+        let indexed = with_view(&state, |v| {
+            (0..v.entries().len() as u32)
+                .filter(|i| v.entries()[*i as usize].is_live())
+                .any(|i| v.full_path_dyn(i) == hidden_path)
+        })
+        .expect("重扫后应挂载可变索引");
+        assert!(
+            indexed,
+            "重扫必须使用新排除集:原自定义排除目录内的文件应被收录"
         );
     }
 
@@ -1420,6 +1449,84 @@ mod tests {
             *state.state_name.lock().unwrap() == state::BUILDING,
             "保存失败不得触发重扫(状态保持原样)"
         );
+    }
+
+    /// 跨连接变更串行化回归:add 与 reset 都必须等待 `exclude_op_lock` 释放。
+    /// started 信号保证线程已进入被调函数后再断言「超时未完成」,避免调度抖动
+    /// 被误判成锁生效;若函数漏用锁,小夹具会立即完成而断言失败。
+    #[test]
+    fn exclude_mutations_serialize_across_threads() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let (tmp, state, paths) = exclude_fixture(&["node_modules"]);
+        config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
+        let sub = tmp.path().join("scan").join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let sub = sub.to_string_lossy().into_owned();
+
+        // add:持锁时线程必须阻塞,释放后成功。
+        let guard = state.exclude_op_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let st = state.clone();
+        let p = paths.clone();
+        let arg = sub.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(apply_exclude_change(&st, &p, &arg, ExcludeOp::Add))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("add 线程应已启动");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_millis(150))
+                .unwrap_err(),
+            RecvTimeoutError::Timeout,
+            "add 必须在排除变更锁内等待"
+        );
+        drop(guard);
+        let added = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("释放锁后 add 应完成");
+        handle.join().unwrap();
+        assert!(added.is_ok(), "{added:?}");
+
+        // reset:同样必须等待变更锁。
+        let guard = state.exclude_op_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let st = state.clone();
+        let p = paths.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(reset_excludes(&st, &p)).unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reset 线程应已启动");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_millis(150))
+                .unwrap_err(),
+            RecvTimeoutError::Timeout,
+            "reset 必须在排除变更锁内等待"
+        );
+        drop(guard);
+        let resp = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("释放锁后 reset 应完成");
+        handle.join().unwrap();
+        match resp {
+            Response::Exclude { ok, excluded, .. } => {
+                assert!(ok);
+                assert_eq!(excluded, config::default_config().excluded);
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
     }
 
     /// Add 契约不变:相对名/根外路径仍拒绝,仅根内绝对路径可加入。

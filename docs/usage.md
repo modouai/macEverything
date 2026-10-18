@@ -165,7 +165,7 @@ $ macEverything status
 
 状态四态:构建中 / 就绪 / 补齐中(重放) / 重扫中(兜底)。权限缺口逐目录列出。
 
-### `macEverything exclude add|remove|list|reset [路径]` — 排除目录
+### `macEverything exclude add|remove|list [路径]` / `macEverything exclude reset` — 排除目录
 
 ```bash
 $ macEverything exclude add /Users/you/Videos

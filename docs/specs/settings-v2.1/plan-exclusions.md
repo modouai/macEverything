@@ -111,16 +111,23 @@
   - **协议版本号不变。** 旧 daemon 解码未知 `exclude_reset` 变体失败并拒绝请求；
     设置页/CLI 按错误展示。手工测试须先 `macEverything stop && start` 用新 CLI
     重启引擎；App 不自动重启引擎。
-  - `client::exclude(paths, "reset", None)` → `ExcludeReset`；未知动作帮助文案更新为
-    `add/remove/list/reset`；CLI 用法同步。
+  - `client::exclude(paths, "reset", None)` → `ExcludeReset`；reset 显式拒绝参数；
+    未知动作帮助文案更新为 `add/remove/list/reset`；CLI 用法同步。
+  - reset 通讯失败（旧 daemon 解码失败后断连）附加「若引擎为旧版本,请停止并重新
+    启动引擎」；离线连接失败与其他动作文案保持不变。
 - [x] **Step 2: daemon `reset_excludes`**
   - 先 `config::save(&default_config(), config_file)`；失败 → `ok=false` +
     当前内存列表 + `配置保存失败(...)`，**不改内存、不重扫**。
   - 保存成功 → 内存配置替换为默认三条 → `degrade_and_rescan`（一次）→
     `ok=true` + 默认三条。
   - 不持 `cfg` 锁跨越保存/重扫；沿用 `apply_exclude_change` 的锁纪律。
+  - **跨连接变更锁**：`EngineState.exclude_op_lock` 覆盖 add/remove/reset 的
+    校验→内存→落盘→重扫整段（`ExcludeList` 保持无锁），防 settings reset 与
+    CLI add/remove 交错造成配置/内存错位与并发重扫。
   - 测试：自定义条目重置后内存/落盘均为三条且自定义消失，状态推进 READY；
-    保存失败路径内存不变、状态保持原样。
+    **原自定义排除目录内的文件在 reset 重扫后入索引**（证明重扫使用新排除集）；
+    保存失败路径内存不变、状态保持原样；用 channel 证明 add/reset 在持锁期间
+    阻塞、释放后完成（跨线程串行化回归）。
 - [x] **Step 3: 设置页状态与动作**
   - `SettingsState.exclude_reset_confirm: bool`：打开/关闭/开始 add/remove/reset/
     取消清；请求/取消确认不清既有错误；确认取走确认态后启动 `"reset"` worker。

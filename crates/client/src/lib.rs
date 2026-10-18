@@ -357,9 +357,14 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
         "list" => Request::ExcludeList {
             v: protocol::PROTOCOL_VERSION,
         },
-        "reset" => Request::ExcludeReset {
-            v: protocol::PROTOCOL_VERSION,
-        },
+        "reset" => {
+            if arg.is_some() {
+                bail!("用法: macEverything exclude reset(无参数;恢复内置默认三条)");
+            }
+            Request::ExcludeReset {
+                v: protocol::PROTOCOL_VERSION,
+            }
+        }
         "add" => {
             let p = arg.ok_or_else(|| anyhow!("用法: macEverything exclude add <绝对路径>"))?;
             Request::ExcludeAdd {
@@ -380,7 +385,16 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
     let Some(mut s) = connect(paths) else {
         bail!("daemon 未在运行;排除变更需引擎在线,先执行 macEverything start");
     };
-    match expect_ok(call(&mut s, &req)?)? {
+    // 旧 daemon 不认识新增的 exclude_reset 变体:解码失败后直接断连,客户端只会
+    // 看到 EOF/解码错误。仅对 reset 附加可操作提示(离线/其他动作文案保持原样)。
+    let resp = match call(&mut s, &req) {
+        Ok(resp) => resp,
+        Err(err) if action == "reset" => bail!(
+            "{err:#};若引擎为旧版本,请停止并重新启动引擎(macEverything stop && macEverything start)"
+        ),
+        Err(err) => return Err(err),
+    };
+    match expect_ok(resp)? {
         Response::Exclude {
             ok,
             excluded,
@@ -410,8 +424,8 @@ mod tests {
         assert!(!err.contains("绝对路径"), "相对名条目也可移除:{err}");
     }
 
-    /// reset 无参且无 daemon 时走连接失败路径(不是用法错误);未知动作提示
-    /// 须把 reset 列为可用动作。请求构造本身由 protocol 往返测试覆盖。
+    /// reset 明确无参:带参数走用法错误;无参无 daemon 才走连接失败路径。
+    /// 未知动作提示须把 reset 列为可用动作。请求构造由 protocol 往返测试覆盖。
     #[test]
     fn exclude_reset_usage_and_unknown_action_help() {
         let paths = DaemonPaths {
@@ -420,13 +434,55 @@ mod tests {
         let err = exclude(&paths, "reset", Some("ignored"))
             .unwrap_err()
             .to_string();
+        assert!(err.contains("无参数"), "reset 不接受参数:{err}");
+        assert!(!err.contains("daemon 未在运行"), "参数校验先于连接:{err}");
+
+        let err = exclude(&paths, "reset", None).unwrap_err().to_string();
         assert!(err.contains("daemon 未在运行"), "{err}");
         assert!(!err.contains("未知动作"), "reset 不得被当成未知动作:{err}");
+        assert!(
+            !err.contains("若引擎为旧版本"),
+            "离线错误不得附加旧 daemon 提示:{err}"
+        );
 
         let err = exclude(&paths, "bogus", None).unwrap_err().to_string();
         assert!(
             err.contains("add/remove/list/reset"),
             "未知动作帮助须包含 reset:{err}"
+        );
+    }
+
+    /// 旧 daemon 解码失败会直接断连(无响应):reset 客户端须把 EOF/IO 错误
+    /// 转成可操作的「重启引擎」提示;桩服务读完请求即关闭模拟该行为。
+    #[test]
+    fn exclude_reset_old_daemon_error_adds_restart_hint() {
+        use std::io::Read;
+
+        let dir =
+            std::env::temp_dir().join(format!("mce-exclude-reset-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).unwrap();
+            let n = u32::from_le_bytes(len) as usize;
+            let mut buf = vec![0u8; n];
+            s.read_exact(&mut buf).unwrap();
+            // 模拟旧 daemon 解码未知变体失败:不回响应直接关闭连接。
+        });
+
+        let paths = DaemonPaths {
+            data_dir: dir.clone(),
+        };
+        let err = exclude(&paths, "reset", None).unwrap_err().to_string();
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.contains("若引擎为旧版本,请停止并重新启动引擎"),
+            "旧 daemon 失败须给出可操作提示:{err}"
         );
     }
 
