@@ -1014,7 +1014,6 @@ git commit -m "feat(app): 设置页语言下拉与即时切换"
     badge_query_failed: "查询失败" / "Query failed",
     // 热键提示（持久）
     hotkey_unavailable: "快捷键不可用,可从托盘唤起" / "Shortcut unavailable; use the menu bar instead",
-    window_hotkey_unavailable: "完整窗口快捷键不可用,可从托盘打开" / "Full Window shortcut unavailable; open it from the menu bar",
     hotkey_unavailable_reason: "可从托盘唤起" / "use the menu bar instead",
     window_hotkey_unavailable_reason: "可从托盘打开" / "open it from the menu bar",
     hotkey_resume_failed: "快捷键恢复失败,请重新录制" / "Failed to restore shortcut; please record it again",
@@ -1071,7 +1070,6 @@ Expected: FAIL（`HotkeyNote` 不存在）。
 pub enum HotkeyNote {
     Fallback { default: String, used: String },
     Unavailable,
-    WindowUnavailable,
     ResumeFailed,
     SavedPaletteDefault { custom: String, default: String },
     SavedPaletteOther { custom: String, used: String },
@@ -1091,7 +1089,6 @@ impl HotkeyNote {
                 &[("default", default.as_str()), ("name", used.as_str())],
             ),
             Self::Unavailable => s.hotkey_unavailable.to_owned(),
-            Self::WindowUnavailable => s.window_hotkey_unavailable.to_owned(),
             Self::ResumeFailed => s.hotkey_resume_failed.to_owned(),
             Self::SavedPaletteDefault { custom, default } => i18n::fill(
                 s.hotkey_saved_palette_default,
@@ -1180,7 +1177,7 @@ fn palette_fallback_note(custom: HotKey, fallback_name: Option<&str>) -> HotkeyN
 ```
 
 - `register_window_default` 的两处 `note` 改为对应 `HotkeyNote` 变体。
-- `WINDOW_UNAVAILABLE_NOTE`/`UNAVAILABLE_NOTE`/`RESUME_FAILED_NOTE` 常量删除；所有引用改为 `HotkeyNote` 变体或 `.text()`（仅日志可 `.text()`）。
+- `WINDOW_UNAVAILABLE_NOTE`/`UNAVAILABLE_NOTE`/`RESUME_FAILED_NOTE` 常量删除；所有引用改为 `HotkeyNote` 变体或 `.text()`（仅日志可 `.text()`）。注意：完整窗口默认键失败且无自定义键时，原行为是只留日志、不常驻提示，因此 `HotkeyNote` 不设独立的 `WindowUnavailable` 变体。
 - `HotkeyRuntime::note()` 签名改为 `pub fn note(&self) -> Option<&HotkeyNote> { self.snapshot.note.as_ref() }`。
 - `ui/mod.rs` 中 `let hotkey_note = hotkey.note().map(str::to_string);` 改为 `let hotkey_note = hotkey.note().cloned();`。
 
