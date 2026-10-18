@@ -988,25 +988,32 @@ fn validate_exclude_in_roots(path: &str, roots: &[PathBuf]) -> Result<(), String
 }
 
 /// 排除变更:校验 → 更新配置 → 落盘配置 → 重扫使变更生效。
+/// Add 须为扫描根内绝对路径;Remove 只要求条目已存在——默认配置含
+/// `node_modules`/`.git` 等相对名,设置页须能移除它们,且待移除条目可能
+/// 已不在扫描根内(如根目录被重命名),故不做绝对路径/根内校验。
 /// 运行时无定向增量(受影响范围重扫可作后续优化),重扫保证正确性;
-/// 失败(路径非法/越界/配置落盘失败)返回可操作原因,不改内存状态之外的任何东西。
+/// 失败(路径非法/越界/条目不存在/配置落盘失败)返回可操作原因。
 fn apply_exclude_change(
     state: &Arc<EngineState>,
     paths: &DaemonPaths,
     path: &str,
     op: ExcludeOp,
 ) -> Result<(), String> {
-    let roots = state.roots.lock().unwrap().clone();
-    validate_exclude_in_roots(path, &roots)?;
-    {
-        let mut cfg = state.cfg.lock().unwrap();
-        match op {
-            ExcludeOp::Add => {
-                if !cfg.excluded.iter().any(|e| e == path) {
-                    cfg.excluded.push(path.to_string());
-                }
+    match op {
+        ExcludeOp::Add => {
+            let roots = state.roots.lock().unwrap().clone();
+            validate_exclude_in_roots(path, &roots)?;
+            let mut cfg = state.cfg.lock().unwrap();
+            if !cfg.excluded.iter().any(|e| e == path) {
+                cfg.excluded.push(path.to_string());
             }
-            ExcludeOp::Remove => cfg.excluded.retain(|e| e != path),
+        }
+        ExcludeOp::Remove => {
+            let mut cfg = state.cfg.lock().unwrap();
+            if !cfg.excluded.iter().any(|e| e == path) {
+                return Err(format!("条目不存在: {path}"));
+            }
+            cfg.excluded.retain(|e| e != path);
         }
     }
     let cfg = state.cfg.lock().unwrap().clone();
@@ -1252,5 +1259,90 @@ mod tests {
         // 相对名(上游只放行绝对路径)
         assert!(validate_exclude_in_roots("node_modules", &roots).is_err());
         assert!(validate_exclude_in_roots("~/Library", &roots).is_err());
+    }
+
+    /// 排除变更夹具:临时扫描根(独立于数据目录)+ 初始配置。
+    fn exclude_fixture(excluded: &[&str]) -> (tempfile::TempDir, Arc<EngineState>, DaemonPaths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("scan");
+        std::fs::create_dir(&root).unwrap();
+        let state = Arc::new(EngineState::new());
+        *state.roots.lock().unwrap() = vec![root];
+        *state.cfg.lock().unwrap() = config::Config {
+            excluded: excluded.iter().map(|e| (*e).to_string()).collect(),
+        };
+        let paths = DaemonPaths {
+            data_dir: tmp.path().join("data"),
+        };
+        (tmp, state, paths)
+    }
+
+    /// 移除只要求条目存在:默认配置里的相对名(node_modules/.git)及
+    /// ~/Library 都是设置页可见条目,必须可移除,不得再走绝对路径/根内校验。
+    /// 突变「Remove 仍先做 validate_exclude_in_roots」时本测试必红。
+    #[test]
+    fn exclude_remove_accepts_existing_relative_name() {
+        let (_tmp, state, paths) = exclude_fixture(&["node_modules", "/abs/x"]);
+        apply_exclude_change(&state, &paths, "node_modules", ExcludeOp::Remove)
+            .expect("已存在的相对名条目应可移除");
+        assert_eq!(
+            state.cfg.lock().unwrap().excluded,
+            vec!["/abs/x".to_string()]
+        );
+        assert_eq!(
+            config::load(&paths.config_file()).excluded,
+            vec!["/abs/x".to_string()],
+            "移除结果应落盘"
+        );
+    }
+
+    /// 移除不存在的条目:如实报「条目不存在」,内存与落盘配置均不变。
+    #[test]
+    fn exclude_remove_missing_entry_errors_without_change() {
+        let (_tmp, state, paths) = exclude_fixture(&["node_modules", "/abs/x"]);
+        config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
+        let err = apply_exclude_change(&state, &paths, "/not/existing", ExcludeOp::Remove)
+            .expect_err("不存在的条目应拒绝移除");
+        assert_eq!(err, "条目不存在: /not/existing");
+        assert_eq!(
+            state.cfg.lock().unwrap().excluded,
+            vec!["node_modules".to_string(), "/abs/x".to_string()],
+            "失败不得改动内存配置"
+        );
+        assert_eq!(
+            config::load(&paths.config_file()).excluded,
+            vec!["node_modules".to_string(), "/abs/x".to_string()],
+            "失败不得落盘"
+        );
+    }
+
+    /// Add 契约不变:相对名/根外路径仍拒绝,仅根内绝对路径可加入。
+    /// 突变「为支持 Remove 而放宽 Add 校验」时相对名/根外断言必红。
+    #[test]
+    fn exclude_add_still_requires_absolute_path_inside_scan_roots() {
+        let (tmp, state, paths) = exclude_fixture(&[]);
+        let err = apply_exclude_change(&state, &paths, "relative/x", ExcludeOp::Add)
+            .expect_err("相对名不得加入");
+        assert_eq!(err, "必须是绝对路径");
+        let err = apply_exclude_change(&state, &paths, "/etc", ExcludeOp::Add)
+            .expect_err("根外绝对路径不得加入");
+        assert!(err.contains("路径不在扫描根内"));
+        assert!(
+            state.cfg.lock().unwrap().excluded.is_empty(),
+            "被拒绝的 Add 不得改动配置"
+        );
+        assert!(!paths.config_file().exists(), "被拒绝的 Add 不得落盘");
+
+        let inside = tmp.path().join("scan").join("sub");
+        std::fs::create_dir(&inside).unwrap();
+        let inside = inside.to_string_lossy().into_owned();
+        apply_exclude_change(&state, &paths, &inside, ExcludeOp::Add)
+            .expect("根内绝对路径应可加入");
+        assert_eq!(state.cfg.lock().unwrap().excluded, vec![inside.clone()]);
+        assert_eq!(
+            config::load(&paths.config_file()).excluded,
+            vec![inside],
+            "加入结果应落盘"
+        );
     }
 }
