@@ -274,7 +274,6 @@ cargo test --workspace
 | 引擎:重扫中 | Engine: Rescanning |
 | 引擎:未运行(离线索引) | Engine: Not Running (Offline Index) |
 | 引擎:未运行 | Engine: Not Running |
-| 未打包提示 | Launch at Login requires macEverything.app |
 | 恢复默认排除目录？ | Restore default excluded folders? |
 | 该快捷键已用于另一个功能 | This shortcut is already used for another feature. |
 
