@@ -1673,7 +1673,7 @@ pub fn menu_items(files: usize, dirs: usize) -> Vec<(&'static str, MenuAction)> 
 错误文案：
 
 ```rust
-.ok_or_else(|| anyhow!("{}:{p}", i18n::s().menu_locate_failed))?;
+.ok_or_else(|| anyhow!("{}: {p}", i18n::s().menu_locate_failed))?;
 return Err(anyhow!("{}", i18n::s().menu_file_missing));
 Err(e) => Err(anyhow!("{}: {e}", i18n::s().menu_open_failed)),
 .map_err(|e| anyhow!("{}: {e}", i18n::s().menu_copy_failed))?;
@@ -1736,6 +1736,7 @@ Expected: 旧断言改为目录文案后通过；托盘 relabel 由真实运行�
 - `state_label` 六态与 `gaps_label(1/2)` 在 zh/en 下精确匹配（含托盘 `⚠ ` 前缀与英文单复数）。
 - `menu_items` 在 `with_lang(En)` 下返回 `["Open","Open in Finder","Show in Finder","Copy Path"]`（文件选中时），中文默认断言保持。
 - `window_title_lookup_accepts_both_settings_titles` 覆盖中/英标题。
+- `reset_native_confirmation_copy_matches_contract` 增加 `cancel` 的中英断言。
 
 - [ ] **Step 8: 全量验证并提交**
 
@@ -1986,6 +1987,8 @@ open release/macEverything.app
 - [ ] 系统为英文时首启：三窗 + 托盘 + 右键菜单 + 恢复默认确认弹窗全英文。
 - [ ] 设置页切「简体中文」：立即生效；重启保持；托盘菜单同步（无需重启）。
 - [ ] 设置页切「English」：立即生效；重启保持。
+- [ ] 切语言后托盘五项 + 状态项 + 缺口项即时更新；切换期间引擎状态/缺口变化仍以新语言显示。
+- [ ] 英文设置窗可被托盘/齿轮原生定位（首次居中、最小化恢复、置前）。
 - [ ] 系统中文 + 显式 English：重启后仍 English。
 - [ ] 切「跟随系统」：按当前系统首选语言显示。
 - [ ] 英文下设置页无裁切；结果窗口状态栏/空态/缺口面板无溢出；悬浮条提示正常截断。
