@@ -311,7 +311,7 @@ pub struct App {
     fonts_logged: bool,
     /// 首帧接线已尝试次数(见 `PATCH_ATTACH_ATTEMPTS`)。
     attach_attempts: u32,
-    /// 根窗首帧隐藏纠偏已发出(产品形态两窗皆隐;见 `logic` 首帧纠偏注释)。
+    /// 根窗首帧隐藏纠偏已发出(产品形态三窗皆隐;见 `logic` 首帧纠偏注释)。
     root_hide_issued: bool,
     /// 纠偏回读已留痕一次(原生 `isVisible()` 核对;见 `logic`)。
     root_hide_verified: bool,
@@ -374,7 +374,7 @@ impl App {
             results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
             settings: settings::SettingsState::default(),
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
-            palette_visible: false, // 启动隐藏(产品形态:两窗皆隐,仅菜单栏图标)
+            palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
         }));
         // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
         // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,
@@ -566,7 +566,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 首帧纠偏(产品形态:两窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
+        // 首帧纠偏(产品形态:三窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
         // eframe 0.37 在首帧 post_rendering 里**无条件** `set_visible(true)`
         //(`native/epi_integration.rs:443-450`,白闪修复;`create_glutin_windowed_context`
         // 也把它压着 `.with_visible(false)`),故 builder 的 with_visible(false) 本身
@@ -580,13 +580,14 @@ impl eframe::App for App {
                 egui::ViewportCommand::Visible(false),
             );
             ctx.request_repaint(); // 排下一帧做原生回读(纠偏命令在本帧末才应用)
-            log::info!("根窗首帧纠偏:Visible(false)(产品形态两窗皆隐)");
+            log::info!("根窗首帧纠偏:Visible(false)(产品形态三窗皆隐)");
         } else if !self.root_hide_verified {
             self.root_hide_verified = true;
             log::info!(
-                "两窗皆隐回读:根窗 isVisible={:?} 悬浮条 isVisible={:?}(期望恒 false;None = 尚未创建)",
+                "三窗皆隐回读:根窗 isVisible={:?} 悬浮条 isVisible={:?} 设置 isVisible={:?}(期望恒 false;None = 尚未创建)",
                 platform::root_visible(),
-                platform::palette_visible()
+                platform::palette_visible(),
+                platform::settings_visible()
             );
         }
 

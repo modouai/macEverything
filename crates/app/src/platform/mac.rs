@@ -55,7 +55,7 @@ use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
-use super::{monotonic_ms, palette_width, SpaceChange, ICON_PX, PALETTE_TITLE};
+use super::{monotonic_ms, palette_width, SpaceChange, ICON_PX, PALETTE_TITLE, SETTINGS_TITLE};
 
 /// 面板顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
 /// 视觉稿 y=110 是含 28px 菜单栏的画布坐标,故物理位置比画布低 28;
@@ -941,6 +941,14 @@ pub fn palette_visible() -> Option<bool> {
     PALETTE.with(|cell| cell.borrow().palette.as_ref().map(|w| w.isVisible()))
 }
 
+/// 设置窗当前原生可见性(按标题回读;诊断用)。
+/// 未创建/非主线程 → None。
+pub fn settings_visible() -> Option<bool> {
+    let mtm = MainThreadMarker::new()?;
+    let root = PALETTE.with(|cell| cell.borrow().root.clone());
+    find_window_by_title(mtm, root.as_deref(), SETTINGS_TITLE).map(|w| w.isVisible())
+}
+
 // ---------------------------------------------------------------------------
 // 内部实现
 
@@ -962,12 +970,21 @@ fn find_palette_window(
     mtm: MainThreadMarker,
     root: Option<&NSWindow>,
 ) -> Option<Retained<NSWindow>> {
+    find_window_by_title(mtm, root, PALETTE_TITLE)
+}
+
+/// 按标题找视口窗(排除根窗;设置窗诊断走同一路径)。
+fn find_window_by_title(
+    mtm: MainThreadMarker,
+    root: Option<&NSWindow>,
+    title: &str,
+) -> Option<Retained<NSWindow>> {
     let app = NSApplication::sharedApplication(mtm);
     for win in app.windows().iter() {
         if root.is_some_and(|r| std::ptr::eq(r, &*win)) {
             continue;
         }
-        if win.title().to_string() == PALETTE_TITLE {
+        if win.title().to_string() == title {
             return Some(win);
         }
     }

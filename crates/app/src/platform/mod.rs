@@ -20,6 +20,9 @@ pub mod mac;
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
 
+/// 设置窗口标题(同上;平台层诊断按标题回读设置窗原生可见性)。
+pub const SETTINGS_TITLE: &str = "设置";
+
 /// 悬浮条最大宽(视觉稿 §1.1/§2.2 = 700;ui 侧 `tokens::PANEL_W` 编译期互钉)。
 pub const PALETTE_MAX_W: f64 = 700.0;
 
@@ -334,6 +337,18 @@ pub fn palette_visible() -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
         mac::palette_visible()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 设置窗当前原生可见性(诊断;非 macOS/未创建恒 None)。
+pub fn settings_visible() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::settings_visible()
     }
     #[cfg(not(target_os = "macos"))]
     {

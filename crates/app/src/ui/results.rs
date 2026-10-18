@@ -3038,16 +3038,50 @@ mod tests {
         assert!(st.status_note_is_error, "重启失败是错误态");
     }
 
-    /// 齿轮请求:置位可被 `take_settings_request` 取走,且消费一次即清
+    /// 齿轮真实点击:1200×800 帧内点击齿轮中心 → 置设置请求;消费一次即清
     /// (后续帧不得重复开窗)。
     #[test]
-    fn gear_sets_and_take_consumes_settings_request() {
+    fn gear_click_sets_and_take_consumes_settings_request() {
         let ctx = egui::Context::default();
-        let mut st = ResultsState::new(ctx, daemon_paths_for_test());
-        assert!(!st.take_settings_request(), "初始无设置请求");
-
-        st.settings_requested = true; // draw_impl 齿轮命中分支的置位
-        assert!(st.take_settings_request(), "置位后应取到设置请求");
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        let mut icons = IconCache::without_worker();
+        let screen = egui::vec2(1200.0, 800.0);
+        // 齿轮中心:x = 屏宽 − 右内边距 − 齿轮半宽;y = 标题栏半高。
+        let gear = egui::pos2(
+            screen.x - window_tokens::TITLEBAR_PAD_X - window_tokens::GEAR_SIZE / 2.0,
+            window_tokens::TITLEBAR_H / 2.0,
+        );
+        // 先空跑一帧注册控件矩形(egui 交互用上一帧的 widget rects 命中)。
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![]);
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![
+                egui::Event::PointerMoved(gear),
+                egui::Event::PointerButton {
+                    pos: gear,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        run_frame_with_events(
+            &ctx,
+            &mut st,
+            &mut icons,
+            screen,
+            vec![egui::Event::PointerButton {
+                pos: gear,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(st.take_settings_request(), "齿轮点击应置设置请求");
         assert!(!st.take_settings_request(), "消费即清,不重复开窗");
     }
 

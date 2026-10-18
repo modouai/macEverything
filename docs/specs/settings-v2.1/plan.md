@@ -21,7 +21,7 @@
 - Modify: `crates/app/src/tray.rs`（`OpenSettings` 改为开窗）
 - Modify: `crates/app/Cargo.toml`、`crates/app/src/platform/*`（删除刚加的 NSAlert 占位）
 
-- [ ] **Step 1: 写失败测试（窗口尺寸常量）**
+- [x] **Step 1: 写失败测试（窗口尺寸常量）**
 
 `crates/app/src/ui/settings.rs` 末尾：
 
@@ -38,12 +38,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `cargo test -p macEverything-app window_size_matches_spec`
 Expected: FAIL（`settings` 模块/常量不存在）
 
-- [ ] **Step 3: 建最小模块与视口 builder**
+- [x] **Step 3: 建最小模块与视口 builder**
 
 `crates/app/src/ui/settings.rs`：
 
@@ -121,7 +121,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 }
 ```
 
-- [ ] **Step 4: 接线 `Shared` / 视口注册 / 打开函数**
+- [x] **Step 4: 接线 `Shared` / 视口注册 / 打开函数**
 
 `crates/app/src/ui/mod.rs`：
 
@@ -167,7 +167,7 @@ fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
 }
 ```
 
-- [ ] **Step 5: 齿轮与托盘入口**
+- [x] **Step 5: 齿轮与托盘入口**
 
 `results.rs`：`ResultsState` 加 `pub settings_requested: bool`（初始 false）。`draw_impl` 中齿轮命中时不再 `show_gear_note`，改为置位；新增：
 
@@ -190,7 +190,7 @@ if self.shared().results.take_settings_request() {
 
 删除：`GEAR_PENDING_NOTE` / `GEAR_NOTE_TTL` / `status_note_until` / `show_gear_note` 及其 tick 清理、线程唤醒；删除托盘 NSAlert 占位（`platform::show_info_alert`、`NSAlert`/`NSButton` features、相关 import）。保留 `status_note` 给错误提示。
 
-- [ ] **Step 6: 运行全部验证**
+- [x] **Step 6: 运行全部验证**
 
 Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: 全绿。
@@ -204,7 +204,9 @@ Expected:
 - 再次点齿轮/托盘 → 同一实例重新出现，不新建窗口；
 - 根窗隐藏时从托盘打开也可见（若不可见，记录并转平台层 `orderFrontRegardless` 方案）。
 
-- [ ] **Step 8: 提交**
+**状态（2026-10-18）:** 核心行为已由 controller 实机 PoC 验证（620×600、原生交通灯、红点隐藏、齿轮重开同一实例）；托盘在 ROOT 隐藏 / 跨 Space 时打开设置仍待验，留作 PoC 缺口。
+
+- [x] **Step 8: 提交**
 
 ```bash
 git add crates/app/src/ui/settings.rs crates/app/src/ui/mod.rs crates/app/src/ui/results.rs crates/app/src/tray.rs crates/app/Cargo.toml crates/app/src/platform
