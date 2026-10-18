@@ -1666,10 +1666,21 @@ fn empty_text(state: &State) -> (&'static str, &'static str) {
 /// 选中行动作提示（§2.4）：文件「打开」、目录「进入」。
 fn action_hint(is_dir: bool) -> &'static str {
     if is_dir {
-        "进入"
+        i18n::s().palette_action_enter
     } else {
-        "打开"
+        i18n::s().palette_action_open
     }
+}
+
+/// 页脚四组键位提示（右→左：隐藏 / 完整窗口 / 访达 / 打开；随语言切换）。
+fn footer_groups() -> [(&'static str, &'static str); 4] {
+    let s = i18n::s();
+    [
+        (s.palette_footer_hide, "esc"),
+        (s.palette_footer_full_window, "⌥↵"),
+        (s.palette_footer_finder, "⌘↵"),
+        (s.palette_action_open, "↵"),
+    ]
 }
 
 /// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
@@ -1790,12 +1801,7 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
     );
     let p = ui.painter();
     p.rect_filled(rect, 0, t.footer_fill);
-    let groups: [(&str, &str); 4] = [
-        ("隐藏", "esc"),
-        ("完整窗口", "⌥↵"),
-        ("访达", "⌘↵"),
-        ("打开", "↵"),
-    ];
+    let groups = footer_groups();
     let mut cursor = rect.max.x - tk::FOOTER_PAD_X;
     for (gi, (label, key)) in groups.iter().enumerate() {
         let kw = text_w(ui, key, FONT_KEYCAP) + 2.0 * tk::KEYCAP_PAD.1;
@@ -1836,7 +1842,7 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
         p.text(
             egui::pos2(rect.min.x + tk::FOOTER_PAD_X, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("共 {total} 项"),
+            i18n::format::total_items(total),
             font(FONT_META),
             t.footer_label,
         );
@@ -1872,8 +1878,41 @@ mod tests {
 
     #[test]
     fn action_hint_dir_enters_file_opens() {
-        assert_eq!(action_hint(true), "进入", "目录动作提示应为「进入」");
-        assert_eq!(action_hint(false), "打开", "文件动作提示应为「打开」");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(action_hint(true), "进入", "目录动作提示应为「进入」");
+            assert_eq!(action_hint(false), "打开", "文件动作提示应为「打开」");
+        });
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(action_hint(true), "Open Folder");
+            assert_eq!(action_hint(false), "Open");
+        });
+    }
+
+    /// 页脚四组提示随语言切换，键位不变。
+    #[test]
+    fn footer_groups_are_localized() {
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(
+                footer_groups(),
+                [
+                    ("隐藏", "esc"),
+                    ("完整窗口", "⌥↵"),
+                    ("访达", "⌘↵"),
+                    ("打开", "↵"),
+                ]
+            );
+        });
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                footer_groups(),
+                [
+                    ("Hide", "esc"),
+                    ("Full Window", "⌥↵"),
+                    ("Finder", "⌘↵"),
+                    ("Open", "↵"),
+                ]
+            );
+        });
     }
 
     #[test]

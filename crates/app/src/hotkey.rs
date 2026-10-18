@@ -959,7 +959,7 @@ fn plan_reset_active<R: KeyRegistrar>(
             let fallback = register_palette_default_with(reg, old_key);
             match (fallback.hotkey, fallback.name) {
                 (Some(hotkey), Some(name)) => (hotkey, name),
-                _ => return Err(reset_failed("候选快捷键均不可用")),
+                _ => return Err(reset_failed(i18n::s().hotkey_all_candidates_unavailable)),
             }
         }
         HotkeySlot::Window => {
@@ -1023,7 +1023,7 @@ fn plan_reset_suspended<R: KeyRegistrar>(
                 _ => {
                     // 默认链全部失败:另一槽旧键已恢复,补回本槽旧键并退出挂起。
                     *active = restore_old_keys(reg, old, other);
-                    return Err(reset_failed("候选快捷键均不可用"));
+                    return Err(reset_failed(i18n::s().hotkey_all_candidates_unavailable));
                 }
             }
         }
@@ -2513,6 +2513,23 @@ mod tests {
             }
             assert_eq!(reg.registered.len(), 2, "恰好两槽各一键");
         }
+    }
+
+    /// 默认候选全部失败的内层原因文案随语言切换（reset 失败路径）。
+    #[test]
+    fn all_candidates_unavailable_message_is_localized() {
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(
+                i18n::s().hotkey_all_candidates_unavailable,
+                "候选快捷键均不可用"
+            );
+        });
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                i18n::s().hotkey_all_candidates_unavailable,
+                "No shortcut candidates are available"
+            );
+        });
     }
 
     /// 挂起态 reset 失败(两槽分别):退出挂起并尽力恢复两个旧键。

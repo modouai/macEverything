@@ -177,12 +177,18 @@ catalog! {
     hotkey_reset_failed: "恢复默认快捷键失败(可能被系统或其他应用占用)" / "Failed to restore the default shortcut (it may be in use by the system or another app)",
     hotkey_global_unavailable: "全局热键不可用" / "Global shortcuts unavailable",
     hotkey_restore_other_failed: "恢复另一快捷键 {name} 失败(可能被占用)" / "Failed to restore the other shortcut {name} (it may be in use)",
+    hotkey_all_candidates_unavailable: "候选快捷键均不可用" / "No shortcut candidates are available",
     hotkey_duplicate: "该快捷键已用于另一个功能" / "This shortcut is already used for another feature",
     hotkey_saved_but_save_failed: "快捷键已生效,但设置保存失败" / "Shortcut applied, but settings could not be saved",
     hotkey_reset_but_save_failed: "快捷键已恢复默认,但设置保存失败" / "Default shortcut restored, but settings could not be saved",
     // 悬浮条打开失败（应用自产）
     palette_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
     palette_open_failed: "打开失败" / "Failed to open",
+    palette_action_enter: "进入" / "Open Folder",
+    palette_action_open: "打开" / "Open",
+    palette_footer_hide: "隐藏" / "Hide",
+    palette_footer_full_window: "完整窗口" / "Full Window",
+    palette_footer_finder: "访达" / "Finder",
 }
 
 #[cfg(test)]

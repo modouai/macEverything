@@ -11,6 +11,15 @@ pub fn items(n: u32) -> String {
     }
 }
 
+/// "共 N 项" / "Total: N item(s)"。
+pub fn total_items(n: u32) -> String {
+    match lang() {
+        Lang::ZhHans => format!("共 {n} 项"),
+        Lang::En if n == 1 => "Total: 1 item".to_owned(),
+        Lang::En => format!("Total: {n} items"),
+    }
+}
+
 /// "N 个目录未收录" / "N folder(s) not indexed"。
 pub fn gaps(n: u32) -> String {
     match lang() {
@@ -73,6 +82,20 @@ mod tests {
         with_lang(Lang::En, || {
             assert_eq!(items(1), "1 item");
             assert_eq!(items(2), "2 items");
+        });
+    }
+
+    #[test]
+    fn total_items_formats_in_both_languages() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(total_items(0), "共 0 项");
+            assert_eq!(total_items(1), "共 1 项");
+            assert_eq!(total_items(2), "共 2 项");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(total_items(0), "Total: 0 items");
+            assert_eq!(total_items(1), "Total: 1 item");
+            assert_eq!(total_items(2), "Total: 2 items");
         });
     }
 
