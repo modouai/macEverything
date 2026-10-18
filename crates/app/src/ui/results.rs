@@ -42,6 +42,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::engine_launcher;
+use crate::i18n;
+use crate::i18n::format;
 use crate::platform;
 use crate::session::{Session, SortKey, State};
 use crate::ui::font as ui_font;
@@ -55,13 +57,9 @@ use protocol::{Gap, HitEntry};
 /// 查询上限(与悬浮条同口径:协议上限一次取满;product §2「展示前 K 条」的 K)。
 const QUERY_LIMIT: u32 = client::RESULT_CAP;
 
-/// 表头列:(排序键, 标题)。顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径。
-const COLUMNS: [(SortKey, &str); 4] = [
-    (SortKey::Name, "名称"),
-    (SortKey::Size, "大小"),
-    (SortKey::Mtime, "修改时间"),
-    (SortKey::Path, "路径"),
-];
+/// 表头列(顺序与 product §2 一致:名称 / 大小 / 修改时间 / 路径)。
+/// 文案在绘制时按当前语言取(见 `column_label`)。
+const COLUMNS: [SortKey; 4] = [SortKey::Name, SortKey::Size, SortKey::Mtime, SortKey::Path];
 
 /// 列索引(与 `COLUMNS` 同序;几何函数按此取位)。
 const COL_NAME: usize = 0;
@@ -77,6 +75,24 @@ const MTIME_MIN_W: f32 = 110.0;
 const PATH_MIN_W: f32 = 120.0;
 /// 列边界拖拽热区半宽(§3.4「边界 ±4」)。
 const DRAG_HOT_ZONE: f32 = 4.0;
+
+/// 状态栏瞬时提示(绘制时按当前语言渲染;Raw 保留外部/技术细节原文)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusNote {
+    EngineNotReady,
+    QueryFailed,
+    Raw(String),
+}
+
+impl StatusNote {
+    fn text(&self) -> String {
+        match self {
+            Self::EngineNotReady => i18n::s().status_engine_not_ready.to_owned(),
+            Self::QueryFailed => i18n::s().status_query_failed.to_owned(),
+            Self::Raw(text) => text.clone(),
+        }
+    }
+}
 
 /// 完整窗口状态与查询会话(与悬浮条独立)。
 pub struct ResultsState {
@@ -110,7 +126,7 @@ pub struct ResultsState {
     pub gaps_open: bool,
     pub input: String,
     /// 瞬时提示(打开失败/查询失败;显示于状态栏)。
-    pub status_note: Option<String>,
+    pub status_note: Option<StatusNote>,
     /// 提示是否为错误态(决定状态栏错误红;中性文本色留给非错误提示)。
     pub status_note_is_error: bool,
     /// 齿轮点击的「打开设置」请求(绘制内只置位;共享锁释放后由 App::ui 消费)。
@@ -351,7 +367,7 @@ impl ResultsState {
                 self.sort_stale = false; // 结果已清,排序警示随旧结果作废
                 if engine_down {
                     self.session.mark_engine_starting();
-                    self.status_note = Some("引擎未就绪".into());
+                    self.status_note = Some(StatusNote::EngineNotReady);
                     self.status_note_is_error = true;
                 } else {
                     // 错误码分流(tech 六态表):warming = 索引未挂载 → 占位态,
@@ -359,7 +375,7 @@ impl ResultsState {
                     self.session.mark_error(code.as_deref().unwrap_or("query"));
                     self.status_note = match self.session.state {
                         State::Warming => None,
-                        _ => Some("查询失败".into()),
+                        _ => Some(StatusNote::QueryFailed),
                     };
                     self.status_note_is_error = self.status_note.is_some();
                 }
@@ -461,7 +477,7 @@ impl ResultsState {
                     painter.text(
                         egui::pos2(layout.text_rect.left(), layout.text_rect.center().y),
                         egui::Align2::LEFT_CENTER,
-                        "搜索文件…",
+                        i18n::s().search_placeholder,
                         ui_font::id(window_tokens::FONT_QUERY),
                         palette.search_hint,
                     );
@@ -773,7 +789,7 @@ impl ResultsState {
                     .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
             }
             RestartOutcome::Err(msg) => {
-                self.status_note = Some(msg);
+                self.status_note = Some(StatusNote::Raw(msg));
                 self.status_note_is_error = true;
             }
         }
@@ -820,7 +836,7 @@ impl ResultsState {
                 Some(action) => match menu_actions::execute(action, &paths) {
                     Ok(()) => log::info!("右键菜单:执行 {action:?}({} 项)", paths.len()),
                     Err(err) => {
-                        self.status_note = Some(err.to_string());
+                        self.status_note = Some(StatusNote::Raw(err.to_string()));
                         self.status_note_is_error = true;
                     }
                 },
@@ -837,7 +853,7 @@ impl ResultsState {
             return;
         };
         if let Err(msg) = palette::open_path(&entry.path, false) {
-            self.status_note = Some(msg);
+            self.status_note = Some(StatusNote::Raw(msg));
             self.status_note_is_error = true;
         }
     }
@@ -1063,6 +1079,18 @@ struct HeaderAction {
     drag: Option<(ColDragState, f32)>,
 }
 
+/// 列头文案(按当前语言;relevance 是默认排序而非列,无列头)。
+fn column_label(key: SortKey) -> Option<&'static str> {
+    let s = i18n::s();
+    match key {
+        SortKey::Name => Some(s.col_name),
+        SortKey::Size => Some(s.col_size),
+        SortKey::Mtime => Some(s.col_mtime),
+        SortKey::Path => Some(s.col_path),
+        SortKey::Relevance => None,
+    }
+}
+
 /// 表头(§3.4):高 32、12pt、无竖分隔线;名称 / 大小 / 修改时间 / 路径四列,
 /// 大小右对齐、其余左对齐;当前排序列文字后 12×12 chevron(↑ 升 / ↓ 降)。
 /// 列边界 ±4 热区拖拽调宽(不占列头点击区;hover 显示横向缩放光标)。
@@ -1086,7 +1114,10 @@ fn draw_header(
     let mut action = HeaderAction::default();
     // 按下帧的实际显示宽:窄窗下 stored 超预算时以投影宽起算,拖拽不跳变。
     let effective = [cols[COL_SIZE].1, cols[COL_MTIME].1, cols[COL_PATH].1];
-    for (i, (key, label)) in COLUMNS.iter().enumerate() {
+    for (i, key) in COLUMNS.into_iter().enumerate() {
+        let Some(label) = column_label(key) else {
+            continue;
+        };
         let cell = egui::Rect::from_min_size(
             egui::pos2(area.left() + cols[i].0, header.top()),
             egui::vec2(cols[i].1, header.height()),
@@ -1097,17 +1128,17 @@ fn draw_header(
             egui::Sense::click(),
         );
         if resp.clicked() {
-            action.sort_click = Some(*key);
+            action.sort_click = Some(key);
         }
         // 默认 relevance 无箭头;仅当前排序列显示。
-        let arrow = (*key == sort && sort != SortKey::Relevance).then_some(sort_asc);
+        let arrow = (key == sort && sort != SortKey::Relevance).then_some(sort_asc);
         let arrow_w = if arrow.is_some() {
             window_tokens::SORT_ARROW + window_tokens::SORT_ARROW_GAP
         } else {
             0.0
         };
         let galley = egui::WidgetText::from(
-            egui::RichText::new(*label)
+            egui::RichText::new(label)
                 .size(ui_font::size(window_tokens::FONT_TABLE))
                 .color(palette.header_text),
         )
@@ -1384,7 +1415,7 @@ fn draw_titlebar(ui: &mut egui::Ui, palette: &FullWindowPalette) -> bool {
     }
     let inset = (window_tokens::GEAR_SIZE - window_tokens::GEAR_ICON) / 2.0;
     draw_settings_icon(ui.painter(), gear.rect.shrink(inset), palette.title_icon);
-    gear.on_hover_text("设置").clicked()
+    gear.on_hover_text(i18n::s().settings_tooltip).clicked()
 }
 
 /// Lucide `settings` 近似(16×16):外圈 + 内圈 + 8 个齿(visual.md §5.2 图标族)。
@@ -1469,15 +1500,12 @@ fn format_metric(value: f64) -> String {
 
 /// 状态栏计数段:N 项 = 命中总数(total);返回条数 < total 时注「展示前 K 条」。
 fn counts_text(total: u32, shown: usize, elapsed_ms: f64, stat_ms: f64) -> String {
-    let mut s = format!(
-        "{total} 项 · 匹配 {} ms · 读取 {} ms",
-        format_metric(elapsed_ms),
-        format_metric(stat_ms)
-    );
-    if (shown as u32) < total {
-        s.push_str(&format!(" · 展示前 {shown} 条"));
-    }
-    s
+    format::counts(
+        total,
+        shown,
+        &format_metric(elapsed_ms),
+        &format_metric(stat_ms),
+    )
 }
 
 /// 状态栏左侧主文本(§3.6 / §3.7,纯函数):计数/耗时/截断/排序中/索引状态,
@@ -1495,12 +1523,12 @@ fn status_text(
     let mut segments: Vec<String> = Vec::new();
     if !idle {
         if total == 0 {
-            segments.push("0 项".into());
+            segments.push(format::items(0));
         } else {
             segments.push(counts_text(total, shown, elapsed_ms, stat_ms));
         }
         if sorting {
-            segments.push("排序中…".into());
+            segments.push(i18n::s().status_sorting.into());
         }
     }
     if let Some(note) = index {
@@ -1512,7 +1540,7 @@ fn status_text(
 /// 窗口内缺口徽标文案(§3.6「N 个目录未收录」)。托盘项 `tray::gaps_label`
 /// 带「⚠」前缀;窗口用自绘警示三角替代图标,文本不重复符号。
 fn gap_badge_text(gaps: u32) -> String {
-    format!("{gaps} 个目录未收录")
+    format::gaps(gaps)
 }
 
 /// 状态栏一行的交互产出(绘制闭包外落地)。
@@ -1674,13 +1702,14 @@ fn draw_status_row(
         index.as_deref(),
         st.sorting_inflight,
     );
-    let stale_text = st.sort_stale.then_some("引擎版本过旧,排序未生效");
+    let stale_text = st.sort_stale.then_some(i18n::s().engine_outdated_sort);
     let restart_text = st.sort_stale.then_some(if st.engine_restarting {
-        "重启中…"
+        i18n::s().restarting
     } else {
-        "重启引擎"
+        i18n::s().restart_engine
     });
-    let note = st.status_note.as_deref();
+    let note = st.status_note.as_ref().map(StatusNote::text);
+    let note = note.as_deref();
     // 打开/查询失败走错误红;非错误提示(预留)用中性文本色。
     let note_color = if st.status_note_is_error {
         error
@@ -1840,7 +1869,7 @@ fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
     ui.horizontal(|ui| {
         ui.add_space(pad);
         ui.label(
-            egui::RichText::new(format!("权限缺口({} 个目录,未收录):", gaps.len()))
+            egui::RichText::new(format::gaps_header(gaps.len()))
                 .size(ui_font::size(window_tokens::FONT_STATUS))
                 .weak(),
         );
@@ -1869,8 +1898,9 @@ fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
     if rest > 0 {
         ui.horizontal(|ui| {
             ui.add_space(pad);
+            let rest = rest.to_string();
             ui.label(
-                egui::RichText::new(format!("… 其余 {rest} 个"))
+                egui::RichText::new(i18n::fill(i18n::s().gaps_more, &[("n", rest.as_str())]))
                     .size(ui_font::size(window_tokens::FONT_STATUS))
                     .weak(),
             );
@@ -1883,23 +1913,25 @@ fn draw_gaps_panel(ui: &mut egui::Ui, gaps: &[Gap]) {
 /// 会话态兜底(与悬浮条角标同口径:warming/引擎拉起中可见)。
 /// 返回 None = 尚未取到(窗口刚开、状态补查未回),不占位。
 fn index_note(engine: Option<&EngineStatus>, state: &State, known: bool) -> Option<String> {
+    let s = i18n::s();
     if let Some(e) = engine {
         return Some(match e.state.as_str() {
-            client::state::BUILDING => format!("索引构建中({} 条)", e.entry_count),
-            client::state::READY => "就绪".into(),
-            client::state::RECONCILING => "索引补齐中(结果可能不全)".into(),
-            client::state::DEGRADED => "索引重扫中(结果可能不全)".into(),
+            client::state::BUILDING => format::index_building_count(u64::from(e.entry_count)),
+            client::state::READY => s.index_ready.into(),
+            client::state::RECONCILING => s.index_reconciling.into(),
+            client::state::DEGRADED => s.index_degraded.into(),
             client::state::OFFLINE => {
-                format!("离线索引 · 生成于 {}", mtime_text(Some(e.built_at)))
+                let time = mtime_text(Some(e.built_at));
+                i18n::fill(s.index_offline_since, &[("time", time.as_str())])
             }
             other => other.to_string(),
         });
     }
     match state {
-        State::Warming => Some("索引构建中".into()),
-        State::EngineStarting => Some("引擎启动中".into()),
-        State::Offline => Some("离线索引".into()), // 无快照:生成时刻不可得
-        _ if known => Some("引擎未运行".into()),
+        State::Warming => Some(s.index_building.into()),
+        State::EngineStarting => Some(s.engine_starting.into()),
+        State::Offline => Some(s.offline_index.into()), // 无快照:生成时刻不可得
+        _ if known => Some(s.engine_not_running.into()),
         _ => None,
     }
 }
@@ -1908,16 +1940,17 @@ fn index_note(engine: Option<&EngineStatus>, state: &State, known: bool) -> Opti
 /// 空词恒为 Idle 文案;Offline 有结果时照常渲染表格,无结果按 Empty;
 /// Error 给出可操作副文案(不再只由状态栏承担)。
 fn empty_state_text(input: &str, state: &State) -> (&'static str, &'static str) {
+    let s = i18n::s();
     if input.is_empty() {
-        return ("输入关键词开始搜索", "可搜文件名，也可搜路径");
+        return (s.empty_start, s.empty_start_sub);
     }
     match state {
-        State::EngineStarting => ("启动引擎中", "请稍候…"),
-        State::Warming => ("索引构建中", "部分结果可能暂不可见"),
-        State::Error(_) => ("搜索失败", "请重试或检查引擎状态"),
+        State::EngineStarting => (s.empty_engine_starting, s.empty_wait),
+        State::Warming => (s.empty_warming, s.empty_warming_sub),
+        State::Error(_) => (s.empty_search_failed, s.empty_search_failed_sub),
         // 首次查询尚无结果(防抖/在途)不误报「无匹配项」。
-        State::Searching => ("搜索中…", "请稍候…"),
-        State::Empty | State::Offline | State::Idle => ("无匹配项", "换个关键词试试"),
+        State::Searching => (s.empty_searching, s.empty_wait),
+        State::Empty | State::Offline | State::Idle => (s.empty_no_match, s.empty_no_match_sub),
     }
 }
 
@@ -2823,6 +2856,21 @@ mod tests {
     }
 
     #[test]
+    fn counts_text_pluralizes_in_english() {
+        assert_eq!(counts_text(1, 1, 2.0, 3.0), "1 项 · 匹配 2 ms · 读取 3 ms");
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                counts_text(1, 1, 2.0, 3.0),
+                "1 item · Match 2 ms · Read 3 ms"
+            );
+            assert_eq!(
+                counts_text(2, 1, 2.0, 3.0),
+                "2 items · Match 2 ms · Read 3 ms · Showing first 1"
+            );
+        });
+    }
+
+    #[test]
     fn index_note_six_states() {
         let idle = State::Idle;
         let eng = |s: &str, built_at: u64| EngineStatus {
@@ -3046,7 +3094,10 @@ mod tests {
         st.apply_restart(RestartOutcome::Err("引擎重启失败:x".into()));
         assert!(st.sort_stale, "失败不清红字(排序仍未生效)");
         assert!(!st.engine_restarting);
-        assert_eq!(st.status_note.as_deref(), Some("引擎重启失败:x"));
+        assert_eq!(
+            st.status_note,
+            Some(StatusNote::Raw("引擎重启失败:x".into()))
+        );
         assert!(st.status_note_is_error, "重启失败是错误态");
     }
 
@@ -3264,7 +3315,9 @@ mod tests {
         st.elapsed_ms = 3.0;
         st.stat_ms = 12.0;
         st.sort_stale = true;
-        st.status_note = Some("查询失败:无法连接引擎,请稍后重试并检查索引状态是否正常".into());
+        st.status_note = Some(StatusNote::Raw(
+            "查询失败:无法连接引擎,请稍后重试并检查索引状态是否正常".into(),
+        ));
         st.status_note_is_error = true;
         st.engine = Some(EngineStatus {
             state: client::state::READY.into(),
@@ -3580,6 +3633,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_state_text_is_localized() {
+        assert_eq!(
+            empty_state_text("", &State::Idle),
+            ("输入关键词开始搜索", "可搜文件名，也可搜路径")
+        );
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                empty_state_text("", &State::Idle),
+                ("Type to search", "Search file names or paths")
+            );
+            assert_eq!(
+                empty_state_text("abc", &State::Empty),
+                ("No matches", "Try a different keyword")
+            );
+        });
+    }
+
     /// 状态栏文本生成(§3.6/§3.7):连接符恒为「 · 」;Idle 隐藏计量;
     /// Empty 只报「0 项」;截断注「展示前 K 条」。
     #[test]
@@ -3643,7 +3714,7 @@ mod tests {
         assert!(!natural_asc(SortKey::Mtime));
         assert!(natural_asc(SortKey::Path));
         // 列定义与 product §2 列序一致
-        let keys: Vec<SortKey> = COLUMNS.iter().map(|c| c.0).collect();
+        let keys: Vec<SortKey> = COLUMNS.to_vec();
         assert_eq!(
             keys,
             [SortKey::Name, SortKey::Size, SortKey::Mtime, SortKey::Path]

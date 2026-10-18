@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod catalog;
+pub mod format;
 
 // `strings`/`Strings`/`all_entries` 是目录的对外入口（后续任务与单测使用）；
 // Task 1 的生产路径只用到 `s`。

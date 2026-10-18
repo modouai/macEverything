@@ -109,6 +109,39 @@ catalog! {
     hotkey_saved_window_default: "保存的完整窗口快捷键 {custom} 不可用,已回落默认 {name}" / "Full Window shortcut {custom} is unavailable; reverted to default {name}",
     hotkey_saved_window_conflict_unavailable: "保存的完整窗口快捷键 {custom} 与唤起键冲突,{reason}" / "Full Window shortcut {custom} conflicts with Quick Search; {reason}",
     hotkey_saved_window_unavailable: "保存的完整窗口快捷键 {custom} 不可用,{reason}" / "Full Window shortcut {custom} is unavailable; {reason}",
+    // 列头 / 搜索
+    col_name: "名称" / "Name",
+    col_size: "大小" / "Size",
+    col_mtime: "修改时间" / "Date Modified",
+    col_path: "路径" / "Path",
+    settings_tooltip: "设置" / "Settings",
+    // 状态栏
+    status_sorting: "排序中…" / "Sorting…",
+    engine_outdated_sort: "引擎版本过旧,排序未生效" / "Engine is outdated; sorting is unavailable",
+    restarting: "重启中…" / "Restarting…",
+    restart_engine: "重启引擎" / "Restart Engine",
+    status_engine_not_ready: "引擎未就绪" / "Engine not ready",
+    status_query_failed: "查询失败" / "Query failed",
+    // 缺口面板
+    gaps_more: "… 其余 {n} 个" / "… {n} more",
+    // 索引状态
+    index_building_count: "索引构建中({n} 条)" / "Building index ({n} entries)",
+    index_ready: "就绪" / "Ready",
+    index_reconciling: "索引补齐中(结果可能不全)" / "Reconciling index (results may be incomplete)",
+    index_degraded: "索引重扫中(结果可能不全)" / "Rescanning index (results may be incomplete)",
+    index_offline_since: "离线索引 · 生成于 {time}" / "Offline index · Generated {time}",
+    index_building: "索引构建中" / "Building index",
+    engine_starting: "引擎启动中" / "Engine starting",
+    offline_index: "离线索引" / "Offline index",
+    engine_not_running: "引擎未运行" / "Engine not running",
+    // 空态
+    empty_engine_starting: "启动引擎中" / "Starting engine",
+    empty_wait: "请稍候…" / "Please wait…",
+    empty_warming: "索引构建中" / "Building index",
+    empty_warming_sub: "部分结果可能暂不可见" / "Some results may be temporarily unavailable",
+    empty_search_failed: "搜索失败" / "Search failed",
+    empty_search_failed_sub: "请重试或检查引擎状态" / "Try again or check the engine status",
+    empty_searching: "搜索中…" / "Searching…",
 }
 
 #[cfg(test)]
