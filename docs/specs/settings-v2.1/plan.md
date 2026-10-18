@@ -4,7 +4,7 @@
 
 **Goal:** 交付 620×600 设置窗口、字号三档、开机自启与齿轮/托盘入口；设置窗口状态与持久化就绪。
 
-**Architecture:** 第三个 eframe deferred viewport（与悬浮条同模式）；设置 UI 在 `ui/settings.rs`，持久化在 `settings.rs`，字号倍率在 `ui/font.rs`；自启复用 SMAppService，托盘与设置页双向同步。
+**Architecture:** 第三个 eframe deferred viewport（与悬浮条同模式）；设置窗口/运行期状态/行为在 `ui/settings.rs`，纯视图在 `ui/settings_view.rs`（行模型在 `ui/settings_layout.rs`），持久化在 `settings.rs`，字号倍率在 `ui/font.rs`；自启复用 SMAppService，托盘与设置页双向同步。
 
 **Tech Stack:** eframe/egui 0.37、objc2-app-kit、global-hotkey、serde/toml。
 
@@ -511,20 +511,21 @@ git commit -m "feat(app): 全局字号倍率基础设施"
 - Modify: `crates/app/src/ui/settings.rs`（布局/控件）
 - Modify: `crates/app/src/ui/settings_tokens.rs`（若需补 token）
 
-- [ ] **Step 1: 写 headless 出帧测试**
+- [x] **Step 1: 写 headless 出帧测试**
 
-用 `egui::Context::default()` + `run_ui` 调 `settings::draw_body_for_test(ui, ...)`（把绘制与 Shared 解耦的纯绘制函数），断言出现：
+用 `egui::Context::default()` + `run_ui` 调纯绘制函数（Task 5 重构后为
+`settings_view::draw_body(ui, &SettingsData)`），断言出现：
 - 「外观」「通用」「索引」三个分组标题；
 - 「字号」「开机自启」「语言」「唤起快捷键」「完整窗口快捷键」「排除目录」标签；
 - 「小」「标准」「大」三段与「简体中文」；
 - 不出现 panic。
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `cargo test -p macEverything-app settings_layout_has_all_rows`
 Expected: FAIL。
 
-- [ ] **Step 3: 实现内容布局**
+- [x] **Step 3: 实现内容布局**
 
 按 `visual` §2.2–§2.4 绘制：
 - Titlebar 44（标题 13pt 居中）；
@@ -533,68 +534,107 @@ Expected: FAIL。
 - 行高 44；控件按 §2.4 尺寸；
 - 语言下拉禁用态「简体中文」+ tooltip；
 - 排除目录卡：Header 52（标题 + 「＋ 添加目录…」按钮）、目录行 40（文件夹图标 16 + 路径 13 + 移除 ×14）；
-- 内容超过可视高时在卡片/内容区滚动，标题栏固定；
+- 内容超过可视高时**整页纵向滚动**（标题栏固定；不做卡片内独立滚动，排除目录 Task 8 沿用整页）；
 - 所有文本用 `font::size`，所有颜色/几何读 `settings_tokens`。
 
-绘制用 `egui::Ui` 的 `allocate_ui_at_rect`/`allocate_exact_size` + painter；控件交互先只记录 hover/点击，行为在 Task 5/后续 plan 接。
+绘制用 `egui::Ui` 的 `allocate_exact_size` + painter；控件交互先只记录 hover/点击，行为在 Task 5/后续 plan 接。
 
-- [ ] **Step 4: 运行测试并实机看**
+- [x] **Step 4: 运行测试并实机看**
 
 Run: `cargo test -p macEverything-app settings_layout_has_all_rows && bash scripts/bundle.sh`
 Expected: 三组五项齐全、深浅色正确、无裁切。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/app/src/ui/settings.rs crates/app/src/ui/settings_tokens.rs
 git commit -m "feat(app): 设置窗口三组五项布局"
 ```
 
+**验证记录（2026-10-18）：** headless 布局测试全绿；视觉由 controller 实机验证
+（三组五项、深浅色、无裁切、620×600 固定窗）。Task 5 前置重构见下。
+
 ---
 
 ## Task 5: 开机自启 + 语言占位 + 字号选择生效
 
 **Files:**
-- Modify: `crates/app/src/ui/settings.rs`
-- Modify: `crates/app/src/ui/mod.rs`（托盘自启同步）
-- Modify: `crates/app/src/tray.rs`（勾选同步）
+- Modify: `crates/app/src/ui/settings.rs`（视口/运行期状态/行为）
+- Create: `crates/app/src/ui/settings_view.rs`（纯视图 + headless 测试）
+- Create: `crates/app/src/ui/settings_layout.rs`（行模型/卡片高度）
+- Modify: `crates/app/src/ui/mod.rs`（`pub(crate)` 字号样式/调色板 id、开窗查询自启、托盘同步）
+- Modify: `crates/app/src/settings.rs`（移除模块级 dead_code allow）
+- Modify: `crates/app/src/tray.rs`（勾选同步，沿用既有 API）
 
-- [ ] **Step 1: 写失败测试（纯状态）**
+- [x] **Step 1: 写失败测试（纯状态）**
 
-为 `SettingsState` 增加 `autostart: Option<bool>`、`autostart_error: Option<String>`、`font_size: FontSize`，测试：
-- `apply_font_size(FontSize::Large)` 后 `font::scale()==1.15`；
-- `autostart_changed(Ok(true))` 更新为 true 且清错误；
-- `autostart_changed(Err(msg))` 保持旧值并落错误。
+为 `SettingsState` 增加 `autostart: Option<bool>`、`autostart_error: Option<String>`、
+`file: SettingsFile`、`font_error: Option<String>`、`tray_autostart_sync: Option<bool>`，测试：
+- 字号纯状态转换：保存失败仍更新 `file.font_size` + `font_error`，成功清错误；
+- 自启查询失败 → 未知（显示关态）+ 错误；成功 → 实际态并清错误；
+- 自启切换成功更新状态并置/取一次性托盘同步标记；失败保持旧值 + 错误；
+- 快照 `SettingsData` 与运行期状态一致。
 
-- [ ] **Step 2: 实现自启读取/切换**
+生产 `font::set_scale` 写进程级原子，单测不调用；非默认倍率视觉测试只用
+`font::with_test_scale`，持久化路径单独用临时目录验证。
 
-打开设置时读 `autostart::is_enabled()`；开关点击调 `autostart::apply_user_choice(&paths.data_dir, desired)`：
-- 成功：更新 `settings.autostart`，写 `SettingsAction::AutostartChanged(desired)`；
-- 失败：恢复旧值 + `autostart_error`。
+- [x] **Step 2: 实现自启读取/切换**
 
-`App::logic` drain `AutostartChanged` → `self.tray.set_autostart_checked(desired)`。托盘切换成功 → `self.shared().settings.autostart = Some(checked)`。
+`open_settings` 在共享锁外查询 `autostart::is_enabled()`；成功 `autostart=Some(..)`，
+失败 `autostart=None` + `autostart_error`（开关显示关态）。开关点击在锁外调
+`autostart::apply_user_choice(&data_dir, desired)`：
+- 成功：更新 `settings.autostart`、清错误、置 `tray_autostart_sync=Some(desired)`；
+- 失败：保持旧值 + `autostart_error`（如开发形态「未打包」）。
 
-- [ ] **Step 3: 实现字号分段**
+`App::logic` 每帧在 `drain_tray` 前 drain `tray_autostart_sync` →
+`self.tray.set_autostart_checked(desired)`。托盘切换成功 →
+`self.shared().settings.autostart = Some(checked)`（清错误）；失败复原勾选并落
+`autostart_error`；设置页打开时请求其重绘。
 
-点击小/标准/大：
+- [x] **Step 3: 实现字号分段**
+
+点击小/标准/大（出共享锁）：
 - `font::set_scale(font_size.scale())`；
-- `install_base_text_styles(ctx)`；
-- 写 `settings.toml`（`SettingsFile { font_size, ..current }`）；
+- `install_base_text_styles(ctx)`（`pub(crate)` 供设置模块复用）；
+- 写 `settings.toml`（`SettingsFile { font_size, ..current }`）；失败只落
+  `font_error`（字号行内联）+ `log::warn`，**保留已应用倍率**；
+- 更新 `file.font_size` / 选中态；
 - `ctx.request_repaint_of(ROOT + palette + settings)`。
 
-- [ ] **Step 4: 语言占位**
+- [x] **Step 4: 语言占位**
 
-下拉按钮禁用态；点击不改变值；hover tooltip「暂仅支持简体中文，语言切换将在后续版本提供」。
+下拉按钮禁用态；点击不改变值；文字/chevron 用次要色（不只靠 hover 区分），
+hover 光标 `NotAllowed` + tooltip「暂仅支持简体中文，语言切换将在后续版本提供」。
 
-- [ ] **Step 5: 运行验证并提交**
+- [x] **Step 5: 运行验证并提交**
 
 Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
-实机：字号三档切换两窗即时变化、重启保持；自启勾选与托盘一致。
+实机：字号三档切换两窗即时变化、重启保持；自启勾选与托盘一致（controller 走查）。
 
 ```bash
-git add crates/app/src/ui/settings.rs crates/app/src/ui/mod.rs crates/app/src/tray.rs crates/app/src/settings.rs
+git add crates/app/src/ui/settings.rs crates/app/src/ui/settings_view.rs crates/app/src/ui/settings_layout.rs crates/app/src/ui/mod.rs crates/app/src/tray.rs crates/app/src/settings.rs crates/app/src/ui/settings_tokens.rs docs/specs/settings-v2.1
 git commit -m "feat(app): 设置页字号与开机自启"
 ```
+
+**前置重构（Task 4 review → Task 5，2026-10-18）：**
+- `ui/settings.rs` 拆为：`settings.rs`（视口 builder / `SettingsState` / 快照→锁外绘制→动作落地 / 隐藏）；
+  `settings_view.rs`（`SettingsData`、纯 `draw_body`、分组/控件/图标与 headless 测试）；
+  `settings_layout.rs`（`RowSpec` 行模型、`card_height`、`take_row`）。
+- 高度与绘制共用同一行模型：卡片高 = Σ(行主体 + 行内错误行) + 行间分隔线；绘制
+  末尾 `debug_assert` 卡片底 == 行游标。内联错误行增高不再导致卡片底/分隔线漂移。
+- 滚动模型定案：**整页纵向滚动、44px 标题栏固定**；不做卡片内独立滚动。
+  Task 8（排除目录真实列表）沿用整页滚动，列表变长只增高索引卡片。
+- 运行期真源收进 `SettingsState`（含 `data_dir`/`excluded` 一次性种子/默认键帽），
+  `SettingsData` 仅为出锁绘制快照；不再每帧克隆 `engine::config::default_config()`。
+- 视觉修复：键帽组按原型在字段内水平居中；标题使用 `platform::SETTINGS_TITLE`；
+  开关钮投影改 3 层递减 alpha 软影；排除目录空列表显示「未排除任何目录」。
+- 删除 `crates/app/src/settings.rs` 模块级 `#![allow(dead_code)]`；仅保留
+  `SettingsPalette::control_text` 的 item-level allow（规格 token，禁用态改次要色）。
+
+**验证记录（2026-10-18）：** `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` 全绿。app 新增/更新测试：
+字号与自启纯状态 4 个、行模型 2 个、headless 布局 9 个（含错误行增高、空态、
+键帽居中、选中段填充、两处点击动作、大字号冒烟）。
 
 ---
 

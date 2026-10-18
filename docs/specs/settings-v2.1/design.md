@@ -42,7 +42,9 @@ ROOT (完整结果窗口)
 | 文件 | 职责 |
 |---|---|
 | `crates/app/src/settings.rs`（新） | `SettingsFile`（字号/快捷键）读写、`FontSize`、原子保存、纯逻辑单测 |
-| `crates/app/src/ui/settings.rs`（新） | 设置窗口视口、布局、控件、录制状态机、排除目录/自启交互 |
+| `crates/app/src/ui/settings.rs`（新） | 设置窗口视口、运行期状态（`SettingsState`）、字号/自启行为编排、快照→锁外绘制→动作落地 |
+| `crates/app/src/ui/settings_view.rs`（新） | 纯视图：`SettingsData` 快照、分组/卡片/行控件绘制、headless 布局测试 |
+| `crates/app/src/ui/settings_layout.rs`（新） | 行模型 `RowSpec`、卡片高度与行游标（高度/绘制单一真源） |
 | `crates/app/src/ui/settings_tokens.rs`（新） | `visual` §2.5 色板 + §2.2/2.4 几何常量；深/浅两套 + 单测钉住 |
 | `crates/app/src/ui/font.rs`（新） | 全局文本倍率 `AtomicU32` + `size(base)` / `id(base)`；启动读取设置 |
 | `crates/app/src/hotkey.rs`（改） | 可重配置：活动键共享状态、录制期 suspend/resume、设置启动偏好 |
@@ -60,9 +62,12 @@ enum SettingsAction {
     BeginRecord(HotkeySlot),          // App: hotkey.suspend(), ready=true
     CancelRecord,                     // App: hotkey.resume()
     CommitHotkey { slot, hotkey },    // App: 尝试注册；成功持久化 + 更新快照
-    AutostartChanged(bool),           // App: 同步托盘勾选
 }
 ```
+
+> 本期（Task 5）只落地字号/自启：自启不经该枚举，成功时置
+> `settings.tray_autostart_sync` 由 `App::logic` 同步托盘（§7）；`SettingsAction`
+> 的录制项留给 `plan-hotkeys.md`。字号在绘制回调收集动作后锁外立即应用。
 
 `App::logic` 每帧 drain：
 - hotkey 动作在主线程处理（manager 只能在主线程用）；
@@ -107,7 +112,8 @@ window_hotkey = "shift+alt+KeyF" # 缺省 = 内置默认（⌥⇧F）
 
 ### 4.2 生效路径
 
-设置页点击分段 → `set_scale` → 重装 text styles → 请求 ROOT/palette/settings 重绘 → 写 `settings.toml`（防抖/立即均可；本期立即写）。
+设置页点击分段 → `set_scale` → 重装 text styles → 写 `settings.toml`（立即写；
+失败只落行内错误、保留已应用倍率）→ 请求 ROOT/palette/settings 重绘。
 
 ---
 
@@ -137,7 +143,9 @@ Content (padding 上下 20 / 左右 24, gap 20)
 - 开关：38×22、圆角 11；开态系统蓝；钮 18×18 白 + 1px 柔和投影。
 - 语言：152×28 下拉按钮禁用态「简体中文」，tooltip「暂仅支持简体中文，语言切换将在后续版本提供」。
 - 快捷键字段：152×28 键帽字段；录制中显示「按下快捷键…」，下方内联错误（冲突/注册失败/需修饰键）。
-- 排除目录：Header 行「排除目录」+ 右侧「＋ 添加目录…」；目录行文件夹图标 16 + 路径 13 + 移除 ×14；列表超过卡片高度时在卡片内滚动。
+- 排除目录：Header 行「排除目录」+ 右侧「＋ 添加目录…」；目录行文件夹图标 16 + 路径 13 + 移除 ×14；空列表显示「未排除任何目录」。
+- 滚动模型（2026-10-18 定案）：内容超出可视高时**整页纵向滚动**，44px 标题栏固定；
+  排除目录列表随整页滚动，**不做卡片内独立滚动**（列表变长只增高索引卡片）。
 - 所有文本走字号倍率；布局尺寸不随字号变。
 
 ---
@@ -184,10 +192,11 @@ Committing → 成功: Idle + 新键；失败: Recording + 内联错误（旧键
 
 ## 七、开机自启
 
-- 打开设置页时查询 `autostart::is_enabled()`（失败按未启用 + 错误文案）。
+- 打开设置页时在共享锁外查询 `autostart::is_enabled()`（失败按未知/关态 + 错误文案）。
 - 点击开关：
-  - `apply_user_choice(data_dir, desired)`；成功更新 UI + `SettingsAction::AutostartChanged(desired)` 同步托盘；
-  - 失败恢复开关 + 内联错误（如开发形态「未打包」）。
+  - 锁外 `apply_user_choice(data_dir, desired)`；成功更新 UI + 置
+    `tray_autostart_sync = Some(desired)`（`App::logic` drain 后同步托盘勾选）；
+  - 失败保持旧状态 + 内联错误（如开发形态「未打包」）。
 - 托盘勾选自启成功 → 更新 `Shared.settings.autostart_enabled`（设置页打开时即时反映）。
 
 ---

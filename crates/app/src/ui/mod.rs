@@ -2,7 +2,8 @@
 //!
 //! 主视口(ROOT)= 完整结果窗口(`ui/results.rs`,Task 17:表格虚拟化/列排序/多选);
 //! 第二视口 = 悬浮条(Task 12 UI;Task 14 接平台层:跨 Space/浮动级别/失焦隐藏/多屏定位);
-//! 第三视口 = 设置窗口(v2.1 Task 1:620×600 固定,deferred + 常驻,骨架见 `ui/settings.rs`)。
+//! 第三视口 = 设置窗口(v2.1:620×600 固定,deferred + 常驻;视口/行为见
+//! `ui/settings.rs`,纯视图见 `ui/settings_view.rs`)。
 //!
 //! ## 菜单栏托盘(Task 16)
 //!
@@ -70,7 +71,9 @@ pub mod menu_actions;
 pub mod palette;
 pub mod results;
 pub mod settings;
+pub mod settings_layout;
 pub mod settings_tokens;
+pub mod settings_view;
 pub mod theme;
 pub mod tokens;
 pub mod window_tokens;
@@ -113,7 +116,7 @@ fn probe_fonts() {
 }
 
 /// 悬浮条视口 id(注册与命令定向同一处,勿散落)。
-fn palette_viewport_id() -> egui::ViewportId {
+pub(crate) fn palette_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("palette")
 }
 
@@ -133,7 +136,7 @@ fn base_text_sizes(scale: f32) -> [f32; 5] {
 /// 幂等(写死目标值,不累加);两主题都写(`all_styles_mut`——egui 的 Style 按主题
 /// 各存一份,只改当前主题会在切换后丢)。悬浮条/完整窗口另有更细的基准字号档
 /// (ui/palette.rs、ui/window_tokens.rs 的 `FONT_*` 常量,绘制时经 `font::size` 换算)。
-fn install_base_text_styles(ctx: &egui::Context) {
+pub(crate) fn install_base_text_styles(ctx: &egui::Context) {
     let [small, body, button, heading, monospace] = base_text_sizes(font::scale());
     ctx.all_styles_mut(|s| {
         let set = |s: &mut egui::Style, ts: egui::TextStyle, size: f32| {
@@ -259,14 +262,18 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     }
 }
 
-/// 打开设置窗口(完整窗口齿轮/托盘「设置…」共用):置开合态 + 命令显示/聚焦 +
-/// 排设置视口与 ROOT 两帧。`send_viewport_cmd` 只入 egui 队列、无 AppKit 调用
-/// (可在短锁内发;锁纪律见「悬浮条显隐」段)。
+/// 打开设置窗口(完整窗口齿轮/托盘「设置…」共用):查询自启真源 → 置开合态 +
+/// 命令显示/聚焦 + 排设置视口与 ROOT 两帧。
+///
+/// `autostart::is_enabled()` 是原生调用:在共享锁外查询(锁纪律见「悬浮条显隐」段);
+/// 查询失败按未知态 + 内联错误(设置页显示关态)。命令只入 egui 队列,可短锁内发。
 fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
+    let autostart = autostart::is_enabled().map_err(|err| format!("读取开机自启状态失败:{err:#}"));
     let was_open = {
         let mut s = lock_shared(shared);
         let was_open = s.settings.open;
         s.settings.open = true;
+        s.settings.autostart_loaded(autostart);
         was_open
     };
     ctx.send_viewport_cmd_to(
@@ -345,7 +352,7 @@ pub struct Shared {
     pub palette: palette::PaletteState,
     /// 完整窗口(根视口)状态与查询会话(Task 17;与悬浮条各自防抖/代际)。
     pub results: results::ResultsState,
-    /// 设置窗口开合态(v2.1 Task 1 骨架;控件由后续任务接入)。
+    /// 设置窗口运行期状态(v2.1:开合/设置快照/自启与字号错误/托盘同步标记)。
     pub settings: settings::SettingsState,
     /// 主题跟随(节流 + 已应用值;Task 13 起为局部状态,Task 14 收进共享态)。
     pub theme: theme::ThemeFollow,
@@ -386,10 +393,7 @@ impl App {
                 hotkey_note,
             ),
             results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
-            settings: settings::SettingsState {
-                open: false,
-                file: settings_file,
-            },
+            settings: settings::SettingsState::new(settings_file, paths.data_dir.clone()),
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
             palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
         }));
@@ -537,11 +541,32 @@ impl App {
                     // 失败(如开发形态未打包)复原勾选 + 日志(无角标面,不静默)。
                     let checked = self.tray.as_ref().is_some_and(|t| t.autostart_checked());
                     match autostart::apply_user_choice(&self.paths.data_dir, checked) {
-                        Ok(note) => log::info!("托盘:开机自启 → {note}"),
+                        Ok(note) => {
+                            log::info!("托盘:开机自启 → {note}");
+                            // 设置页打开时即时反映托盘切换结果。
+                            let open = {
+                                let mut s = self.shared();
+                                s.settings.autostart = Some(checked);
+                                s.settings.autostart_error = None;
+                                s.settings.open
+                            };
+                            if open {
+                                ctx.request_repaint_of(settings::viewport_id());
+                            }
+                        }
                         Err(err) => {
                             log::warn!("托盘:开机自启设置失败(勾选复原): {err:#}");
                             if let Some(tray) = &self.tray {
                                 tray.set_autostart_checked(!checked);
+                            }
+                            let open = {
+                                let mut s = self.shared();
+                                let message = format!("开机自启设置失败:{err:#}");
+                                s.settings.autostart_failed(message);
+                                s.settings.open
+                            };
+                            if open {
+                                ctx.request_repaint_of(settings::viewport_id());
                             }
                         }
                     }
@@ -625,6 +650,19 @@ impl eframe::App for App {
         if platform::root_visible() == Some(true) {
             self.shared().theme.maybe_apply(ctx, Instant::now());
             ctx.request_repaint_after(theme::CHECK_INTERVAL);
+        }
+
+        // 设置页「开机自启」切换成功 → 同步托盘勾选(muda 菜单项须主线程写)。
+        // 放在 drain_tray 前:本帧托盘动作更新,不被上一帧设置页的旧值覆盖。
+        let autostart_sync = {
+            let mut s = self.shared();
+            s.settings.take_tray_autostart_sync()
+        };
+        if let Some(desired) = autostart_sync {
+            if let Some(tray) = &self.tray {
+                tray.set_autostart_checked(desired);
+                log::info!("设置页自启:同步托盘勾选 {desired}");
+            }
         }
 
         // 托盘(Task 16):先消费用户动作,再把最新引擎快照落到菜单项(菜单项增删/

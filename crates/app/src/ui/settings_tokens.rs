@@ -51,7 +51,8 @@ pub struct SettingsPalette {
     pub divider: egui::Color32,
     /// 控件底（分段容器 / 下拉字段等未选中态的共用底色）。
     pub control_fill: egui::Color32,
-    /// 控件文字。
+    /// 控件文字（规格对账；语言项禁用态改用次要色，启用态文案留给后续版本）。
+    #[allow(dead_code)]
     pub control_text: egui::Color32,
     /// 字号分段：选中段底。
     pub segment_selected_fill: egui::Color32,
@@ -63,7 +64,8 @@ pub struct SettingsPalette {
     pub switch_on: egui::Color32,
     /// 开关钮（两主题均为白色）。
     pub switch_knob: egui::Color32,
-    /// 开关钮 1px 柔和投影（§2.4 表外补充：黑色 20%，两主题同值）。
+    /// 开关钮柔和投影基色（§2.4 表外补充：黑色 20%，两主题同值；
+    /// 绘制时由外到内分层降低透明度形成软边）。
     pub switch_knob_shadow: egui::Color32,
     /// 键帽底。
     pub keycap_fill: egui::Color32,
@@ -79,8 +81,7 @@ pub struct SettingsPalette {
     pub remove_icon: egui::Color32,
     /// 错误提示（settings-visual.md §2.5 表外：与完整窗口
     /// `FullWindowPalette::error_text` 同源——同一错误红在同类底上取同值）。
-    /// Task 4 静态布局无错误提示；Task 5/8 接自启/目录失败文案后消费。
-    #[allow(dead_code)]
+    /// 字号保存失败 / 自启切换失败的行内错误消费。
     pub error_text: egui::Color32,
 }
 
@@ -195,13 +196,9 @@ pub const DIVIDER_H: f32 = 1.0;
 pub const LABEL_FONT: f32 = 13.0;
 /// 标签与右侧控件间距（§2.3：16）。
 pub const LABEL_CONTROL_GAP: f32 = 16.0;
-/// 辅助说明字号（§2.3：11pt）。
-/// Task 4 静态布局无辅助说明；后续任务接行内错误/说明文字时消费。
-#[allow(dead_code)]
+/// 辅助说明/行内错误字号（§2.3：11pt）。
 pub const SUPPORT_FONT: f32 = 11.0;
-/// 辅助说明与标签间距（§2.3：2）。
-/// 同上：Task 4 无辅助说明行，留待后续任务。
-#[allow(dead_code)]
+/// 辅助说明/行内错误与标签间距（§2.3：2）。
 pub const LABEL_SUPPORT_GAP: f32 = 2.0;
 
 // —— 字号分段（§2.4）——

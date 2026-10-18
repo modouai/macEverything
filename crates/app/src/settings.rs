@@ -7,10 +7,6 @@
 //! 原文件（坏文件留待人工或后续版本修复）。写入：同目录 tmp + rename 原子替换，
 //! 失败以 `anyhow::Result` 交给调用方（设置页只留痕，不中断）。
 
-// 本模块由 Task 3（启动读取字号）/ Task 5（设置页写入）接入；接入前避免
-// dead_code 告警。接入后移除本 allow（届时全部 API 均应有消费者）。
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
