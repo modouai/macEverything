@@ -2762,4 +2762,67 @@ mod tests {
         });
         out.textures_delta.clear(); // headless：不做纹理上传，清掉免得 Drop 告警
     }
+
+    /// 行点击命中:点击视觉行中心应选中该行(不偏上/偏下)。
+    /// 面板顶 = 形象条 70；结果区首行 y = 70 + 搜索行 64 + 分隔线 1 + LIST_PAD_V 8。
+    #[test]
+    fn result_row_click_hits_its_visual_row() {
+        use egui::{pos2, Event, Modifiers, PointerButton};
+        let ctx = egui::Context::default();
+        let mut st = PaletteState::new_for_test(
+            ctx.clone(),
+            DaemonPaths {
+                data_dir: std::path::PathBuf::from("/tmp/mce-probe"),
+            },
+            egui::ViewportId::ROOT,
+            None,
+        );
+        st.results = hits(3);
+        st.total = 3;
+        st.visible_rows = 3;
+        // 走几帧让高度过渡收敛（点击时窗口/裁剪不再截断行）。
+        for _ in 0..12 {
+            probe_frame(&ctx, &mut st, vec![]);
+        }
+        let first_row_y = MASCOT_STRIP + tk::SEARCH_H + tk::DIVIDER_H + tk::LIST_PAD_V;
+        let click = |st: &mut PaletteState, pos: egui::Pos2| {
+            let mods = Modifiers::default();
+            probe_frame(&ctx, st, vec![Event::PointerMoved(pos)]);
+            probe_frame(
+                &ctx,
+                st,
+                vec![Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: mods,
+                }],
+            );
+            probe_frame(
+                &ctx,
+                st,
+                vec![Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: mods,
+                }],
+            );
+        };
+        for (row, x, dy) in [
+            (1, PANEL_W / 2.0, tk::ROW_H / 2.0),
+            (0, 120.0, tk::ROW_H / 2.0),
+            (2, 650.0, tk::ROW_H / 2.0),
+            (1, 300.0, 1.0),
+            (1, 300.0, tk::ROW_H - 1.0),
+        ] {
+            st.selected = usize::MAX; // 清空选中，确保本次点击确实命中
+            let start = first_row_y + row as f32 * (tk::ROW_H + tk::ROW_GAP);
+            click(&mut st, pos2(x, start + dy));
+            assert_eq!(
+                st.selected, row,
+                "点击第 {row} 行（x={x}, 行内 y={dy}）应选中该行"
+            );
+        }
+    }
 }
