@@ -1784,6 +1784,13 @@ git commit -m "feat(app): 托盘与原生层双语"
     hotkey_reset_but_save_failed: "快捷键已恢复默认,但设置保存失败" / "Default shortcut restored, but settings could not be saved",
     hotkey_global_unavailable: "全局热键不可用" / "Global shortcuts unavailable",
     hotkey_restore_other_failed: "恢复另一快捷键 {name} 失败(可能被占用)" / "Failed to restore the other shortcut {name} (it may be in use)",
+    hotkey_all_candidates_unavailable: "候选快捷键均不可用" / "No shortcut candidates are available",
+    // 悬浮条结果行 / 页脚
+    palette_action_enter: "进入" / "Open Folder",
+    palette_action_open: "打开" / "Open",
+    palette_footer_hide: "隐藏" / "Hide",
+    palette_footer_full_window: "完整窗口" / "Full Window",
+    palette_footer_finder: "访达" / "Finder",
     // 悬浮条打开失败（应用自产）
     palette_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
     palette_open_failed: "打开失败" / "Failed to open",
@@ -1834,6 +1841,7 @@ pub fn validate(hotkey: HotKey) -> Result<(), HotkeyError> { /* 原逻辑，返�
 - 注册失败文案（`"注册失败(可能被系统或其他应用占用): {err}"`）→ `format!("{}: {err}", i18n::s().hotkey_register_failed)`。
 - manager 缺失文案 `"全局热键不可用"` → `i18n::s().hotkey_global_unavailable`。
 - 回滚路径 `"恢复另一快捷键 {} 失败(可能被占用): {err}"` → `i18n::fill(i18n::s().hotkey_restore_other_failed, &[("name", &display_name(other_key))])` + `: {err}`。
+- 候选全失败 `reset_failed("候选快捷键均不可用")` → `reset_failed(i18n::s().hotkey_all_candidates_unavailable)`。
 - `ui/mod.rs` 的“已生效/已恢复默认但保存失败”改为目录条目。
 - `BadgeText::Raw` 无生产消费者时删除该变体（布局测试改用 `BadgeText::Open(OpenError::Failed(long))`），不要保留 `#[allow(dead_code)]`。
 
@@ -1920,6 +1928,20 @@ impl OpenError {
   不要继续把中文串塞进 `StatusNote::Raw`。
 - 测试：`with_lang(En)` 下 `FileMissing` 文案为 `File not found; the index may be out of date`；
   中文默认下为「文件不存在,索引可能待更新」。
+- **悬浮条结果行/页脚剩余文案**：
+  - `action_hint(is_dir)` 改为目录 `i18n::s().palette_action_enter`、文件 `i18n::s().palette_action_open`。
+  - 页脚四组标签改为 `palette_footer_hide` / `palette_footer_full_window` / `palette_footer_finder` / `palette_action_open`。
+  - 页脚计数改为 `i18n::format::total_items(total)`；在 `i18n/format.rs` 新增：
+    ```rust
+    pub fn total_items(n: u32) -> String {
+        match lang() {
+            Lang::ZhHans => format!("共 {n} 项"),
+            Lang::En if n == 1 => "Total: 1 item".to_owned(),
+            Lang::En => format!("Total: {n} items"),
+        }
+    }
+    ```
+  - 测试：`action_hint(true/false)`、页脚标签与 `total_items(0/1/2)` 的 zh/en 文案。
 
 - [ ] **Step 6: 跑测试并修断言**
 
