@@ -177,10 +177,28 @@ pub struct EngineStatus {
     pub built_at: u64,
 }
 
+/// 打开失效的原因（应用自产；文案按当前语言渲染）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenError {
+    /// 路径已不存在（索引陈旧）。
+    FileMissing,
+    /// 系统 `open` 启动失败；`detail` 为原始技术原因。
+    Failed(String),
+}
+
+impl OpenError {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::FileMissing => i18n::s().palette_file_missing.to_owned(),
+            Self::Failed(detail) => format!("{}: {detail}", i18n::s().palette_open_failed),
+        }
+    }
+}
+
 /// 角标文案（绘制时按当前语言渲染）。
 ///
-/// `Raw` 用于外部/技术原文，有意不翻译；应用自编的悬浮条打开错误文案
-/// 留待后续任务本地化。
+/// `Raw` 只用于真正外部/技术的原文（有意不翻译）；应用自产的打开失败走
+/// [`BadgeText::Open`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BadgeText {
     Building(u64),
@@ -190,7 +208,10 @@ pub(crate) enum BadgeText {
     EngineNotRunning,
     Warming,
     QueryFailed,
-    /// 外部/技术原文（有意不翻译）。
+    Open(OpenError),
+    /// 外部/技术原文（有意不翻译）。当前打开失败已改用 [`Self::Open`]；
+    /// 保留给未来真正的外部错误直出。
+    #[allow(dead_code)]
     Raw(String),
 }
 
@@ -208,6 +229,7 @@ impl BadgeText {
             Self::EngineNotRunning => s.badge_engine_not_running.to_owned(),
             Self::Warming => s.badge_building_index.to_owned(),
             Self::QueryFailed => s.badge_query_failed.to_owned(),
+            Self::Open(err) => err.text(),
             Self::Raw(text) => text.clone(),
         }
     }
@@ -1331,9 +1353,9 @@ impl PaletteState {
         let path = self.results.get(self.selected)?.path.clone();
         match open_path(&path, reveal) {
             Ok(()) => Some(Action::Hide),
-            Err(msg) => {
+            Err(err) => {
                 // 边界(product §边界):文件已删/打开失败 → 提示,不隐藏、不静默
-                self.status_note = Some(Badge::error(BadgeText::Raw(msg)));
+                self.status_note = Some(Badge::error(BadgeText::Open(err)));
                 None
             }
         }
@@ -1504,10 +1526,10 @@ pub(crate) fn engine_status(paths: &DaemonPaths) -> Option<EngineStatus> {
 }
 
 /// 默认应用打开(reveal=false → 目录 = 访达进入)或访达显示(reveal=true,`open -R`)。
-/// 悬浮条与完整窗口共用(勿复制第二份);失败返回可展示的提示(None 之外不静默)。
-pub(crate) fn open_path(path: &str, reveal: bool) -> Result<(), String> {
+/// 悬浮条与完整窗口共用(勿复制第二份);失败返回按当前语言渲染的错误。
+pub(crate) fn open_path(path: &str, reveal: bool) -> Result<(), OpenError> {
     if std::fs::metadata(path).is_err() {
-        return Err("文件不存在,索引可能待更新".into());
+        return Err(OpenError::FileMissing);
     }
     log::info!(
         "{}:{path}",
@@ -1533,7 +1555,7 @@ pub(crate) fn open_path(path: &str, reveal: bool) -> Result<(), String> {
             });
             Ok(())
         }
-        Err(e) => Err(format!("打开失败:{e}")),
+        Err(e) => Err(OpenError::Failed(e.to_string())),
     }
 }
 
@@ -2871,6 +2893,37 @@ mod tests {
         i18n::with_lang(i18n::Lang::En, || {
             assert_eq!(i18n::s().open_in_full_window, "Open in Full Window (⌥↵)");
         });
+    }
+
+    /// 打开失败文案随语言切换；缺失路径直接产出 `FileMissing`（不 spawn `open`）。
+    #[test]
+    fn open_error_text_is_localized() {
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                OpenError::FileMissing.text(),
+                "File not found; the index may be out of date"
+            );
+            assert_eq!(
+                OpenError::Failed("boom".into()).text(),
+                "Failed to open: boom"
+            );
+            assert_eq!(
+                BadgeText::Open(OpenError::FileMissing).text(),
+                "File not found; the index may be out of date"
+            );
+        });
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(OpenError::FileMissing.text(), "文件不存在,索引可能待更新");
+            assert_eq!(OpenError::Failed("boom".into()).text(), "打开失败: boom");
+            assert_eq!(
+                BadgeText::Open(OpenError::FileMissing).text(),
+                "文件不存在,索引可能待更新"
+            );
+        });
+        assert_eq!(
+            open_path("/definitely/not/here/mce-task6", false),
+            Err(OpenError::FileMissing)
+        );
     }
 
     /// 超长角标文案按实测宽截断：chip 宽 ≤ 上限且以「…」结尾；短文本原样。

@@ -16,22 +16,38 @@ use std::fmt;
 use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 
-/// 快捷键校验错误；`.0` 即直接展示给用户的中文文案。
+use crate::i18n;
+
+/// 快捷键校验错误；`text()` / `Display` 按当前语言输出可直接展示的文案。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HotkeyError(pub &'static str);
+pub enum HotkeyError {
+    /// 未按任何修饰键。
+    NeedsModifier,
+    /// 键位不在白名单内。
+    Unsupported,
+}
+
+impl HotkeyError {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::NeedsModifier => i18n::s().hotkey_needs_modifier,
+            Self::Unsupported => i18n::s().hotkey_unsupported,
+        }
+    }
+}
 
 impl fmt::Display for HotkeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.text())
     }
 }
 
 impl std::error::Error for HotkeyError {}
 
 /// 未按任何修饰键。
-const NO_MODIFIER: HotkeyError = HotkeyError("需包含修饰键");
+const NO_MODIFIER: HotkeyError = HotkeyError::NeedsModifier;
 /// 键位不在白名单内。
-const UNSUPPORTED_KEY: HotkeyError = HotkeyError("不支持该键");
+const UNSUPPORTED_KEY: HotkeyError = HotkeyError::Unsupported;
 
 /// 把一次 egui 按键事件翻译成全局热键。
 ///
@@ -422,7 +438,7 @@ mod tests {
         ] {
             let err = from_egui(key, egui::Modifiers::NONE).unwrap_err();
             assert_eq!(err, NO_MODIFIER, "{key:?} 无修饰键必须被拒");
-            assert_eq!(err.0, "需包含修饰键");
+            assert_eq!(err.text(), "需包含修饰键");
         }
     }
 
@@ -453,7 +469,7 @@ mod tests {
         ] {
             let err = from_egui(key, egui::Modifiers::ALT).unwrap_err();
             assert_eq!(err, UNSUPPORTED_KEY, "{key:?} 不在白名单内");
-            assert_eq!(err.0, "不支持该键");
+            assert_eq!(err.text(), "不支持该键");
         }
     }
 
@@ -549,6 +565,7 @@ mod tests {
         let err = validate(escape).unwrap_err();
         assert_eq!(err, UNSUPPORTED_KEY);
         assert_eq!(err.to_string(), "不支持该键");
+        assert_eq!(err.text(), i18n::s().hotkey_unsupported);
         assert_eq!(display_keys(escape), ["⌥", "Escape"], "展示回落规范名");
 
         // 白名单内键位对照：同样带修饰键 → Ok。
@@ -565,14 +582,26 @@ mod tests {
         }
     }
 
-    /// HotkeyError 实现 Display + std::error::Error（H3 内联错误可直接 to_string）。
+    /// HotkeyError 实现 Display + std::error::Error（H3 内联错误可直接 to_string），
+    /// 文案随当前语言切换。
     #[test]
     fn hotkey_error_displays_user_facing_text() {
         fn assert_error(err: &dyn std::error::Error) -> String {
             err.to_string()
         }
 
-        assert_eq!(assert_error(&NO_MODIFIER), "需包含修饰键");
-        assert_eq!(assert_error(&UNSUPPORTED_KEY), "不支持该键");
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(assert_error(&NO_MODIFIER), "需包含修饰键");
+            assert_eq!(assert_error(&UNSUPPORTED_KEY), "不支持该键");
+            assert_eq!(NO_MODIFIER.text(), "需包含修饰键");
+            assert_eq!(UNSUPPORTED_KEY.text(), "不支持该键");
+        });
+
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(assert_error(&NO_MODIFIER), "A modifier key is required");
+            assert_eq!(assert_error(&UNSUPPORTED_KEY), "Unsupported key");
+            assert_eq!(NO_MODIFIER.text(), "A modifier key is required");
+            assert_eq!(UNSUPPORTED_KEY.text(), "Unsupported key");
+        });
     }
 }

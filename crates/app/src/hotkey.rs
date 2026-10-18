@@ -177,12 +177,6 @@ impl HotkeyNote {
     }
 }
 
-/// 恢复内置默认时系统注册失败(错误文案前缀;设置页内联展示)。
-const RESET_FAILED_PREFIX: &str = "恢复默认快捷键失败(可能被系统或其他应用占用)";
-
-/// 两槽使用同一组合的本地拒绝文案(录制视图先行查重,运行时兜底;文案须一致)。
-pub(crate) const DUPLICATE_HOTKEY_MESSAGE: &str = "该快捷键已用于另一个功能";
-
 /// 热键动作(直调回调与兜底队列共用;ui 层按此分派到同一份实现)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -636,7 +630,7 @@ impl HotkeyRuntime {
 
     /// 提交录制结果(主线程;设置页命令队列调用)。
     ///
-    /// 校验失败/与另一槽重复/系统注册失败 → `Err`(中文文案,可直接内联展示),
+    /// 校验失败/与另一槽重复/系统注册失败 → `Err`(当前语言文案,可直接内联展示),
     /// 旧键保持可用;成功 → 更新快照并清空启动回退提示。
     pub fn commit(&mut self, slot: HotkeySlot, hotkey: HotKey) -> Result<HotkeySnapshot, String> {
         let manager = self
@@ -840,7 +834,7 @@ fn plan_commit<R: KeyRegistrar>(
             reg,
             active,
             old,
-            DUPLICATE_HOTKEY_MESSAGE.to_string(),
+            i18n::s().hotkey_duplicate.to_string(),
         ));
     }
 
@@ -860,7 +854,7 @@ fn plan_commit<R: KeyRegistrar>(
                     other_registered = true;
                 }
                 reg.register(hotkey)
-                    .map_err(|err| format!("注册失败(可能被系统或其他应用占用): {err}"))
+                    .map_err(|err| format!("{}: {err}", i18n::s().hotkey_register_failed))
             })();
 
             if let Err(err) = outcome {
@@ -882,7 +876,7 @@ fn plan_commit<R: KeyRegistrar>(
                 return Ok(HotkeySnapshot::from_active(*active, None, None));
             }
             reg.register(hotkey)
-                .map_err(|err| format!("注册失败(可能被系统或其他应用占用): {err}"))?;
+                .map_err(|err| format!("{}: {err}", i18n::s().hotkey_register_failed))?;
             let old_key = active.get(slot);
             // 先更新 active 再注销旧键:旧事件在注销后仍被泵看到也不会再触发。
             active.set(slot, Some(hotkey));
@@ -911,7 +905,7 @@ fn rollback_suspended<R: KeyRegistrar>(
 }
 
 fn reset_failed(err: impl std::fmt::Display) -> String {
-    format!("{RESET_FAILED_PREFIX}: {err}")
+    format!("{}: {err}", i18n::s().hotkey_reset_failed)
 }
 
 /// 恢复默认成功后的分槽提示:唤起槽按默认链实际落点(`note_for` 暴露降级),

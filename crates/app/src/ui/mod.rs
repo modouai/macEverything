@@ -89,6 +89,7 @@ use std::time::Instant;
 use crate::autostart;
 use crate::engine_launcher;
 use crate::hotkey;
+use crate::i18n;
 use crate::platform;
 use crate::settings as store;
 use crate::single_instance::Incoming;
@@ -793,7 +794,7 @@ impl App {
                 };
                 // 保存与运行时调用都不持共享锁；失败只留内联错误，键保持生效。
                 let save_error = store::save(&data_dir, &file).err().map(|err| {
-                    let message = format!("快捷键已生效,但设置保存失败:{err:#}");
+                    let message = format!("{}: {err:#}", i18n::s().hotkey_saved_but_save_failed);
                     log::warn!("{message}");
                     message
                 });
@@ -842,7 +843,7 @@ impl App {
                 };
                 // 保存与运行时调用都不持共享锁；失败只留内联错误，默认键保持生效。
                 let save_error = store::save(&data_dir, &file).err().map(|err| {
-                    let message = format!("快捷键已恢复默认,但设置保存失败:{err:#}");
+                    let message = format!("{}: {err:#}", i18n::s().hotkey_reset_but_save_failed);
                     log::warn!("{message}");
                     message
                 });

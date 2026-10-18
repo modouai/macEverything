@@ -7,11 +7,13 @@
 //!
 //! 纯逻辑(候选生成 / 错误文案)在本文件测;spawn 与轮询由实机冒烟验证。
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use crate::i18n;
 
 /// 拉起后连通轮询:总超时与间隔(tech「进程编排」:≤3s,250ms 间隔)。
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -19,6 +21,37 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 引擎可执行文件名(与 CLI bin 名一致)。
 const ENGINE_BIN: &str = "macEverything";
+
+/// 拉起失败(用户可见)。原始细节(OS 错误、socket/日志路径)只进日志，
+/// 变体只保留本地化展示所需的信息。
+#[derive(Debug)]
+pub enum LaunchError {
+    NotFound { tried: Vec<PathBuf> },
+    LocateApp,
+    Start,
+    Timeout,
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { tried } => {
+                let paths = tried
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                write!(f, "{}\n{paths}", i18n::s().engine_not_found)?;
+                write!(f, "\n{}", i18n::s().engine_not_found_hint)
+            }
+            Self::LocateApp => f.write_str(i18n::s().engine_locate_app_failed),
+            Self::Start => f.write_str(i18n::s().engine_start_failed),
+            Self::Timeout => f.write_str(i18n::s().engine_start_timeout),
+        }
+    }
+}
+
+impl std::error::Error for LaunchError {}
 
 /// 定位候选(顺序):① exe_dir/macEverything ② PATH 各段/macEverything。
 /// 去重按出现顺序保首;空 PATH 段(POSIX 语义 = 当前目录)跳过——进程 cwd
@@ -40,14 +73,13 @@ pub fn engine_candidates(exe_dir: &Path, path_var: Option<&OsStr>) -> Vec<PathBu
 }
 
 /// 全失败错误消息:每条候选路径单独一行(顺序与搜索顺序一致)。
+/// 仅测试用；生产路径直接构造 [`LaunchError::NotFound`]。
+#[cfg(test)]
 pub fn no_engine_found_msg(candidates: &[PathBuf]) -> String {
-    let mut msg = String::from("未找到引擎可执行文件(macEverything),已搜索以下路径:");
-    for c in candidates {
-        msg.push_str("\n  ");
-        msg.push_str(&c.display().to_string());
+    LaunchError::NotFound {
+        tried: candidates.to_vec(),
     }
-    msg.push_str("\n请将 macEverything 放到 App 同目录,或加入 PATH 后重试。");
-    msg
+    .to_string()
 }
 
 /// 「存在且可执行」:普通文件(符号链接解析后)+ 任一执行位。
@@ -69,23 +101,39 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
         log::info!("引擎已在运行,跳过拉起");
         return Ok(());
     }
-    let exe = std::env::current_exe().context("定位 App 可执行文件失败")?;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            log::error!("定位 App 可执行文件失败: {err:#}");
+            return Err(LaunchError::LocateApp.into());
+        }
+    };
     let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     let path_var = std::env::var_os("PATH");
     let candidates = engine_candidates(&exe_dir, path_var.as_deref());
 
     let Some(cand) = candidates.iter().find(|c| is_executable(c)) else {
-        bail!("{}", no_engine_found_msg(&candidates));
+        log::error!(
+            "未找到引擎可执行文件(macEverything),已搜索 {} 个路径",
+            candidates.len()
+        );
+        return Err(LaunchError::NotFound { tried: candidates }.into());
     };
     log::info!("拉起引擎: {}", cand.display());
 
-    let mut child = std::process::Command::new(cand)
+    let mut child = match std::process::Command::new(cand)
         .arg("start")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .with_context(|| format!("启动引擎失败({})", cand.display()))?;
+    {
+        Ok(child) => child,
+        Err(err) => {
+            log::error!("启动引擎失败({}): {err:#}", cand.display());
+            return Err(LaunchError::Start.into());
+        }
+    };
     // CLI `start` 后台化(再 spawn 自身驻留)后很快退出;收尸线程避免留僵尸,
     // 不参与就绪判定(就绪以 socket 轮询为准)。
     std::thread::spawn(move || match child.wait() {
@@ -105,13 +153,14 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    bail!(
+    log::error!(
         "引擎进程已拉起({}),但 {} 秒内未能连接引擎 socket({});请查看 {} 了解启动失败原因",
         cand.display(),
         POLL_TIMEOUT.as_secs(),
         paths.socket().display(),
         paths.log_file().display()
-    )
+    );
+    Err(LaunchError::Timeout.into())
 }
 
 #[cfg(test)]
@@ -180,5 +229,58 @@ mod tests {
         }
         // 可操作提示(文案契约:告诉你怎么办)
         assert!(msg.contains("PATH"), "缺可操作提示:\n{msg}");
+    }
+
+    /// LaunchError 的 Display 随语言切换；NotFound 保留全部候选路径与可操作提示。
+    #[test]
+    fn launch_error_display_is_localized() {
+        let tried = vec![
+            PathBuf::from("/a/bin/macEverything"),
+            PathBuf::from("/b/bin/macEverything"),
+        ];
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            let msg = LaunchError::NotFound {
+                tried: tried.clone(),
+            }
+            .to_string();
+            assert!(msg.contains("未找到引擎可执行文件"), "{msg}");
+            assert!(msg.contains("/a/bin/macEverything"), "{msg}");
+            assert!(msg.contains("/b/bin/macEverything"), "{msg}");
+            assert!(msg.contains("或加入 PATH 后重试"), "{msg}");
+            assert_eq!(
+                LaunchError::LocateApp.to_string(),
+                "定位 App 可执行文件失败"
+            );
+            assert_eq!(LaunchError::Start.to_string(), "启动引擎失败");
+            assert_eq!(
+                LaunchError::Timeout.to_string(),
+                "引擎进程已拉起,但未能连接引擎 socket"
+            );
+        });
+        i18n::with_lang(i18n::Lang::En, || {
+            let msg = LaunchError::NotFound {
+                tried: tried.clone(),
+            }
+            .to_string();
+            assert!(
+                msg.contains("Could not find the macEverything engine. Searched:"),
+                "{msg}"
+            );
+            assert!(msg.contains("/a/bin/macEverything"), "{msg}");
+            assert!(msg.contains("/b/bin/macEverything"), "{msg}");
+            assert!(
+                msg.contains("Place macEverything next to the app or add it to PATH"),
+                "{msg}"
+            );
+            assert_eq!(
+                LaunchError::LocateApp.to_string(),
+                "Could not locate the app executable"
+            );
+            assert_eq!(LaunchError::Start.to_string(), "Failed to start the engine");
+            assert_eq!(
+                LaunchError::Timeout.to_string(),
+                "The engine process started but did not accept connections"
+            );
+        });
     }
 }

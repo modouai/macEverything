@@ -163,6 +163,24 @@ catalog! {
     menu_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
     menu_open_failed: "打开失败" / "Failed to open",
     menu_copy_failed: "拷贝路径失败" / "Failed to copy path",
+    // 引擎拉起（用户可见）
+    engine_not_found: "未找到引擎可执行文件(macEverything),已搜索以下路径:" / "Could not find the macEverything engine. Searched:",
+    engine_not_found_hint: "请将 macEverything 放到 App 同目录,或加入 PATH 后重试。" / "Place macEverything next to the app or add it to PATH, then try again.",
+    engine_locate_app_failed: "定位 App 可执行文件失败" / "Could not locate the app executable",
+    engine_start_failed: "启动引擎失败" / "Failed to start the engine",
+    engine_start_timeout: "引擎进程已拉起,但未能连接引擎 socket" / "The engine process started but did not accept connections",
+    engine_restart_failed: "引擎重启失败" / "Failed to restart the engine",
+    // 热键校验/运行时错误（一次性）
+    hotkey_needs_modifier: "需包含修饰键" / "A modifier key is required",
+    hotkey_unsupported: "不支持该键" / "Unsupported key",
+    hotkey_register_failed: "注册失败(可能被系统或其他应用占用)" / "Registration failed (it may be in use by the system or another app)",
+    hotkey_reset_failed: "恢复默认快捷键失败(可能被系统或其他应用占用)" / "Failed to restore the default shortcut (it may be in use by the system or another app)",
+    hotkey_duplicate: "该快捷键已用于另一个功能" / "This shortcut is already used for another feature",
+    hotkey_saved_but_save_failed: "快捷键已生效,但设置保存失败" / "Shortcut applied, but settings could not be saved",
+    hotkey_reset_but_save_failed: "快捷键已恢复默认,但设置保存失败" / "Default shortcut restored, but settings could not be saved",
+    // 悬浮条打开失败（应用自产）
+    palette_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
+    palette_open_failed: "打开失败" / "Failed to open",
 }
 
 #[cfg(test)]

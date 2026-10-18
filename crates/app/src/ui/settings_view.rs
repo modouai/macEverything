@@ -13,7 +13,7 @@
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 
-use crate::hotkey::{self, HotkeyNote, HotkeySlot, HotkeySnapshot};
+use crate::hotkey::{HotkeyNote, HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
 use crate::ui::{
@@ -1040,7 +1040,7 @@ fn capture_recorded_key(
         Ok(hotkey) if other_slot_hotkey(data, slot) == Some(hotkey) => {
             actions.push(SettingsAction::HotkeyError {
                 slot,
-                message: hotkey::DUPLICATE_HOTKEY_MESSAGE.to_owned(),
+                message: i18n::s().hotkey_duplicate.to_owned(),
             });
         }
         Ok(hotkey) => actions.push(SettingsAction::CommitHotkey { slot, hotkey }),
@@ -2325,7 +2325,7 @@ mod tests {
             output.actions,
             vec![SettingsAction::HotkeyError {
                 slot: HotkeySlot::Palette,
-                message: "需包含修饰键".to_owned(),
+                message: i18n::s().hotkey_needs_modifier.to_owned(),
             }]
         );
         assert!(!leftover);
@@ -2416,7 +2416,7 @@ mod tests {
             output.actions,
             vec![SettingsAction::HotkeyError {
                 slot: HotkeySlot::Palette,
-                message: "需包含修饰键".to_owned(),
+                message: i18n::s().hotkey_needs_modifier.to_owned(),
             }]
         );
     }
@@ -2440,7 +2440,7 @@ mod tests {
             output.actions,
             vec![SettingsAction::HotkeyError {
                 slot: HotkeySlot::Palette,
-                message: hotkey::DUPLICATE_HOTKEY_MESSAGE.to_owned(),
+                message: i18n::s().hotkey_duplicate.to_owned(),
             }]
         );
     }
@@ -2457,7 +2457,7 @@ mod tests {
             output.actions,
             vec![SettingsAction::HotkeyError {
                 slot: HotkeySlot::Palette,
-                message: hotkey::DUPLICATE_HOTKEY_MESSAGE.to_owned(),
+                message: i18n::s().hotkey_duplicate.to_owned(),
             }]
         );
     }

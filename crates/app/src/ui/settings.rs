@@ -1746,7 +1746,7 @@ mod tests {
 
         state.recording_failed(
             HotkeySlot::Palette,
-            "恢复默认快捷键失败(可能被系统或其他应用占用): 被占用".into(),
+            format!("{}: 被占用", i18n::s().hotkey_reset_failed),
             old.clone(),
         );
 
@@ -1759,7 +1759,7 @@ mod tests {
         );
         assert!(
             state.hotkey_error.as_ref().is_some_and(|(slot, message)| {
-                *slot == HotkeySlot::Palette && message.contains("恢复默认快捷键失败")
+                *slot == HotkeySlot::Palette && message.contains(i18n::s().hotkey_reset_failed)
             }),
             "失败须按槽落内联错误:{:?}",
             state.hotkey_error
@@ -1773,21 +1773,12 @@ mod tests {
         let old = hotkey_snapshot(Some(alt_space()), None);
         state.begin_recording(HotkeySlot::Palette, old.clone());
 
-        state.recording_failed(
-            HotkeySlot::Palette,
-            "注册失败(可能被系统或其他应用占用): 被占用".into(),
-            old.clone(),
-        );
+        let message = format!("{}: 被占用", i18n::s().hotkey_register_failed);
+        state.recording_failed(HotkeySlot::Palette, message.clone(), old.clone());
 
         assert_eq!(state.recording, None, "失败退出录制（旧键已恢复）");
         assert_eq!(state.hotkey_snapshot, old, "回滚后的快照 = 旧键");
-        assert_eq!(
-            state.hotkey_error,
-            Some((
-                HotkeySlot::Palette,
-                "注册失败(可能被系统或其他应用占用): 被占用".to_owned()
-            ))
-        );
+        assert_eq!(state.hotkey_error, Some((HotkeySlot::Palette, message)));
         assert_eq!(state.file.palette_hotkey, None, "失败不得落盘新键");
     }
 
@@ -1810,7 +1801,7 @@ mod tests {
         let err = crate::settings::save(&state.data_dir, &file).unwrap_err();
         state.hotkey_save_failed(
             HotkeySlot::Palette,
-            format!("快捷键已生效,但设置保存失败:{err:#}"),
+            format!("{}: {err:#}", i18n::s().hotkey_saved_but_save_failed),
         );
 
         assert_eq!(
@@ -1822,7 +1813,8 @@ mod tests {
         assert_eq!(state.recording, None);
         assert!(
             state.hotkey_error.as_ref().is_some_and(|(slot, message)| {
-                *slot == HotkeySlot::Palette && message.contains("设置保存失败")
+                *slot == HotkeySlot::Palette
+                    && message.contains(i18n::s().hotkey_saved_but_save_failed)
             }),
             "保存失败须落内联错误:{:?}",
             state.hotkey_error
@@ -1834,11 +1826,14 @@ mod tests {
     fn rejected_key_keeps_recording_with_inline_error() {
         let mut state = test_state();
         state.begin_recording(HotkeySlot::Palette, HotkeySnapshot::default());
-        state.hotkey_rejected(HotkeySlot::Palette, "需包含修饰键".into());
+        state.hotkey_rejected(HotkeySlot::Palette, i18n::s().hotkey_needs_modifier.into());
         assert_eq!(state.recording, Some(HotkeySlot::Palette));
         assert_eq!(
             state.hotkey_error,
-            Some((HotkeySlot::Palette, "需包含修饰键".to_owned()))
+            Some((
+                HotkeySlot::Palette,
+                i18n::s().hotkey_needs_modifier.to_owned()
+            ))
         );
     }
 

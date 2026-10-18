@@ -81,8 +81,8 @@ const DRAG_HOT_ZONE: f32 = 4.0;
 pub enum StatusNote {
     EngineNotReady,
     QueryFailed,
-    /// 外部/技术细节原文;应用侧生成的「引擎重启失败:…」/打开失败/菜单动作
-    /// 失败等中文前缀是临时债务,待 Task 6 统一本地化。
+    /// 原样展示的文本：外部/技术细节，或已在构造处按当前语言拼好细节的提示
+    /// （如打开失败 `OpenError::text()`、重启失败前缀）。
     Raw(String),
 }
 
@@ -155,6 +155,11 @@ pub struct ResultsState {
     /// 引擎重启结果通道(sort_echo 未生效的修复动作;worker → tick)。
     restart_tx: mpsc::Sender<RestartOutcome>,
     restart_rx: mpsc::Receiver<RestartOutcome>,
+}
+
+/// 引擎重启失败状态栏文案：本地化前缀 + 可展示原因（原始链路只进日志）。
+fn restart_failed_message(err: impl std::fmt::Display) -> String {
+    format!("{}: {err}", i18n::s().engine_restart_failed)
 }
 
 /// 引擎重启结果(worker → tick);失败带可展示文案(落状态栏,不静默)。
@@ -764,7 +769,7 @@ impl ResultsState {
                 }
                 Err(err) => {
                     log::warn!("重启引擎失败:{err:#}");
-                    RestartOutcome::Err(format!("引擎重启失败:{err}"))
+                    RestartOutcome::Err(restart_failed_message(err))
                 }
             };
             let _ = tx.send(outcome);
@@ -849,13 +854,13 @@ impl ResultsState {
         self.ctx.request_repaint();
     }
 
-    /// 双击:默认应用打开(palette::open_path 复用;失败落状态栏,不静默)。
+    /// 双击:默认应用打开(palette::open_path 复用;失败以本地化文案落状态栏)。
     fn open_row(&mut self, i: usize) {
         let Some(entry) = self.results.get(i) else {
             return;
         };
-        if let Err(msg) = palette::open_path(&entry.path, false) {
-            self.status_note = Some(StatusNote::Raw(msg));
+        if let Err(err) = palette::open_path(&entry.path, false) {
+            self.status_note = Some(StatusNote::Raw(err.text()));
             self.status_note_is_error = true;
         }
     }
@@ -3182,13 +3187,11 @@ mod tests {
 
         // 失败落地:红字保留 + 原因可见(不静默)
         st.sort_stale = true;
-        st.apply_restart(RestartOutcome::Err("引擎重启失败:x".into()));
+        let failure = restart_failed_message("x");
+        st.apply_restart(RestartOutcome::Err(failure.clone()));
         assert!(st.sort_stale, "失败不清红字(排序仍未生效)");
         assert!(!st.engine_restarting);
-        assert_eq!(
-            st.status_note,
-            Some(StatusNote::Raw("引擎重启失败:x".into()))
-        );
+        assert_eq!(st.status_note, Some(StatusNote::Raw(failure)));
         assert!(st.status_note_is_error, "重启失败是错误态");
     }
 
@@ -3845,13 +3848,27 @@ mod tests {
             assert_eq!(StatusNote::EngineNotReady.text(), "Engine not ready");
             assert_eq!(StatusNote::QueryFailed.text(), "Query failed");
             assert_eq!(
-                StatusNote::Raw("引擎重启失败:x".into()).text(),
-                "引擎重启失败:x"
+                StatusNote::Raw("external detail: x".into()).text(),
+                "external detail: x"
             );
         });
         i18n::with_lang(i18n::Lang::ZhHans, || {
             assert_eq!(StatusNote::EngineNotReady.text(), "引擎未就绪");
             assert_eq!(StatusNote::QueryFailed.text(), "查询失败");
+        });
+    }
+
+    /// 重启失败状态栏前缀随语言切换（原始原因原样附后）。
+    #[test]
+    fn restart_failure_message_is_localized() {
+        i18n::with_lang(i18n::Lang::ZhHans, || {
+            assert_eq!(restart_failed_message("boom"), "引擎重启失败: boom");
+        });
+        i18n::with_lang(i18n::Lang::En, || {
+            assert_eq!(
+                restart_failed_message("boom"),
+                "Failed to restart the engine: boom"
+            );
         });
     }
 
