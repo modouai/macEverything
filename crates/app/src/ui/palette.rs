@@ -90,6 +90,8 @@ const FONT_DIR: f32 = tk::FONT_DIR;
 const FONT_META: f32 = tk::FONT_HINT;
 /// 键帽 / 状态角标（11pt）。
 const FONT_KEYCAP: f32 = tk::FONT_KEYCAP;
+/// 空态主文案（14pt 基准；绘制时经全局倍率）。
+const FONT_EMPTY_TITLE: f32 = tk::FONT_EMPTY_TITLE;
 /// 状态角标 chip 最大宽（px）：超长错误文案不得挤爆搜索行。
 const BADGE_MAX_W: f32 = 240.0;
 /// 搜索行输入框下限（px）：角标挤压时的底线（与布局 `.max` 同源）。
@@ -921,10 +923,10 @@ impl PaletteState {
                     );
                     empty_ui.add_space((tk::EMPTY_H - tk::EMPTY_TEXT_H) / 2.0);
                     empty_ui.spacing_mut().item_spacing.y = tk::EMPTY_GAP;
-                    // 空态主文案 14pt（基准值经全局倍率；几何占位不变）。
+                    // 空态主文案（token 基准 14pt 经全局倍率；几何占位不变）。
                     empty_ui.label(
                         egui::RichText::new(primary)
-                            .size(ui_font::size(14.0))
+                            .size(ui_font::size(FONT_EMPTY_TITLE))
                             .color(t.file_name),
                     );
                     empty_ui.label(

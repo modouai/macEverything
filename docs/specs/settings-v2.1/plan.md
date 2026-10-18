@@ -382,10 +382,12 @@ git commit -m "feat(app): 设置持久化与视觉 token"
 - Modify: `crates/app/src/ui/mod.rs`（加载设置、`install_base_text_styles`）
 - Modify: `crates/app/src/ui/palette.rs`、`crates/app/src/ui/results.rs`（显式字号接入）
 - Modify: `crates/app/src/main.rs`（启动读取 `SettingsFile`）
+- Modify: `crates/app/src/ui/settings.rs`（设置状态持 `SettingsFile`、标题接入倍率）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
-`ui/font.rs`：
+并行测试不得写进程级全局倍率（会与其它 UI 测试竞态）。非默认倍率用
+`ui/font.rs` 中的线程局部覆盖 `with_test_scale`（闭包内生效、结束还原）：
 
 ```rust
 #[cfg(test)]
@@ -393,70 +395,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scale_affects_size_and_id() {
-        set_scale(1.0);
-        assert_eq!(size(13.0), 13.0);
-        assert!((id(13.0).size - 13.0).abs() < f32::EPSILON);
-        set_scale(1.15);
-        assert!((size(13.0) - 14.95).abs() < 0.001);
-        set_scale(1.0);
+    fn size_and_id_follow_test_scale_then_restore() {
+        with_test_scale(1.15, || {
+            assert_eq!(size(10.0), 11.5);
+            assert_eq!(id(10.0).size, 11.5);
+        });
+        assert_eq!(size(10.0), 10.0); // 闭包结束已还原
+    }
+
+    #[test]
+    fn sanitize_scale_rejects_non_finite_and_clamps() {
+        assert_eq!(sanitize_scale(f32::NAN), 1.0);
+        assert_eq!(sanitize_scale(f32::INFINITY), 1.0);
+        assert_eq!(sanitize_scale(0.1), 0.5);
+        assert_eq!(sanitize_scale(3.0), 2.0);
     }
 }
 ```
 
-- [ ] **Step 2: 运行确认失败**
+另测 `base_text_sizes(1.0/1.15)` 纯函数，以及安装后**两主题**五档字号与 family
+（`install_base_text_styles_scales_both_themes`）。
+
+- [x] **Step 2: 运行确认失败**
 
 Run: `cargo test -p macEverything-app font::tests`
 Expected: FAIL。
 
-- [ ] **Step 3: 实现 `ui/font.rs` 并接入基础字号**
+- [x] **Step 3: 实现 `ui/font.rs` 并接入基础字号**
 
 ```rust
-//! 全局文本倍率（字号设置）：只缩放文字，几何尺寸不变。
+//! 全局文本倍率（设置 · 字号）：只缩放文字，几何尺寸不变。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use eframe::egui;
 
 static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0f32
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SCALE: std::cell::Cell<Option<f32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub fn scale() -> f32 {
+    #[cfg(test)]
+    if let Some(s) = TEST_SCALE.with(std::cell::Cell::get) {
+        return s;
+    }
     f32::from_bits(SCALE_BITS.load(Ordering::Relaxed))
 }
 
+/// NaN / ±∞ → 1.0；其余 clamp 0.5–2.0。
+pub fn sanitize_scale(s: f32) -> f32 {
+    if s.is_finite() { s.clamp(0.5, 2.0) } else { 1.0 }
+}
+
 pub fn set_scale(s: f32) {
-    SCALE_BITS.store(s.clamp(0.5, 2.0).to_bits(), Ordering::Relaxed);
+    SCALE_BITS.store(sanitize_scale(s).to_bits(), Ordering::Relaxed);
+}
+
+pub fn scaled(base: f32, scale: f32) -> f32 {
+    base * scale
 }
 
 pub fn size(base: f32) -> f32 {
-    base * scale()
+    scaled(base, scale())
 }
 
 pub fn id(base: f32) -> egui::FontId {
     egui::FontId::proportional(size(base))
 }
+
+#[cfg(test)]
+pub(crate) fn with_test_scale<T>(scale: f32, f: impl FnOnce() -> T) -> T { /* 覆盖→f→还原 */ }
 ```
 
-`ui/mod.rs`：`install_base_text_styles` 的 11/15/15/20/15 改为 `font::size(...)`；`App::new` 先 `font::set_scale(settings.font_size.scale())`，再 `install_base_text_styles`。
+生产写入点仅两处：启动读取设置、Task 5 设置页改字号（后者还需重装基础样式）。
+`ui/mod.rs`：`install_base_text_styles` 使用纯函数 `base_text_sizes(scale)` 的
+11/15/15/20/15 基准 × 倍率；`App::new` 先 `font::set_scale(settings.font_size.scale())`，
+再 `install_base_text_styles`。`ui/settings.rs` 标题改用 `font::id(TITLE_FONT)`。
 
-- [ ] **Step 4: 机械替换全部显式字号**
+- [x] **Step 4: 机械替换全部显式字号**
 
-Run: `rg -n "FontId::proportional|\.size\\(FONT_|\\.size\\(tk::FONT_" crates/app/src/ui`
+Run: `rg -n "FontId::proportional|\.size\(FONT_|\.size\(window_tokens::FONT_|\.size\(tk::FONT_|fn font\(" crates/app/src/ui`
 
-全部改为 `font::id(...)` / `.size(font::size(...))`；`palette.rs` 的 `font()` 与 `text_w()` 内部使用 `font::id/size`，避免双重缩放。逐个跑现有测试确认无回归。
+全部改为 `font::id(...)` / `.size(font::size(...))`；`palette.rs` 的 `font()` 与
+`text_w()` 内部使用 `font::id/size`，避免双重缩放；palette 空态 14pt 收进
+`ui/tokens.rs::FONT_EMPTY_TITLE`。逐个跑现有测试确认无回归。
 
-- [ ] **Step 5: 启动读取设置**
+- [x] **Step 5: 启动读取设置**
 
-`main.rs` 读取 `let settings = settings::load(&paths.data_dir);`，传给 `App::new`；`App::new` 应用字号并按 settings 初始化设置状态（本任务先只应用字号）。`SettingsFile` 后续由 Task 5 使用。
+`main.rs` 读取 `let settings = settings::load(&paths.data_dir);`，传给 `App::new`；
+`App::new` 应用字号并用 settings 初始化设置状态（本任务只应用启动字号；
+**运行期改字号仍属 Task 5**）。`SettingsState.file` 供 Task 4–5 读取。
 
-- [ ] **Step 6: 运行全量测试并提交**
+- [x] **Step 6: 运行全量测试并提交**
 
 Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: 全绿。
 
 ```bash
-git add crates/app/src/ui/font.rs crates/app/src/ui/mod.rs crates/app/src/ui/palette.rs crates/app/src/ui/results.rs crates/app/src/main.rs
+git add crates/app/src/ui/font.rs crates/app/src/ui/mod.rs crates/app/src/ui/palette.rs crates/app/src/ui/results.rs crates/app/src/main.rs crates/app/src/ui/settings.rs
 git commit -m "feat(app): 全局字号倍率基础设施"
 ```
+
+**验证记录（2026-10-18，复查修复后）：** fmt / clippy 通过；
+`cargo test --workspace` 全绿：workspace 298 passed / 5 ignored，其中
+`macEverything-app` 188 passed / 3 ignored（含 font 单测 4 个、基础样式端到端 1 个）。
 
 ---
 

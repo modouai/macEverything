@@ -871,6 +871,58 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// 端到端：两主题的五档基础字号均按全局倍率安装，family 保持。
+    ///
+    /// 非默认倍率只用线程局部覆盖（`with_test_scale`），不写进程级原子。
+    #[test]
+    fn install_base_text_styles_scales_both_themes() {
+        let ctx = egui::Context::default();
+        let expected = [
+            (egui::TextStyle::Small, egui::FontFamily::Proportional, 11.0),
+            (egui::TextStyle::Body, egui::FontFamily::Proportional, 15.0),
+            (
+                egui::TextStyle::Button,
+                egui::FontFamily::Proportional,
+                15.0,
+            ),
+            (
+                egui::TextStyle::Heading,
+                egui::FontFamily::Proportional,
+                20.0,
+            ),
+            (
+                egui::TextStyle::Monospace,
+                egui::FontFamily::Monospace,
+                15.0,
+            ),
+        ];
+
+        for scale in [1.0, 1.15] {
+            font::with_test_scale(scale, || {
+                install_base_text_styles(&ctx);
+                for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                    let style = ctx.style_of(theme);
+                    for (text_style, family, base) in &expected {
+                        let installed = style
+                            .text_styles
+                            .get(text_style)
+                            .unwrap_or_else(|| panic!("{theme:?} 缺少 {text_style:?} 基础字号"));
+                        assert!(
+                            (installed.size - base * scale).abs() < 1e-5,
+                            "{theme:?} {text_style:?}: 期望 {}×{scale}，实际 {}",
+                            base,
+                            installed.size
+                        );
+                        assert_eq!(
+                            &installed.family, family,
+                            "{theme:?} {text_style:?} family 不得改变"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。
     #[test]
     fn base_text_sizes_follow_scale() {

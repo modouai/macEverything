@@ -111,11 +111,16 @@ pub fn palette(is_dark: bool) -> Palette {
 }
 
 // —— 字号（§4.3，逻辑点）——
+//
+// **全部为基准点（base pt），不是最终 pt**：绘制与测量必须经 `font::size` /
+// `font::id` 乘全局倍率（设置 · 字号）；几何尺寸不随字号缩放。
 pub const FONT_QUERY: f32 = 21.0;
 pub const FONT_FILENAME: f32 = 15.0;
 pub const FONT_DIR: f32 = 12.0;
 pub const FONT_HINT: f32 = 12.0; // 动作提示 / 页脚标签 / 结果计数
 pub const FONT_KEYCAP: f32 = 11.0; // 键帽 / 状态角标
+/// 悬浮条空态主文案（§2.7：14pt 基准）。
+pub const FONT_EMPTY_TITLE: f32 = 14.0;
 
 // —— 几何（§2.2/§2.3/§2.4/§2.5）——
 pub const PANEL_W: f32 = 700.0;

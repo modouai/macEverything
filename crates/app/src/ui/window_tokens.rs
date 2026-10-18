@@ -113,6 +113,9 @@ pub fn palette(is_dark: bool) -> FullWindowPalette {
 }
 
 // —— 字号（§4.3，逻辑点）——
+//
+// **全部为基准点（base pt），不是最终 pt**：绘制与测量必须经 `font::size` /
+// `font::id` 乘全局倍率（设置 · 字号）；几何尺寸不随字号缩放。
 pub const FONT_QUERY: f32 = 14.0;
 pub const FONT_FILENAME: f32 = 13.0;
 /// 表头 / 大小 / 修改时间 / 路径 / 空态副文案。
