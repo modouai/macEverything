@@ -12,6 +12,7 @@
 //! `SpaceExemptDecider`(纯逻辑,本文件)按「同一次过渡 + 豁免一次」判定失焦是否豁免。
 //! 实机实测通知晚于失焦约 +270~380ms(全屏 Space 进出两例),故判据以失焦时刻为锚。
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -94,6 +95,22 @@ impl SpaceExemptDecider {
         }
         self.consumed_seq = Some(c.seq);
         true
+    }
+}
+
+/// 系统目录选择器（主线程；取消/失败 = None）。非 macOS = None。
+///
+/// 原生 `NSOpenPanel` 模态面板：仅目录、单选。阻塞返回——调用方须在主线程
+/// （egui 绘制/事件处理中）调用。
+#[allow(dead_code)] // E3(设置页“添加目录”)接线前暂未调用
+pub fn pick_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::pick_directory()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 

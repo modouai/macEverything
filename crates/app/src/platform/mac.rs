@@ -32,6 +32,7 @@
 //! `Mutex`(通知投递线程文档未承诺为主线程,不预设前提)。
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
@@ -42,8 +43,8 @@ use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel,
-    NSImage, NSMenu, NSMenuItem, NSPanel, NSResponder, NSScreen, NSView,
-    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSImage, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPanel, NSResponder, NSScreen,
+    NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
     NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
     NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
@@ -560,6 +561,50 @@ fn settings_origin(visible: NSRect, w: f64, h: f64) -> NSPoint {
         top_anchored_y
     };
     NSPoint::new(x, y)
+}
+
+/// 系统目录选择器(阻塞;仅主线程调用——调用点须在 egui 主线程)。
+///
+/// 取消/失败 = None。实现:
+/// ① 先激活 app:面板是独立窗口,app 不在前台时可能落在其他窗口之后;
+/// ② `NSOpenPanel::openPanel`(系统共享面板)→ 仅目录、单选、不选文件;
+/// ③ `runModal()` 阻塞至用户确认/取消;`NSModalResponseOK` 才取首个 URL 的
+///   本地路径(`NSURL.path`,已解码百分号转义);其余响应留痕返回 None。
+///
+/// 面板期间 egui 冻结(嵌套 run loop),与右键菜单/托盘菜单同款模态语义
+/// (关闭后当帧恢复);产品接受。
+#[allow(dead_code)] // E3(设置页“添加目录”)接线前暂未调用
+pub fn pick_directory() -> Option<PathBuf> {
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::warn!("目录选择器:非主线程调用,忽略");
+        return None;
+    };
+    // 先激活:不激活时面板可能被其他 app 的窗口挡住(用户误以为没弹出)。
+    NSApplication::sharedApplication(mtm).activate();
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseFiles(false);
+    panel.setCanChooseDirectories(true);
+    panel.setAllowsMultipleSelection(false);
+    let response = panel.runModal(); // 阻塞:嵌套 run loop,返回即面板关闭
+    if response != NSModalResponseOK {
+        log::info!("目录选择器:取消/未确认(response={response})");
+        return None;
+    }
+    let Some(url) = panel.URLs().firstObject() else {
+        log::warn!("目录选择器:已确认但未返回 URL");
+        return None;
+    };
+    let Some(path) = url.path() else {
+        log::warn!("目录选择器:所选 URL 无本地路径");
+        return None;
+    };
+    let path = PathBuf::from(path.to_string());
+    if path.as_os_str().is_empty() {
+        log::warn!("目录选择器:所选目录路径为空");
+        return None;
+    }
+    log::info!("目录选择器:选中 {path:?}");
+    Some(path)
 }
 
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。

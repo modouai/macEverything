@@ -51,6 +51,12 @@ objc2-app-kit = { version = "0.3", features = [
     # Task 5 结果行真实图标:iconForContentType(UTI) 的 cfg 门槛(0.3.2 源码
     # NSWorkspace.rs:132 要求 NSImage + objc2-uniform-type-identifiers 两个 feature)。
     "objc2-uniform-type-identifiers",
+    # Task E2 原生目录选择器:NSOpenPanel + runModal/URLs/path。0.3.2 生成的
+    # NSOpenPanel impl 块还要求 NSSavePanel 与超类 NSPanel/NSResponder/NSWindow
+    # 同在(前三者已列,补 NSSavePanel);打开的 "NSOpenPanel" 门控模块本身只
+    # 连带 foundation 的 NSArray/NSURL 等。
+    "NSOpenPanel",
+    "NSSavePanel",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification
