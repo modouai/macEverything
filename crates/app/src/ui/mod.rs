@@ -102,6 +102,21 @@ const CJK_FONT_CANDIDATES: [&str; 2] = [
     "/System/Library/Fonts/STHeiti Light.ttc", // 黑体(旧备选)
 ];
 
+/// macOS 原生 UI 字体：拉丁优先 SF Pro / SF Mono；CJK 缺失字形仍由
+/// `system_fonts` 的 CoreText 回退（苹方/AppleSDGothicNeo 等）。
+const SYSTEM_UI_FONT_SPECS: [(&str, &str, egui::FontFamily); 2] = [
+    (
+        "SF Pro",
+        "/System/Library/Fonts/SFNS.ttf",
+        egui::FontFamily::Proportional,
+    ),
+    (
+        "SF Mono",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        egui::FontFamily::Monospace,
+    ),
+];
+
 /// 首帧接线轮询上限(悬浮条视口窗创建于注册 pass 之后,补丁须下一帧才找得到;
 /// 上限防「窗口永不出现」时无限排帧烧 CPU)。
 const PATCH_ATTACH_ATTEMPTS: u32 = 300;
@@ -117,6 +132,31 @@ fn probe_fonts() {
                 "不存在"
             }
         );
+    }
+}
+
+/// 安装 macOS 原生 UI 字体（拉丁主字体）。
+///
+/// 只把 SF Pro / SF Mono 放到对应 family 的**首位**，保留 egui 默认字体与
+/// system_fonts 回退链；中文等 CJK 字形仍由 CoreText 回退到苹方。
+fn install_system_ui_fonts(ctx: &egui::Context) {
+    for (name, path, family) in SYSTEM_UI_FONT_SPECS {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                ctx.add_font(egui::FontInsert::new(
+                    name,
+                    egui::FontData::from_owned(bytes),
+                    vec![egui::InsertFontFamily {
+                        family,
+                        priority: egui::FontPriority::Highest,
+                    }],
+                ));
+                log::info!("系统 UI 字体已加载:{name}({path})");
+            }
+            Err(err) => {
+                log::warn!("系统 UI 字体加载失败({path}),保留 egui 默认字体: {err}");
+            }
+        }
     }
 }
 
@@ -402,6 +442,8 @@ impl App {
         tray: Option<tray::TrayRuntime>,
     ) -> Self {
         probe_fonts();
+        // 拉丁主字体用 macOS 原生 SF Pro / SF Mono；CJK 仍走系统回退。
+        install_system_ui_fonts(&cc.egui_ctx);
         // 全局字号倍率先于基准安装（设置 · 字号：只缩放文字，几何尺寸不变）。
         font::set_scale(settings_file.font_size.scale());
         // 字号基准(全局长大两号);悬浮条另有更细的字号档(ui/palette.rs 常量)。
@@ -1312,6 +1354,51 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// macOS 原生拉丁字体：SF Pro / SF Mono 必须排在 family 首位，且能实际排版
+    /// （中文仍由 system_fonts 回退，不要求出现在定义表里）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_ui_fonts_are_primary_and_rasterize() {
+        for (name, path, _) in SYSTEM_UI_FONT_SPECS {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "{name} 字体不存在: {path}"
+            );
+        }
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input(), |_ui| {});
+        out.textures_delta.clear();
+        install_system_ui_fonts(&ctx);
+        let mut out = ctx.run_ui(input(), |_ui| {});
+        out.textures_delta.clear();
+
+        let (families, galley) = ctx.fonts_mut(|fonts| {
+            let families = fonts.definitions().families.clone();
+            let galley = fonts.layout_no_wrap(
+                "English 中文 123".to_owned(),
+                egui::FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+            (families, galley)
+        });
+        for (name, _, family) in SYSTEM_UI_FONT_SPECS {
+            let list = families.get(&family).expect("字体 family 缺失");
+            assert_eq!(
+                list.first().map(String::as_str),
+                Some(name),
+                "{family:?} 首位应为 {name}，实际 {list:?}"
+            );
+        }
+        assert!(galley.size().x > 0.0, "SF Pro 排版失败（空 galley）");
     }
 
     /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。
