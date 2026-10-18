@@ -1518,7 +1518,8 @@ pub(crate) fn engine_status(paths: &DaemonPaths) -> Option<EngineStatus> {
 }
 
 /// 默认应用打开(reveal=false → 目录 = 访达进入)或访达显示(reveal=true,`open -R`)。
-/// 悬浮条与完整窗口共用(勿复制第二份);失败返回按当前语言渲染的错误。
+/// 悬浮条与完整窗口共用(勿复制第二份);失败返回 [`OpenError`]，由
+/// [`OpenError::text`] 在绘制时按当前语言渲染。
 pub(crate) fn open_path(path: &str, reveal: bool) -> Result<(), OpenError> {
     if std::fs::metadata(path).is_err() {
         return Err(OpenError::FileMissing);
@@ -1801,6 +1802,10 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
     );
     let p = ui.painter();
     p.rect_filled(rect, 0, t.footer_fill);
+    let count_text = has_query.then(|| i18n::format::total_items(total));
+    let count_w = count_text
+        .as_deref()
+        .map_or(0.0, |text| text_w(ui, text, FONT_META));
     let groups = footer_groups();
     let mut cursor = rect.max.x - tk::FOOTER_PAD_X;
     for (gi, (label, key)) in groups.iter().enumerate() {
@@ -1808,8 +1813,8 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
         let lw = text_w(ui, label, FONT_META);
         let gw = lw + tk::KEYCAP_GAP + kw;
         let last = gi == groups.len() - 1;
-        // 窄屏裁减：为左端计数预留 120px；「打开」无论如何保留
-        if !last && cursor - gw < rect.min.x + 120.0 {
+        // 窄屏裁减：按左端计数实测宽预留；「打开」无论如何保留
+        if !last && cursor - gw < rect.min.x + tk::FOOTER_PAD_X + count_w + tk::FOOTER_GAP {
             break;
         }
         let chip = egui::Rect::from_center_size(
@@ -1838,11 +1843,11 @@ fn draw_footer(ui: &mut egui::Ui, has_query: bool, total: u32, t: &tk::Palette) 
         cursor -= gw + tk::FOOTER_GAP;
     }
     // 左：结果计数（空词隐藏；无匹配项显示「共 0 项」）
-    if has_query {
+    if let Some(count_text) = &count_text {
         p.text(
             egui::pos2(rect.min.x + tk::FOOTER_PAD_X, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            i18n::format::total_items(total),
+            count_text,
             font(FONT_META),
             t.footer_label,
         );
@@ -1883,7 +1888,7 @@ mod tests {
             assert_eq!(action_hint(false), "打开", "文件动作提示应为「打开」");
         });
         i18n::with_lang(i18n::Lang::En, || {
-            assert_eq!(action_hint(true), "Open Folder");
+            assert_eq!(action_hint(true), "Enter");
             assert_eq!(action_hint(false), "Open");
         });
     }
@@ -1912,6 +1917,63 @@ mod tests {
                     ("Open", "↵"),
                 ]
             );
+        });
+    }
+
+    /// 英文尺寸回归：动作提示不超预留宽；页脚计数与组在最小/最大面板宽内放得下。
+    #[test]
+    fn english_footer_and_action_hint_fit_widths() {
+        i18n::with_lang(i18n::Lang::En, || {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(PANEL_W, 200.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let hint_w = text_w(ui, action_hint(true), FONT_META);
+                assert!(
+                    hint_w <= tk::ACTION_HINT_W,
+                    "动作提示宽 {hint_w} 超过预留 {}",
+                    tk::ACTION_HINT_W
+                );
+
+                // 与 draw_footer 同口径的组宽（标签 + 间距 + 键帽 + 内边距）。
+                let groups = footer_groups();
+                let widths: Vec<f32> = groups
+                    .iter()
+                    .map(|(label, key)| {
+                        text_w(ui, label, FONT_META)
+                            + tk::KEYCAP_GAP
+                            + text_w(ui, key, FONT_KEYCAP)
+                            + 2.0 * tk::KEYCAP_PAD.1
+                    })
+                    .collect();
+                let count = i18n::format::total_items(2);
+                let count_w = text_w(ui, &count, FONT_META);
+
+                // 窄屏：计数 + 最后一组（「Open」）+ 两侧内边距 + 组前间距，
+                // 即 draw_footer 的裁减阈值（不写死像素）。
+                let min_needed =
+                    count_w + widths[widths.len() - 1] + 2.0 * tk::FOOTER_PAD_X + tk::FOOTER_GAP;
+                assert!(
+                    min_needed <= PANEL_MIN_W,
+                    "最小宽放不下计数 + 最后一组: {min_needed} > {PANEL_MIN_W}"
+                );
+
+                // 最大宽：计数 + 四组 + 组间距 + 两侧内边距。
+                let max_needed = count_w
+                    + widths.iter().sum::<f32>()
+                    + (groups.len() as f32 - 1.0) * tk::FOOTER_GAP
+                    + 2.0 * tk::FOOTER_PAD_X;
+                assert!(
+                    max_needed <= PANEL_W,
+                    "最大宽放不下计数 + 四组: {max_needed} > {PANEL_W}"
+                );
+            });
+            out.textures_delta.clear();
         });
     }
 

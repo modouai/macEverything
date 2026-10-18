@@ -1541,7 +1541,7 @@ mod tests {
             palette,
         )
         .unwrap_err();
-        assert!(err.contains("另一个功能"), "{err}");
+        assert_eq!(err, "该快捷键已用于另一个功能");
         assert_eq!(
             active,
             ActiveKeys {
@@ -1565,7 +1565,7 @@ mod tests {
             palette,
         )
         .unwrap_err();
-        assert!(err.contains("另一个功能"), "{err}");
+        assert_eq!(err, "该快捷键已用于另一个功能");
         assert!(suspended.is_none(), "失败须退出挂起");
         assert_eq!(
             active,
@@ -1577,6 +1577,28 @@ mod tests {
         );
         assert!(reg.registered.contains(&palette));
         assert!(reg.registered.contains(&window));
+
+        // 英文路径同样走目录（删除 `i18n::s().hotkey_duplicate` 即红）。
+        i18n::with_lang(i18n::Lang::En, || {
+            let mut active = ActiveKeys {
+                palette: Some(palette),
+                window: Some(window),
+            };
+            let mut suspended = None;
+            let mut reg = FakeRegistrar {
+                registered: vec![palette, window],
+                ..FakeRegistrar::default()
+            };
+            let err = plan_commit(
+                &mut reg,
+                &mut active,
+                &mut suspended,
+                HotkeySlot::Window,
+                palette,
+            )
+            .unwrap_err();
+            assert_eq!(err, "This shortcut is already used for another feature");
+        });
     }
 
     /// 提交(挂起态)校验失败(越界键):同样恢复旧键并退出挂起,不丢热键。
@@ -1675,7 +1697,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("注册失败"), "{err}");
+        assert!(
+            err.starts_with("注册失败(可能被系统或其他应用占用): "),
+            "{err}"
+        );
         assert_eq!(
             active,
             ActiveKeys {
@@ -1686,6 +1711,34 @@ mod tests {
         );
         assert_eq!(reg.registered, vec![old_palette]);
         assert!(suspended.is_none());
+
+        // 英文路径同样走目录（删除 `i18n::s().hotkey_register_failed` 即红）。
+        i18n::with_lang(i18n::Lang::En, || {
+            let mut active = ActiveKeys {
+                palette: Some(old_palette),
+                window: None,
+            };
+            let mut suspended = None;
+            let mut reg = FakeRegistrar {
+                registered: vec![old_palette],
+                fail_register: vec![new_palette],
+                ..FakeRegistrar::default()
+            };
+            let err = plan_commit(
+                &mut reg,
+                &mut active,
+                &mut suspended,
+                HotkeySlot::Palette,
+                new_palette,
+            )
+            .unwrap_err();
+            assert!(
+                err.starts_with(
+                    "Registration failed (it may be in use by the system or another app): "
+                ),
+                "{err}"
+            );
+        });
     }
 
     /// 提交(挂起态):重新注册另一槽旧键 + 新键;成功后退出挂起。
@@ -2367,7 +2420,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("恢复默认快捷键失败"), "{err}");
+        assert!(
+            err.starts_with("恢复默认快捷键失败(可能被系统或其他应用占用): "),
+            "{err}"
+        );
         assert_eq!(active.palette, Some(old_palette), "失败不得动旧键");
         assert_eq!(active.window, Some(old_window));
         assert_eq!(
@@ -2397,10 +2453,43 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("恢复默认快捷键失败"), "{err}");
+        assert!(
+            err.starts_with("恢复默认快捷键失败(可能被系统或其他应用占用): "),
+            "{err}"
+        );
         assert_eq!(active.window, Some(old_window));
         assert!(reg.registered.contains(&old_window));
         assert!(!reg.registered.contains(&direct));
+
+        // 英文路径同样走目录（删除 `i18n::s().hotkey_reset_failed` 即红）。
+        i18n::with_lang(i18n::Lang::En, || {
+            let direct = window_default();
+            let mut active = ActiveKeys {
+                palette: Some(old_palette),
+                window: Some(old_window),
+            };
+            let mut suspended = None;
+            let mut reg = FakeRegistrar {
+                registered: vec![old_palette, old_window],
+                fail_register: vec![direct],
+                ..FakeRegistrar::default()
+            };
+            let err = plan_reset(
+                &mut reg,
+                &mut active,
+                &mut suspended,
+                HotkeySlot::Window,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.starts_with(
+                    "Failed to restore the default shortcut (it may be in use by the system or another app): "
+                ),
+                "{err}"
+            );
+        });
     }
 
     /// 默认链降级:⌥Space 被占 → 用 ⌥⇧Space,快照 note 如实提示。
@@ -2515,21 +2604,39 @@ mod tests {
         }
     }
 
-    /// 默认候选全部失败的内层原因文案随语言切换（reset 失败路径）。
+    /// 默认候选全部失败：驱动 `plan_reset`/`reset_failed`，内层原因随语言切换。
     #[test]
     fn all_candidates_unavailable_message_is_localized() {
-        i18n::with_lang(i18n::Lang::ZhHans, || {
-            assert_eq!(
-                i18n::s().hotkey_all_candidates_unavailable,
-                "候选快捷键均不可用"
-            );
-        });
-        i18n::with_lang(i18n::Lang::En, || {
-            assert_eq!(
-                i18n::s().hotkey_all_candidates_unavailable,
-                "No shortcut candidates are available"
-            );
-        });
+        let failures: Vec<HotKey> = candidates()
+            .iter()
+            .map(|&(mods, code, _)| HotKey::new(Some(mods), code))
+            .collect();
+        for (lang, expected) in [
+            (
+                i18n::Lang::ZhHans,
+                "恢复默认快捷键失败(可能被系统或其他应用占用): 候选快捷键均不可用",
+            ),
+            (
+                i18n::Lang::En,
+                "Failed to restore the default shortcut (it may be in use by the system or another app): No shortcut candidates are available",
+            ),
+        ] {
+            i18n::with_lang(lang, || {
+                let mut active = ActiveKeys::default();
+                let mut suspended = None;
+                let mut reg = FakeRegistrar::failing(&failures);
+                let err = plan_reset(
+                    &mut reg,
+                    &mut active,
+                    &mut suspended,
+                    HotkeySlot::Palette,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+                assert_eq!(err, expected);
+            });
+        }
     }
 
     /// 挂起态 reset 失败(两槽分别):退出挂起并尽力恢复两个旧键。

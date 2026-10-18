@@ -29,7 +29,7 @@ pub enum LaunchError {
     NotFound { tried: Vec<PathBuf> },
     LocateApp,
     Start,
-    Timeout,
+    Timeout { log: PathBuf },
 }
 
 impl std::fmt::Display for LaunchError {
@@ -46,7 +46,14 @@ impl std::fmt::Display for LaunchError {
             }
             Self::LocateApp => f.write_str(i18n::s().engine_locate_app_failed),
             Self::Start => f.write_str(i18n::s().engine_start_failed),
-            Self::Timeout => f.write_str(i18n::s().engine_start_timeout),
+            Self::Timeout { log } => {
+                write!(f, "{}: ", i18n::s().engine_start_timeout)?;
+                let log = log.display().to_string();
+                f.write_str(&i18n::fill(
+                    i18n::s().engine_start_timeout_hint,
+                    &[("log", log.as_str())],
+                ))
+            }
         }
     }
 }
@@ -153,14 +160,17 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    log::error!(
+    log::warn!(
         "引擎进程已拉起({}),但 {} 秒内未能连接引擎 socket({});请查看 {} 了解启动失败原因",
         cand.display(),
         POLL_TIMEOUT.as_secs(),
         paths.socket().display(),
         paths.log_file().display()
     );
-    Err(LaunchError::Timeout.into())
+    Err(LaunchError::Timeout {
+        log: paths.log_file(),
+    }
+    .into())
 }
 
 #[cfg(test)]
@@ -238,6 +248,7 @@ mod tests {
             PathBuf::from("/a/bin/macEverything"),
             PathBuf::from("/b/bin/macEverything"),
         ];
+        let log = PathBuf::from("/tmp/mce/daemon.log");
         i18n::with_lang(i18n::Lang::ZhHans, || {
             let msg = LaunchError::NotFound {
                 tried: tried.clone(),
@@ -253,8 +264,8 @@ mod tests {
             );
             assert_eq!(LaunchError::Start.to_string(), "启动引擎失败");
             assert_eq!(
-                LaunchError::Timeout.to_string(),
-                "引擎进程已拉起,但未能连接引擎 socket"
+                LaunchError::Timeout { log: log.clone() }.to_string(),
+                "引擎进程已拉起,但未能连接引擎 socket: 请查看 /tmp/mce/daemon.log 了解启动失败原因"
             );
         });
         i18n::with_lang(i18n::Lang::En, || {
@@ -278,8 +289,8 @@ mod tests {
             );
             assert_eq!(LaunchError::Start.to_string(), "Failed to start the engine");
             assert_eq!(
-                LaunchError::Timeout.to_string(),
-                "The engine process started but did not accept connections"
+                LaunchError::Timeout { log: log.clone() }.to_string(),
+                "The engine process started but did not accept connections: See /tmp/mce/daemon.log for details"
             );
         });
     }

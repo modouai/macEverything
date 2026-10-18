@@ -169,6 +169,7 @@ catalog! {
     engine_locate_app_failed: "定位 App 可执行文件失败" / "Could not locate the app executable",
     engine_start_failed: "启动引擎失败" / "Failed to start the engine",
     engine_start_timeout: "引擎进程已拉起,但未能连接引擎 socket" / "The engine process started but did not accept connections",
+    engine_start_timeout_hint: "请查看 {log} 了解启动失败原因" / "See {log} for details",
     engine_restart_failed: "引擎重启失败" / "Failed to restart the engine",
     // 热键校验/运行时错误（一次性）
     hotkey_needs_modifier: "需包含修饰键" / "A modifier key is required",
@@ -184,7 +185,7 @@ catalog! {
     // 悬浮条打开失败（应用自产）
     palette_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
     palette_open_failed: "打开失败" / "Failed to open",
-    palette_action_enter: "进入" / "Open Folder",
+    palette_action_enter: "进入" / "Enter",
     palette_action_open: "打开" / "Open",
     palette_footer_hide: "隐藏" / "Hide",
     palette_footer_full_window: "完整窗口" / "Full Window",
