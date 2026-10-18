@@ -2,29 +2,35 @@
 //!
 //! 录制层拿到的是一次 egui 按键事件（`egui::Key` + 当时修饰态），落盘/注册层用
 //! `global_hotkey::hotkey::HotKey`；本模块是两层之间唯一的翻译点：
-//! [`from_egui`] 白名单映射 + 必须含修饰键，[`validate`] 在注册/持久化前复核，
-//! [`display_keys`] 只负责设置页键帽文案（macOS 符号 + 可读键名），与 `HotKey`
-//! 的 serde 规范串（如 `alt+Space`）彼此独立。
+//! [`from_egui`] 白名单映射 + 必须含修饰键，[`validate`] 在注册/持久化前复核
+//! （同一张白名单 + 修饰键），[`display_keys`] 只负责设置页键帽文案（macOS 符号 +
+//! 可读键名），与 `HotKey` 的 serde 规范串（如 `alt+Space`）彼此独立。
 //!
 //! 支持面刻意收窄：A–Z、0–9、F1–F12、Space/Enter/Tab、方向键、Home/End/
 //! PageUp/PageDown 与主键区常见标点。媒体键、浏览器键等一律拒绝（需求未列出的
-//! 键不做「顺手支持」）。
+//! 键不做「顺手支持」）。白名单是 [`SUPPORTED_KEYS`] 唯一真源：录制映射与
+//! `settings.toml` 校验共用，手工编辑写入的 Escape 等越界键会在注册前被拒。
+
+use std::fmt;
 
 use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 
 /// 快捷键校验错误；`.0` 即直接展示给用户的中文文案。
-// H1 只交付纯映射层,消费方(H2 运行时/H3 录制)尚未接线——本模块在非测试构建
-// 里暂无调用点。以下逐项 allow 是临时哨兵,接入后删除,勿改为模块级 allow。
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyError(pub &'static str);
 
+impl fmt::Display for HotkeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for HotkeyError {}
+
 /// 未按任何修饰键。
-#[allow(dead_code)]
 const NO_MODIFIER: HotkeyError = HotkeyError("需包含修饰键");
 /// 键位不在白名单内。
-#[allow(dead_code)]
 const UNSUPPORTED_KEY: HotkeyError = HotkeyError("不支持该键");
 
 /// 把一次 egui 按键事件翻译成全局热键。
@@ -32,6 +38,8 @@ const UNSUPPORTED_KEY: HotkeyError = HotkeyError("不支持该键");
 /// `key` 必须是**非修饰键**的实际按键，修饰键只从 `mods` 读取。白名单外的键
 /// （纯修饰键、F13+、媒体键、未列入的标点等）→「不支持该键」；白名单键但
 /// 未按任何修饰键 →「需包含修饰键」。
+// H3 录制层尚未接线，本函数在非测试构建里暂无调用点；allow 是临时哨兵，
+// 接入后删除（validate/display_keys 已由 H2 运行时使用）。
 #[allow(dead_code)]
 pub fn from_egui(key: egui::Key, mods: egui::Modifiers) -> Result<HotKey, HotkeyError> {
     let code = code_from_egui(key)?;
@@ -59,17 +67,20 @@ pub fn from_egui(key: egui::Key, mods: egui::Modifiers) -> Result<HotKey, Hotkey
     Ok(HotKey::new(Some(hotkey_mods), code))
 }
 
-/// 注册/持久化前复核：必须至少含一个修饰键（键位由 [`from_egui`] 白名单保证）。
-#[allow(dead_code)]
+/// 注册/持久化前复核：必须至少含一个修饰键，且键位在 [`from_egui`] 的同一白名单
+/// （[`SUPPORTED_KEYS`]）内。手工编辑 `settings.toml` 写入的 Escape/媒体键等会在
+/// 注册前被拒，由调用方回落默认键并提示。
 pub fn validate(hotkey: HotKey) -> Result<(), HotkeyError> {
     if hotkey.mods.is_empty() {
         return Err(NO_MODIFIER);
+    }
+    if !is_supported_code(hotkey.key) {
+        return Err(UNSUPPORTED_KEY);
     }
     Ok(())
 }
 
 /// 键帽展示：macOS 符号按 ⌃⌥⇧⌘ 顺序 + 可读键名。
-#[allow(dead_code)]
 pub fn display_keys(hotkey: HotKey) -> Vec<String> {
     let mut keys = Vec::with_capacity(5);
     if hotkey.mods.contains(Modifiers::CONTROL) {
@@ -88,83 +99,96 @@ pub fn display_keys(hotkey: HotKey) -> Vec<String> {
     keys
 }
 
-/// egui 逻辑键 → keyboard-types 物理键位（H1 白名单）。
+/// 支持键位唯一真源：egui 录制映射与 `settings.toml` 校验共用同一张表。
+///
+/// 增删键位只改这里——[`from_egui`] 与 [`validate`] 自动保持一致。
+const SUPPORTED_KEYS: &[(egui::Key, Code)] = &[
+    (egui::Key::A, Code::KeyA),
+    (egui::Key::B, Code::KeyB),
+    (egui::Key::C, Code::KeyC),
+    (egui::Key::D, Code::KeyD),
+    (egui::Key::E, Code::KeyE),
+    (egui::Key::F, Code::KeyF),
+    (egui::Key::G, Code::KeyG),
+    (egui::Key::H, Code::KeyH),
+    (egui::Key::I, Code::KeyI),
+    (egui::Key::J, Code::KeyJ),
+    (egui::Key::K, Code::KeyK),
+    (egui::Key::L, Code::KeyL),
+    (egui::Key::M, Code::KeyM),
+    (egui::Key::N, Code::KeyN),
+    (egui::Key::O, Code::KeyO),
+    (egui::Key::P, Code::KeyP),
+    (egui::Key::Q, Code::KeyQ),
+    (egui::Key::R, Code::KeyR),
+    (egui::Key::S, Code::KeyS),
+    (egui::Key::T, Code::KeyT),
+    (egui::Key::U, Code::KeyU),
+    (egui::Key::V, Code::KeyV),
+    (egui::Key::W, Code::KeyW),
+    (egui::Key::X, Code::KeyX),
+    (egui::Key::Y, Code::KeyY),
+    (egui::Key::Z, Code::KeyZ),
+    (egui::Key::Num0, Code::Digit0),
+    (egui::Key::Num1, Code::Digit1),
+    (egui::Key::Num2, Code::Digit2),
+    (egui::Key::Num3, Code::Digit3),
+    (egui::Key::Num4, Code::Digit4),
+    (egui::Key::Num5, Code::Digit5),
+    (egui::Key::Num6, Code::Digit6),
+    (egui::Key::Num7, Code::Digit7),
+    (egui::Key::Num8, Code::Digit8),
+    (egui::Key::Num9, Code::Digit9),
+    (egui::Key::F1, Code::F1),
+    (egui::Key::F2, Code::F2),
+    (egui::Key::F3, Code::F3),
+    (egui::Key::F4, Code::F4),
+    (egui::Key::F5, Code::F5),
+    (egui::Key::F6, Code::F6),
+    (egui::Key::F7, Code::F7),
+    (egui::Key::F8, Code::F8),
+    (egui::Key::F9, Code::F9),
+    (egui::Key::F10, Code::F10),
+    (egui::Key::F11, Code::F11),
+    (egui::Key::F12, Code::F12),
+    (egui::Key::Space, Code::Space),
+    (egui::Key::Enter, Code::Enter),
+    (egui::Key::Tab, Code::Tab),
+    (egui::Key::ArrowDown, Code::ArrowDown),
+    (egui::Key::ArrowLeft, Code::ArrowLeft),
+    (egui::Key::ArrowRight, Code::ArrowRight),
+    (egui::Key::ArrowUp, Code::ArrowUp),
+    (egui::Key::Home, Code::Home),
+    (egui::Key::End, Code::End),
+    (egui::Key::PageUp, Code::PageUp),
+    (egui::Key::PageDown, Code::PageDown),
+    (egui::Key::Minus, Code::Minus),
+    (egui::Key::Equals, Code::Equal),
+    (egui::Key::OpenBracket, Code::BracketLeft),
+    (egui::Key::CloseBracket, Code::BracketRight),
+    (egui::Key::Backslash, Code::Backslash),
+    (egui::Key::Semicolon, Code::Semicolon),
+    (egui::Key::Quote, Code::Quote),
+    (egui::Key::Comma, Code::Comma),
+    (egui::Key::Period, Code::Period),
+    (egui::Key::Slash, Code::Slash),
+    (egui::Key::Backtick, Code::Backquote),
+];
+
+/// egui 逻辑键 → keyboard-types 物理键位（白名单查表）。
 #[allow(dead_code)]
 fn code_from_egui(key: egui::Key) -> Result<Code, HotkeyError> {
-    let code = match key {
-        egui::Key::A => Code::KeyA,
-        egui::Key::B => Code::KeyB,
-        egui::Key::C => Code::KeyC,
-        egui::Key::D => Code::KeyD,
-        egui::Key::E => Code::KeyE,
-        egui::Key::F => Code::KeyF,
-        egui::Key::G => Code::KeyG,
-        egui::Key::H => Code::KeyH,
-        egui::Key::I => Code::KeyI,
-        egui::Key::J => Code::KeyJ,
-        egui::Key::K => Code::KeyK,
-        egui::Key::L => Code::KeyL,
-        egui::Key::M => Code::KeyM,
-        egui::Key::N => Code::KeyN,
-        egui::Key::O => Code::KeyO,
-        egui::Key::P => Code::KeyP,
-        egui::Key::Q => Code::KeyQ,
-        egui::Key::R => Code::KeyR,
-        egui::Key::S => Code::KeyS,
-        egui::Key::T => Code::KeyT,
-        egui::Key::U => Code::KeyU,
-        egui::Key::V => Code::KeyV,
-        egui::Key::W => Code::KeyW,
-        egui::Key::X => Code::KeyX,
-        egui::Key::Y => Code::KeyY,
-        egui::Key::Z => Code::KeyZ,
-        egui::Key::Num0 => Code::Digit0,
-        egui::Key::Num1 => Code::Digit1,
-        egui::Key::Num2 => Code::Digit2,
-        egui::Key::Num3 => Code::Digit3,
-        egui::Key::Num4 => Code::Digit4,
-        egui::Key::Num5 => Code::Digit5,
-        egui::Key::Num6 => Code::Digit6,
-        egui::Key::Num7 => Code::Digit7,
-        egui::Key::Num8 => Code::Digit8,
-        egui::Key::Num9 => Code::Digit9,
-        egui::Key::F1 => Code::F1,
-        egui::Key::F2 => Code::F2,
-        egui::Key::F3 => Code::F3,
-        egui::Key::F4 => Code::F4,
-        egui::Key::F5 => Code::F5,
-        egui::Key::F6 => Code::F6,
-        egui::Key::F7 => Code::F7,
-        egui::Key::F8 => Code::F8,
-        egui::Key::F9 => Code::F9,
-        egui::Key::F10 => Code::F10,
-        egui::Key::F11 => Code::F11,
-        egui::Key::F12 => Code::F12,
-        egui::Key::Space => Code::Space,
-        egui::Key::Enter => Code::Enter,
-        egui::Key::Tab => Code::Tab,
-        egui::Key::ArrowDown => Code::ArrowDown,
-        egui::Key::ArrowLeft => Code::ArrowLeft,
-        egui::Key::ArrowRight => Code::ArrowRight,
-        egui::Key::ArrowUp => Code::ArrowUp,
-        egui::Key::Home => Code::Home,
-        egui::Key::End => Code::End,
-        egui::Key::PageUp => Code::PageUp,
-        egui::Key::PageDown => Code::PageDown,
-        egui::Key::Minus => Code::Minus,
-        egui::Key::Equals => Code::Equal,
-        egui::Key::OpenBracket => Code::BracketLeft,
-        egui::Key::CloseBracket => Code::BracketRight,
-        egui::Key::Backslash => Code::Backslash,
-        egui::Key::Semicolon => Code::Semicolon,
-        egui::Key::Quote => Code::Quote,
-        egui::Key::Comma => Code::Comma,
-        egui::Key::Period => Code::Period,
-        egui::Key::Slash => Code::Slash,
-        egui::Key::Backtick => Code::Backquote,
-        _ => return Err(UNSUPPORTED_KEY),
-    };
-    Ok(code)
+    SUPPORTED_KEYS
+        .iter()
+        .find_map(|&(egui_key, code)| (egui_key == key).then_some(code))
+        .ok_or(UNSUPPORTED_KEY)
+}
+
+/// 物理键位是否在录制白名单内（`settings.toml` 手工编辑校验用）。
+fn is_supported_code(code: Code) -> bool {
+    SUPPORTED_KEYS
+        .iter()
+        .any(|&(_, supported)| supported == code)
 }
 
 /// `Code` → 键帽可读名。白名单外的键（持久化文件陈旧/手工编辑）回落到
@@ -508,7 +532,7 @@ mod tests {
         assert_eq!(display_keys(window), ["⌥", "⇧", "F"]);
     }
 
-    /// validate：无修饰键 → 「需包含修饰键」；带修饰键 → Ok。
+    /// validate：无修饰键 → 「需包含修饰键」；白名单内带修饰键 → Ok。
     #[test]
     fn validate_requires_at_least_one_modifier() {
         for hotkey in [
@@ -520,5 +544,40 @@ mod tests {
 
         assert!(validate(HotKey::new(Some(Modifiers::ALT), Code::Space)).is_ok());
         assert!(validate(HotKey::new(Some(Modifiers::SUPER), Code::KeyF)).is_ok());
+    }
+
+    /// 手工编辑 settings.toml 写入白名单外的键（如 Escape）：
+    /// 校验拒绝、提示「不支持该键」；展示层仍回落 canonical 名，不 panic 不丢键。
+    #[test]
+    fn validate_rejects_unsupported_persisted_code_with_canonical_display() {
+        let escape = "alt+Escape".parse::<HotKey>().unwrap();
+        let err = validate(escape).unwrap_err();
+        assert_eq!(err, UNSUPPORTED_KEY);
+        assert_eq!(err.to_string(), "不支持该键");
+        assert_eq!(display_keys(escape), ["⌥", "Escape"], "展示回落规范名");
+
+        // 白名单内键位对照：同样带修饰键 → Ok。
+        assert!(validate("alt+Space".parse::<HotKey>().unwrap()).is_ok());
+    }
+
+    /// 每种 from_egui 映射出的键位都能通过 validate（两处共用 SUPPORTED_KEYS）。
+    #[test]
+    fn validate_accepts_every_recordable_key() {
+        for &(key, _) in SUPPORTED_KEYS {
+            let hotkey = from_egui(key, egui::Modifiers::ALT)
+                .unwrap_or_else(|err| panic!("{key:?} 应在白名单内: {err}"));
+            assert!(validate(hotkey).is_ok(), "{key:?} 映射结果须可注册");
+        }
+    }
+
+    /// HotkeyError 实现 Display + std::error::Error（H3 内联错误可直接 to_string）。
+    #[test]
+    fn hotkey_error_displays_user_facing_text() {
+        fn assert_error(err: &dyn std::error::Error) -> String {
+            err.to_string()
+        }
+
+        assert_eq!(assert_error(&NO_MODIFIER), "需包含修饰键");
+        assert_eq!(assert_error(&UNSUPPORTED_KEY), "不支持该键");
     }
 }

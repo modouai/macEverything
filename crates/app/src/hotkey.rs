@@ -9,6 +9,29 @@
 //! ⌥⇧F(product §2:字母键避开空格族的系统占用)独立注册;注册失败不降级
 //! (完整窗口入口仍有托盘与悬浮条 ⌥↵),日志留痕。
 //!
+//! ## 可重配置与启动偏好(设置 · 快捷键 Task H2)
+//!
+//! `settings.toml` 的 `palette_hotkey` / `window_hotkey` 存在时优先注册自定义键;
+//! 校验失败或注册失败(被占用等)回落该槽默认键并留提示:
+//! - 唤起槽回落 `candidates()` 降级链;
+//! - 完整窗口槽回落 [`direct_key`]。
+//!
+//! 未配置(默认)时行为与旧版一致。两个槽的当前键存于 `Arc<Mutex<ActiveKeys>>`,
+//! 事件泵每次事件读取**当前** id(不再捕获固定键);因此 [`HotkeyRuntime::commit`]
+//! 换键后泵立即生效。注册/注销必须回主线程执行:install / `App::logic` 之外的
+//! 设置 UI 不得直接调用 `suspend`/`resume`/`commit`(H3 通过命令队列交给 App)。
+//!
+//! ## 录制期与提交回滚(H3 依赖的语义)
+//!
+//! - [`HotkeyRuntime::suspend`][]:注销两槽并记住旧键(`suspended`),泵读到的 active
+//!   为空 → 录制按键不会触发旧动作;快照仍显示旧键(设置页录制中仍可看到另一槽)。
+//! - [`HotkeyRuntime::resume`][]:取消录制,重新注册旧键;尽力恢复,失败留提示。
+//! - [`HotkeyRuntime::commit`][]:校验白名单 + 拒绝与另一槽重复,再注册新键。
+//!   - 挂起态(正常录制路径):注销态下先注册另一槽旧键 + 新键;失败则注销新键、
+//!     尽力恢复两个旧键并**退出挂起**(`suspended = None`,H3 期望失败后旧键仍可用)。
+//!   - 非挂起态:旧键保持注册,直接注册新键;成功后才注销该槽旧键,失败不动旧键。
+//!     成功统一清空启动回退提示(`snapshot.note = None`)。
+//!
 //! ## 事件泵为什么必须带唤醒(与 plan 示意的差异,证据链)
 //!
 //! 1. Carbon 热键事件进 channel 的前提是主线程 AppKit 事件循环在派发(PoC-2 隔离
@@ -47,11 +70,14 @@
 //! 唤醒,CPU 0%(product §1 红线)。
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+
+use crate::settings::SettingsFile;
+use crate::ui::hotkey_keys;
 
 /// 候选热键(顺序 = 降级链;PoC-2 三候选注册 3/3 成功,默认取首个)。
 /// ⌃Space / ⌃⌥Space = 系统输入法切换、⌘Space / ⌘⌥Space = Spotlight(本机实测占用),
@@ -75,8 +101,16 @@ pub fn direct_key() -> (Modifiers, Code, &'static str) {
     (Modifiers::ALT | Modifiers::SHIFT, Code::KeyF, "⌥⇧F")
 }
 
-/// 全部候选注册失败时的悬浮条提示(托盘唤起 Task 16 接,先给文案)。
+/// 全部候选项注册失败时的悬浮条提示(托盘唤起 Task 16 接,先给文案)。
 pub const UNAVAILABLE_NOTE: &str = "快捷键不可用,可从托盘唤起";
+
+/// 完整窗口快捷键缺失/注册失败提示(仍有托盘与悬浮条 ⌥↵入口)。
+const WINDOW_UNAVAILABLE_NOTE: &str = "完整窗口快捷键不可用,可从托盘打开";
+
+/// 录制取消后旧键恢复失败提示(键可能已被其他应用抢占)。
+// H3 录制命令接入前,resume 在非测试构建里无调用点;临时 allow,接入后删除。
+#[allow(dead_code)]
+const RESUME_FAILED_NOTE: &str = "快捷键恢复失败,请重新录制";
 
 /// 热键动作(直调回调与兜底队列共用;ui 层按此分派到同一份实现)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,28 +121,108 @@ pub enum Action {
     OpenResults,
 }
 
+/// 可配置的两个热键槽(设置页录制与提交按此定位;H3 命令队列使用)。
+// H3 命令队列接入前非测试构建无调用点;临时 allow,接入后删除。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HotkeySlot {
+    /// 唤起/隐藏悬浮条。
+    Palette,
+    /// 完整窗口直达。
+    Window,
+}
+
+/// 当前注册的热键(事件泵每事件读取)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ActiveKeys {
+    palette: Option<HotKey>,
+    window: Option<HotKey>,
+}
+
+// 仅被 H2 运行时规划器（H3 接线前无外部调用点）与测试使用；临时 allow。
+#[allow(dead_code)]
+impl ActiveKeys {
+    fn get(self, slot: HotkeySlot) -> Option<HotKey> {
+        match slot {
+            HotkeySlot::Palette => self.palette,
+            HotkeySlot::Window => self.window,
+        }
+    }
+
+    fn set(&mut self, slot: HotkeySlot, hotkey: Option<HotKey>) {
+        match slot {
+            HotkeySlot::Palette => self.palette = hotkey,
+            HotkeySlot::Window => self.window = hotkey,
+        }
+    }
+
+    /// 另一槽的热键(重复校验用)。
+    fn other(self, slot: HotkeySlot) -> Option<HotKey> {
+        match slot {
+            HotkeySlot::Palette => self.window,
+            HotkeySlot::Window => self.palette,
+        }
+    }
+}
+
+/// 设置页展示/录制用的热键快照(纯数据;H3 消费)。
+///
+/// `palette_keys` / `window_keys` 是 macOS 键帽符号(⌃⌥⇧⌘ + 键名),槽位未注册时
+/// 为空 `Vec`;`note` 为启动回落/不可用提示,一切正常为 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HotkeySnapshot {
+    /// 唤起槽已注册键。
+    pub palette: Option<HotKey>,
+    /// 完整窗口槽已注册键。
+    pub window: Option<HotKey>,
+    /// 唤起槽键帽展示(如 `["⌥", "Space"]`)。
+    pub palette_keys: Vec<String>,
+    /// 完整窗口槽键帽展示(如 `["⌥", "⇧", "F"]`)。
+    pub window_keys: Vec<String>,
+    /// 启动回落/不可用提示;正常 = None。
+    pub note: Option<String>,
+}
+
+impl HotkeySnapshot {
+    fn from_active(active: ActiveKeys, note: Option<String>) -> Self {
+        Self {
+            palette: active.palette,
+            window: active.window,
+            palette_keys: active
+                .palette
+                .map(hotkey_keys::display_keys)
+                .unwrap_or_default(),
+            window_keys: active
+                .window
+                .map(hotkey_keys::display_keys)
+                .unwrap_or_default(),
+            note,
+        }
+    }
+}
+
 /// 主队列直调目标:主线程执行,返回 true = 已即时处理(不再入兜底队列)。
 pub type DispatchFn = Arc<dyn Fn(Action) -> bool + Send + Sync + 'static>;
 
-/// 按 `candidates()` 顺序注册,首个成功即返回 `(命中的 HotKey, 显示名)`;
-/// 全部失败 → `Err`(附逐个候选的失败原因)。
-///
-/// 必须在主线程调用(crate 文档:macOS 上 manager 须在主线程创建,且事件循环在跑)。
-pub fn register_default(manager: &GlobalHotKeyManager) -> anyhow::Result<(HotKey, String)> {
-    let mut failures = Vec::new();
-    for (mods, code, name) in candidates() {
-        let hotkey = HotKey::new(Some(mods), code);
-        match manager.register(hotkey) {
-            Ok(()) => return Ok((hotkey, name.to_string())),
-            // 注册失败信息不含 OSStatus 码(PoC-2 差异 #3):「被占用」与其它 OS 错误
-            // 无法区分,统一按注册失败降级。
-            Err(err) => failures.push(format!("{name}: {err}")),
-        }
+/// 注册/注销抽象:生产实现包 `GlobalHotKeyManager`,单测用假实现验证纯规划
+/// (不创建 manager、不碰系统热键,CI/无头环境可跑)。
+// unregister 仅由挂起/提交路径（H3 接线前无外部调用点）使用；临时 allow。
+#[allow(dead_code)]
+trait KeyRegistrar {
+    fn register(&mut self, hotkey: HotKey) -> Result<(), String>;
+    fn unregister(&mut self, hotkey: HotKey) -> Result<(), String>;
+}
+
+struct ManagerRegistrar<'a>(&'a GlobalHotKeyManager);
+
+impl KeyRegistrar for ManagerRegistrar<'_> {
+    fn register(&mut self, hotkey: HotKey) -> Result<(), String> {
+        self.0.register(hotkey).map_err(|err| err.to_string())
     }
-    Err(anyhow::anyhow!(
-        "候选热键全部注册失败({})",
-        failures.join(";")
-    ))
+
+    fn unregister(&mut self, hotkey: HotKey) -> Result<(), String> {
+        self.0.unregister(hotkey).map_err(|err| err.to_string())
+    }
 }
 
 /// 事件是否命中注册键的「按下」(Released 忽略:id 由 crate 计算勿自行拼,PoC-2 差异 #2)。
@@ -116,6 +230,17 @@ pub fn register_default(manager: &GlobalHotKeyManager) -> anyhow::Result<(HotKey
 /// key repeat:macOS 走 Carbon,长按不产生重复 Pressed(PoC-2 实测),故不设去抖。
 pub fn is_toggle_press(event: &GlobalHotKeyEvent, registered: HotKey) -> bool {
     event.state == HotKeyState::Pressed && event.id == registered.id()
+}
+
+/// 事件 + 当前 active 键 → 动作(泵线程纯判定;双槽未注册 = 无动作)。
+fn action_for(event: &GlobalHotKeyEvent, keys: ActiveKeys) -> Option<Action> {
+    if keys.palette.is_some_and(|key| is_toggle_press(event, key)) {
+        Some(Action::TogglePalette)
+    } else if keys.window.is_some_and(|key| is_toggle_press(event, key)) {
+        Some(Action::OpenResults)
+    } else {
+        None
+    }
 }
 
 /// 注册结果 → 悬浮条提示(纯逻辑):默认键正常 = 不打扰;降级/全失败 = 常驻提示。
@@ -128,15 +253,177 @@ fn note_for(registered: Option<&str>) -> Option<String> {
     }
 }
 
+/// 键帽符号串(提示文案用;如 `⌃⌥K`)。
+fn display_name(hotkey: HotKey) -> String {
+    hotkey_keys::display_keys(hotkey).concat()
+}
+
+/// 校验 + 注册:来自设置文件/录制的键必须先过白名单,再交给系统注册。
+fn register_checked<R: KeyRegistrar>(reg: &mut R, hotkey: HotKey) -> Result<(), String> {
+    hotkey_keys::validate(hotkey)
+        .map_err(|err| err.to_string())
+        .and_then(|()| reg.register(hotkey))
+}
+
+struct DefaultPalette {
+    hotkey: Option<HotKey>,
+    name: Option<&'static str>,
+}
+
+/// 按 `candidates()` 顺序注册,首个成功即返回;全部失败 → None。
+fn register_palette_default<R: KeyRegistrar>(reg: &mut R) -> DefaultPalette {
+    let mut failures = Vec::new();
+    for (mods, code, name) in candidates() {
+        let hotkey = HotKey::new(Some(mods), code);
+        match reg.register(hotkey) {
+            Ok(()) => {
+                return DefaultPalette {
+                    hotkey: Some(hotkey),
+                    name: Some(name),
+                }
+            }
+            // 注册失败信息不含 OSStatus 码(PoC-2 差异 #3):「被占用」与其它 OS 错误
+            // 无法区分,统一按注册失败降级。
+            Err(err) => failures.push(format!("{name}: {err}")),
+        }
+    }
+    log::error!("候选热键全部注册失败({})", failures.join(";"));
+    DefaultPalette {
+        hotkey: None,
+        name: None,
+    }
+}
+
+/// 自定义唤起键失败后的回落提示(区分「默认键」与「降级键」)。
+fn palette_fallback_note(custom: HotKey, fallback_name: Option<&str>) -> String {
+    let custom = display_name(custom);
+    match fallback_name {
+        Some(name) if name == candidates()[0].2 => {
+            format!("保存的唤起快捷键 {custom} 不可用,已回落默认 {name}")
+        }
+        Some(name) => format!("保存的唤起快捷键 {custom} 不可用,已改用 {name}"),
+        None => format!("保存的唤起快捷键 {custom} 不可用,{UNAVAILABLE_NOTE}"),
+    }
+}
+
+/// 完整窗口槽回落默认直键(⌥⇧F);`custom` 为 Some 表示是自定义键失败后的回落。
+fn register_window_default<R: KeyRegistrar>(
+    reg: &mut R,
+    custom: Option<HotKey>,
+    notes: &mut Vec<String>,
+) -> Option<HotKey> {
+    let (mods, code, name) = direct_key();
+    let hotkey = HotKey::new(Some(mods), code);
+    match reg.register(hotkey) {
+        Ok(()) => {
+            if let Some(custom) = custom {
+                notes.push(format!(
+                    "保存的完整窗口快捷键 {} 不可用,已回落默认 {name}",
+                    display_name(custom)
+                ));
+            }
+            Some(hotkey)
+        }
+        Err(err) => {
+            log::warn!("完整窗口快捷键({name})注册失败(入口仍有托盘与悬浮条 ⌥↵): {err}");
+            // 无自定义键时保持旧行为:只留日志不常驻提示;自定义回落失败才提示。
+            if let Some(custom) = custom {
+                notes.push(format!(
+                    "保存的完整窗口快捷键 {} 不可用,{WINDOW_UNAVAILABLE_NOTE}",
+                    display_name(custom)
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// 启动偏好选择(纯规划器):自定义键有效且注册成功 → 用自定义;否则回落默认 + 提示;
+/// 未配置 → 旧默认行为。两槽自定义键相同时第二槽(完整窗口)回落默认。
+struct InitialPlan {
+    active: ActiveKeys,
+    note: Option<String>,
+}
+
+fn register_initial<R: KeyRegistrar>(reg: &mut R, file: &SettingsFile) -> InitialPlan {
+    let mut notes = Vec::new();
+
+    let palette = match file.palette_hotkey {
+        Some(custom) => match register_checked(reg, custom) {
+            Ok(()) => Some(custom),
+            Err(err) => {
+                log::warn!(
+                    "保存的唤起快捷键 {} 不可用,回落默认键: {err}",
+                    display_name(custom)
+                );
+                let fallback = register_palette_default(reg);
+                notes.push(palette_fallback_note(custom, fallback.name));
+                fallback.hotkey
+            }
+        },
+        None => {
+            let fallback = register_palette_default(reg);
+            if let Some(note) = note_for(fallback.name) {
+                notes.push(note);
+            }
+            fallback.hotkey
+        }
+    };
+
+    let window = match file.window_hotkey {
+        Some(custom) if palette != Some(custom) => match register_checked(reg, custom) {
+            Ok(()) => Some(custom),
+            Err(err) => {
+                log::warn!(
+                    "保存的完整窗口快捷键 {} 不可用,回落默认键: {err}",
+                    display_name(custom)
+                );
+                register_window_default(reg, Some(custom), &mut notes)
+            }
+        },
+        Some(custom) => {
+            // 同一组合不能用于两槽:启动时第二槽直接回落,不依赖 OS 判重。
+            log::warn!(
+                "保存的完整窗口快捷键 {} 与唤起键冲突,回落默认键",
+                display_name(custom)
+            );
+            register_window_default(reg, Some(custom), &mut notes)
+        }
+        None => register_window_default(reg, None, &mut notes),
+    };
+
+    InitialPlan {
+        active: ActiveKeys { palette, window },
+        note: if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join(";"))
+        },
+    }
+}
+
+fn lock_active(active: &Arc<Mutex<ActiveKeys>>) -> MutexGuard<'_, ActiveKeys> {
+    match active.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// 全局热键运行时(挂 `ui::App` 保活):
 /// manager drop 即注销全部热键,须与进程同寿。
 pub struct HotkeyRuntime {
     /// 注册状态的宿主;创建失败时为 None(热键不可用,其余功能照常)。
-    _manager: Option<GlobalHotKeyManager>,
-    /// 命中键显示名(日志用;None = 全候选失败)。
-    name: Option<String>,
-    /// 悬浮条提示(降级/不可用;默认键正常 = None)。
-    note: Option<String>,
+    // H3 录制命令接线前,suspend/resume/commit 无调用点;以下三字段暂标记 allow。
+    #[allow(dead_code)]
+    manager: Option<GlobalHotKeyManager>,
+    /// 当前注册键(事件泵每事件读取此份;重配置后立即生效)。
+    #[allow(dead_code)]
+    active: Arc<Mutex<ActiveKeys>>,
+    /// 当前快照(设置页种子;commit/suspend 后更新)。
+    snapshot: HotkeySnapshot,
+    /// 录制期挂起的旧键(Some = 已注销、等待 resume/commit)。
+    #[allow(dead_code)]
+    suspended: Option<ActiveKeys>,
     /// 主队列直调目标(ui 层启动期回填;未回填时按下走兜底队列)。
     on_action: Arc<OnceLock<DispatchFn>>,
     /// 兜底队列(直调未竟的动作;`poll_action` 帧内消费)。
@@ -144,14 +431,19 @@ pub struct HotkeyRuntime {
 }
 
 impl HotkeyRuntime {
-    /// 命中键显示名(未注册 = None)。
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+    /// 唤起槽命中键显示名(未注册 = None;日志用)。
+    pub fn name(&self) -> Option<String> {
+        (!self.snapshot.palette_keys.is_empty()).then(|| self.snapshot.palette_keys.concat())
     }
 
     /// 悬浮条常驻提示(降级/不可用;默认键正常 = None)。
     pub fn note(&self) -> Option<&str> {
-        self.note.as_deref()
+        self.snapshot.note.as_deref()
+    }
+
+    /// 当前热键快照(设置页展示/录制用;H3 消费)。
+    pub fn snapshot(&self) -> HotkeySnapshot {
+        self.snapshot.clone()
     }
 
     /// 回填主队列直调目标(ui 层在共享态构造完成后调用;进程内一次)。
@@ -160,66 +452,269 @@ impl HotkeyRuntime {
             log::warn!("热键直调目标重复回填(忽略后填)");
         }
     }
+
+    /// 进入录制:注销两槽并记住旧键(主线程;幂等)。
+    ///
+    /// 快照保持不变——设置页录制期间仍显示旧键,另一槽的键帽不消失。
+    // H3 命令队列尚未接线;临时 allow,接入后删除。
+    #[allow(dead_code)]
+    pub fn suspend(&mut self) {
+        let Some(manager) = self.manager.as_ref() else {
+            return;
+        };
+        let mut active = *lock_active(&self.active);
+        suspend_with(
+            &mut ManagerRegistrar(manager),
+            &mut active,
+            &mut self.suspended,
+        );
+        *lock_active(&self.active) = active;
+    }
+
+    /// 取消录制:重新注册挂起的旧键(主线程;无挂起 = 无操作)。
+    #[allow(dead_code)]
+    pub fn resume(&mut self) {
+        let Some(manager) = self.manager.as_ref() else {
+            return;
+        };
+        let mut active = *lock_active(&self.active);
+        let restored = resume_with(
+            &mut ManagerRegistrar(manager),
+            &mut active,
+            &mut self.suspended,
+        );
+        *lock_active(&self.active) = active;
+        let note = if restored {
+            self.snapshot.note.clone()
+        } else {
+            Some(RESUME_FAILED_NOTE.to_string())
+        };
+        self.snapshot = HotkeySnapshot::from_active(active, note);
+    }
+
+    /// 提交录制结果(主线程;H3 命令队列调用)。
+    ///
+    /// 校验失败/与另一槽重复/系统注册失败 → `Err`(中文文案,可直接内联展示),
+    /// 旧键保持可用;成功 → 更新快照并清空启动回退提示。
+    #[allow(dead_code)]
+    pub fn commit(&mut self, slot: HotkeySlot, hotkey: HotKey) -> Result<HotkeySnapshot, String> {
+        let manager = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| "全局热键不可用".to_string())?;
+        let mut active = *lock_active(&self.active);
+        let result = plan_commit(
+            &mut ManagerRegistrar(manager),
+            &mut active,
+            &mut self.suspended,
+            slot,
+            hotkey,
+        );
+        *lock_active(&self.active) = active;
+        match result {
+            Ok(snapshot) => {
+                self.snapshot = snapshot;
+                Ok(self.snapshot.clone())
+            }
+            Err(err) => {
+                // 状态已按回滚语义落定(H3 失败后退回 Idle,旧键为 active 真源);
+                // 保留启动回退提示,错误单独经 Err 展示。
+                self.snapshot = HotkeySnapshot::from_active(active, self.snapshot.note.clone());
+                Err(err)
+            }
+        }
+    }
+}
+
+/// 注销两槽并挂起(纯状态;测试可复用)。
+// 仅由 runtime.suspend（H3 接线前无调用点）与测试调用;临时 allow。
+#[allow(dead_code)]
+fn suspend_with<R: KeyRegistrar>(
+    reg: &mut R,
+    active: &mut ActiveKeys,
+    suspended: &mut Option<ActiveKeys>,
+) {
+    if suspended.is_some() {
+        return;
+    }
+    for slot in [HotkeySlot::Palette, HotkeySlot::Window] {
+        if let Some(hotkey) = active.get(slot) {
+            if let Err(err) = reg.unregister(hotkey) {
+                // 注销失败时该键仍可能被系统触发;active 置空后事件泵会忽略它。
+                log::warn!(
+                    "录制前注销快捷键 {} 失败(泵将忽略该键): {err}",
+                    display_name(hotkey)
+                );
+            }
+        }
+    }
+    *suspended = Some(*active);
+    *active = ActiveKeys::default();
+}
+
+/// 恢复挂起的旧键;返回 false = 至少一个键恢复失败(仍尽力恢复其余)。
+#[allow(dead_code)]
+fn resume_with<R: KeyRegistrar>(
+    reg: &mut R,
+    active: &mut ActiveKeys,
+    suspended: &mut Option<ActiveKeys>,
+) -> bool {
+    let Some(old) = suspended.take() else {
+        return true;
+    };
+    let mut restored = ActiveKeys::default();
+    for slot in [HotkeySlot::Palette, HotkeySlot::Window] {
+        if let Some(hotkey) = old.get(slot) {
+            match reg.register(hotkey) {
+                Ok(()) => restored.set(slot, Some(hotkey)),
+                Err(err) => log::warn!("恢复快捷键 {} 失败: {err}", display_name(hotkey)),
+            }
+        }
+    }
+    *active = restored;
+    restored == old
+}
+
+/// 提交规划器(纯逻辑;注册器可注入)。校验/查重在前,失败不改任何注册态。
+///
+/// 挂起态失败会**退出挂起**(恢复旧键 by best effort);非挂起态失败保留旧键注册。
+#[allow(dead_code)]
+fn plan_commit<R: KeyRegistrar>(
+    reg: &mut R,
+    active: &mut ActiveKeys,
+    suspended: &mut Option<ActiveKeys>,
+    slot: HotkeySlot,
+    hotkey: HotKey,
+) -> Result<HotkeySnapshot, String> {
+    hotkey_keys::validate(hotkey).map_err(|err| err.to_string())?;
+
+    // 查重以「逻辑上的旧键」为准:录制挂起时 active 为空,旧键在 suspended。
+    let logical = suspended.unwrap_or(*active);
+    if logical.other(slot) == Some(hotkey) {
+        return Err("该快捷键已用于另一个功能".to_string());
+    }
+
+    match suspended.take() {
+        Some(old) => {
+            let other = old.other(slot);
+            let mut other_registered = false;
+            let outcome = (|| {
+                // 录制期两槽都已注销:先把另一槽旧键注册回来,再注册新键。
+                if let Some(other_key) = other {
+                    reg.register(other_key).map_err(|err| {
+                        format!(
+                            "恢复另一快捷键 {} 失败(可能被占用): {err}",
+                            display_name(other_key)
+                        )
+                    })?;
+                    other_registered = true;
+                }
+                reg.register(hotkey)
+                    .map_err(|err| format!("注册失败(可能被系统或其他应用占用): {err}"))
+            })();
+
+            if let Err(err) = outcome {
+                // 失败退出录制:尽力恢复两个旧键(已注册的 other 不重复注册)。
+                let mut restored = ActiveKeys::default();
+                for old_slot in [HotkeySlot::Palette, HotkeySlot::Window] {
+                    let Some(old_key) = old.get(old_slot) else {
+                        continue;
+                    };
+                    let already = other_registered && Some(old_key) == other;
+                    if already || reg.register(old_key).is_ok() {
+                        restored.set(old_slot, Some(old_key));
+                    } else {
+                        log::warn!("恢复旧快捷键 {} 失败", display_name(old_key));
+                    }
+                }
+                *active = restored;
+                *suspended = None;
+                return Err(err);
+            }
+
+            let mut next = old;
+            next.set(slot, Some(hotkey));
+            *active = next;
+            *suspended = None;
+            Ok(HotkeySnapshot::from_active(next, None))
+        }
+        None => {
+            // 非录制直提:旧键仍注册中,直接注册新键;成功后才注销该槽旧键。
+            reg.register(hotkey)
+                .map_err(|err| format!("注册失败(可能被系统或其他应用占用): {err}"))?;
+            if let Some(old_key) = active.get(slot) {
+                if let Err(err) = reg.unregister(old_key) {
+                    // 旧键已不在 active,事件泵不会触发;仅留痕(可能仍占系统组合)。
+                    log::warn!("注销旧快捷键 {} 失败: {err}", display_name(old_key));
+                }
+            }
+            active.set(slot, Some(hotkey));
+            Ok(HotkeySnapshot::from_active(*active, None))
+        }
+    }
 }
 
 /// 注册热键并起事件泵线程(主线程调用;失败不中断 App,降级为提示 + 日志)。
-pub fn install(ctx: &egui::Context) -> HotkeyRuntime {
+///
+/// `file` 提供启动偏好:两槽 Some → 优先注册自定义键,失败回落默认并留提示;
+/// None → 保持旧默认行为(候选降级链 / ⌥⇧F)。
+pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
     let on_action: Arc<OnceLock<DispatchFn>> = Arc::new(OnceLock::new());
     let deferred: Arc<Mutex<VecDeque<Action>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let active: Arc<Mutex<ActiveKeys>> = Arc::new(Mutex::new(ActiveKeys::default()));
+
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => manager,
         Err(err) => {
             log::error!("全局热键管理器创建失败(热键不可用):{err}");
             return HotkeyRuntime {
-                _manager: None,
-                name: None,
-                note: note_for(None),
+                manager: None,
+                active,
+                snapshot: HotkeySnapshot::from_active(ActiveKeys::default(), note_for(None)),
+                suspended: None,
                 on_action,
                 deferred,
             };
         }
     };
-    // 完整窗口直达键(⌥⇧F):失败只留痕,不降级(入口仍有托盘与悬浮条 ⌥↵)。
-    let (dmods, dcode, dname) = direct_key();
-    let direct = HotKey::new(Some(dmods), dcode);
-    let direct = match manager.register(direct) {
-        Ok(()) => {
-            log::info!("完整窗口直达键注册成功:{dname}(id={})", direct.id());
-            Some(direct)
-        }
-        Err(err) => {
-            log::warn!("完整窗口直达键({dname})注册失败(入口仍有托盘与悬浮条 ⌥↵):{err}");
-            None
-        }
-    };
-    // ⌥Space 族(降级链):全失败只降级提示,不影响 ⌥⇧F 的命中。
-    let (space, name, note) = match register_default(&manager) {
-        Ok((hotkey, name)) => {
-            log::info!("全局热键注册成功:{name}(id={})", hotkey.id());
-            let note = note_for(Some(&name));
-            if let Some(text) = &note {
-                log::warn!("热键降级:{text}");
-            }
-            (Some(hotkey), Some(name), note)
-        }
-        Err(err) => {
-            log::error!("全局热键不可用({UNAVAILABLE_NOTE}):{err:#}");
-            (None, None, note_for(None))
-        }
-    };
-    if space.is_some() || direct.is_some() {
-        spawn_event_pump(
-            ctx.clone(),
-            space,
-            direct,
-            Arc::clone(&on_action),
-            Arc::clone(&deferred),
-        );
+
+    let plan = register_initial(&mut ManagerRegistrar(&manager), file);
+    match plan.active.palette {
+        Some(hotkey) => log::info!(
+            "唤起快捷键注册成功:{} (id={})",
+            display_name(hotkey),
+            hotkey.id()
+        ),
+        None => log::error!("全局热键不可用({UNAVAILABLE_NOTE})"),
     }
+    match plan.active.window {
+        Some(hotkey) => log::info!(
+            "完整窗口快捷键注册成功:{} (id={})",
+            display_name(hotkey),
+            hotkey.id()
+        ),
+        None => log::warn!("完整窗口快捷键未注册(入口仍有托盘与悬浮条 ⌥↵)"),
+    }
+    if let Some(note) = &plan.note {
+        log::warn!("热键回退提示:{note}");
+    }
+
+    *lock_active(&active) = plan.active;
+    let snapshot = HotkeySnapshot::from_active(plan.active, plan.note);
+
+    // manager 存在就起泵:即使启动时两槽都未注册,H3 之后仍可 commit 新键。
+    spawn_event_pump(
+        ctx.clone(),
+        Arc::clone(&active),
+        Arc::clone(&on_action),
+        Arc::clone(&deferred),
+    );
+
     HotkeyRuntime {
-        _manager: Some(manager),
-        name,
-        note,
+        manager: Some(manager),
+        active,
+        snapshot,
+        suspended: None,
         on_action,
         deferred,
     }
@@ -234,13 +729,12 @@ pub fn poll_action(runtime: &HotkeyRuntime) -> Option<Action> {
     q.pop_front()
 }
 
-/// 事件泵线程:阻塞收官方 channel(零轮询);命中注册键的 Pressed → 主队列直调动作。
+/// 事件泵线程:阻塞收官方 channel(零轮询);命中**当前**注册键的 Pressed → 主队列直调。
 ///
-/// `space` = ⌥Space 族命中键、`direct` = ⌥⇧F(各自 None = 该键未注册成功,不参与判定)。
+/// 每事件读取 `active`(重配置后立即生效);线程不接触 manager(注册/注销只在主线程)。
 fn spawn_event_pump(
     ctx: egui::Context,
-    space: Option<HotKey>,
-    direct: Option<HotKey>,
+    active: Arc<Mutex<ActiveKeys>>,
     on_action: Arc<OnceLock<DispatchFn>>,
     deferred: Arc<Mutex<VecDeque<Action>>>,
 ) {
@@ -250,12 +744,9 @@ fn spawn_event_pump(
             // 静态 channel(PoC-2 用法:receiver 全局唯一,本线程是唯一消费者)。
             let rx = GlobalHotKeyEvent::receiver();
             while let Ok(event) = rx.recv() {
-                let action = if space.is_some_and(|k| is_toggle_press(&event, k)) {
-                    Some(Action::TogglePalette)
-                } else if direct.is_some_and(|k| is_toggle_press(&event, k)) {
-                    Some(Action::OpenResults)
-                } else {
-                    None
+                let action = {
+                    let keys = *lock_active(&active);
+                    action_for(&event, keys)
                 };
                 let Some(action) = action else { continue };
                 // 直调块:`Context`/共享态句柄均 Send+Sync;块本身在主线程执行。
@@ -293,6 +784,64 @@ fn spawn_event_pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hotkey(mods: Modifiers, code: Code) -> HotKey {
+        HotKey::new(Some(mods), code)
+    }
+
+    fn alt_space() -> HotKey {
+        hotkey(Modifiers::ALT, Code::Space)
+    }
+
+    fn alt_shift_f() -> HotKey {
+        hotkey(Modifiers::ALT | Modifiers::SHIFT, Code::KeyF)
+    }
+
+    fn custom_palette() -> HotKey {
+        hotkey(Modifiers::CONTROL | Modifiers::ALT, Code::KeyK)
+    }
+
+    fn custom_window() -> HotKey {
+        hotkey(Modifiers::SUPER | Modifiers::SHIFT, Code::KeyJ)
+    }
+
+    /// 假注册器:记录已注册键,可配置注册/注销失败(不创建系统 manager)。
+    #[derive(Default)]
+    struct FakeRegistrar {
+        registered: Vec<HotKey>,
+        fail_register: Vec<HotKey>,
+        fail_unregister: Vec<HotKey>,
+    }
+
+    impl FakeRegistrar {
+        fn failing(keys: &[HotKey]) -> Self {
+            Self {
+                fail_register: keys.to_vec(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl KeyRegistrar for FakeRegistrar {
+        fn register(&mut self, hotkey: HotKey) -> Result<(), String> {
+            if self.fail_register.contains(&hotkey) {
+                return Err("被占用".to_string());
+            }
+            if self.registered.contains(&hotkey) {
+                return Err("重复注册".to_string());
+            }
+            self.registered.push(hotkey);
+            Ok(())
+        }
+
+        fn unregister(&mut self, hotkey: HotKey) -> Result<(), String> {
+            if self.fail_unregister.contains(&hotkey) {
+                return Err("注销失败".to_string());
+            }
+            self.registered.retain(|registered| *registered != hotkey);
+            Ok(())
+        }
+    }
 
     /// 降级链顺序与显示名(product §边界:⌥Space → ⌥⇧Space → ⌃⌥⇧Space)。
     #[test]
@@ -339,13 +888,415 @@ mod tests {
         assert!(!is_toggle_press(&other, registered), "他键不触发");
     }
 
+    /// 泵判定读当前 active:双槽各自命中;Released/双槽空 → 无动作。
+    #[test]
+    fn pump_action_follows_active_keys() {
+        let palette = alt_space();
+        let window = alt_shift_f();
+        let keys = ActiveKeys {
+            palette: Some(palette),
+            window: Some(window),
+        };
+        let press = |hotkey: HotKey| GlobalHotKeyEvent {
+            id: hotkey.id(),
+            state: HotKeyState::Pressed,
+        };
+        let release = |hotkey: HotKey| GlobalHotKeyEvent {
+            id: hotkey.id(),
+            state: HotKeyState::Released,
+        };
+
+        assert_eq!(
+            action_for(&press(palette), keys),
+            Some(Action::TogglePalette)
+        );
+        assert_eq!(action_for(&press(window), keys), Some(Action::OpenResults));
+        assert_eq!(action_for(&release(palette), keys), None, "Released 忽略");
+        assert_eq!(
+            action_for(&press(palette), ActiveKeys::default()),
+            None,
+            "双槽未注册时泵不得动作"
+        );
+    }
+
+    /// 启动:自定义键有效且注册成功 → 直接用自定义,无提示。
+    #[test]
+    fn startup_prefers_valid_custom_hotkeys() {
+        let palette = custom_palette();
+        let window = custom_window();
+        let file = SettingsFile {
+            palette_hotkey: Some(palette),
+            window_hotkey: Some(window),
+            ..SettingsFile::default()
+        };
+        let mut reg = FakeRegistrar::default();
+
+        let plan = register_initial(&mut reg, &file);
+
+        assert_eq!(
+            plan.active,
+            ActiveKeys {
+                palette: Some(palette),
+                window: Some(window)
+            }
+        );
+        assert_eq!(plan.note, None, "自定义键正常不提示");
+        assert_eq!(reg.registered, vec![palette, window]);
+    }
+
+    /// 启动:自定义键注册失败 → 回落默认键 + 提示(两槽各一条)。
+    #[test]
+    fn startup_custom_failure_falls_back_with_note() {
+        let palette = custom_palette();
+        let window = custom_window();
+        let file = SettingsFile {
+            palette_hotkey: Some(palette),
+            window_hotkey: Some(window),
+            ..SettingsFile::default()
+        };
+        let mut reg = FakeRegistrar::failing(&[palette, window]);
+
+        let plan = register_initial(&mut reg, &file);
+
+        let (pmods, pcode, _) = candidates()[0];
+        let (wmods, wcode, _) = direct_key();
+        assert_eq!(
+            plan.active.palette,
+            Some(HotKey::new(Some(pmods), pcode)),
+            "唤起键回落默认链首项"
+        );
+        assert_eq!(
+            plan.active.window,
+            Some(HotKey::new(Some(wmods), wcode)),
+            "完整窗口键回落 ⌥⇧F"
+        );
+        let note = plan.note.expect("自定义键失败须留提示");
+        assert!(note.contains("保存的唤起快捷键"), "{note}");
+        assert!(note.contains("已回落默认 ⌥Space"), "{note}");
+        assert!(note.contains("保存的完整窗口快捷键"), "{note}");
+        assert!(note.contains("已回落默认 ⌥⇧F"), "{note}");
+    }
+
+    /// 启动:文件里持久化的越界键(Escape)不注册,回落默认 + 提示(H1 校验联动)。
+    #[test]
+    fn startup_invalid_persisted_key_falls_back() {
+        let invalid = hotkey(Modifiers::ALT, Code::Escape);
+        let file = SettingsFile {
+            palette_hotkey: Some(invalid),
+            ..SettingsFile::default()
+        };
+        let mut reg = FakeRegistrar::default();
+
+        let plan = register_initial(&mut reg, &file);
+
+        let (mods, code, _) = candidates()[0];
+        assert_eq!(plan.active.palette, Some(HotKey::new(Some(mods), code)));
+        assert!(!reg.registered.contains(&invalid), "越界键不得注册");
+        let note = plan.note.expect("越界键须提示");
+        assert!(note.contains("保存的唤起快捷键"), "{note}");
+    }
+
+    /// 启动:无自定义键 → 旧默认行为(⌥Space + ⌥⇧F),无提示。
+    #[test]
+    fn startup_without_preferences_uses_defaults() {
+        let mut reg = FakeRegistrar::default();
+
+        let plan = register_initial(&mut reg, &SettingsFile::default());
+
+        let (pmods, pcode, _) = candidates()[0];
+        let (wmods, wcode, _) = direct_key();
+        assert_eq!(
+            plan.active,
+            ActiveKeys {
+                palette: Some(HotKey::new(Some(pmods), pcode)),
+                window: Some(HotKey::new(Some(wmods), wcode)),
+            }
+        );
+        assert_eq!(plan.note, None, "默认键正常不打扰");
+    }
+
+    /// 启动:两槽配置同一组合 → 完整窗口槽回落默认 + 提示。
+    #[test]
+    fn startup_duplicate_custom_slots_fall_back_second() {
+        let shared = custom_palette();
+        let file = SettingsFile {
+            palette_hotkey: Some(shared),
+            window_hotkey: Some(shared),
+            ..SettingsFile::default()
+        };
+        let mut reg = FakeRegistrar::default();
+
+        let plan = register_initial(&mut reg, &file);
+
+        let (wmods, wcode, _) = direct_key();
+        assert_eq!(plan.active.palette, Some(shared));
+        assert_eq!(
+            plan.active.window,
+            Some(HotKey::new(Some(wmods), wcode)),
+            "第二槽回落默认"
+        );
+        let note = plan.note.expect("冲突须提示");
+        assert!(note.contains("保存的完整窗口快捷键"), "{note}");
+    }
+
+    /// 快照:注册键转 macOS 键帽;未注册槽为空 vec;提示原样保留。
+    #[test]
+    fn snapshot_displays_keys_and_empty_slots() {
+        let palette = alt_space();
+        let snapshot = HotkeySnapshot::from_active(
+            ActiveKeys {
+                palette: Some(palette),
+                window: None,
+            },
+            Some("提示".to_string()),
+        );
+
+        assert_eq!(snapshot.palette, Some(palette));
+        assert_eq!(snapshot.window, None);
+        assert_eq!(snapshot.palette_keys, ["⌥", "Space"]);
+        assert!(snapshot.window_keys.is_empty());
+        assert_eq!(snapshot.note.as_deref(), Some("提示"));
+    }
+
+    /// 提交:只替换目标槽,另一槽保持注册;成功后清空启动回退提示。
+    #[test]
+    fn commit_preserves_other_slot_and_clears_note() {
+        let old_palette = alt_space();
+        let window = alt_shift_f();
+        let new_palette = custom_palette();
+        let mut active = ActiveKeys {
+            palette: Some(old_palette),
+            window: Some(window),
+        };
+        let mut suspended = None;
+        let mut reg = FakeRegistrar {
+            registered: vec![old_palette, window],
+            ..FakeRegistrar::default()
+        };
+
+        let snapshot = plan_commit(
+            &mut reg,
+            &mut active,
+            &mut suspended,
+            HotkeySlot::Palette,
+            new_palette,
+        )
+        .expect("合法新键应提交成功");
+
+        assert_eq!(active.palette, Some(new_palette));
+        assert_eq!(active.window, Some(window), "另一槽保持");
+        assert!(reg.registered.contains(&new_palette));
+        assert!(!reg.registered.contains(&old_palette), "旧键须注销");
+        assert!(reg.registered.contains(&window));
+        assert!(suspended.is_none());
+        assert_eq!(snapshot.palette, Some(new_palette));
+        assert_eq!(snapshot.window, Some(window));
+        assert_eq!(snapshot.palette_keys, ["⌃", "⌥", "K"]);
+        assert_eq!(snapshot.window_keys, ["⌥", "⇧", "F"]);
+        assert_eq!(snapshot.note, None, "成功后清空启动回退提示");
+    }
+
+    /// 提交:与另一槽相同 → 本地拒绝,注册态不变。
+    #[test]
+    fn commit_rejects_duplicate_with_other_slot() {
+        let palette = alt_space();
+        let window = alt_shift_f();
+        let mut active = ActiveKeys {
+            palette: Some(palette),
+            window: Some(window),
+        };
+        let mut suspended = None;
+        let mut reg = FakeRegistrar {
+            registered: vec![palette, window],
+            ..FakeRegistrar::default()
+        };
+
+        let err = plan_commit(
+            &mut reg,
+            &mut active,
+            &mut suspended,
+            HotkeySlot::Window,
+            palette,
+        )
+        .unwrap_err();
+        assert!(err.contains("另一个功能"), "{err}");
+        assert_eq!(
+            active,
+            ActiveKeys {
+                palette: Some(palette),
+                window: Some(window)
+            }
+        );
+
+        // 挂起态同样以旧键查重,且拒绝时不得退出挂起。
+        let mut active = ActiveKeys::default();
+        let mut suspended = Some(ActiveKeys {
+            palette: Some(palette),
+            window: Some(window),
+        });
+        let err = plan_commit(
+            &mut reg,
+            &mut active,
+            &mut suspended,
+            HotkeySlot::Window,
+            palette,
+        )
+        .unwrap_err();
+        assert!(err.contains("另一个功能"), "{err}");
+        assert!(suspended.is_some(), "校验失败保持录制挂起态");
+    }
+
+    /// 提交:非挂起态注册失败 → 旧键保持注册/active 不变。
+    #[test]
+    fn commit_failure_keeps_old_keys_active() {
+        let old_palette = alt_space();
+        let new_palette = custom_palette();
+        let mut active = ActiveKeys {
+            palette: Some(old_palette),
+            window: None,
+        };
+        let mut suspended = None;
+        let mut reg = FakeRegistrar {
+            registered: vec![old_palette],
+            fail_register: vec![new_palette],
+            ..FakeRegistrar::default()
+        };
+
+        let err = plan_commit(
+            &mut reg,
+            &mut active,
+            &mut suspended,
+            HotkeySlot::Palette,
+            new_palette,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("注册失败"), "{err}");
+        assert_eq!(
+            active,
+            ActiveKeys {
+                palette: Some(old_palette),
+                window: None
+            },
+            "失败不得动旧键"
+        );
+        assert_eq!(reg.registered, vec![old_palette]);
+        assert!(suspended.is_none());
+    }
+
+    /// 提交(挂起态):重新注册另一槽旧键 + 新键;成功后退出挂起。
+    #[test]
+    fn commit_while_suspended_reregisters_other_and_new() {
+        let old_palette = alt_space();
+        let window = alt_shift_f();
+        let new_palette = custom_palette();
+        let mut active = ActiveKeys::default();
+        let mut suspended = Some(ActiveKeys {
+            palette: Some(old_palette),
+            window: Some(window),
+        });
+        let mut reg = FakeRegistrar::default();
+
+        let snapshot = plan_commit(
+            &mut reg,
+            &mut active,
+            &mut suspended,
+            HotkeySlot::Palette,
+            new_palette,
+        )
+        .expect("挂起态提交应成功");
+
+        assert_eq!(
+            active,
+            ActiveKeys {
+                palette: Some(new_palette),
+                window: Some(window)
+            }
+        );
+        assert!(suspended.is_none(), "成功后退出录制挂起");
+        assert!(reg.registered.contains(&window));
+        assert!(reg.registered.contains(&new_palette));
+        assert!(!reg.registered.contains(&old_palette));
+        assert_eq!(snapshot.palette, Some(new_palette));
+    }
+
+    /// 提交(挂起态)失败:退出挂起并尽力恢复两个旧键(H3 期望旧键仍可用)。
+    #[test]
+    fn commit_while_suspended_failure_restores_old_keys() {
+        let old_palette = alt_space();
+        let window = alt_shift_f();
+        let new_palette = custom_palette();
+        let mut active = ActiveKeys::default();
+        let mut suspended = Some(ActiveKeys {
+            palette: Some(old_palette),
+            window: Some(window),
+        });
+        let mut reg = FakeRegistrar::failing(&[new_palette]);
+
+        let err = plan_commit(
+            &mut reg,
+            &mut active,
+            &mut suspended,
+            HotkeySlot::Palette,
+            new_palette,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("注册失败"), "{err}");
+        assert_eq!(
+            active,
+            ActiveKeys {
+                palette: Some(old_palette),
+                window: Some(window)
+            },
+            "失败须恢复旧键"
+        );
+        assert!(suspended.is_none(), "失败后退出挂起");
+        assert!(reg.registered.contains(&old_palette));
+        assert!(reg.registered.contains(&window));
+        assert!(!reg.registered.contains(&new_palette), "新键须回滚");
+    }
+
+    /// 录制挂起/取消:注销全部键、幂等;resume 恢复旧键。
+    #[test]
+    fn suspend_and_resume_roundtrip_old_keys() {
+        let palette = alt_space();
+        let window = alt_shift_f();
+        let old = ActiveKeys {
+            palette: Some(palette),
+            window: Some(window),
+        };
+        let mut active = old;
+        let mut suspended = None;
+        let mut reg = FakeRegistrar {
+            registered: vec![palette, window],
+            ..FakeRegistrar::default()
+        };
+
+        suspend_with(&mut reg, &mut active, &mut suspended);
+        assert_eq!(active, ActiveKeys::default(), "录制期注销全部热键");
+        assert!(reg.registered.is_empty());
+        assert_eq!(suspended, Some(old));
+
+        suspend_with(&mut reg, &mut active, &mut suspended);
+        assert_eq!(suspended, Some(old), "重复 suspend 幂等");
+        assert!(reg.registered.is_empty());
+
+        assert!(resume_with(&mut reg, &mut active, &mut suspended));
+        assert_eq!(active, old, "取消录制恢复旧键");
+        assert!(suspended.is_none());
+        assert!(reg.registered.contains(&palette));
+        assert!(reg.registered.contains(&window));
+    }
+
     /// 兜底队列:空 = None;入列动作按先进先出逐条消费,取尽不再重复。
     #[test]
     fn poll_action_drains_deferred_fifo() {
         let runtime = HotkeyRuntime {
-            _manager: None,
-            name: None,
-            note: None,
+            manager: None,
+            active: Arc::new(Mutex::new(ActiveKeys::default())),
+            snapshot: HotkeySnapshot::default(),
+            suspended: None,
             on_action: Arc::new(OnceLock::new()),
             deferred: Arc::new(Mutex::new(VecDeque::new())),
         };

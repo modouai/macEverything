@@ -14,6 +14,7 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::autostart::{self, Status};
+use crate::hotkey::HotkeySnapshot;
 use crate::platform;
 use crate::settings::{self as store, FontSize, SettingsFile};
 use crate::ui::{
@@ -75,6 +76,10 @@ pub struct SettingsState {
     pub(crate) palette_keys: Vec<String>,
     /// 完整窗口快捷键键帽（内置默认）。
     pub(crate) window_keys: Vec<String>,
+    /// 全局热键运行时快照（H2 启动种子；H3 录制/展示真源）。
+    // H3 设置页消费前仅有写入;临时 allow,接入后删除。
+    #[allow(dead_code)]
+    pub(crate) hotkey_snapshot: HotkeySnapshot,
     /// 设置页切换自启成功后待同步给托盘的值（App::logic 消费）。
     pub(crate) tray_autostart_sync: Option<bool>,
     /// 首次打开已完成定位决策：之后重开只置前，保留用户拖动后的位置。
@@ -85,8 +90,13 @@ pub struct SettingsState {
 }
 
 impl SettingsState {
-    /// 启动/打开前的初始状态：排除目录按引擎默认种一次。
-    pub(crate) fn new(file: SettingsFile, data_dir: PathBuf) -> Self {
+    /// 启动/打开前的初始状态：排除目录按引擎默认种一次；热键快照由 `App::new`
+    /// 从 `HotkeyRuntime::snapshot()` 种入（注册成功后的真实键位/提示）。
+    pub(crate) fn new(
+        file: SettingsFile,
+        data_dir: PathBuf,
+        hotkey_snapshot: HotkeySnapshot,
+    ) -> Self {
         Self {
             open: false,
             file,
@@ -98,6 +108,7 @@ impl SettingsState {
             excluded: engine::config::default_config().excluded,
             palette_keys: vec!["⌥".to_owned(), "Space".to_owned()],
             window_keys: vec!["⌥".to_owned(), "⇧".to_owned(), "F".to_owned()],
+            hotkey_snapshot,
             tray_autostart_sync: None,
             positioned_once: false,
             cancel_recording_pending: false,
@@ -440,6 +451,7 @@ mod tests {
         SettingsState::new(
             SettingsFile::default(),
             PathBuf::from("/tmp/mace-everything-settings-test"),
+            HotkeySnapshot::default(),
         )
     }
 
@@ -460,6 +472,11 @@ mod tests {
             vec!["⌥".to_owned(), "⇧".to_owned(), "F".to_owned()]
         );
         assert_eq!(state.tray_autostart_sync, None);
+        assert_eq!(
+            state.hotkey_snapshot,
+            HotkeySnapshot::default(),
+            "快照由 App::new 植入,构造时为默认空值"
+        );
         assert!(!state.positioned_once, "首开前未定位");
         assert!(!state.cancel_recording_pending);
     }
@@ -534,7 +551,11 @@ mod tests {
     #[test]
     fn font_size_state_records_error_and_persists_separately() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = SettingsState::new(SettingsFile::default(), dir.path().to_path_buf());
+        let mut state = SettingsState::new(
+            SettingsFile::default(),
+            dir.path().to_path_buf(),
+            HotkeySnapshot::default(),
+        );
 
         state.set_font_size_result(FontSize::Large, Some("设置保存失败:磁盘只读".into()));
         assert_eq!(

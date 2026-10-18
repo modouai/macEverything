@@ -413,6 +413,7 @@ impl App {
         // 切 Space(尤其进他人全屏)后主动唤醒悬浮条重绘并恢复层级:
         // 否则窗口可能停在一帧空白内容,点一下才恢复(2026-10-18 实机反馈)。
         platform::install_space_repaint(cc.egui_ctx.clone());
+        let hotkey_snapshot = hotkey.snapshot();
         let hotkey_note = hotkey.note().map(str::to_string);
         let shared = Arc::new(Mutex::new(Shared {
             palette: palette::PaletteState::new(
@@ -422,7 +423,11 @@ impl App {
                 hotkey_note,
             ),
             results: results::ResultsState::new(cc.egui_ctx.clone(), paths.clone()),
-            settings: settings::SettingsState::new(settings_file, paths.data_dir.clone()),
+            settings: settings::SettingsState::new(
+                settings_file,
+                paths.data_dir.clone(),
+                hotkey_snapshot,
+            ),
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
             palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
         }));
@@ -726,12 +731,21 @@ impl eframe::App for App {
                 hotkey::Action::TogglePalette => {
                     log::info!(
                         "热键 {} 兜底:切换悬浮条",
-                        self.hotkey.name().unwrap_or("(未注册)")
+                        self.hotkey.name().as_deref().unwrap_or("(未注册)")
                     );
                     self.toggle_palette(ctx, "热键兜底");
                 }
                 hotkey::Action::OpenResults => {
-                    log::info!("热键 ⌥⇧F 兜底:打开完整窗口");
+                    // 键位可自定义,日志不写死 ⌥⇧F(兜底路径罕见,快照克隆成本可忽略)。
+                    let keys = self.hotkey.snapshot().window_keys.concat();
+                    log::info!(
+                        "热键 {} 兜底:打开完整窗口",
+                        if keys.is_empty() {
+                            "(未注册)"
+                        } else {
+                            &keys
+                        }
+                    );
                     self.open_results(ctx);
                 }
             }
