@@ -7,10 +7,16 @@
 #   Resources/AppIcon.icns    应用图标(吉祥物);Info.plist 的 CFBundleIconFile 指向它
 #   Info.plist                bundle 标识 = 自启条目身份键(PoC-5 坑②)
 #
-# 必须 ad-hoc 签名(PoC-5 硬门槛:未签名 arm64 进程直接 SIGKILL;签名无效时
+# 必须签名(PoC-5 硬门槛:未签名 arm64 进程直接 SIGKILL;签名无效时
 # SMAppService.register 报 kSMErrorInvalidSignature)。先签内层 CLI 再签外层 bundle。
 #
-# 用法:bash scripts/bundle.sh   (输出 release/macEverything.app)
+# 默认 ad-hoc 签名（本地开发）。设置 MACEEVERYTHING_SIGN_IDENTITY 时走 Developer ID
+# + hardened runtime + timestamp（公证要求）；可选 MACEEVERYTHING_ENTITLEMENTS 指定
+# entitlements 文件。
+#
+# 用法:
+#   bash scripts/bundle.sh                         # ad-hoc 开发包
+#   MACEEVERYTHING_SIGN_IDENTITY="Developer ID Application: ..." bash scripts/bundle.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +27,8 @@ APP="release/macEverything.app"
 BUNDLE_ID="com.example.maceverything"    # 与 crates/app/src/autostart.rs::BUNDLE_ID 同值
 EXE="macEverything-app"
 CLI="macEverything"
+SIGN_IDENTITY="${MACEEVERYTHING_SIGN_IDENTITY:--}"
+ENTITLEMENTS="${MACEEVERYTHING_ENTITLEMENTS:-}"
 
 # 1) 版本号:根 Cargo.toml 的 [workspace.package].version(单一真相)
 VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
@@ -63,10 +71,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# 4) ad-hoc 签名(先内层 CLI,再外层 bundle;--deep 已弃用,不用)
-echo "== 4/4 ad-hoc 签名 =="
-codesign --force -s - "$APP/Contents/MacOS/$CLI"
-codesign --force -s - "$APP"
+# 4) 签名(先内层 CLI,再外层 bundle;--deep 已弃用,不用)
+echo "== 4/4 签名: $SIGN_IDENTITY =="
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  codesign --force -s - "$APP/Contents/MacOS/$CLI"
+  codesign --force -s - "$APP"
+else
+  SIGN_ARGS=(--force --options runtime --timestamp --sign "$SIGN_IDENTITY")
+  if [[ -n "$ENTITLEMENTS" ]]; then
+    SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+  fi
+  codesign "${SIGN_ARGS[@]}" "$APP/Contents/MacOS/$CLI"
+  codesign "${SIGN_ARGS[@]}" "$APP"
+fi
 
 # —— 自检(产物实证,失败即退出非零)——
 echo "-- plutil -lint Info.plist --"
@@ -76,7 +93,11 @@ codesign --verify --strict --verbose=2 "$APP"
 echo "-- codesign --verify --strict(CLI) --"
 codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/$CLI"
 echo "-- codesign -dv(app) --"
-codesign -dv "$APP" 2>&1 | grep -E "Identifier|Format|Signature|CDHash|TeamIdentifier" || true
+codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Identifier|Format|Signature|Authority|TeamIdentifier|Timestamp|flags=" || true
 echo "-- 结构 --"
 ls -l "$APP/Contents" "$APP/Contents/MacOS"
-echo "== 完成: $APP(ad-hoc 签名;版本 $VERSION) =="
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  echo "== 完成: $APP(ad-hoc 签名;版本 $VERSION) =="
+else
+  echo "== 完成: $APP(Developer ID 签名;版本 $VERSION) =="
+fi

@@ -38,8 +38,12 @@ macOS 上的全盘文件名即时搜索引擎——对标 Windows 的 [Everythin
 ### 图形界面(推荐)
 
 ```bash
-# 构建 + 组装 + ad-hoc 签名,输出 release/macEverything.app
+# 构建 + 组装 + ad-hoc 签名（本地开发），输出 release/macEverything.app
 bash scripts/bundle.sh
+
+# 对外分发：Developer ID 签名 + Apple 公证 + DMG
+# 需本机 Developer ID 证书与 notarytool 凭据（见 docs/development.md「发布」）
+bash scripts/release.sh
 
 # 运行(或把 .app 拖入 /Applications 或 ~/Applications 后双击)
 open release/macEverything.app

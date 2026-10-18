@@ -118,10 +118,18 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 
 ## 发布
 
-v1 为个人使用,ad-hoc 签名本地运行,无对外分发流程。若后续发布:Developer ID 签名 + 公证 + `SMAppService` 登录自启(v2 候选)。
+对外分发使用 Developer ID 签名 + Apple 公证：
+
+- 版本号：`Cargo.toml` 的 `[workspace.package].version`（写入 `Info.plist` 与 DMG 文件名）。
+- 本地开发：`bash scripts/bundle.sh` 默认 ad-hoc 签名。
+- Developer ID 构建：`MACEEVERYTHING_SIGN_IDENTITY="Developer ID Application: ..." bash scripts/bundle.sh`（hardened runtime + timestamp）。
+- 一键发布：`bash scripts/release.sh`（ZIP 公证 → staple App → 生成 DMG → 签名/公证/staple → SHA256）。
+- 公证凭据：优先 keychain profile（默认 `maceverything-notary`；先执行 `xcrun notarytool store-credentials`），钥匙串锁定时回落到 `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_SPECIFIC_PASSWORD`。
+- 产物：`release/macEverything-<version>.dmg`（+ `.sha256`）与 `.zip`（公证中间产物）。
+- 验收：`spctl --assess --type execute`（App）、`spctl --assess --type open --context context:primary-signature`（DMG）、`xcrun stapler validate`、`hdiutil verify`。
 
 ## v2 方向(未排期)
 
 - 图形界面:悬浮条(全局快捷键唤起)+ 完整窗口 + 设置;菜单栏常驻
-- 界面 i18n(中英)
+- 界面 i18n(中英，v2.1 已交付；繁中/日/韩规划中)
 - 引擎候选:正则/`size:`/`dm:` 过滤器、外置盘扫描、`getattrlistbulk` 列信息加速
