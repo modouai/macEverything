@@ -437,6 +437,12 @@ pub fn quick_look_poll(frame: &eframe::Frame) {
     let _ = frame;
 }
 
+/// 静默关闭 Quick Look（完整窗口隐藏/退出时用；不激活 App）。
+pub fn quick_look_dismiss() {
+    #[cfg(target_os = "macos")]
+    mac_quicklook::dismiss();
+}
+
 /// 把选中文件写入通用剪贴板(语义 = Finder「拷贝」;主线程)。
 /// 空列表 = no-op;非 macOS / 非主线程 / 写入失败 → Err。
 pub fn copy_files(paths: &[String]) -> anyhow::Result<()> {

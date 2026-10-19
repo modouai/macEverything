@@ -763,7 +763,8 @@ pub fn popup_menu(
 /// 把选中文件 URL 写入通用剪贴板(v2.3 §5.1;语义 = Finder「拷贝」)。
 ///
 /// 写入 NSPasteboard 的 `NSURL` 数组即可被 Finder 等接收方当作文件拷贝
-/// (NSURL 遵循 `NSPasteboardWriting`);须主线程且不得持有共享锁。
+/// (NSURL 遵循 `NSPasteboardWriting`);须主线程；绘制期调用安全（winit 事件处理中
+/// AppKit 通知排队），主队列直调路径不得持共享锁。
 pub fn copy_files(paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());

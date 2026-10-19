@@ -402,6 +402,26 @@ mod tests {
     }
 
     #[test]
+    fn ensure_existing_rejects_mixed_batch() {
+        let base = std::env::temp_dir().join(format!("mce-menu-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let existing = base.join("exists.txt");
+        std::fs::write(&existing, b"x").unwrap();
+        let missing = base.join("missing.txt");
+        let paths = vec![
+            existing.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        let err = ensure_existing(&paths).unwrap_err();
+        assert!(
+            err.to_string().contains("文件不存在"),
+            "错误文案应可展示:{err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn plan_command_lines() {
         let base = std::env::temp_dir().join(format!("mce-menu-plan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);

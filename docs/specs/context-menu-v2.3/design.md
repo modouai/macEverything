@@ -104,12 +104,12 @@
   `std`、`objc2-app-kit`、`QLPreviewPanel`、`QLPreviewItem`（`NSURL` 已原生符合
   `QLPreviewItem`）。
 - 新增 `platform/mac_quicklook.rs`：
-  - `QLPreviewPanel::sharedPreviewPanel(mtm)` 单例；设置 data source/delegate。
+  - `QLPreviewPanel::sharedPreviewPanel(mtm)` 单例；设置 data source。
   - 用 `define_class!` 定义 data source 类，实现
     `numberOfPreviewItemsInPreviewPanel:` 与 `previewPanel:previewItemAtIndex:`；
     预览项直接返回 `NSURL`。
-  - 选中 URL 保存在 data source 实例中（`Vec<Retained<NSURL>>`）；data source 与
-    delegate 被面板弱引用，必须由平台层静态持有（主线程），直到面板关闭/进程退出。
+  - 选中 URL 保存在 data source 实例中（`Vec<Retained<NSURL>>`）；data source 被
+    面板弱引用，必须由平台层静态持有（主线程），直到面板关闭/进程退出。
   - 展示：设置 data source → `reloadData` → `makeKeyAndOrderFront`；关闭后清空 URL。
   - 焦点返回：监听面板关闭（`NSWindowWillCloseNotification` / delegate），
     重新激活结果窗口；具体路径由 PoC 决定（见 §4.3）。最终实现见 §4.5：每 200ms 轮询 `isVisible`，未监听 `NSWindowWillCloseNotification`/delegate。
@@ -117,8 +117,8 @@
 - 空格键处理在 `results.rs`：
   - 仅当结果表格获得焦点、搜索框未聚焦、选中非空、非中文输入法组字态时；
   - 忽略按键自动重复（一次按下只 toggle 一次）；
-  - 调用 `platform::quick_look(paths, frame)`；失败落状态栏。
-- 右键项与空格共用同一平台入口。
+  - 调用 `platform::quick_look_toggle`；失败落状态栏。
+- 右键项调用 `quick_look_show`（更新并置前，不关闭）；空格调用 `quick_look_toggle`（可见即关闭）。
 
 ### 4.3 PoC 门槛（实现前置）
 
@@ -164,6 +164,8 @@ PoC 不通过时的退路（按优先级）：
 - 单测覆盖：菜单结构/tag/中英文案、文件名载荷、存在性校验、shell 计划、空格门控与事件消费、平台动作分派。
 - 失活处理：App 非 active 时轮询不归还焦点，避免 ⌘Tab 切走后抢回前台。
 - 行为说明见 `docs/usage.md`；人工验收清单见 `plan.md` Task 4 Step 6。
+- 完整窗口隐藏/退出时静默关闭面板（`quick_look_dismiss`，不激活 App、不归还焦点）。
+- 已知限制：QL 打开期间改变选中或结果替换不会自动刷新面板；需再次触发「快速查看」/空格更新。
 
 ## 5. 拷贝增强
 
@@ -233,12 +235,12 @@ pub enum MenuEntry {
   - 新增 `names_text(paths)` 纯函数与单测。
 - `crates/app/src/ui/results.rs`
   - 空格键处理（表格焦点/搜索框未聚焦/非重复）。
-  - 动作分派：`QuickLook` → `platform::quick_look`；`CopyFile` → `platform::copy_files`；
+  - 动作分派：`QuickLook` → `platform::quick_look_show`；`CopyFile` → `platform::copy_files`；
     其余 → `menu_actions::execute(ShellAction)`。
   - 菜单项构建改为嵌套 `MenuEntry`。
 - `crates/app/src/platform/mod.rs`
   - `MenuEntry` 增加 `Submenu`；`popup_menu` 走 target/action。
-  - 新增 facade：`quick_look(paths, frame)`、`copy_files(paths)`（非 macOS 返回不支持）。
+  - 新增 facade：`quick_look_show/toggle/visible/poll/dismiss`、`copy_files`（非 macOS 返回不支持）。
 - `crates/app/src/platform/mac.rs`
   - 菜单构建支持子菜单、target/action、分隔线、禁用项。
   - `copy_files`：NSPasteboard 写入 NSURL。

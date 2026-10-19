@@ -1139,6 +1139,7 @@ impl eframe::App for App {
                 // 否则「调整后 400ms 内点红点」会丢最后一次调整。
                 self.window_size.flush(&self.paths.data_dir);
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                platform::quick_look_dismiss();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }

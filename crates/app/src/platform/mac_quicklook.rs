@@ -149,6 +149,18 @@ pub fn close(frame: &eframe::Frame) {
     restore_focus(frame);
 }
 
+/// 静默关闭面板(宿主窗口隐藏/退出时用;不激活 App、不归还焦点)。
+pub fn dismiss() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    if let Some(panel) = existing_panel(mtm) {
+        panel.orderOut(None);
+    }
+    PANEL_WAS_VISIBLE.with(|v| v.set(false));
+    QL_URLS.with(|slot| slot.borrow_mut().clear());
+}
+
 /// 空格语义:未显示 -> 打开;已显示 -> 关闭。
 pub fn toggle(paths: &[String], frame: &eframe::Frame) -> Result<()> {
     if visible() {
