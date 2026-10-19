@@ -11,8 +11,13 @@ pub const MANIFEST_URL: &str = "https://maceverything.modouai.dev/version.json";
 /// 当前编译版本（与 Cargo.toml / CFBundleShortVersionString 同一真源）。
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 请求超时。
+///
+/// 不变量：平台侧抓取的总等待上限为 `REQUEST_TIMEOUT + 2s`（12 秒），必须小于
+/// [`WATCHDOG`]；否则合法的慢请求会在结果返回前被看门狗判超时并丢弃。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// 无回调看门狗（UI 侧兜底，避免状态卡在 Checking）。
+///
+/// 必须大于平台抓取的 `REQUEST_TIMEOUT + 2s`（见 [`REQUEST_TIMEOUT`]）。
 pub const WATCHDOG: Duration = Duration::from_secs(15);
 /// 响应体上限。
 pub const MAX_BODY: usize = 64 * 1024;
@@ -212,11 +217,26 @@ mod tests {
         assert_eq!(Version::parse("2.4.0").unwrap().display(), "2.4.0");
         assert_eq!(Version::parse("v2.4.0").unwrap().display(), "2.4.0");
         assert_eq!(Version::parse("02.004.0").unwrap().display(), "2.4.0");
-        assert!(Version::parse("2.3.0") < Version::parse("2.4.0"));
-        assert!(Version::parse("9.9.9") < Version::parse("10.0.0"));
-        for bad in ["", "2.4", "2.4.0.1", "2.4.x", "2.4.0-beta.1", "v", "1..2"] {
+        assert!(Version::parse("2.3.0").unwrap() < Version::parse("2.4.0").unwrap());
+        assert!(Version::parse("9.9.9").unwrap() < Version::parse("10.0.0").unwrap());
+        assert!(Version::parse("18446744073709551615.0.0").is_ok());
+        for bad in [
+            "",
+            "2.4",
+            "2.4.0.1",
+            "2.4.x",
+            "2.4.0-beta.1",
+            "v",
+            "1..2",
+            "18446744073709551616.0.0",
+        ] {
             assert!(Version::parse(bad).is_err(), "{bad:?} 应被拒绝");
         }
+    }
+
+    #[test]
+    fn current_version_is_parseable() {
+        assert!(Version::parse(CURRENT_VERSION).is_ok());
     }
 
     #[test]
@@ -224,6 +244,11 @@ mod tests {
         let current = "2.3.0";
         assert_eq!(
             evaluate(br#"{"version":"2.4.0"}"#, current),
+            CheckOutcome::Available("2.4.0".into())
+        );
+        // 未知字段忽略；v 前缀与前导零归一化后再比较。
+        assert_eq!(
+            evaluate(br#"{"version":"v02.004.0","extra":1}"#, current),
             CheckOutcome::Available("2.4.0".into())
         );
         assert_eq!(
@@ -281,12 +306,14 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_fails_after_timeout_and_ignores_late_result() {
+    fn watchdog_fails_after_timeout_and_discards_queued_result() {
         let t0 = Instant::now();
         let mut state = UpdateState::new();
         let tx = state.begin_at(t0).unwrap();
 
         assert!(!state.tick_at(t0 + Duration::from_secs(14)));
+        // 结果在看门狗到点前已入队：tick 必须优先判超时并丢弃它。
+        tx.send(CheckOutcome::Available("9.9.9".into())).unwrap();
         assert!(state.tick_at(t0 + WATCHDOG));
         assert_eq!(state.phase(), &UpdatePhase::Failed);
 
@@ -296,6 +323,32 @@ mod tests {
             "超时后忽略迟到结果"
         );
         assert_eq!(state.phase(), &UpdatePhase::Failed);
+    }
+
+    #[test]
+    fn spawn_failure_and_timeout_allow_retry() {
+        let t0 = Instant::now();
+        let mut state = UpdateState::new();
+
+        let _tx = state.begin_at(t0).unwrap();
+        state.spawn_failed("boom".into());
+        assert_eq!(state.phase(), &UpdatePhase::Failed);
+
+        let tx = state
+            .begin_at(t0 + Duration::from_secs(1))
+            .expect("启动失败后应可重试");
+        tx.send(CheckOutcome::UpToDate).unwrap();
+        assert!(state.tick_at(t0 + Duration::from_secs(2)));
+        assert_eq!(state.phase(), &UpdatePhase::UpToDate);
+
+        let _tx = state.begin_at(t0 + Duration::from_secs(3)).unwrap();
+        assert!(state.tick_at(t0 + Duration::from_secs(3) + WATCHDOG));
+        assert_eq!(state.phase(), &UpdatePhase::Failed);
+
+        assert!(
+            state.begin_at(t0 + Duration::from_secs(20)).is_some(),
+            "看门狗超时后应可重试"
+        );
     }
 
     #[test]
