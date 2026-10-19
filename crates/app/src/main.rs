@@ -15,9 +15,6 @@ mod settings;
 mod single_instance;
 mod tray;
 mod ui;
-// 剩余未接线的公开 API 是托盘/设置页文案与下载页地址，待 Task 6-7 接入；
-// 全部消费后必须移除本模块级 allow。
-#[allow(dead_code)]
 mod update;
 mod window_state;
 

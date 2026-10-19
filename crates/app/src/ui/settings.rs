@@ -89,6 +89,22 @@ impl SettingsError {
     }
 }
 
+/// 关于分组的更新错误（保存自动检查开关失败 / 打开下载页失败）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateError {
+    SaveFailed,
+    OpenFailed,
+}
+
+impl UpdateError {
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Self::SaveFailed => i18n::s().settings_save_failed,
+            Self::OpenFailed => i18n::s().update_open_failed,
+        }
+    }
+}
+
 /// 语言保存失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LanguageError {
@@ -213,6 +229,8 @@ pub struct SettingsState {
     pub(crate) font_error: Option<SettingsError>,
     /// 语言保存失败的内联错误（语言已即时应用，仅落盘失败时留痕）。
     pub(crate) language_error: Option<LanguageError>,
+    /// 关于分组内联错误（自动检查开关保存失败 / 打开下载页失败）。
+    pub(crate) update_error: Option<UpdateError>,
     /// 语言切换后待 App 刷新的托盘文案标记。
     pub(crate) tray_relabel_pending: bool,
     /// 排除目录（daemon 响应为唯一真源；首次成功 list 响应前为引擎默认种子，
@@ -269,6 +287,7 @@ impl SettingsState {
             autostart_error: None,
             font_error: None,
             language_error: None,
+            update_error: None,
             tray_relabel_pending: false,
             excluded: engine::config::default_config().excluded,
             exclude_busy: false,
@@ -602,10 +621,35 @@ impl SettingsState {
         self.language_error = save_error;
     }
 
+    /// 自动检查开关落地（纯状态）：保存失败也保留用户选择，仅显示内联错误。
+    /// 保存成功只清 SaveFailed，保留尚未处理的 OpenFailed。
+    pub(crate) fn set_check_updates_result(&mut self, enabled: bool, error: Option<UpdateError>) {
+        self.file.check_updates = enabled;
+        match error {
+            Some(error) => self.update_error = Some(error),
+            None => self.clear_update_error(UpdateError::SaveFailed),
+        }
+    }
+
+    /// 关于分组一次性错误（打开下载页失败）。
+    pub(crate) fn set_update_error(&mut self, error: Option<UpdateError>) {
+        self.update_error = error;
+    }
+
+    /// 只清指定类别的关于组错误（保存成功 / 打开下载页成功各清各的，
+    /// 不吞掉另一条尚未处理的错误）。
+    pub(crate) fn clear_update_error(&mut self, kind: UpdateError) {
+        if self.update_error == Some(kind) {
+            self.update_error = None;
+        }
+    }
+
     /// 任一设置保存成功：清掉两类保存失败内联错误，避免旧错误跨设置常驻。
+    /// 关于组的保存失败也属于设置保存错误；打开下载页失败保留。
     pub(crate) fn clear_save_errors(&mut self) {
         self.font_error = None;
         self.language_error = None;
+        self.clear_update_error(UpdateError::SaveFailed);
     }
 
     /// 语言切换后请求 App 刷新托盘文案（App::logic 消费）。
@@ -648,7 +692,7 @@ impl SettingsData {
     /// 从运行期状态复制一帧快照（锁内调用，绘制在锁外）。
     ///
     /// 放在行为模块：视图只依赖 `SettingsData`，构造真源仍在 `SettingsState`。
-    pub(crate) fn from_state(state: &SettingsState) -> Self {
+    pub(crate) fn from_state(state: &SettingsState, update: &crate::update::UpdateState) -> Self {
         Self {
             font_size: state.file.font_size,
             autostart: state.autostart.unwrap_or(false),
@@ -664,6 +708,9 @@ impl SettingsData {
             exclude_busy: state.exclude_busy,
             exclude_busy_list: state.exclude_busy_list,
             exclude_error: state.exclude_error.clone(),
+            check_updates: state.file.check_updates,
+            update: update.phase().clone(),
+            update_error: state.update_error,
         }
     }
 }
@@ -703,7 +750,10 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ctx.request_repaint_of(viewport_id());
     }
     // 快照放在启动 list 之后：首帧即带 busy（避免旧快照允许在加载中点击添加）。
-    let data = SettingsData::from_state(&lock_shared(shared).settings);
+    let data = {
+        let s = lock_shared(shared);
+        SettingsData::from_state(&s.settings, &s.update)
+    };
     if theme_changed {
         // `set_theme` 只改偏好；显式排一帧让本视口按新主题出图。
         ctx.request_repaint_of(viewport_id());
@@ -819,6 +869,12 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             spawn_exclude(ctx, shared, "remove", Some(path));
             ctx.request_repaint_of(viewport_id());
         }
+        SettingsAction::SetAutoCheck(enabled) => apply_auto_check(shared, ctx, enabled),
+        SettingsAction::CheckUpdate => {
+            super::spawn_update_check(shared, ctx);
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::OpenUpdatePage => apply_update_page(shared, ctx),
     }
 }
 
@@ -946,6 +1002,48 @@ fn apply_font_size(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, size: FontS
     // 5. ROOT + 悬浮条 + 设置页全部重绘（两个窗口文字即时变化）。
     ctx.request_repaint_of(egui::ViewportId::ROOT);
     ctx.request_repaint_of(crate::ui::palette_viewport_id());
+    ctx.request_repaint_of(viewport_id());
+}
+
+/// 自动检查开关：立即落共享态并写盘；失败仅内联留痕，不回退开关。
+fn apply_auto_check(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bool) {
+    let (mut file, data_dir) = {
+        let s = lock_shared(shared);
+        (s.settings.file.clone(), s.settings.data_dir.clone())
+    };
+    file.check_updates = enabled;
+    let error = store::save(&data_dir, &file).err().map(|err| {
+        log::warn!("自动检查更新 {enabled} 已应用,但设置保存失败: {err:#}");
+        UpdateError::SaveFailed
+    });
+    {
+        let mut s = lock_shared(shared);
+        let saved = error.is_none();
+        s.settings.set_check_updates_result(enabled, error);
+        if saved {
+            s.settings.clear_save_errors();
+        }
+    }
+    log::info!("启动时自动检查更新 → {enabled}");
+    ctx.request_repaint_of(viewport_id());
+}
+
+/// 打开官网下载页：失败在关于分组内联显示，并写日志。
+fn apply_update_page(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
+    let error = match crate::update::open_download_page() {
+        Ok(()) => None,
+        Err(err) => {
+            log::warn!("打开下载页失败: {err}");
+            Some(UpdateError::OpenFailed)
+        }
+    };
+    {
+        let mut s = lock_shared(shared);
+        match error {
+            Some(error) => s.settings.set_update_error(Some(error)),
+            None => s.settings.clear_update_error(UpdateError::OpenFailed),
+        }
+    }
     ctx.request_repaint_of(viewport_id());
 }
 
@@ -2120,7 +2218,8 @@ mod tests {
         state.exclude_busy_list = true;
         state.exclude_error = Some(ExcludeError::Daemon("daemon 未在运行".into()));
 
-        let data = SettingsData::from_state(&state);
+        let update = crate::update::UpdateState::new();
+        let data = SettingsData::from_state(&state, &update);
         assert_eq!(data.font_size, FontSize::Large);
         assert!(!data.autostart, "审批中显示为关");
         assert!(data.autostart_approval);
@@ -2286,6 +2385,74 @@ mod tests {
     fn window_size_matches_spec() {
         assert_eq!((SETTINGS_W, SETTINGS_H), (620.0, 600.0));
         assert_eq!(TITLEBAR_H, 44.0);
+    }
+
+    #[test]
+    fn auto_check_result_updates_file_and_error() {
+        let mut state = test_state();
+        state.set_check_updates_result(false, Some(UpdateError::SaveFailed));
+        assert!(!state.file.check_updates);
+        assert_eq!(state.update_error, Some(UpdateError::SaveFailed));
+
+        state.set_check_updates_result(true, None);
+        assert!(state.file.check_updates);
+        assert_eq!(state.update_error, None);
+
+        state.set_update_error(Some(UpdateError::OpenFailed));
+        assert_eq!(state.update_error, Some(UpdateError::OpenFailed));
+
+        // 保存成功（None）只清 SaveFailed；未处理的 OpenFailed 必须保留。
+        state.set_check_updates_result(true, None);
+        assert_eq!(
+            state.update_error,
+            Some(UpdateError::OpenFailed),
+            "自动检查保存成功不得吞掉打开下载页失败"
+        );
+
+        // SaveFailed → 保存成功 → None（原有行为不变）。
+        state.set_check_updates_result(false, Some(UpdateError::SaveFailed));
+        assert_eq!(state.update_error, Some(UpdateError::SaveFailed));
+        state.set_check_updates_result(true, None);
+        assert_eq!(state.update_error, None, "保存成功须清 SaveFailed");
+    }
+
+    /// 关于组两类错误的清理互不误伤：保存成功清 SaveFailed、保 OpenFailed；
+    /// 打开下载页成功清 OpenFailed、保 SaveFailed。
+    #[test]
+    fn update_error_clears_only_its_own_kind() {
+        let mut state = test_state();
+        state.set_update_error(Some(UpdateError::OpenFailed));
+        state.clear_update_error(UpdateError::SaveFailed);
+        assert_eq!(
+            state.update_error,
+            Some(UpdateError::OpenFailed),
+            "清理保存失败不得吞掉打开下载页失败"
+        );
+        state.clear_update_error(UpdateError::OpenFailed);
+        assert_eq!(state.update_error, None);
+
+        state.set_update_error(Some(UpdateError::OpenFailed));
+        state.clear_save_errors();
+        assert_eq!(
+            state.update_error,
+            Some(UpdateError::OpenFailed),
+            "保存成功不得清掉打开下载页失败"
+        );
+
+        state.set_check_updates_result(true, Some(UpdateError::SaveFailed));
+        state.clear_save_errors();
+        assert_eq!(state.update_error, None, "保存成功须清保存失败");
+    }
+
+    #[test]
+    fn settings_data_exposes_update_state() {
+        let mut state = test_state();
+        state.file.check_updates = false;
+        let update = crate::update::UpdateState::new();
+        let data = SettingsData::from_state(&state, &update);
+        assert!(!data.check_updates);
+        assert_eq!(data.update, crate::update::UpdatePhase::Idle);
+        assert_eq!(data.update_error, None);
     }
 
     /// 视口 builder：固定尺寸、启动隐藏、无标题/标题栏 + 全尺寸内容视图

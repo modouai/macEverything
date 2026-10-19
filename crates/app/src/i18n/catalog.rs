@@ -44,6 +44,10 @@ catalog! {
     row_window_hotkey: "完整窗口快捷键" / "Full Window Shortcut",
     row_excluded: "排除目录" / "Excluded Folders",
     // 关于 / 更新
+    group_about: "关于" / "About",
+    row_version: "版本" / "Version",
+    row_auto_check: "启动时自动检查更新" / "Check for Updates at Launch",
+    update_open_failed: "无法打开下载页" / "Couldn't open the download page",
     update_status_idle: "尚未检查" / "Not checked yet",
     update_status_checking: "正在检查…" / "Checking…",
     update_status_up_to_date: "已是最新版本" / "You're up to date",
