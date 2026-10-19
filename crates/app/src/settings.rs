@@ -1,7 +1,8 @@
 //! v2.1 设置持久化：数据目录 `settings.toml`。
 //!
-//! 字号与两个全局快捷键入此文件；开机自启的真源是 SMAppService，排除目录的
-//! 真源是引擎配置，均不写入本文件（design §三）。
+//! 界面偏好（字号、语言、启动时自动检查更新）与两个全局快捷键入此文件；
+//! `check_updates` 默认开启，缺字段按 true 读取（前向兼容）。开机自启的真源是
+//! SMAppService，排除目录的真源是引擎配置，均不写入本文件（design §三）。
 //!
 //! 读取：文件缺失 → 默认值；损坏/读取失败 → 默认值 + `log::warn`，且**不改写**
 //! 原文件（坏文件留待人工或后续版本修复）。写入：同目录 tmp + rename 原子替换，
@@ -297,6 +298,8 @@ mod tests {
             ..SettingsFile::default()
         };
         save(dir.path(), &f).unwrap();
-        assert!(!load(dir.path()).check_updates);
+        let loaded = load(dir.path());
+        assert!(!loaded.check_updates, "显式 false 必须保持关闭");
+        assert_eq!(loaded, f, "显式 false 完整往返");
     }
 }
