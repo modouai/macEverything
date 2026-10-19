@@ -1712,8 +1712,6 @@ fn result_row_text_and_hint_rights(rect_right: f32, hint_measured: f32) -> (f32,
     (text_right, hint_left)
 }
 
-/// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
-/// 动作提示 12pt 仅选中行。悬停 = 选中态约 50% 强度；鼠标移动不改键盘选中。
 /// 结果行的指针动作(双击优先于单击;打开语义与 ↵ 相同)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowPointerAction {
@@ -1732,6 +1730,8 @@ fn row_pointer_action(clicked: bool, double_clicked: bool) -> RowPointerAction {
     }
 }
 
+/// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
+/// 动作提示 12pt 仅选中行。悬停 = 选中态约 50% 强度；鼠标移动不改键盘选中。
 fn draw_result_row(
     ui: &mut egui::Ui,
     e: &HitEntry,

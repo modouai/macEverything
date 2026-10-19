@@ -1,6 +1,6 @@
 //! 平台能力 facade:悬浮条窗口的 macOS 补丁走这里。
 //!
-//! 真实实现集中在 `platform/mac.rs`(objc2;unsafe 逐处 SAFETY);
+//! 真实实现集中在 `platform/mac.rs` 与 `platform/mac_quicklook.rs`(objc2;unsafe 逐处 SAFETY);
 //! 生效配方与差分结论见 docs/specs/v2-ui/poc-results.md「必须的属性组合」,
 //! 活样例见 scripts/poc/poc1b_nspanel/src/main.rs。
 //!

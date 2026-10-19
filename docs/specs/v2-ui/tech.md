@@ -125,7 +125,7 @@ pub fn execute_sorted(
 | 形象条点击(**已知限制**,Task 9) | 形象条区域(窗口顶部 70px)属悬浮条窗口,点击落到窗口而非背后应用;ghost/失焦判定按整窗 frame,暂不区分条带。改为独立穿透窗口的架构代价大,不由本任务承担;待实机验收拍板(验收清单一节已列「实机确认是否接受」) |
 | 包(package)语义(**已知项**,Task 9) | `.app/.pages/.rtfd` 等包被协议 `is_dir` 当目录:图标走文件夹、提示「进入」,但 `open` 实为启动/打开。待辉哥验收拍板;可选修法:按扩展名或 `NSWorkspace.isFilePackageAtPath` 走文件语义 |
 | 排帧纪律(L4) | 只在悬浮条可见期排帧(悬浮条 pass 自排 `CHECK_INTERVAL` 上限,含主题跟随检查);全隐藏期不排帧 → 事件循环回 Wait(隐藏态 CPU 0% 红线;Task 14 实测 60s 累计 CPU 零增量);唤起时 `ThemeFollow::check_now` 立即补查外观 |
-| 根窗(完整窗口)唤起 | `NSApp.activate()` + `orderFrontRegardless`(常规 App 窗口语义,与悬浮条「不夺前台」相反);实测非激活 app 下 winit `makeKeyAndOrderFront` 不切 Space |
+| 根窗(完整窗口)唤起 | `NSApp.activate()` + `orderFrontRegardless` + `makeKeyAndOrderFront`;根窗 `collectionBehavior` 增加 `MoveToActiveSpace`,从悬浮条 ⌥↵ 进入时跟随当前 Space(2026-10-19 实机);`orderFrontRegardless` 保留「激活未完成也置顶」的历史保证 |
 | 根窗关闭 | 取消关闭(`CancelClose`)+ 隐藏窗口(关闭窗口不退出 App,product §2);真退出走托盘「退出」(Task 16) |
 | 无边框/透明/圆角 | `ViewportBuilder { decorations:false, transparent:true, ... }`(官方)+ egui 自绘圆角阴影 |
 | 毛玻璃(**PoC-7 落地 2026-10-17**) | 「面板窗 + **下挂同级毛玻璃窗**」,构建顺序是硬约束:①建**普通 NSWindow**(borderless+`ignoresMouseEvents`+level/collectionBehavior 同面板);②装 `NSVisualEffectView`(blendingMode=BehindWindow,state=Active,material=`UnderWindowBackground`,圆角用官方 `maskImage`);③`orderFrontRegardless` + `orderWindow:relativeTo:Below`(面板之下);④**最后**换类为 NSPanel 并补 `NonactivatingPanel`(跨他人全屏 Space 的硬条件;裸 NSPanel 收不到键盘,垫窗正合适)。**顺序反了(先换类/直接 NSPanel 构造)会打死 vibrancy**——浅深两色磨砂全失,三轮实机对照。圆角禁用 `layer.masksToBounds`(离屏通道同理会打死 vibrancy)。frame 每帧同步、显隐随面板(隐藏/切完整窗口当帧 orderOut)。**层级约束**:winit 视图即 contentView,禁换容器/加兄弟层(UB)。取证见 poc-results.md「PoC-7」与 floatbar-visual/plan.md「Task 10」 |

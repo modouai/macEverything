@@ -1,4 +1,5 @@
-//! macOS 平台补丁实现(objc2;unsafe 集中于此,SAFETY 逐处注释)。
+//! macOS 平台补丁实现(objc2;unsafe 集中在 `platform` 模块的 mac.rs / mac_quicklook.rs,
+//! SAFETY 逐处注释)。
 //!
 //! Task 14 产品化 PoC-1 续 spike(NSPanel 改类五要素+两补丁;活样例
 //! `scripts/poc/poc1b_nspanel/src/main.rs`,结论见 docs/specs/v2-ui/poc-results.md):
@@ -222,7 +223,7 @@ pub fn last_space_change() -> Option<SpaceChange> {
 }
 
 // ---------------------------------------------------------------------------
-// 原生菜单 target/action(叶子项选择回传;子菜单下不依赖 highlightedItem)
+// 原生菜单 target/action(菜单项选择回传;不依赖 highlightedItem)
 
 /// 菜单选择 tag 的进程内落点(target/action 回传;-1 = 未选择)。
 static MENU_CHOICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
@@ -506,10 +507,12 @@ pub fn show_root_window() -> Result<()> {
     }
     // 从悬浮条(可能是他人全屏 Space 上的 non-activating panel)进入完整窗口时,
     // 普通窗口默认留在 App 原 Space,会出现「窗口显示在别处且不是 key」。显式允许
-    // 跟随当前 Space,并用 makeKeyAndOrderFront 置前成 key(实机 2026-10-19)。
+    // 跟随当前 Space;保留历史定案的 orderFrontRegardless(激活未完成也置顶),
+    // 再用 makeKeyAndOrderFront 取得 key(实机 2026-10-19)。
     root.setCollectionBehavior(
         root.collectionBehavior() | NSWindowCollectionBehavior::MoveToActiveSpace,
     );
+    root.orderFrontRegardless();
     root.makeKeyAndOrderFront(None);
     root.makeMainWindow();
     let f = root.frame();
@@ -708,15 +711,15 @@ pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
 
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。
 ///
-/// `items` = 菜单项树([`MenuEntry`]):叶子项经 target/action(`menuItemChosen:`)
-/// 回传 tag,子菜单父项无 action;返回所选项的 tag(None = 取消/Esc/未选中)。
+/// `items` = 平铺菜单项列表([`MenuEntry`]):每项经 target/action(`menuItemChosen:`)
+/// 回传 tag;返回所选项的 tag(None = 取消/Esc/未选中)。
 /// 位置为视图坐标(左上原点、y 向下);PoC-3 实测视图坐标与 egui 坐标同值可直接
 /// 互用,此处保留换算核对(弹出前把鼠标窗口坐标经 `convertPoint_fromView` 换算
 /// 一份并入日志),以实机观测验证该结论。
 ///
 /// 三个 PoC-3 必知坑在此落地:
-/// ① 无 action 的项默认被自动验证判禁用(子菜单父项亦然)→ 根/子菜单
-///    `setAutoenablesItems(false)`,叶子按 `enabled`、子菜单父项显式启用;
+/// ① 无 action 的项默认被自动验证判禁用 → `setAutoenablesItems(false)`,
+///    每项按 `enabled` 显式启用;
 /// ② `NSMenu`/`NSMenuItem` 均 MainThreadOnly(alloc 需 mtm 凭证);
 /// ③ `popUpMenuPositioningItem` 返回值 bool 语义不稳定(24 次成功选择里 1 次
 ///    false)→ **判定一律用 target/action 回传的 tag**(`MENU_CHOICE`),不读返回值。
