@@ -1224,6 +1224,7 @@ dependencies = [
  "protocol",
  "raw-window-handle",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "tray-icon",

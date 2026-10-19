@@ -117,6 +117,8 @@ anyhow = "1"
 # v2.1 Task 2:设置持久化(`settings.toml`;字号 + 两个全局快捷键)。
 serde.workspace = true
 toml.workspace = true
+# 版本清单解析。
+serde_json.workspace = true
 # Task 17:完整窗口「修改时间」列按本地时区显示(localtime_r;cli 的 fmt_time 是 UTC)。
 libc.workspace = true
 log = { workspace = true, features = ["std"] }

@@ -15,6 +15,9 @@ mod settings;
 mod single_instance;
 mod tray;
 mod ui;
+// Task 2 只交付纯逻辑；清单拉取与 UI 接线在后续任务，接线前公开 API 暂无调用方。
+#[allow(dead_code)]
+mod update;
 mod window_state;
 
 use eframe::egui;
