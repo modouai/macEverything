@@ -39,20 +39,20 @@ use anyhow::{anyhow, Result};
 use eframe::egui;
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol};
+use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType,
     NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem,
     NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPanel,
-    NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
-    NSLocale, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey,
-    NSURL,
+    NSArray, NSLocale, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString,
+    NSURLCustomIconKey, NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -760,6 +760,37 @@ pub fn popup_menu(
     choice
 }
 
+/// 把选中文件 URL 写入通用剪贴板(v2.3 §5.1;语义 = Finder「拷贝」)。
+///
+/// 写入 NSPasteboard 的 `NSURL` 数组即可被 Finder 等接收方当作文件拷贝
+/// (NSURL 遵循 `NSPasteboardWriting`);须主线程且不得持有共享锁。
+#[allow(dead_code)] // Task 3 才接菜单/快捷键;接线前无调用点。
+pub fn copy_files(paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    if MainThreadMarker::new().is_none() {
+        return Err(anyhow!("{}", crate::i18n::s().copy_file_failed));
+    }
+    let urls: Vec<Retained<NSURL>> = paths
+        .iter()
+        .map(|p| NSURL::fileURLWithPath(&NSString::from_str(p)))
+        .collect();
+    let objects: Vec<&ProtocolObject<dyn NSPasteboardWriting>> = urls
+        .iter()
+        .map(|url| ProtocolObject::from_ref(&**url))
+        .collect();
+    let array = NSArray::from_slice(&objects);
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    if pasteboard.writeObjects(&array) {
+        log::info!("拷贝文件:{} 项已写入剪贴板", paths.len());
+        Ok(())
+    } else {
+        Err(anyhow!("{}", crate::i18n::s().copy_file_failed))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 托盘菜单自弹(2026-10-16 实机修复:副屏点击 → 菜单落在主屏)
 
@@ -875,7 +906,8 @@ fn fallback_menu_bar_height(mtm: MainThreadMarker) -> f64 {
 }
 
 /// 取 Frame 的 NSView(结果窗口即根视口窗;取窗路径与 PoC-3 同法)。
-fn frame_view(frame: &eframe::Frame) -> Option<Retained<NSView>> {
+/// `pub(super)`:同层 `mac_quicklook` 关闭面板后取结果窗口归还焦点。
+pub(super) fn frame_view(frame: &eframe::Frame) -> Option<Retained<NSView>> {
     let handle = match frame.window_handle() {
         Ok(h) => h,
         Err(e) => {

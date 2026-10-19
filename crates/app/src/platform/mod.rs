@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 pub mod mac;
+#[cfg(target_os = "macos")]
+pub mod mac_quicklook;
 
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
@@ -386,6 +388,73 @@ pub fn popup_menu(
     {
         let _ = (items, at_view_pos, frame);
         None
+    }
+}
+
+/// 打开/更新 Quick Look 预览面板(主线程;始终置前,不承担关闭语义)。
+///
+/// `paths` 为空 = no-op。非 macOS / 非主线程 / 面板不可用 → Err。
+#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
+pub fn quick_look_show(paths: &[String], frame: &eframe::Frame) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac_quicklook::show(paths, frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (paths, frame);
+        Err(anyhow::anyhow!("非 macOS:快速查看不可用"))
+    }
+}
+
+/// 空格语义:面板未显示 → 打开;已显示 → 关闭并归还焦点。
+#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
+pub fn quick_look_toggle(paths: &[String], frame: &eframe::Frame) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac_quicklook::toggle(paths, frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (paths, frame);
+        Err(anyhow::anyhow!("非 macOS:快速查看不可用"))
+    }
+}
+
+/// Quick Look 面板当前是否可见(非 macOS 恒 false)。
+#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
+pub fn quick_look_visible() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac_quicklook::visible()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 每帧轮询:系统侧关闭面板后归还结果窗口焦点(非 macOS:no-op)。
+#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
+pub fn quick_look_poll(frame: &eframe::Frame) {
+    #[cfg(target_os = "macos")]
+    mac_quicklook::poll(frame);
+    #[cfg(not(target_os = "macos"))]
+    let _ = frame;
+}
+
+/// 把选中文件写入通用剪贴板(语义 = Finder「拷贝」;主线程)。
+/// 空列表 = no-op;非 macOS / 非主线程 / 写入失败 → Err。
+#[allow(dead_code)] // Task 3 才接菜单/快捷键;接线前无调用点。
+pub fn copy_files(paths: &[String]) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::copy_files(paths)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = paths;
+        Err(anyhow::anyhow!("非 macOS:文件剪贴板不可用"))
     }
 }
 

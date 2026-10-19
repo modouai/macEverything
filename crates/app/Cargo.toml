@@ -63,6 +63,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSAlert",
     "NSButton",
     "NSControl",
+    # v2.3 拷贝文件:NSPasteboard.writeObjects(NSURL 数组)。
+    "NSPasteboard",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification
@@ -98,6 +100,10 @@ image = { version = "0.25.10", default-features = false, features = ["png", "tif
 # 关默认 features:本任务只用 SMAppService(注册/注销/状态)+ SMErrors(错误码),
 # block2/core-foundation/security 均用不到,不开。
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService", "SMErrors"] }
+# v2.3 Quick Look(PoC-8 验证路径):QLPreviewPanel 单例 + dataSource + NSURL 预览项。
+# 关默认 features:只需 QLPreviewPanel/QLPreviewItem 与 app-kit 桥接(其余 QuickLookUI
+# 生成模块用不到),避免拖入 PDFKit/CoreGraphics 等构建面。
+objc2-quick-look-ui = { version = "0.3.2", default-features = false, features = ["std", "objc2-app-kit", "QLPreviewPanel", "QLPreviewItem"] }
 raw-window-handle = "0.6"
 # Task 15 全局热键(PoC-2 实锁 0.6.4;macOS 后端 = Carbon RegisterEventHotKey)。
 # 注意 crate 文档:macOS 上 manager 必须在主线程创建,且需主线程事件循环在跑

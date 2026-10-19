@@ -163,6 +163,8 @@ catalog! {
     menu_file_missing: "文件不存在,索引可能待更新" / "File not found; the index may be out of date",
     menu_open_failed: "打开失败" / "Failed to open",
     menu_copy_failed: "拷贝路径失败" / "Failed to copy path",
+    quick_look_failed: "无法预览该项目" / "Could not preview this item",
+    copy_file_failed: "拷贝文件失败" / "Failed to copy file",
     // 引擎拉起（用户可见）
     engine_not_found: "未找到引擎可执行文件(macEverything),已搜索以下路径:" / "Could not find the macEverything engine. Searched:",
     engine_not_found_hint: "请将 macEverything 放到 App 同目录,或加入 PATH 后重试。" / "Place macEverything next to the app or add it to PATH, then try again.",
