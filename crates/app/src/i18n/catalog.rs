@@ -158,7 +158,6 @@ catalog! {
     menu_open: "打开" / "Open",
     menu_show_in_finder: "在访达中显示" / "Show in Finder",
     menu_quick_look: "快速查看" / "Quick Look",
-    menu_copy: "拷贝" / "Copy",
     menu_copy_file: "拷贝文件" / "Copy File",
     menu_copy_path: "拷贝路径" / "Copy Path",
     menu_copy_name: "拷贝文件名" / "Copy File Name",

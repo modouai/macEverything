@@ -18,7 +18,7 @@
 目标：
 
 1. 完整结果窗口支持快速查看：空格 + 右键项，多选进 Quick Look 画廊。
-2. 「拷贝路径」升级为「拷贝 ▸」子菜单：拷贝文件 / 拷贝路径 / 拷贝文件名。
+2. 拷贝增强：拷贝文件 / 拷贝路径 / 拷贝文件名（最终平铺在一级菜单）。
 3. 顺带完成右键菜单的中英文案（i18n v2.1 Step 4），新增文案全部入目录。
 4. 快速查看先过一个 PoC 门槛，验证通过再进正式实现。
 
@@ -47,22 +47,22 @@
 在访达中显示
 快速查看
 ———（分隔线）
-拷贝 ▸
-  拷贝文件
-  拷贝路径
-  拷贝文件名
+拷贝文件        ⌘C
+拷贝路径        ⌘⇧C
+拷贝文件名
 ```
 
-| 菜单项 | 行为 | 多选 |
-|---|---|---|
-| 打开 | 文件=默认应用；目录=访达进入 | 逐项 |
-| 在访达中显示 | 父目录中选中该项 | 逐项 |
-| 快速查看 | 打开/更新 Quick Look 面板（空格为开关） | 画廊（全部选中项） |
-| 拷贝文件 | 文件 URL 写入剪贴板 | 全部写入 |
-| 拷贝路径 | 完整路径文本 | 逐行 |
-| 拷贝文件名 | 文件名文本 | 逐行 |
+| 菜单项 | 快捷键 | 行为 | 多选 |
+|---|---|---|---|
+| 打开 | | 文件=默认应用；目录=访达进入 | 逐项 |
+| 在访达中显示 | | 父目录中选中该项 | 逐项 |
+| 快速查看 | 空格 | 打开/更新 Quick Look 面板（空格为开关） | 画廊（全部选中项） |
+| 拷贝文件 | ⌘C | 文件 URL 写入剪贴板 | 全部写入 |
+| 拷贝路径 | ⌘⇧C | 完整路径文本 | 逐行 |
+| 拷贝文件名 | | 文件名文本 | 逐行 |
 
-- 子菜单标题「拷贝」无 tag、无 action，仅承载子菜单。
+- 2026-10-19 用户验收反馈：拷贝三项改为**一级平铺**，不再使用「拷贝 ▸」子菜单；菜单项通过 NSMenuItem keyEquivalent 显示快捷键。⌘C / ⌘⇧C 仅在表格有焦点、搜索框未聚焦时生效。
+- 无子菜单父项；`MenuEntry::Submenu` 已移除。
 - `NSMenu` tag（进程内标识，无持久化）：
 
 | 动作 | tag |
@@ -160,13 +160,24 @@ PoC 不通过时的退路（按优先级）：
 ### 4.5 实施记录（2026-10-19）
 
 - 平台层采用 PoC-8 的轮询方案：面板可见期间每 200ms 唤醒结果窗口轮询一次，系统侧关闭后归还焦点；未实现 QLPreviewPanelController。
-- 菜单桥接升级为 target/action，支持子菜单与分隔线；选择经 `MENU_CHOICE`（-1 哨兵）回传。
+- 菜单桥接升级为 target/action 与分隔线（子菜单已按用户反馈移除）；选择经 `MENU_CHOICE`（-1 哨兵）回传。
 - 单测覆盖：菜单结构/tag/中英文案、文件名载荷、存在性校验、shell 计划、空格门控与事件消费、平台动作分派。
+- 2026-10-19 用户验收反馈：拷贝三项平铺一级菜单；拷贝文件显示并响应 ⌘C，拷贝路径显示并响应 ⌘⇧C；菜单项经 keyEquivalent 展示快捷键。
 - 失活处理：App 非 active 时轮询不归还焦点，避免 ⌘Tab 切走后抢回前台。
 - 行为说明见 `docs/usage.md`；人工验收清单见 `plan.md` Task 4 Step 6。
 - 完整窗口隐藏/退出时静默关闭面板（`quick_look_dismiss`，不激活 App、不归还焦点）。
+- 从悬浮条 ⌥↵ 进入完整窗口：根窗允许 `MoveToActiveSpace` 并用 `makeKeyAndOrderFront`，跟随当前 Space 并成为 key；修复此前窗口显示在其他 Space/不是 key、按键落在隐藏悬浮条上的问题（2026-10-19 实机）。
 - 已知限制：QL 打开期间改变选中或结果替换不会自动刷新面板；菜单「快速查看」可更新；空格在面板可见时是关闭。
 - 最小化完整窗口不会关闭面板（未监听 NSWindowDidMiniaturizeNotification）；按隐藏处理路径仅覆盖红点关闭与 ⌘W。实机验收确认是否接受。
+
+### 4.6 键盘行导航（2026-10-19 用户反馈）
+
+- 搜索框聚焦且结果非空时按 **↓**：选中第一行，同时交还搜索框焦点。
+- 表格聚焦后 **↑ / ↓** 按结果顺序移动单行选择，目标行自动滚入视野；长按可连续移动。
+- 选中后空格 Quick Look、右键菜单、⌘C/⌘⇧C 直接可用。
+- 返回搜索框：表格焦点时 **Esc**；首行再按 **↑**；任意时刻 **⌘F** 聚焦并全选查询词；点击搜索框同样可回焦。
+- 回焦在触发键**松开后**执行：按住方向键产生的 repeat 事件会在输入框刚获得焦点的首帧被 egui 当作焦点导航，导致再次失焦。搜索框同时捕获 Esc，避免按下 Esc 后进入「输入框与表格都不持焦」的死区。
+- 纯逻辑 `stepped_row`（空结果/首末行 clamp）与 `scroll_offset_for_row`（居中/贴顶）有单测。
 
 ## 5. 拷贝增强
 
@@ -201,6 +212,8 @@ PoC 不通过时的退路（按优先级）：
 
 ## 6. 菜单桥接升级（子菜单与可靠选择）
 
+> 2026-10-19 后续变更：拷贝项已改为一级平铺，`MenuEntry::Submenu` 已移除；下文 target/action + 哨兵方案仍有效，子菜单相关内容仅作历史记录。
+
 现状：`platform::popup_menu` 创建无 action 的菜单项，弹出返回后读
 `highlightedItem().tag()`。该方式在**子菜单**下不可靠（根菜单的 highlightedItem 可能是
 子菜单父项，而不是叶子项），必须升级。
@@ -232,7 +245,7 @@ pub enum MenuEntry {
   - `MenuAction` 增加 `QuickLook` / `CopyFile` / `CopyFileName`（在 v2.2 三项基础上）。
   - `ShellAction` 扩展 `CopyFileName`（文本类）；`QuickLook` / `CopyFile` 为平台动作，
     不进入 shell plan。
-  - `menu_entries()` 产出 §3 的嵌套结构；子菜单标题用 i18n。
+  - `menu_entries()` 产出 §3 的平铺结构；拷贝文件/路径带 `MenuShortcut`（⌘C/⌘⇧C）。
   - 新增 `names_text(paths)` 纯函数与单测。
 - `crates/app/src/ui/results.rs`
   - 空格键处理（表格焦点/搜索框未聚焦/非重复）。
@@ -240,15 +253,15 @@ pub enum MenuEntry {
     其余 → `menu_actions::execute(ShellAction)`。
   - 菜单项构建改为嵌套 `MenuEntry`。
 - `crates/app/src/platform/mod.rs`
-  - `MenuEntry` 增加 `Submenu`；`popup_menu` 走 target/action。
+  - `MenuEntry::Item` 增加 `shortcut`；`popup_menu` 走 target/action；不再提供 `Submenu`。
   - 新增 facade：`quick_look_show/toggle/visible/poll/dismiss`、`copy_files`（非 macOS 返回不支持）。
 - `crates/app/src/platform/mac.rs`
-  - 菜单构建支持子菜单、target/action、分隔线、禁用项。
+  - 菜单构建支持 target/action、快捷键 keyEquivalent、分隔线、禁用项。
   - `copy_files`：NSPasteboard 写入 NSURL。
 - `crates/app/src/platform/mac_quicklook.rs`（新增）
   - QLPreviewPanel 单例、设置 data source、焦点返回。
 - `crates/app/src/i18n/catalog.rs`
-  - 新增：`menu_quick_look`、`menu_copy`、`menu_copy_file`、`menu_copy_path`、
+  - 新增：`menu_quick_look`、`menu_copy_file`、`menu_copy_path`、
     `menu_copy_name`、`quick_look_failed`、`copy_file_failed`、`copy_name_failed`；
     补齐既有 `menu_open` / `menu_show_in_finder`（Step 4 一并落地）。
 - `crates/app/Cargo.toml`
@@ -266,15 +279,15 @@ pub enum MenuEntry {
 | Quick Look 多选中部分文件缺失 | 整批前置校验拦截（与既有动作一致） |
 | 剪贴板写入失败 | 状态栏「拷贝文件失败」 |
 | 文本拷贝失败 | 状态栏「拷贝文件名失败 / 拷贝路径失败」 |
-| 子菜单未选择（Esc/点外部） | 无动作（哨兵未命中） |
+| 菜单未选择（Esc/点外部） | 无动作（哨兵未命中） |
 | 禁用项 | 不可选中；不触发 action |
 
 ## 9. 测试与验收
 
 **单测（纯逻辑）**
 
-- `menu_entries()`：顶层结构为打开/在访达中显示/快速查看/分隔线/拷贝子菜单（3 个顶层动作 + 分隔线 + 子菜单，共 6 个叶子动作）；
-  子菜单三项顺序与 tag、子菜单父项无 tag。
+- `menu_entries()`：顶层 7 项（打开/在访达中显示/快速查看/分隔线/拷贝文件/拷贝路径/拷贝文件名），
+  拷贝三项平铺；拷贝文件带 ⌘C、拷贝路径带 ⌘⇧C，其余无快捷键。
 - tag 往返：1–6；0/未知不映射。
 - `names_text`：单文件、多文件、根目录回退、空集。
 - `plan`：CopyFileName 的 Pipe 载荷；既有三动作命令面不变。
@@ -298,7 +311,7 @@ pub enum MenuEntry {
 |---|---|---|
 | QLPreviewPanel 集成 | 面板跟随 responder 链，egui 窗口可能无法正确接管/关闭 | §4.3 PoC 前置；必要时实现 QLPreviewPanelController；再不行降级或砍掉 |
 | LSUIElement 焦点 | 无 Dock 图标 App 的激活/焦点返回可能异常 | PoC 专项验证；关闭时显式激活结果窗口 |
-| 子菜单选择回传 | `highlightedItem` 在子菜单下不可靠 | target/action 升级 + 实机回归 |
+| 菜单选择回传 | `highlightedItem` 判定不可靠 | target/action + `MENU_CHOICE` 哨兵 + 实机回归 |
 | 文件 URL 剪贴板兼容性 | 个别旧 App 只认 legacy filenames 类型 | 先写现代 NSURL 并实测 Finder/邮件；不通过再补 legacy 类型 |
 | 空格键冲突 | 搜索框空格输入 / 列表滚动 | 仅在表格聚焦且搜索框未聚焦时拦截；忽略自动重复 |
 | 菜单 i18n 回归 | 本次把既有三项一并本地化 | 复用已有 i18n 测试与双语实机清单 |
@@ -325,7 +338,7 @@ pub enum MenuEntry {
 
 1. **快速查看只做完整结果窗口**：悬浮条失焦即隐藏，与 QL 面板抢焦点冲突；完整窗口是主工作区。
 2. **空格 toggle + 右键项**：符合 macOS 标准；菜单项提供可发现性。
-3. **拷贝做成子菜单**：避免顶层菜单膨胀；为将来的「打开方式 ▸」复用子菜单桥接。
+3. **拷贝项平铺（2026-10-19 用户反馈调整）**：三项直接放一级并提供 ⌘C/⌘⇧C；不再使用子菜单。
 4. **拷贝文件 = 文件 URL，不复制内容**：与 Finder 的「拷贝」语义一致，粘贴目标决定用途。
 5. **菜单 i18n 随本任务落地**：新增菜单项必须双语，避免与既有 i18n 工作混排。
 6. **Quick Look 先 PoC 再实现**：集成风险集中在 responder 链与焦点，不能靠纸面设计拍板。

@@ -3,7 +3,9 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **实施状态（2026-10-19）：** Task 1–3 已实现并通过双审；Task 4 文档已回填；Task 4 Step 6 实机验收待人工确认。已完成步骤已勾选。
-> **实施偏差（以代码为准）：** Quick Look 用 existing_panel 避免查询时创建面板；show 校验 isVisible；poll 在 App 非 active 时跳过，系统关闭时清空 URL。空格仅打开方向做存在性校验，关闭方向不校验；select_all 置 table_focused。菜单分派对 shell()==None 用 debug_assert! + log::error!。拷贝路径不校验存在性，其余动作整批校验。Task 2 为未接线入口加的 dead_code allow 已全部删除。下文代码块为计划稿，与最终实现有差异时以本节为准。
+> **实施偏差（以代码为准）：** Quick Look 用 existing_panel 避免查询时创建面板；show 校验 isVisible；poll 在 App 非 active 时跳过，系统关闭时清空 URL。空格仅打开方向做存在性校验，关闭方向不校验；select_all 置 table_focused。菜单分派对 shell()==None 用 debug_assert! + log::error!。拷贝路径不校验存在性，其余动作整批校验。Task 2 为未接线入口加的 dead_code allow 已全部删除。
+> **用户验收反馈（2026-10-19）：** 拷贝三项改为一级平铺（无子菜单）；⌘C 拷贝文件、⌘⇧C 拷贝路径；菜单项显示快捷键。`MenuEntry::Submenu` 已移除。
+> 下文代码块为计划稿，与最终实现有差异时以本节为准。
 
 **Goal:** 把完整结果窗口的右键菜单落地为 v2.3 最终形态：删除「在访达中打开」，加入快速查看、拷贝文件/路径/文件名子菜单，并完成菜单 i18n。
 
@@ -1350,7 +1352,10 @@ open release/macEverything.app
 
 - 空格:表格焦点单选/多选打开;再按空格关闭;Esc 关闭;方向键切换画廊;关闭后焦点回到结果窗口。
 - 搜索框聚焦时空格只输入空格。
-- 右键:六个叶子项 tag 正确;取消不误触;子菜单可展开。
+- 搜索框输入后按 ↓:选中第一行且搜索框失焦;继续 ↑/↓ 顺序移动并自动滚动;长按可连续移动;空格/⌘C 对当前行生效;点击搜索框可继续输入。
+- 表格焦点时 Esc 回到搜索框(保留查询与选中);首行再按 ↑ 回到搜索框;任意时刻 ⌘F 聚焦搜索框并全选查询词。
+- 右键:六项平铺(无子菜单);拷贝文件右侧显示 ⌘C、拷贝路径右侧显示 ⌘⇧C;取消不误触。
+- 表格焦点下 ⌘C 拷贝文件、⌘⇧C 拷贝路径;搜索框聚焦时 ⌘C 归输入框(复制文本),不触发文件拷贝。
 - 拷贝文件:粘到 Finder 生成副本、粘到邮件为附件;多选全部写入。
 - 拷贝路径/文件名:单/多选文本正确;根目录回退完整路径。
 - 缺失文件:打开、在访达中显示、快速查看（打开方向）、拷贝文件、拷贝文件名整批拒绝并提示;拷贝路径不校验存在性,空格关闭方向不校验。

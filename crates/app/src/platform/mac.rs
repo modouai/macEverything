@@ -43,11 +43,12 @@ use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType,
-    NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem,
-    NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPanel,
-    NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSImage, NSMenu,
+    NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel,
+    NSPanel, NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView,
+    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
@@ -503,8 +504,13 @@ pub fn show_root_window() -> Result<()> {
         root.deminiaturize(None);
         log::info!("完整窗口(根窗)最小化中:deminiaturize 恢复");
     }
-    root.orderFrontRegardless();
-    root.makeKeyWindow();
+    // 从悬浮条(可能是他人全屏 Space 上的 non-activating panel)进入完整窗口时,
+    // 普通窗口默认留在 App 原 Space,会出现「窗口显示在别处且不是 key」。显式允许
+    // 跟随当前 Space,并用 makeKeyAndOrderFront 置前成 key(实机 2026-10-19)。
+    root.setCollectionBehavior(
+        root.collectionBehavior() | NSWindowCollectionBehavior::MoveToActiveSpace,
+    );
+    root.makeKeyAndOrderFront(None);
     root.makeMainWindow();
     let f = root.frame();
     log::info!(
@@ -925,24 +931,23 @@ pub(super) fn frame_view(frame: &eframe::Frame) -> Option<Retained<NSView>> {
     unsafe { Retained::retain(h.ns_view.as_ptr().cast::<NSView>()) }
 }
 
-/// 构建右键菜单(递归:叶子 target/action、分隔线、子菜单)。
+/// 构建右键菜单(菜单项 target/action、可选快捷键、分隔线)。
 ///
-/// 子菜单父项 action = None、显式启用;`NSMenuItem.target` 为弱引用,由调用方
-/// (`popup_menu`)保活 `target` 到弹出返回。
+/// `NSMenuItem.target` 为弱引用,由调用方(`popup_menu`)保活 `target` 到弹出返回。
 fn build_context_menu(
     mtm: MainThreadMarker,
     items: &[MenuEntry],
     target: &MenuTarget,
 ) -> Retained<NSMenu> {
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(""));
-    // 无 action 的项会被自动验证判为禁用(子菜单父项同理);关掉自动验证,
-    // 逐项显式启用——项可高亮、可选择(PoC-3 实锤)。
+    // 无 action 的项会被自动验证判为禁用;关掉自动验证,逐项显式启用——
+    // 项可高亮、可选择(PoC-3 实锤)。
     menu.setAutoenablesItems(false);
     add_menu_entries(mtm, &menu, items, target);
     menu
 }
 
-/// 递归填充菜单项:叶子(标题 + tag + enabled + target/action)、分隔线、子菜单。
+/// 填充菜单项:标题 + tag + enabled + 可选快捷键 + target/action;分隔线。
 fn add_menu_entries(
     mtm: MainThreadMarker,
     menu: &NSMenu,
@@ -955,6 +960,7 @@ fn add_menu_entries(
                 title,
                 tag,
                 enabled,
+                shortcut,
             } => {
                 // SAFETY:selector 为本类实装的 menuItemChosen:(签名匹配,AppKit 在
                 // 菜单跟踪期于主线程投递);标题与键等价串为本次调用内构造的
@@ -970,6 +976,17 @@ fn add_menu_entries(
                 debug_assert!(*tag != NO_MENU_CHOICE, "菜单 tag -1 是未选择哨兵");
                 item.setTag(*tag as NSInteger); // i64 → isize(边界转换,见 popup_menu)
                 item.setEnabled(*enabled);
+                if let Some(shortcut) = shortcut {
+                    item.setKeyEquivalent(&NSString::from_str(shortcut.key));
+                    let mut mask = NSEventModifierFlags::empty();
+                    if shortcut.command {
+                        mask |= NSEventModifierFlags::Command;
+                    }
+                    if shortcut.shift {
+                        mask |= NSEventModifierFlags::Shift;
+                    }
+                    item.setKeyEquivalentModifierMask(mask);
+                }
                 let target_obj: &AnyObject = target.as_super().as_ref();
                 // SAFETY:target_obj 指向调用方保活的 MenuTarget;setTarget 为
                 // 弱引用赋值,selector 与目标类方法签名匹配。
@@ -978,24 +995,6 @@ fn add_menu_entries(
             }
             MenuEntry::Separator => {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
-            }
-            MenuEntry::Submenu { title, items } => {
-                // SAFETY:selector 传 None(子菜单父项无 action);标题/键等价串
-                // 为本次调用内构造的 NSString 临时值,AppKit 拷贝入项。
-                let item = unsafe {
-                    NSMenuItem::initWithTitle_action_keyEquivalent(
-                        NSMenuItem::alloc(mtm),
-                        &NSString::from_str(title),
-                        None,
-                        &NSString::from_str(""),
-                    )
-                };
-                item.setEnabled(true); // 父项无 action,防自动验证判禁用
-                let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
-                submenu.setAutoenablesItems(false);
-                add_menu_entries(mtm, &submenu, items, target);
-                item.setSubmenu(Some(&submenu));
-                menu.addItem(&item);
             }
         }
     }

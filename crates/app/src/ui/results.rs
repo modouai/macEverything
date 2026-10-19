@@ -145,6 +145,14 @@ pub struct ResultsState {
     ime_composing: bool,
     /// 上帧搜索框是否持焦(⌘A 归属:聚焦 = 输入框全选文本,未聚焦 = 表格全选行)。
     input_focused: bool,
+    /// 下一帧交还搜索框焦点(搜索框 ↓ 进入表格时置位)。
+    blur_input_pending: bool,
+    /// 聚焦搜索框后全选查询词(⌘F)。
+    select_all_input_pending: bool,
+    /// 等该键松开后把焦点交还搜索框(Esc/首行 ↑;避免按住重复键导致再次失焦)。
+    return_focus_on_release: Option<egui::Key>,
+    /// 下一帧把表格滚动到该行(键盘导航用;绘制表格时消费)。
+    scroll_to_row: Option<usize>,
     /// 结果表格是否持键盘焦点(点击过行;搜索框聚焦时清除;空格 Quick Look 的门槛)。
     table_focused: bool,
     paths: DaemonPaths,
@@ -208,6 +216,10 @@ impl ResultsState {
             focus_input_pending: true,
             ime_composing: false,
             input_focused: false,
+            blur_input_pending: false,
+            select_all_input_pending: false,
+            return_focus_on_release: None,
+            scroll_to_row: None,
             table_focused: false,
             paths,
             ctx,
@@ -226,6 +238,10 @@ impl ResultsState {
         self.focus_input_pending = true;
         self.status_refresh_pending = true;
         self.table_focused = false;
+        self.blur_input_pending = false;
+        self.select_all_input_pending = false;
+        self.return_focus_on_release = None;
+        self.scroll_to_row = None;
         // 每次唤起从干净状态开始:上次会话的瞬时提示(如查询失败)不得跨唤起驻留。
         self.status_note = None;
         self.status_note_is_error = false;
@@ -434,6 +450,72 @@ impl ResultsState {
             self.select_all();
         }
 
+        // ⌘F:回到搜索框并全选查询词(任意焦点状态)。
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.focus_input_pending = true;
+            self.select_all_input_pending = true;
+            self.table_focused = false;
+            self.return_focus_on_release = None;
+        }
+
+        // Esc:表格焦点 -> 返回搜索框(保留查询词与选中行)。
+        if self.table_focused
+            && !self.ime_composing
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.return_focus_on_release = Some(egui::Key::Escape);
+        }
+
+        // ↓:搜索框聚焦时进入表格并选中首行(同时交还搜索框焦点);
+        // 表格聚焦后 ↑/↓ 按行移动(显示顺序;允许长按重复)。
+        let down_from_input = self.input_focused
+            && !self.ime_composing
+            && !self.results.is_empty()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+        if down_from_input {
+            self.blur_input_pending = true;
+            self.return_focus_on_release = None;
+        }
+        let table_nav = if !down_from_input && self.table_focused && !self.ime_composing {
+            ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    Some(1)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    Some(-1)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(delta) = if down_from_input { Some(1) } else { table_nav } {
+            let current = if down_from_input {
+                None
+            } else {
+                self.anchor
+                    .or_else(|| self.selection.iter().next().copied())
+            };
+            if delta < 0 && should_focus_search_on_up(current) {
+                // 已选中第一行再按 ↑:等按键松开后回焦,保留当前选中行。
+                self.return_focus_on_release = Some(egui::Key::ArrowUp);
+            } else if let Some(next) = stepped_row(current, self.results.len(), delta) {
+                self.selection.clear();
+                self.selection.insert(next);
+                self.anchor = Some(next);
+                self.table_focused = true;
+                self.scroll_to_row = Some(next);
+            }
+        }
+
+        if let Some(key) = self.return_focus_on_release {
+            if ui.input(|i| key_released(&i.events, key)) {
+                self.focus_input_pending = true;
+                self.table_focused = false;
+                self.return_focus_on_release = None;
+            }
+        }
+
         // 空格:表格有焦点(点击过行)且搜索框未聚焦 -> Quick Look 开关。
         // 搜索框聚焦时空格照常输入;忽略自动重复(长按只 toggle 一次)。
         let space_gate = space_activation_allowed(
@@ -443,10 +525,18 @@ impl ResultsState {
             !self.selection.is_empty(),
         );
         let space_pressed = space_gate && ui.input(|i| initial_space_press(&i.events));
+        let copy_action = if space_gate {
+            ui.input(|i| initial_copy_shortcut(&i.events))
+        } else {
+            None
+        };
         if space_gate {
-            // 门控成立即消费所有无修饰 Space(含自动重复),避免漏给其他控件;
-            // 但只在首次按下(space_pressed)时触发 toggle。
-            ui.input_mut(|i| consume_unmodified_space_presses(&mut i.events));
+            // 门控成立即消费所有无修饰 Space 与 Command+C(含自动重复),避免漏给
+            // 其他控件;但只在首次按下时触发对应动作。
+            ui.input_mut(|i| {
+                consume_unmodified_space_presses(&mut i.events);
+                consume_copy_shortcuts(&mut i.events);
+            });
         }
 
         let mut sort_click: Option<SortKey> = None;
@@ -536,6 +626,14 @@ impl ResultsState {
                         .text_color(palette.query_text)
                         .frame(egui::Frame::NONE)
                         .min_size(layout.text_rect.size())
+                        // 捕获方向键(移动光标)与 Esc:否则 egui 默认把 Esc 当作
+                        // 「交还焦点」,搜索框会进入谁都不持焦的状态,方向键全失效。
+                        .event_filter(egui::EventFilter {
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            tab: false,
+                            escape: true,
+                        })
                         // 文字垂直居中、左对齐(egui 0.37 TextEdit 主题默认贴顶)。
                         .align(egui::Align2::LEFT_CENTER),
                 );
@@ -549,9 +647,17 @@ impl ResultsState {
                     egui::CornerRadius::ZERO,
                     palette.divider,
                 );
-                resp
+                (resp, input_id)
             })
             .inner;
+
+        let (input_resp, input_id) = input_resp;
+
+        if self.blur_input_pending {
+            // ↓ 已把选择移入表格:交还搜索框焦点,后续 ↑/↓ 由表格导航处理。
+            input_resp.surrender_focus();
+            self.blur_input_pending = false;
+        }
 
         // —— 底部:状态栏(顶部 1px 分隔线 + 28 内容,§3.6)+ 缺口面板(展开时在上)——
         // min_size 固定状态行首帧高度(egui 面板尺寸跨帧记忆;缺省最小 20 会让
@@ -644,41 +750,46 @@ impl ResultsState {
                 // 滚动/虚拟化路径。
                 table_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                 table_ui.spacing_mut().scroll.floating = true;
-                egui::ScrollArea::vertical()
+                let mut scroll_area = egui::ScrollArea::vertical()
                     .id_salt("results-table")
                     .auto_shrink([false, false])
-                    .max_height(table_rect.height())
-                    .show_rows(
-                        &mut table_ui,
-                        window_tokens::ROW_H,
-                        results.len(),
-                        |ui, range| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            for i in range {
-                                let resp = draw_row(
-                                    ui,
-                                    &results[i],
-                                    &cols,
-                                    selection.contains(&i),
-                                    home.as_deref(),
-                                    &palette,
-                                    icons,
-                                );
-                                if resp.double_clicked() {
-                                    open_row = Some(i); // 双击 = 默认应用打开(product §2)
-                                } else if resp.secondary_clicked() {
-                                    // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
-                                    // 表格闭包外做(借用结束)
-                                    match resp.interact_pointer_pos() {
-                                        Some(pos) => context_click = Some((i, pos)),
-                                        None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
-                                    }
-                                } else if resp.clicked() {
-                                    row_click = Some((i, shift_down, cmd_down));
+                    .max_height(table_rect.height());
+                if let Some(row) = self.scroll_to_row.take() {
+                    // 键盘导航:只在本帧强制目标偏移,之后交给用户滚动。
+                    scroll_area = scroll_area
+                        .vertical_scroll_offset(scroll_offset_for_row(row, table_rect.height()));
+                }
+                scroll_area.show_rows(
+                    &mut table_ui,
+                    window_tokens::ROW_H,
+                    results.len(),
+                    |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for i in range {
+                            let resp = draw_row(
+                                ui,
+                                &results[i],
+                                &cols,
+                                selection.contains(&i),
+                                home.as_deref(),
+                                &palette,
+                                icons,
+                            );
+                            if resp.double_clicked() {
+                                open_row = Some(i); // 双击 = 默认应用打开(product §2)
+                            } else if resp.secondary_clicked() {
+                                // 右键(Task 18):记录行与点击点;选择收敛与弹菜单在
+                                // 表格闭包外做(借用结束)
+                                match resp.interact_pointer_pos() {
+                                    Some(pos) => context_click = Some((i, pos)),
+                                    None => log::warn!("右键点击行 {i} 缺位置信息,菜单不弹"),
                                 }
+                            } else if resp.clicked() {
+                                row_click = Some((i, shift_down, cmd_down));
                             }
-                        },
-                    );
+                        }
+                    },
+                );
             });
 
         // —— 交互落地(表格闭包外:借用结束)——
@@ -714,6 +825,29 @@ impl ResultsState {
                 log::warn!("空格快速查看:无 eframe Frame(测试路径),忽略");
             }
         }
+
+        if let Some(action) = copy_action {
+            let paths = self.selected_paths();
+            let result = match action {
+                menu_actions::MenuAction::CopyFile => menu_actions::ensure_existing(&paths)
+                    .and_then(|()| platform::copy_files(&paths)),
+                menu_actions::MenuAction::CopyPaths => {
+                    menu_actions::execute(menu_actions::ShellAction::CopyPaths, &paths)
+                }
+                _ => {
+                    debug_assert!(false, "非拷贝动作进入快捷键分派:{action:?}");
+                    log::error!("快捷键分派收到非拷贝动作:{action:?}");
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => log::info!("快捷键 {action:?}:{} 项", paths.len()),
+                Err(err) => {
+                    self.status_note = Some(StatusNote::Raw(err.to_string()));
+                    self.status_note_is_error = true;
+                }
+            }
+        }
         if gaps_clicked {
             self.gaps_open = !self.gaps_open;
             log::info!(
@@ -747,11 +881,46 @@ impl ResultsState {
         }
         if self.focus_input_pending {
             input_resp.request_focus();
+            if self.select_all_input_pending {
+                // ⌘F:聚焦搜索框并全选当前查询词(状态下一帧由 TextEdit 读取)。
+                if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, input_id) {
+                    let end = egui::text::CCursor::new(self.input.chars().count());
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            end,
+                        )));
+                    state.store(&ctx, input_id);
+                }
+                self.select_all_input_pending = false;
+            }
             self.focus_input_pending = false;
         }
+        // egui 的 focus filter 要到控件绘制时才安装:输入框刚获得焦点的首帧,
+        // Esc 会被当成「交还焦点」。搜索框内 Esc 不应把焦点丢成「谁都没有」,
+        // 否则后续方向键全部失效;检测到该情况时当帧补回焦点。
+        let esc_pressed = ui.input(|i| {
+            i.events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.is_none()
+                )
+            })
+        });
+        if esc_pressed && self.input_focused && !input_resp.has_focus() {
+            input_resp.request_focus();
+        }
+
         self.input_focused = input_resp.has_focus();
         if self.input_focused {
             self.table_focused = false;
+            self.return_focus_on_release = None;
         }
 
         // —— 窗口内描边(最内层,压在所有分段之上;§4.2 window_stroke / §4.4) ——
@@ -1545,7 +1714,8 @@ fn converge_selection(selection: &mut BTreeSet<usize>, anchor: &mut Option<usize
     }
 }
 
-/// 空格 Quick Look 门控(纯逻辑):搜索框未聚焦、非 IME 组合、表格持焦、有选中。
+/// 表格键盘动作门控(空格/拷贝快捷键共用):搜索框未聚焦、非 IME 组合、
+/// 表格持焦、有选中。
 fn space_activation_allowed(
     input_focused: bool,
     ime_composing: bool,
@@ -1553,6 +1723,102 @@ fn space_activation_allowed(
     has_selection: bool,
 ) -> bool {
     !input_focused && !ime_composing && table_focused && has_selection
+}
+
+/// ⌘C → 拷贝文件;⌘⇧C → 拷贝路径。仅认 Command,带 Alt/Ctrl 或其他键不处理。
+fn copy_shortcut_for(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Option<menu_actions::MenuAction> {
+    if key != egui::Key::C || !modifiers.command || modifiers.alt || modifiers.ctrl {
+        return None;
+    }
+    if modifiers.shift {
+        Some(menu_actions::MenuAction::CopyPaths)
+    } else {
+        Some(menu_actions::MenuAction::CopyFile)
+    }
+}
+
+/// 行移动(纯逻辑):空结果 None;无当前行时下移选首行、上移选末行;
+/// 其余按 delta 步进并 clamp 到 [0, len-1]。
+fn stepped_row(current: Option<usize>, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match current {
+        Some(i) => {
+            let max = len - 1;
+            let next = (i as isize + delta).clamp(0, max as isize);
+            Some(next as usize)
+        }
+        None => Some(if delta >= 0 { 0 } else { len - 1 }),
+    }
+}
+
+/// 首行再按 ↑:焦点回到搜索框(无选中时 ↑ 仍选末行)。
+fn should_focus_search_on_up(current: Option<usize>) -> bool {
+    current == Some(0)
+}
+
+/// 本帧是否包含指定键的释放事件(用于「等触发键松开再回焦」)。
+///
+/// 直接在按下帧回焦会让仍按住的方向键重复事件落到刚获得焦点的 TextEdit:
+/// egui 的 focus filter 要到控件绘制时才安装,首帧会把这些重复键当成焦点导航,
+/// 输入框随即再次失焦(实机日志 2026-10-19)。
+fn key_released(events: &[egui::Event], key: egui::Key) -> bool {
+    events.iter().any(|ev| {
+        matches!(
+            ev,
+            egui::Event::Key {
+                key: k,
+                pressed: false,
+                ..
+            } if *k == key
+        )
+    })
+}
+
+/// 键盘导航的目标滚动偏移:尽量让目标行居中;视口顶部/前几行保持贴顶。
+fn scroll_offset_for_row(row: usize, viewport_h: f32) -> f32 {
+    let row_h = window_tokens::ROW_H;
+    (row as f32 * row_h - (viewport_h - row_h) / 2.0).max(0.0)
+}
+
+/// 本帧是否存在首次按下(非自动重复)的拷贝快捷键。
+///
+/// egui-winit 把纯 ⌘C 译为 `Event::Copy`(不再产出 Key 事件);⌘⇧C 仍走 Key。
+/// `Event::Copy` 在表格门控成立时才被消费,搜索框聚焦时留给 TextEdit。
+fn initial_copy_shortcut(events: &[egui::Event]) -> Option<menu_actions::MenuAction> {
+    events.iter().find_map(|ev| match ev {
+        egui::Event::Copy => Some(menu_actions::MenuAction::CopyFile),
+        egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            ..
+        } => copy_shortcut_for(*key, *modifiers),
+        _ => None,
+    })
+}
+
+/// 消费 ⌘C/⌘⇧C 事件(含自动重复);释放、裸 C、⌘⌥C/⌘⌃C 保留。
+fn consume_copy_shortcuts(events: &mut Vec<egui::Event>) {
+    events.retain(|ev| {
+        if matches!(ev, egui::Event::Copy) {
+            return false;
+        }
+        !matches!(
+            ev,
+            egui::Event::Key {
+                key: egui::Key::C,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.command && !modifiers.alt && !modifiers.ctrl
+        )
+    });
 }
 
 /// 本帧是否存在首次按下(非自动重复)的无修饰 Space。
@@ -2199,6 +2465,7 @@ fn format_ymd_hm(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::menu_actions::MenuAction;
 
     /// 原型口径:整数去 `.0`(18 KB / 12 MB),非整数保留一位(2.4 MB);
     /// 字节 `B` 恒整数。
@@ -4491,6 +4758,392 @@ mod tests {
                 }
             ),
             "其他键保留"
+        );
+    }
+
+    /// 快捷键映射:⌘C 拷贝文件;⌘⇧C 拷贝路径;带 Alt/Ctrl 或其他键不认。
+    #[test]
+    fn copy_shortcuts_map_command_c_and_command_shift_c() {
+        let cmd = egui::Modifiers {
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let cmd_shift = egui::Modifiers {
+            command: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let cmd_alt = egui::Modifiers {
+            command: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            copy_shortcut_for(egui::Key::C, cmd),
+            Some(MenuAction::CopyFile)
+        );
+        assert_eq!(
+            copy_shortcut_for(egui::Key::C, cmd_shift),
+            Some(MenuAction::CopyPaths)
+        );
+        assert_eq!(copy_shortcut_for(egui::Key::C, cmd_alt), None);
+        assert_eq!(copy_shortcut_for(egui::Key::C, ctrl), None);
+        assert_eq!(copy_shortcut_for(egui::Key::V, cmd), None);
+    }
+
+    /// 集成回归:搜索框持焦时 ↓ 应选中首行、交还输入焦点,并建立表格焦点。
+    #[test]
+    fn down_from_input_enters_table_headless() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..5)
+            .map(|i| HitEntry {
+                name: format!("file-{i}.txt"),
+                path: format!("/tmp/mce-test/file-{i}.txt"),
+                size: Some(1),
+                mtime: Some(1_700_000_000),
+                is_dir: false,
+            })
+            .collect();
+        st.total = 5;
+        let mut icons = IconCache::without_worker();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        // 首帧:focus_input_pending 生效。
+        let mut out = ctx.run_ui(raw(), |ui| st.draw_impl(ui, None, &mut icons));
+        out.textures_delta.clear();
+        assert!(st.input_focused, "首帧后搜索框应持焦");
+
+        // 次帧:↓。
+        let mut input = raw();
+        input.events.push(key_event(
+            egui::Key::ArrowDown,
+            true,
+            false,
+            egui::Modifiers::NONE,
+        ));
+        let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, &mut icons));
+        out.textures_delta.clear();
+
+        assert_eq!(st.selection, BTreeSet::from([0]), "↓ 应选中首行");
+        assert!(st.table_focused, "↓ 后表格应持焦");
+        assert!(!st.input_focused, "↓ 后搜索框应交还焦点");
+    }
+
+    /// 回归:首行 ↑ 回焦必须等按键松开;若按下帧立即回焦,按住产生的 repeat
+    /// 事件会在输入框获得焦点的首帧被当成焦点导航,导致再次失焦。
+    #[test]
+    fn up_at_first_row_returns_focus_after_release_headless() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..5)
+            .map(|i| HitEntry {
+                name: format!("file-{i}.txt"),
+                path: format!("/tmp/mce-test/file-{i}.txt"),
+                size: Some(1),
+                mtime: Some(1_700_000_000),
+                is_dir: false,
+            })
+            .collect();
+        st.total = 5;
+        let mut icons = IconCache::without_worker();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |ctx: &egui::Context, st: &mut ResultsState, icons: &mut IconCache, events| {
+            let mut input = raw();
+            input.events = events;
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, icons));
+            out.textures_delta.clear();
+        };
+
+        // 聚焦输入框 → ↓ 进入表格首行。
+        frame(&ctx, &mut st, &mut icons, vec![]);
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::ArrowDown,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )],
+        );
+        assert_eq!(st.selection, BTreeSet::from([0]));
+
+        // 首行 ↑:按下与重复帧都只登记「等松开」,不立即回焦。
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::ArrowUp,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )],
+        );
+        assert_eq!(st.return_focus_on_release, Some(egui::Key::ArrowUp));
+        assert!(st.table_focused);
+        assert!(!st.input_focused);
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::ArrowUp,
+                true,
+                true,
+                egui::Modifiers::NONE,
+            )],
+        );
+        assert!(!st.input_focused, "按住期间不回焦");
+
+        // 松开:回焦;随后空帧焦点必须保持(旧实现在这里会丢掉焦点)。
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::ArrowUp,
+                false,
+                false,
+                egui::Modifiers::NONE,
+            )],
+        );
+        assert!(st.input_focused, "松开后输入框应持焦");
+        frame(&ctx, &mut st, &mut icons, vec![]);
+        assert!(st.input_focused, "空帧后输入框焦点应保持");
+        assert!(!st.table_focused);
+    }
+
+    /// 搜索框聚焦时 Esc 不应把焦点丢到「谁都没有」的状态;之后 ↓ 仍能进入表格。
+    #[test]
+    fn escape_in_search_keeps_focus_headless() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..3)
+            .map(|i| HitEntry {
+                name: format!("file-{i}.txt"),
+                path: format!("/tmp/mce-test/file-{i}.txt"),
+                size: Some(1),
+                mtime: Some(1_700_000_000),
+                is_dir: false,
+            })
+            .collect();
+        st.total = 3;
+        let mut icons = IconCache::without_worker();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |ctx: &egui::Context, st: &mut ResultsState, icons: &mut IconCache, events| {
+            let mut input = raw();
+            input.events = events;
+            let mut out = ctx.run_ui(input, |ui| st.draw_impl(ui, None, icons));
+            out.textures_delta.clear();
+        };
+
+        frame(&ctx, &mut st, &mut icons, vec![]);
+        assert!(st.input_focused);
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::Escape,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )],
+        );
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::Escape,
+                false,
+                false,
+                egui::Modifiers::NONE,
+            )],
+        );
+        assert!(st.input_focused, "搜索框 Esc 后焦点应仍在输入框");
+        frame(
+            &ctx,
+            &mut st,
+            &mut icons,
+            vec![key_event(
+                egui::Key::ArrowDown,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )],
+        );
+        assert_eq!(st.selection, BTreeSet::from([0]), "Esc 后 ↓ 仍可进入表格");
+        assert!(st.table_focused);
+    }
+
+    /// 行移动:空结果 None;无选中时下移选首行、上移选末行;边界 clamp。
+    #[test]
+    fn stepped_row_clamps_and_handles_empty() {
+        assert_eq!(stepped_row(None, 0, 1), None);
+        assert_eq!(stepped_row(None, 5, 1), Some(0));
+        assert_eq!(stepped_row(None, 5, -1), Some(4));
+        assert_eq!(stepped_row(Some(0), 5, 1), Some(1));
+        assert_eq!(stepped_row(Some(2), 5, -1), Some(1));
+        assert_eq!(stepped_row(Some(4), 5, 1), Some(4), "末行下移保持");
+        assert_eq!(stepped_row(Some(0), 5, -1), Some(0), "首行上移保持");
+    }
+
+    /// 只有 release 事件才算触发键已松开(重复 press 不算)。
+    #[test]
+    fn key_released_detects_release_only() {
+        let none = egui::Modifiers::NONE;
+        assert!(key_released(
+            &[key_event(egui::Key::ArrowUp, false, false, none)],
+            egui::Key::ArrowUp
+        ));
+        assert!(!key_released(
+            &[key_event(egui::Key::ArrowUp, true, false, none)],
+            egui::Key::ArrowUp
+        ));
+        assert!(!key_released(
+            &[key_event(egui::Key::Escape, false, false, none)],
+            egui::Key::ArrowUp
+        ));
+    }
+
+    /// 首行再按 ↑ 应回到搜索框(其余行继续向上)。
+    #[test]
+    fn up_at_first_row_returns_to_search() {
+        assert!(should_focus_search_on_up(Some(0)));
+        assert!(!should_focus_search_on_up(Some(1)));
+        assert!(!should_focus_search_on_up(None), "无选中时 ↑ 选末行");
+    }
+
+    /// 滚动偏移:首行贴顶;其余行在视口内居中,不出现负偏移。
+    #[test]
+    fn scroll_offset_centers_rows_without_negative() {
+        assert_eq!(scroll_offset_for_row(0, 300.0), 0.0);
+        assert_eq!(scroll_offset_for_row(1, 300.0), 0.0, "第二行仍在贴顶区");
+        assert_eq!(scroll_offset_for_row(10, 300.0), 165.0);
+    }
+
+    /// 只认首次按下:repeat / release 不触发;egui-winit 的 Event::Copy 等价 ⌘C。
+    #[test]
+    fn initial_copy_shortcut_excludes_repeat_and_release() {
+        let cmd = egui::Modifiers {
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            initial_copy_shortcut(&[egui::Event::Copy]),
+            Some(MenuAction::CopyFile),
+            "⌘C 被 egui-winit 译为 Event::Copy"
+        );
+        assert_eq!(
+            initial_copy_shortcut(&[key_event(egui::Key::C, true, false, cmd)]),
+            Some(MenuAction::CopyFile),
+            "Key 兜底路径"
+        );
+        assert_eq!(
+            initial_copy_shortcut(&[key_event(egui::Key::C, true, true, cmd)]),
+            None,
+            "自动重复不重复复制"
+        );
+        assert_eq!(
+            initial_copy_shortcut(&[key_event(egui::Key::C, false, false, cmd)]),
+            None,
+            "释放不触发"
+        );
+    }
+
+    /// 消费语义:⌘C/⌘⇧C 的 press/repeat 移除;release、裸 C、其他键保留。
+    #[test]
+    fn consume_copy_shortcuts_only_command_c_presses() {
+        let cmd = egui::Modifiers {
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let cmd_shift = egui::Modifiers {
+            command: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let cmd_alt = egui::Modifiers {
+            command: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        let mut events = vec![
+            egui::Event::Copy,
+            key_event(egui::Key::C, true, false, cmd),
+            key_event(egui::Key::C, true, true, cmd_shift),
+            key_event(egui::Key::C, false, false, cmd),
+            key_event(egui::Key::C, true, false, egui::Modifiers::NONE),
+            key_event(egui::Key::V, true, false, cmd),
+            key_event(egui::Key::C, true, false, cmd_alt),
+        ];
+        consume_copy_shortcuts(&mut events);
+        assert_eq!(events.len(), 4);
+        assert!(
+            !events.iter().any(|ev| matches!(ev, egui::Event::Copy)),
+            "Event::Copy 应被消费"
+        );
+        assert!(matches!(
+            &events[0],
+            egui::Event::Key {
+                key: egui::Key::C,
+                pressed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[1],
+            egui::Event::Key {
+                key: egui::Key::C,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.is_none()
+        ));
+        assert!(matches!(
+            &events[2],
+            egui::Event::Key {
+                key: egui::Key::V,
+                ..
+            }
+        ));
+        assert!(
+            matches!(
+                &events[3],
+                egui::Event::Key {
+                    key: egui::Key::C,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.alt
+            ),
+            "⌘⌥C 不在处理范围,不应消费"
         );
     }
 }

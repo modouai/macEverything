@@ -6,8 +6,9 @@
 //! - shell 动作执行:`plan`(动作 -> 命令/载荷步骤,纯数据可测)产出计划,`execute`
 //!   只做落地(open / pbcopy 数组参数调起,禁 shell 拼接——platform-compat 红线)。
 //!
-//! 菜单最终形态(v2.3 §3):打开 / 在访达中显示 / 快速查看 / 分隔线 / 拷贝 ▸
-//! (拷贝文件 / 拷贝路径 / 拷贝文件名)。快速查看与拷贝文件是平台动作,不进 shell plan。
+//! 菜单最终形态(用户反馈后):打开 / 在访达中显示 / 快速查看 / 分隔线 /
+//! 拷贝文件 / 拷贝路径 / 拷贝文件名(拷贝三项平铺,无二级菜单)。
+//! 快速查看与拷贝文件是平台动作,不进 shell plan;⌘C/⌘⇧C 由 results.rs 处理。
 
 use std::io::Write;
 use std::path::Path;
@@ -16,7 +17,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, Result};
 
 use crate::i18n;
-use crate::platform::MenuEntry;
+use crate::platform::{MenuEntry, MenuShortcut};
 
 /// 菜单动作(tag 为 NSMenu 进程内标识,无持久化)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +75,7 @@ pub enum ShellAction {
     CopyFileName,
 }
 
-/// v2.3 §3 菜单结构(每次右键重建;文案取当前语言)。
+/// 菜单结构(每次右键重建;文案取当前语言;拷贝三项平铺)。
 pub fn menu_entries() -> Vec<MenuEntry> {
     let s = i18n::s();
     vec![
@@ -82,37 +83,46 @@ pub fn menu_entries() -> Vec<MenuEntry> {
             title: s.menu_open,
             tag: MenuAction::Open.tag(),
             enabled: true,
+            shortcut: None,
         },
         MenuEntry::Item {
             title: s.menu_show_in_finder,
             tag: MenuAction::RevealInFinder.tag(),
             enabled: true,
+            shortcut: None,
         },
         MenuEntry::Item {
             title: s.menu_quick_look,
             tag: MenuAction::QuickLook.tag(),
             enabled: true,
+            shortcut: None,
         },
         MenuEntry::Separator,
-        MenuEntry::Submenu {
-            title: s.menu_copy,
-            items: vec![
-                MenuEntry::Item {
-                    title: s.menu_copy_file,
-                    tag: MenuAction::CopyFile.tag(),
-                    enabled: true,
-                },
-                MenuEntry::Item {
-                    title: s.menu_copy_path,
-                    tag: MenuAction::CopyPaths.tag(),
-                    enabled: true,
-                },
-                MenuEntry::Item {
-                    title: s.menu_copy_name,
-                    tag: MenuAction::CopyFileName.tag(),
-                    enabled: true,
-                },
-            ],
+        MenuEntry::Item {
+            title: s.menu_copy_file,
+            tag: MenuAction::CopyFile.tag(),
+            enabled: true,
+            shortcut: Some(MenuShortcut {
+                key: "c",
+                command: true,
+                shift: false,
+            }),
+        },
+        MenuEntry::Item {
+            title: s.menu_copy_path,
+            tag: MenuAction::CopyPaths.tag(),
+            enabled: true,
+            shortcut: Some(MenuShortcut {
+                key: "c",
+                command: true,
+                shift: true,
+            }),
+        },
+        MenuEntry::Item {
+            title: s.menu_copy_name,
+            tag: MenuAction::CopyFileName.tag(),
+            enabled: true,
+            shortcut: None,
         },
     ]
 }
@@ -262,7 +272,18 @@ fn copy_to_clipboard(text: &str, failure: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::i18n::{with_lang, Lang};
-    use crate::platform::MenuEntry;
+    use crate::platform::{MenuEntry, MenuShortcut};
+
+    const CMD_C: Option<MenuShortcut> = Some(MenuShortcut {
+        key: "c",
+        command: true,
+        shift: false,
+    });
+    const CMD_SHIFT_C: Option<MenuShortcut> = Some(MenuShortcut {
+        key: "c",
+        command: true,
+        shift: true,
+    });
 
     fn assert_item(entry: &MenuEntry, expected_title: &str, expected_tag: i64) {
         match entry {
@@ -270,6 +291,7 @@ mod tests {
                 title,
                 tag,
                 enabled,
+                ..
             } => {
                 assert_eq!(*title, expected_title);
                 assert_eq!(*tag, expected_tag);
@@ -279,24 +301,31 @@ mod tests {
         }
     }
 
+    fn assert_shortcut(entry: &MenuEntry, expected: Option<MenuShortcut>) {
+        match entry {
+            MenuEntry::Item { shortcut, .. } => assert_eq!(*shortcut, expected),
+            other => panic!("期望菜单项,得到 {other:?}"),
+        }
+    }
+
+    /// 用户反馈后的最终形态:拷贝三项平铺到一级,并显示快捷键。
     #[test]
     fn menu_entries_final_shape() {
         let items = menu_entries();
-        assert_eq!(items.len(), 5);
+        assert_eq!(items.len(), 7);
         assert_item(&items[0], "打开", MenuAction::Open.tag());
+        assert_shortcut(&items[0], None);
         assert_item(&items[1], "在访达中显示", MenuAction::RevealInFinder.tag());
+        assert_shortcut(&items[1], None);
         assert_item(&items[2], "快速查看", MenuAction::QuickLook.tag());
+        assert_shortcut(&items[2], None);
         assert_eq!(items[3], MenuEntry::Separator);
-        match &items[4] {
-            MenuEntry::Submenu { title, items } => {
-                assert_eq!(*title, "拷贝");
-                assert_eq!(items.len(), 3);
-                assert_item(&items[0], "拷贝文件", MenuAction::CopyFile.tag());
-                assert_item(&items[1], "拷贝路径", MenuAction::CopyPaths.tag());
-                assert_item(&items[2], "拷贝文件名", MenuAction::CopyFileName.tag());
-            }
-            other => panic!("期望拷贝子菜单,得到 {other:?}"),
-        }
+        assert_item(&items[4], "拷贝文件", MenuAction::CopyFile.tag());
+        assert_shortcut(&items[4], CMD_C);
+        assert_item(&items[5], "拷贝路径", MenuAction::CopyPaths.tag());
+        assert_shortcut(&items[5], CMD_SHIFT_C);
+        assert_item(&items[6], "拷贝文件名", MenuAction::CopyFileName.tag());
+        assert_shortcut(&items[6], None);
     }
 
     #[test]
@@ -328,15 +357,12 @@ mod tests {
             assert_item(&items[0], "Open", 1);
             assert_item(&items[1], "Show in Finder", 2);
             assert_item(&items[2], "Quick Look", 4);
-            match &items[4] {
-                MenuEntry::Submenu { title, items } => {
-                    assert_eq!(*title, "Copy");
-                    assert_item(&items[0], "Copy File", 5);
-                    assert_item(&items[1], "Copy Path", 3);
-                    assert_item(&items[2], "Copy File Name", 6);
-                }
-                other => panic!("期望拷贝子菜单,得到 {other:?}"),
-            }
+            assert_eq!(items[3], MenuEntry::Separator);
+            assert_item(&items[4], "Copy File", 5);
+            assert_shortcut(&items[4], CMD_C);
+            assert_item(&items[5], "Copy Path", 3);
+            assert_shortcut(&items[5], CMD_SHIFT_C);
+            assert_item(&items[6], "Copy File Name", 6);
         });
     }
 

@@ -1570,7 +1570,6 @@ git commit -m "feat(app): 完整窗口双语与状态提示类型化"
     menu_open: "打开" / "Open",
     menu_show_in_finder: "在访达中显示" / "Show in Finder",
     menu_quick_look: "快速查看" / "Quick Look",
-    menu_copy: "拷贝" / "Copy",
     menu_copy_file: "拷贝文件" / "Copy File",
     menu_copy_path: "拷贝路径" / "Copy Path",
     menu_copy_name: "拷贝文件名" / "Copy File Name",
@@ -1657,26 +1656,21 @@ if let Some(tray) = &mut self.tray {
 
 - [ ] **Step 4: 右键菜单文案**
 
-> 历史说明：原计划为 `menu_items(files, dirs)` 按文件/目录计数收敛；v2.2/v2.3 已改为固定菜单，`menu_entries()` 无参，文件与目录同形（打开 / 在访达中显示 / 快速查看 / 分隔线 / 拷贝 ▸ 拷贝文件/拷贝路径/拷贝文件名）。「在访达中打开」及其执行分支已删除。
+> 历史说明：原计划为 `menu_items(files, dirs)` 按文件/目录计数收敛；v2.2/v2.3 已改为固定菜单，`menu_entries()` 无参，文件与目录同形。2026-10-19 用户反馈后，拷贝三项改为一级平铺（打开 / 在访达中显示 / 快速查看 / 分隔线 / 拷贝文件 / 拷贝路径 / 拷贝文件名）。「在访达中打开」及其执行分支已删除。
 
-`menu_actions.rs` 的 `menu_entries()` 返回嵌套 `MenuEntry`：
+`menu_actions.rs` 的 `menu_entries()` 返回平铺 `MenuEntry`：
 
 ```rust
 pub fn menu_entries() -> Vec<MenuEntry> {
     let s = i18n::s();
     vec![
-        MenuEntry::Item { title: s.menu_open, tag: MenuAction::Open.tag(), enabled: true },
-        MenuEntry::Item { title: s.menu_show_in_finder, tag: MenuAction::RevealInFinder.tag(), enabled: true },
-        MenuEntry::Item { title: s.menu_quick_look, tag: MenuAction::QuickLook.tag(), enabled: true },
+        MenuEntry::Item { title: s.menu_open, tag: MenuAction::Open.tag(), enabled: true, shortcut: None },
+        MenuEntry::Item { title: s.menu_show_in_finder, tag: MenuAction::RevealInFinder.tag(), enabled: true, shortcut: None },
+        MenuEntry::Item { title: s.menu_quick_look, tag: MenuAction::QuickLook.tag(), enabled: true, shortcut: None },
         MenuEntry::Separator,
-        MenuEntry::Submenu {
-            title: s.menu_copy,
-            items: vec![
-                MenuEntry::Item { title: s.menu_copy_file, tag: MenuAction::CopyFile.tag(), enabled: true },
-                MenuEntry::Item { title: s.menu_copy_path, tag: MenuAction::CopyPaths.tag(), enabled: true },
-                MenuEntry::Item { title: s.menu_copy_name, tag: MenuAction::CopyFileName.tag(), enabled: true },
-            ],
-        },
+        MenuEntry::Item { title: s.menu_copy_file, tag: MenuAction::CopyFile.tag(), enabled: true, shortcut: Some(MenuShortcut { key: "c", command: true, shift: false }) },
+        MenuEntry::Item { title: s.menu_copy_path, tag: MenuAction::CopyPaths.tag(), enabled: true, shortcut: Some(MenuShortcut { key: "c", command: true, shift: true }) },
+        MenuEntry::Item { title: s.menu_copy_name, tag: MenuAction::CopyFileName.tag(), enabled: true, shortcut: None },
     ]
 }
 ```
@@ -1747,7 +1741,7 @@ Expected: 旧断言改为目录文案后通过；托盘 relabel 由真实运行�
 
 补充双语断言：
 - `state_label` 六态与 `gaps_label(1/2)` 在 zh/en 下精确匹配（含托盘 `⚠ ` 前缀与英文单复数）。
-- `menu_entries` 在 `with_lang(En)` 下返回 `["Open","Show in Finder","Quick Look"]` + `Copy` 子菜单 `["Copy File","Copy Path","Copy File Name"]`，中文默认断言保持。
+- `menu_entries` 在 `with_lang(En)` 下返回 `["Open","Show in Finder","Quick Look"]` + 分隔线 + `["Copy File","Copy Path","Copy File Name"]`（平铺，无 `Copy` 父项），中文默认断言保持。
 - `window_title_lookup_accepts_both_settings_titles` 覆盖中/英标题。
 - `reset_native_confirmation_copy_matches_contract` 增加 `cancel` 的中英断言。
 

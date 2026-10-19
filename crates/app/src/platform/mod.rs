@@ -351,26 +351,35 @@ pub fn revert_class() {
     mac::revert_class();
 }
 
-/// 原生菜单项(支持分隔线与子菜单;`tag` 只用于叶子项)。
+/// 菜单项快捷键(仅展示/菜单跟踪期触发;窗口级按键由 results.rs 处理)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuShortcut {
+    /// NSMenuItem keyEquivalent(`"c"` 等)。
+    pub key: &'static str,
+    /// Command(⌘)。
+    pub command: bool,
+    /// Shift(⇧)。
+    pub shift: bool,
+}
+
+/// 原生菜单项(支持分隔线;`tag` 只用于菜单项)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuEntry {
     Item {
         title: &'static str,
-        /// 叶子项选择回传标识。
+        /// 菜单项选择回传标识。
         ///
         /// -1 保留为未选择哨兵,构造方不得使用。
         tag: i64,
         enabled: bool,
+        /// 菜单右侧展示的快捷键(菜单打开时也可触发)。
+        shortcut: Option<MenuShortcut>,
     },
     Separator,
-    Submenu {
-        title: &'static str,
-        items: Vec<MenuEntry>,
-    },
 }
 
-/// 弹出原生右键菜单(阻塞;主线程)。`items` = 菜单项树;叶子项经 target/action
-/// 回传 tag,子菜单父项无 action。返回所选项 tag(None = 取消)。
+/// 弹出原生右键菜单(阻塞;主线程)。`items` = 菜单项列表;每项经 target/action
+/// 回传 tag。返回所选项 tag(None = 取消)。
 /// 位置为视图坐标(与 egui 坐标同值,PoC-3 实测;见 mac.rs)。
 /// 非 macOS / 非主线程 / 取窗失败返回 None(留痕,调用方按取消处理)。
 pub fn popup_menu(
