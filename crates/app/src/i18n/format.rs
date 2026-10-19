@@ -2,6 +2,22 @@
 
 use super::{lang, Lang};
 
+/// "发现新版本 v2.4.0" / "Version 2.4.0 is available"。
+pub fn update_available(version: &str) -> String {
+    match lang() {
+        Lang::ZhHans => format!("发现新版本 v{version}"),
+        Lang::En => format!("Version {version} is available"),
+    }
+}
+
+/// "有新版本 v2.4.0 — 前往下载" / "Version 2.4.0 Available — Download"。
+pub fn tray_update_available(version: &str) -> String {
+    match lang() {
+        Lang::ZhHans => format!("有新版本 v{version} — 前往下载"),
+        Lang::En => format!("Version {version} Available — Download"),
+    }
+}
+
 /// "{n} 项" / "{n} item(s)"。
 pub fn items(n: u32) -> String {
     match lang() {
@@ -160,6 +176,21 @@ mod tests {
         with_lang(Lang::En, || {
             assert_eq!(index_building_count(1), "Building index (1 entry)");
             assert_eq!(index_building_count(2), "Building index (2 entries)");
+        });
+    }
+
+    #[test]
+    fn update_strings_format_in_both_languages() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(update_available("2.4.0"), "发现新版本 v2.4.0");
+            assert_eq!(tray_update_available("2.4.0"), "有新版本 v2.4.0 — 前往下载");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(update_available("2.4.0"), "Version 2.4.0 is available");
+            assert_eq!(
+                tray_update_available("2.4.0"),
+                "Version 2.4.0 Available — Download"
+            );
         });
     }
 }

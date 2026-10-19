@@ -208,6 +208,54 @@ pub fn manifest_url() -> String {
     std::env::var("MACEEVERYTHING_UPDATE_URL").unwrap_or_else(|_| MANIFEST_URL.to_owned())
 }
 
+/// 官网下载页（按指定界面语言）。
+pub fn download_page(lang: crate::i18n::Lang) -> &'static str {
+    match lang {
+        crate::i18n::Lang::ZhHans => "https://maceverything.modouai.dev/#download",
+        crate::i18n::Lang::En => "https://maceverything.modouai.dev/en/#download",
+    }
+}
+
+/// 设置页版本行状态说明。
+pub fn status_text(phase: &UpdatePhase) -> String {
+    let s = crate::i18n::s();
+    match phase {
+        UpdatePhase::Idle => s.update_status_idle.to_owned(),
+        UpdatePhase::Checking => s.update_status_checking.to_owned(),
+        UpdatePhase::UpToDate => s.update_status_up_to_date.to_owned(),
+        UpdatePhase::Available { version } => crate::i18n::format::update_available(version),
+        UpdatePhase::Failed => s.update_status_failed.to_owned(),
+    }
+}
+
+/// 设置页版本行动作文案。
+pub fn action_text(phase: &UpdatePhase) -> &'static str {
+    match phase {
+        UpdatePhase::Available { .. } => crate::i18n::s().update_action_download,
+        _ => crate::i18n::s().update_action_check,
+    }
+}
+
+/// 设置页版本行动作是否可点。
+pub fn action_enabled(phase: &UpdatePhase) -> bool {
+    !matches!(phase, UpdatePhase::Checking)
+}
+
+/// 托盘更新项文案。
+pub fn tray_text(phase: &UpdatePhase) -> String {
+    let s = crate::i18n::s();
+    match phase {
+        UpdatePhase::Checking => s.tray_checking.to_owned(),
+        UpdatePhase::Available { version } => crate::i18n::format::tray_update_available(version),
+        _ => s.tray_check_update.to_owned(),
+    }
+}
+
+/// 托盘更新项是否可点。
+pub fn tray_enabled(phase: &UpdatePhase) -> bool {
+    !matches!(phase, UpdatePhase::Checking)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +406,100 @@ mod tests {
         drop(tx);
         assert!(state.tick_at(Instant::now()));
         assert_eq!(state.phase(), &UpdatePhase::Failed);
+    }
+
+    #[test]
+    fn labels_cover_all_phases_in_both_languages() {
+        use crate::i18n::{with_lang, Lang};
+
+        fn available() -> UpdatePhase {
+            UpdatePhase::Available {
+                version: "2.4.0".into(),
+            }
+        }
+
+        with_lang(Lang::ZhHans, || {
+            // 状态说明：五个阶段全覆盖。
+            assert_eq!(status_text(&UpdatePhase::Idle), "尚未检查");
+            assert_eq!(status_text(&UpdatePhase::Checking), "正在检查…");
+            assert_eq!(status_text(&UpdatePhase::UpToDate), "已是最新版本");
+            assert_eq!(status_text(&available()), "发现新版本 v2.4.0");
+            assert_eq!(status_text(&UpdatePhase::Failed), "检查失败，请稍后重试");
+
+            // 行内动作：五个阶段全覆盖。
+            assert_eq!(action_text(&UpdatePhase::Idle), "检查更新");
+            assert_eq!(action_text(&UpdatePhase::Checking), "检查更新");
+            assert_eq!(action_text(&UpdatePhase::UpToDate), "检查更新");
+            assert_eq!(action_text(&available()), "前往下载");
+            assert_eq!(action_text(&UpdatePhase::Failed), "检查更新");
+
+            // 可点性：仅检查中禁用。
+            assert!(action_enabled(&UpdatePhase::Idle));
+            assert!(!action_enabled(&UpdatePhase::Checking));
+            assert!(action_enabled(&UpdatePhase::UpToDate));
+            assert!(action_enabled(&available()));
+            assert!(action_enabled(&UpdatePhase::Failed));
+
+            // 托盘文案：五个阶段全覆盖。
+            assert_eq!(tray_text(&UpdatePhase::Idle), "检查更新…");
+            assert_eq!(tray_text(&UpdatePhase::Checking), "检查中…");
+            assert_eq!(tray_text(&UpdatePhase::UpToDate), "检查更新…");
+            assert_eq!(tray_text(&available()), "有新版本 v2.4.0 — 前往下载");
+            assert_eq!(tray_text(&UpdatePhase::Failed), "检查更新…");
+
+            assert!(tray_enabled(&UpdatePhase::Idle));
+            assert!(!tray_enabled(&UpdatePhase::Checking));
+            assert!(tray_enabled(&UpdatePhase::UpToDate));
+            assert!(tray_enabled(&available()));
+            assert!(tray_enabled(&UpdatePhase::Failed));
+        });
+
+        with_lang(Lang::En, || {
+            assert_eq!(status_text(&UpdatePhase::Idle), "Not checked yet");
+            assert_eq!(status_text(&UpdatePhase::Checking), "Checking…");
+            assert_eq!(status_text(&UpdatePhase::UpToDate), "You're up to date");
+            assert_eq!(status_text(&available()), "Version 2.4.0 is available");
+            assert_eq!(
+                status_text(&UpdatePhase::Failed),
+                "Couldn't check for updates. Try again later."
+            );
+
+            assert_eq!(action_text(&UpdatePhase::Idle), "Check for Updates");
+            assert_eq!(action_text(&UpdatePhase::Checking), "Check for Updates");
+            assert_eq!(action_text(&UpdatePhase::UpToDate), "Check for Updates");
+            assert_eq!(action_text(&available()), "Download");
+            assert_eq!(action_text(&UpdatePhase::Failed), "Check for Updates");
+
+            assert!(action_enabled(&UpdatePhase::Idle));
+            assert!(!action_enabled(&UpdatePhase::Checking));
+            assert!(action_enabled(&UpdatePhase::UpToDate));
+            assert!(action_enabled(&available()));
+            assert!(action_enabled(&UpdatePhase::Failed));
+
+            assert_eq!(tray_text(&UpdatePhase::Idle), "Check for Updates…");
+            assert_eq!(tray_text(&UpdatePhase::Checking), "Checking…");
+            assert_eq!(tray_text(&UpdatePhase::UpToDate), "Check for Updates…");
+            assert_eq!(
+                tray_text(&available()),
+                "Version 2.4.0 Available — Download"
+            );
+            assert_eq!(tray_text(&UpdatePhase::Failed), "Check for Updates…");
+
+            assert!(tray_enabled(&UpdatePhase::Idle));
+            assert!(!tray_enabled(&UpdatePhase::Checking));
+            assert!(tray_enabled(&UpdatePhase::UpToDate));
+            assert!(tray_enabled(&available()));
+            assert!(tray_enabled(&UpdatePhase::Failed));
+        });
+
+        // 下载页随显式语言参数切换，与当前界面语言无关。
+        assert_eq!(
+            download_page(crate::i18n::Lang::ZhHans),
+            "https://maceverything.modouai.dev/#download"
+        );
+        assert_eq!(
+            download_page(crate::i18n::Lang::En),
+            "https://maceverything.modouai.dev/en/#download"
+        );
     }
 }

@@ -43,6 +43,15 @@ catalog! {
     row_palette_hotkey: "唤起快捷键" / "Quick Search Shortcut",
     row_window_hotkey: "完整窗口快捷键" / "Full Window Shortcut",
     row_excluded: "排除目录" / "Excluded Folders",
+    // 关于 / 更新
+    update_status_idle: "尚未检查" / "Not checked yet",
+    update_status_checking: "正在检查…" / "Checking…",
+    update_status_up_to_date: "已是最新版本" / "You're up to date",
+    update_status_failed: "检查失败，请稍后重试" / "Couldn't check for updates. Try again later.",
+    update_action_check: "检查更新" / "Check for Updates",
+    update_action_download: "前往下载" / "Download",
+    tray_check_update: "检查更新…" / "Check for Updates…",
+    tray_checking: "检查中…" / "Checking…",
     // 字号档
     font_small: "小" / "Small",
     font_standard: "标准" / "Standard",
