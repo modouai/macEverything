@@ -149,7 +149,7 @@ pub fn close(frame: &eframe::Frame) {
     restore_focus(frame);
 }
 
-/// 静默关闭面板(宿主窗口隐藏/退出时用;不激活 App、不归还焦点)。
+/// 静默关闭面板(宿主窗口隐藏时用;不激活 App、不归还焦点)。
 pub fn dismiss() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;

@@ -108,8 +108,8 @@
   - 用 `define_class!` 定义 data source 类，实现
     `numberOfPreviewItemsInPreviewPanel:` 与 `previewPanel:previewItemAtIndex:`；
     预览项直接返回 `NSURL`。
-  - 选中 URL 保存在 data source 实例中（`Vec<Retained<NSURL>>`）；data source 被
-    面板弱引用，必须由平台层静态持有（主线程），直到面板关闭/进程退出。
+  - 选中 URL 由模块 thread-local 持有（`QL_URLS`）；data source 无实例变量，
+    由 thread-local 保活（主线程），直到面板关闭/进程退出。
   - 展示：设置 data source → `reloadData` → `makeKeyAndOrderFront`；关闭后清空 URL。
   - 焦点返回：监听面板关闭（`NSWindowWillCloseNotification` / delegate），
     重新激活结果窗口；具体路径由 PoC 决定（见 §4.3）。最终实现见 §4.5：每 200ms 轮询 `isVisible`，未监听 `NSWindowWillCloseNotification`/delegate。
@@ -165,7 +165,8 @@ PoC 不通过时的退路（按优先级）：
 - 失活处理：App 非 active 时轮询不归还焦点，避免 ⌘Tab 切走后抢回前台。
 - 行为说明见 `docs/usage.md`；人工验收清单见 `plan.md` Task 4 Step 6。
 - 完整窗口隐藏/退出时静默关闭面板（`quick_look_dismiss`，不激活 App、不归还焦点）。
-- 已知限制：QL 打开期间改变选中或结果替换不会自动刷新面板；需再次触发「快速查看」/空格更新。
+- 已知限制：QL 打开期间改变选中或结果替换不会自动刷新面板；菜单「快速查看」可更新；空格在面板可见时是关闭。
+- 最小化完整窗口不会关闭面板（未监听 NSWindowDidMiniaturizeNotification）；按隐藏处理路径仅覆盖红点关闭与 ⌘W。实机验收确认是否接受。
 
 ## 5. 拷贝增强
 
@@ -245,7 +246,7 @@ pub enum MenuEntry {
   - 菜单构建支持子菜单、target/action、分隔线、禁用项。
   - `copy_files`：NSPasteboard 写入 NSURL。
 - `crates/app/src/platform/mac_quicklook.rs`（新增）
-  - QLPreviewPanel 单例、data source/delegate、焦点返回。
+  - QLPreviewPanel 单例、设置 data source、焦点返回。
 - `crates/app/src/i18n/catalog.rs`
   - 新增：`menu_quick_look`、`menu_copy`、`menu_copy_file`、`menu_copy_path`、
     `menu_copy_name`、`quick_look_failed`、`copy_file_failed`、`copy_name_failed`；
