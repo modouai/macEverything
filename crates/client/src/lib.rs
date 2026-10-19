@@ -350,7 +350,7 @@ pub struct ExcludeOutcome {
 }
 
 /// 排除目录管理(list/add/remove/reset);变更需引擎在线,离线直接报错。
-/// `reset` 无参:恢复引擎内置默认三条,一次重扫生效(旧 daemon 会拒绝,
+/// `reset` 无参:恢复引擎内置默认排除项,一次重扫生效(旧 daemon 会拒绝,
 /// 须以新 CLI 重启引擎)。
 pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<ExcludeOutcome> {
     let req = match action {
@@ -359,7 +359,7 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
         },
         "reset" => {
             if arg.is_some() {
-                bail!("用法: macEverything exclude reset(无参数;恢复内置默认三条)");
+                bail!("用法: macEverything exclude reset(无参数;恢复内置默认排除项)");
             }
             Request::ExcludeReset {
                 v: protocol::PROTOCOL_VERSION,

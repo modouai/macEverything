@@ -1,14 +1,16 @@
 //! 配置:应用数据目录下 config.toml。
 //! v1 契约:仅 `excluded` 一字段(排除目录列表),无版本字段——单字段无演进面,
 //! 未来加字段靠 serde default 兜底旧文件读取,破坏性格式变更才走版本化迁移。
-//! 默认排除 ~/Library、node_modules、.git(product §1)。
+//! 默认排除 ~/Library、node_modules、.git、~/.Trash(product §1)。
+//! `~/.Trash` 用绝对形态(非相对名 `.Trash`):只排除回收站本身,且它受 TCC
+//! 保护,不排除会成为 status 里永久的权限缺口噪音。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// 应用配置。
 /// 双默认语义:`Default` derive 未实现(空 excluded 误用即漏扫 ~/Library),
-/// 唯一默认入口是 [`default_config()`](三条基线排除)。
+/// 唯一默认入口是 [`default_config()`](四条基线排除)。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     /// 排除目录列表(条目语义由扫描侧解释)。
@@ -19,7 +21,12 @@ pub struct Config {
 /// 默认配置(product §1)。
 pub fn default_config() -> Config {
     Config {
-        excluded: vec!["~/Library".into(), "node_modules".into(), ".git".into()],
+        excluded: vec![
+            "~/Library".into(),
+            "node_modules".into(),
+            ".git".into(),
+            "~/.Trash".into(),
+        ],
     }
 }
 
@@ -40,7 +47,7 @@ pub fn load(path: &Path) -> Config {
 
 /// 原子保存:先建父目录,写 `<目标>.tmp` 后 rename 替换,不留半写文件
 /// (tmp 命名复用 persist::tmp_path_for)。
-/// 取舍:不做 fsync——最坏断电配置损坏,load 的降级路径已兜住(回默认三条)。
+/// 取舍:不做 fsync——最坏断电配置损坏,load 的降级路径已兜住(回默认四条)。
 pub fn save(cfg: &Config, path: &Path) -> std::io::Result<()> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
@@ -67,6 +74,17 @@ mod tests {
         assert_eq!(load(&p), c2);
     }
 
+    /// 默认排除四条:`~/.Trash` 用绝对形态只命中回收站,不用相对名 `.Trash`
+    /// 以免误伤任意层级的同名目录;它受 TCC 保护,不排除会在 status 里留下
+    /// 永久「Operation not permitted」缺口噪音。
+    #[test]
+    fn default_config_excludes_home_trash() {
+        assert_eq!(
+            default_config().excluded,
+            vec!["~/Library", "node_modules", ".git", "~/.Trash"]
+        );
+    }
+
     #[test]
     fn corrupt_file_falls_back_to_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -82,7 +100,7 @@ mod tests {
         std::fs::write(&p, "future_field = 1\n").unwrap();
         let c = load(&p);
         // 未知字段容忍;excluded 缺失走 serde default 得空列表。
-        // 若解析失败降级,这里会是 default_config 的 3 条,断言即红。
+        // 若解析失败降级,这里会是 default_config 的 4 条,断言即红。
         assert!(c.excluded.is_empty());
     }
 

@@ -979,7 +979,7 @@ enum ExcludeOp {
 ///
 /// 顺序有语义:先落盘默认配置,成功后才替换内存并重扫。保存失败时内存配置与
 /// 索引都不变(返回当前列表 + 可操作原因)——不能先改内存再赌落盘成功。
-/// 不持 `cfg` 锁跨越保存/重扫;成功后一次全量重扫使三条默认同时生效。
+/// 不持 `cfg` 锁跨越保存/重扫;成功后一次全量重扫使默认排除项同时生效。
 fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
     // 与 add/remove 共用变更锁:保存/内存替换/重扫整体串行,防配置与内存错位。
     let _op = state.exclude_op_lock.lock().unwrap();
@@ -1351,7 +1351,7 @@ mod tests {
         );
     }
 
-    /// 恢复默认(E5):自定义条目清空 → 内存/落盘均为内置三条,并按**新排除集**
+    /// 恢复默认(E5):自定义条目清空 → 内存/落盘均为内置默认集,并按**新排除集**
     /// 重扫(原本被自定义条目剪枝的目录/文件重置后必须入索引)。状态从 BUILDING
     /// 推进到 READY;单次 reset 只触发这一次全量重扫,不为每条默认单独重扫。
     #[test]
@@ -1383,7 +1383,7 @@ mod tests {
         }
 
         let memory = state.cfg.lock().unwrap().excluded.clone();
-        assert_eq!(memory, defaults.excluded, "内存配置须恢复默认三条");
+        assert_eq!(memory, defaults.excluded, "内存配置须恢复默认排除项");
         assert!(
             !memory.iter().any(|e| e == &custom),
             "自定义条目必须消失:{memory:?}"

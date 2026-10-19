@@ -46,7 +46,7 @@ pub enum Request {
     ExcludeList {
         v: u32,
     },
-    /// 恢复内置默认排除项(`~/Library`、`node_modules`、`.git`)。
+    /// 恢复内置默认排除项(`~/Library`、`node_modules`、`.git`、`~/.Trash`)。
     /// 协议版本不变:旧 daemon 解码未知变体失败并拒绝请求,设置页按错误展示;
     /// 使用新请求须以新 CLI 重启引擎(不自动重启)。
     ExcludeReset {

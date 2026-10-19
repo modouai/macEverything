@@ -356,7 +356,7 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
 
 ### 8.6 恢复默认（E5，2026-10-18）
 
-- **语义**：把 `excluded` 重置为内置三条 `~/Library`、`node_modules`、`.git`
+- **语义**：把 `excluded` 重置为内置四条 `~/Library`、`node_modules`、`.git`、`~/.Trash`
   （`engine::config::default_config()`）；自定义条目全部清除。不新增名称规则输入，
   不改变默认列表。默认相对名（`.git`、`node_modules`）无法经目录选择器重新添加，
   这是本操作的直接动机。
@@ -365,7 +365,7 @@ Committing → 成功: Idle + 新键；失败: Idle + 内联错误（旧键已�
   在共享锁外、主线程调用 `platform::confirm_action(title, message, action_label)`。
   macOS 实现为 `NSAlert`（非 macOS 恒 false）：
   - 标题：「恢复默认排除目录？」
-  - 正文：「将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。」
+  - 正文：「将清空自定义排除项，恢复 ~/Library、node_modules、.git、~/.Trash。此操作会触发一次索引重扫。」
   - 按钮：第一个「取消」（默认 Return），第二个「恢复默认」（显式清空 Return
     键等价，必须显式点击）。
   - 取消/关闭/非主线程返回 false，不改变任何状态；确认才启动 reset worker。

@@ -140,14 +140,14 @@ Settings Window (620×600, 纵向)
 `NSAlert`（模态，期间 egui 冻结，与目录选择器同款）：
 
 - 标题：「恢复默认排除目录？」
-- 正文：「将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。」
+- 正文：「将清空自定义排除项，恢复 ~/Library、node_modules、.git、~/.Trash。此操作会触发一次索引重扫。」
 - 按钮：第一按钮「取消」（AppKit 默认 Return；回车只会取消），第二按钮
   「恢复默认」（显式清空 Return 键等价，必须显式点击）。
 - 取消/关闭 = 不改变列表与错误；只有点「恢复默认」才启动 reset worker。
 - 内联确认态（取消/确认恢复按钮、支持行、`RowSpec.extra`）已按 UX 反馈删除。
 
-行为：恢复默认是**破坏性**操作；确认后恢复内置三条
-`~/Library`、`node_modules`、`.git`，清空所有自定义条目，并经 daemon 一次重扫
+行为：恢复默认是**破坏性**操作；确认后恢复内置四条
+`~/Library`、`node_modules`、`.git`、`~/.Trash`，清空所有自定义条目，并经 daemon 一次重扫
 生效；失败保留旧列表并显示错误。旧 daemon 不认识 `exclude_reset` 请求，须先用
 新 CLI 重启引擎（App 不自动重启）。
 

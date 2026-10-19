@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(i18n::s().reset_confirm_title, "恢复默认排除目录？");
         assert_eq!(
             i18n::s().reset_confirm_message,
-            "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。"
+            "将清空自定义排除项，恢复 ~/Library、node_modules、.git、~/.Trash。此操作会触发一次索引重扫。"
         );
         assert_eq!(i18n::s().reset_confirm_action, "恢复默认");
         // 原生确认弹窗的 Cancel 按钮文案（发布门禁：中英各自钉住）。
@@ -1289,7 +1289,7 @@ mod tests {
         });
     }
 
-    /// reset worker 成功：响应三条默认覆盖旧列表、清错、结束 busy。
+    /// reset worker 成功：响应默认集覆盖旧列表、清错、结束 busy。
     #[test]
     fn exclude_reset_success_replaces_entries_with_defaults() {
         let mut state = test_state();
@@ -1309,7 +1309,7 @@ mod tests {
         .unwrap();
         state.tick_exclude();
 
-        assert_eq!(state.excluded, defaults, "成功须以响应覆盖为默认三条");
+        assert_eq!(state.excluded, defaults, "成功须以响应覆盖为默认排除项");
         assert!(state.exclude_error.is_none(), "reset 成功须清旧错误");
         assert!(!state.exclude_busy);
         assert!(state.exclude_loaded);

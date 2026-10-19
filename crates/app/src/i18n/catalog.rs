@@ -66,7 +66,7 @@ catalog! {
     // 提示 / 错误
     autostart_approval_note: "已注册,待系统设置「登录项」允许" / "Registered. Allow it in System Settings > Login Items.",
     reset_confirm_title: "恢复默认排除目录？" / "Restore default excluded folders?",
-    reset_confirm_message: "将清空自定义排除项，恢复 ~/Library、node_modules、.git。此操作会触发一次索引重扫。" / "This clears custom exclusions and restores ~/Library, node_modules, and .git. This will trigger a full index rescan.",
+    reset_confirm_message: "将清空自定义排除项，恢复 ~/Library、node_modules、.git、~/.Trash。此操作会触发一次索引重扫。" / "This clears custom exclusions and restores ~/Library, node_modules, .git, and ~/.Trash. This will trigger a full index rescan.",
     reset_confirm_action: "恢复默认" / "Restore Defaults",
     cancel: "取消" / "Cancel",
     settings_save_failed: "设置保存失败" / "Failed to save settings",

@@ -225,7 +225,7 @@ fn main() -> Result<()> {
                  macEverything query \"关键词\"   查询(含语法:空格 AND、* ? 通配、path: case: whole:)\n  \
                  macEverything status          查看索引状态与权限缺口\n  \
                  macEverything exclude add|remove|list [路径]  管理排除目录(add 须扫描根内绝对路径;remove 接受已有条目原文)\n  \
-                 macEverything exclude reset     恢复默认排除项(~/Library、node_modules、.git)"
+                 macEverything exclude reset     恢复默认排除项(~/Library、node_modules、.git、~/.Trash)"
             );
             std::process::exit(2);
         }

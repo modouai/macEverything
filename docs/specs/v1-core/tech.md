@@ -152,7 +152,7 @@ macEverything/
 
 ## daemon 通信契约(适配表 3)
 
-socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0600;协议:4 字节小端长度 + UTF-8 JSON,长度上限 1 MB(超限断连);每消息首字段 `v`(协议版本,当前 1),daemon 不识别即拒绝;`exclude.add` 的 `path` 必须为扫描根内绝对路径,否则拒绝;`exclude.remove` 接受**已存在的条目原文**(含 `node_modules` 等相对名);`exclude.reset` 无参数,恢复内置默认三条。`exclude.add`/`remove`/`reset` 共用 daemon 变更锁(校验→内存→落盘→重扫整体串行),防跨连接交错。
+socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0600;协议:4 字节小端长度 + UTF-8 JSON,长度上限 1 MB(超限断连);每消息首字段 `v`(协议版本,当前 1),daemon 不识别即拒绝;`exclude.add` 的 `path` 必须为扫描根内绝对路径,否则拒绝;`exclude.remove` 接受**已存在的条目原文**(含 `node_modules` 等相对名);`exclude.reset` 无参数,恢复内置默认四条。`exclude.add`/`remove`/`reset` 共用 daemon 变更锁(校验→内存→落盘→重扫整体串行),防跨连接交错。
 
 | 消息 | 方向 | 请求字段 | 响应字段 | 说明 |
 |---|---|---|---|---|
@@ -161,7 +161,7 @@ socket 路径:`~/Library/Application Support/macEverything/daemon.sock`,权限 0
 | status | client → daemon | `{}` | `state: building/ready/reconciling/degraded`、`entry_count: int`、`gaps: [{path, reason}]`、`io_error_count: int`、`built_at: int`、`index_file: string` | 状态契约唯一出口;daemon 不在时 client 读索引文件头自答并标 `offline: true` |
 | exclude.add / exclude.remove | client → daemon | `path: string` | `ok: bool`、`excluded: [string]`、`message?: string` | 变更即生效并触发受影响范围重扫;失败(路径越界/落盘失败)回 ok=false + 可操作原因 |
 | exclude.list | client → daemon | `{}` | `excluded: [string]` | 读操作,不加变更锁 |
-| exclude.reset | client → daemon | `{}`(无参数) | `ok: bool`、`excluded: [string]`、`message?: string` | 恢复内置默认 `~/Library`/`node_modules`/`.git`;先落盘默认配置再替换内存并一次重扫,保存失败不改内存;新增请求不 bump 协议版本,旧 daemon 解码失败拒绝,须停止/重启引擎 |
+| exclude.reset | client → daemon | `{}`(无参数) | `ok: bool`、`excluded: [string]`、`message?: string` | 恢复内置默认 `~/Library`/`node_modules`/`.git`/`~/.Trash`;先落盘默认配置再替换内存并一次重扫,保存失败不改内存;新增请求不 bump 协议版本,旧 daemon 解码失败拒绝,须停止/重启引擎 |
 
 离线模式(query 时 daemon 不在):client 直接 mmap 索引文件执行同一查询管线,响应加 `offline: true` 与 `built_at`,CLI 输出标注「离线索引」。
 
