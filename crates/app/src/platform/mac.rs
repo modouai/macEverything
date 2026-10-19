@@ -747,7 +747,7 @@ pub fn popup_menu(
     let t0 = std::time::Instant::now();
     // 阻塞调用:内部为嵌套 run loop(菜单跟踪模式),返回即菜单关闭。
     let popped = menu.popUpMenuPositioningItem_atLocation_inView(None, location, Some(&view));
-    let raw = MENU_CHOICE.load(std::sync::atomic::Ordering::SeqCst);
+    let raw = MENU_CHOICE.swap(NO_MENU_CHOICE, std::sync::atomic::Ordering::SeqCst);
     let choice = (raw != NO_MENU_CHOICE).then_some(raw);
     log::info!(
         "右键菜单:顶层 {} 项,位置=({:.1},{:.1}) 鼠标换算={:?},阻塞 {}ms,返回值={popped}(仅留痕),选择 tag={choice:?}",
@@ -764,7 +764,6 @@ pub fn popup_menu(
 ///
 /// 写入 NSPasteboard 的 `NSURL` 数组即可被 Finder 等接收方当作文件拷贝
 /// (NSURL 遵循 `NSPasteboardWriting`);须主线程且不得持有共享锁。
-#[allow(dead_code)] // Task 3 才接菜单/快捷键;接线前无调用点。
 pub fn copy_files(paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -967,6 +966,7 @@ fn add_menu_entries(
                         &NSString::from_str(""),
                     )
                 };
+                debug_assert!(*tag != NO_MENU_CHOICE, "菜单 tag -1 是未选择哨兵");
                 item.setTag(*tag as NSInteger); // i64 → isize(边界转换,见 popup_menu)
                 item.setEnabled(*enabled);
                 let target_obj: &AnyObject = target.as_super().as_ref();

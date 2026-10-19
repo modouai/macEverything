@@ -145,6 +145,8 @@ pub struct ResultsState {
     ime_composing: bool,
     /// 上帧搜索框是否持焦(⌘A 归属:聚焦 = 输入框全选文本,未聚焦 = 表格全选行)。
     input_focused: bool,
+    /// 结果表格是否持键盘焦点(点击过行;搜索框聚焦时清除;空格 Quick Look 的门槛)。
+    table_focused: bool,
     paths: DaemonPaths,
     ctx: egui::Context,
     tx: mpsc::Sender<QueryResult>,
@@ -206,6 +208,7 @@ impl ResultsState {
             focus_input_pending: true,
             ime_composing: false,
             input_focused: false,
+            table_focused: false,
             paths,
             ctx,
             tx,
@@ -222,6 +225,7 @@ impl ResultsState {
     pub fn on_window_shown(&mut self) {
         self.focus_input_pending = true;
         self.status_refresh_pending = true;
+        self.table_focused = false;
         // 每次唤起从干净状态开始:上次会话的瞬时提示(如查询失败)不得跨唤起驻留。
         self.status_note = None;
         self.status_note_is_error = false;
@@ -413,12 +417,47 @@ impl ResultsState {
         icons.begin_frame(&ctx);
         self.track_ime(ui);
 
+        // Quick Look 系统侧关闭 -> 归还焦点;面板可见期间每 200ms 唤醒轮询。
+        if let Some(frame) = frame {
+            platform::quick_look_poll(frame);
+            if platform::quick_look_visible() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+
         // ⌘A:输入框未聚焦时 = 表格全选行(聚焦时归输入框「全选文本」,平台惯例)。
         if !self.input_focused
             && !self.ime_composing
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
         {
             self.select_all();
+        }
+
+        // 空格:表格有焦点(点击过行)且搜索框未聚焦 -> Quick Look 开关。
+        // 搜索框聚焦时空格照常输入;忽略自动重复(长按只 toggle 一次)。
+        let space_pressed = !self.input_focused
+            && !self.ime_composing
+            && self.table_focused
+            && !self.selection.is_empty()
+            && ui.input(|i| {
+                i.events.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        egui::Event::Key {
+                            key: egui::Key::Space,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if modifiers.is_none()
+                    )
+                })
+            });
+        if space_pressed {
+            // 消费掉(含自动重复),避免传给其他控件。
+            ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+            });
         }
 
         let mut sort_click: Option<SortKey> = None;
@@ -659,12 +698,24 @@ impl ResultsState {
         }
         if let Some((i, shift, cmd)) = row_click {
             apply_click(&mut self.selection, &mut self.anchor, i, shift, cmd);
+            self.table_focused = true;
         }
         if let Some(i) = open_row {
             self.open_row(i);
         }
         if let Some((i, pos)) = context_click {
             self.open_context_menu(i, pos, frame);
+        }
+        if space_pressed {
+            if let Some(frame) = frame {
+                let paths = self.selected_paths();
+                if let Err(err) = platform::quick_look_toggle(&paths, frame) {
+                    self.status_note = Some(StatusNote::Raw(err.to_string()));
+                    self.status_note_is_error = true;
+                }
+            } else {
+                log::warn!("空格快速查看:无 eframe Frame(测试路径),忽略");
+            }
         }
         if gaps_clicked {
             self.gaps_open = !self.gaps_open;
@@ -702,6 +753,9 @@ impl ResultsState {
             self.focus_input_pending = false;
         }
         self.input_focused = input_resp.has_focus();
+        if self.input_focused {
+            self.table_focused = false;
+        }
 
         // —— 窗口内描边(最内层,压在所有分段之上;§4.2 window_stroke / §4.4) ——
         // 原生窗口负责圆角裁剪与投影;内容层按同半径在窗口内侧补 1px 描边。
@@ -806,60 +860,60 @@ impl ResultsState {
     /// 按选中类型收敛菜单项(product §2 表),弹原生菜单并执行所选动作。
     /// 弹出阻塞(嵌套 run loop,期间本帧冻结——PoC-3 定论);执行失败落状态栏。
     fn open_context_menu(&mut self, row: usize, pos: egui::Pos2, frame: Option<&eframe::Frame>) {
-        // 1. 选中收敛(标准表格语义)
         converge_selection(&mut self.selection, &mut self.anchor, row);
-        // 2. 选中行 → 路径集合 + 文件/目录计数 → 菜单项(按选中类型收敛)
-        let paths: Vec<String> = self
-            .selection
-            .iter()
-            .filter_map(|&i| self.results.get(i))
-            .map(|e| e.path.clone())
-            .collect();
+        self.table_focused = true;
+        let paths = self.selected_paths();
         if paths.is_empty() {
-            return; // 理论不可达(selection 行号只在 results 内维护,两者同步清空)
+            return;
         }
-        let (files, dirs) = menu_actions::count_types(&paths);
-        let menu_items = menu_actions::menu_items(files, dirs);
-        if menu_items.is_empty() {
-            return; // 空选(理论不可达,见上)——不弹空菜单
-        }
-        // 本任务只升级平台桥接:旧四项平铺内容暂原样转换(菜单内容改动在后续任务)。
-        let items: Vec<platform::MenuEntry> = menu_items
-            .into_iter()
-            .map(|(title, action)| platform::MenuEntry::Item {
-                title,
-                tag: action.tag(),
-                enabled: true,
-            })
-            .collect();
+        let items = menu_actions::menu_entries();
         log::info!(
-            "右键菜单:选中 {} 行(文件 {files} · 目录 {dirs}),弹出于 ({:.0},{:.0})",
+            "右键菜单:选中 {} 行,弹出于 ({:.0},{:.0})",
             paths.len(),
             pos.x,
             pos.y
         );
-        // 3. 弹出原生菜单(阻塞;菜单关闭后返回所选 tag)
         let Some(frame) = frame else {
             log::warn!("右键菜单:无 eframe Frame(测试路径),不弹出");
             return;
         };
         let choice = platform::popup_menu(&items, (pos.x as f64, pos.y as f64), frame);
-        // 4. 执行(未知 tag 留痕;失败落状态栏,不静默)
         match choice {
             None => log::info!("右键菜单:取消(未选择)"),
             Some(tag) => match menu_actions::MenuAction::from_tag(tag) {
-                Some(action) => match menu_actions::execute(action, &paths) {
-                    Ok(()) => log::info!("右键菜单:执行 {action:?}({} 项)", paths.len()),
-                    Err(err) => {
-                        self.status_note = Some(StatusNote::Raw(err.to_string()));
-                        self.status_note_is_error = true;
+                Some(action) => {
+                    let result = match action {
+                        menu_actions::MenuAction::QuickLook => {
+                            menu_actions::ensure_existing(&paths)
+                                .and_then(|()| platform::quick_look_show(&paths, frame))
+                        }
+                        menu_actions::MenuAction::CopyFile => menu_actions::ensure_existing(&paths)
+                            .and_then(|()| platform::copy_files(&paths)),
+                        _ => action
+                            .shell()
+                            .map_or(Ok(()), |shell| menu_actions::execute(shell, &paths)),
+                    };
+                    match result {
+                        Ok(()) => log::info!("右键菜单:执行 {action:?}({} 项)", paths.len()),
+                        Err(err) => {
+                            self.status_note = Some(StatusNote::Raw(err.to_string()));
+                            self.status_note_is_error = true;
+                        }
                     }
-                },
+                }
                 None => log::warn!("右键菜单:未知 tag {tag},忽略"),
             },
         }
-        // 阻塞期本帧未上屏:重绘刷出选中态 / 状态栏提示
         self.ctx.request_repaint();
+    }
+
+    /// 选中行 -> 路径集合(行号与结果同步维护)。
+    fn selected_paths(&self) -> Vec<String> {
+        self.selection
+            .iter()
+            .filter_map(|&i| self.results.get(i))
+            .map(|e| e.path.clone())
+            .collect()
     }
 
     /// 双击:默认应用打开(palette::open_path 复用;失败以本地化文案落状态栏)。

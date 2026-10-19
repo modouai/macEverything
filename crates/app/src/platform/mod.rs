@@ -352,19 +352,17 @@ pub fn revert_class() {
 }
 
 /// 原生菜单项(支持分隔线与子菜单;`tag` 只用于叶子项)。
-///
-/// 本任务菜单内容仍为旧四项平铺,`Separator`/`Submenu` 由原生桥接消费但尚无
-/// 构造点(后续菜单任务会构造),故局部 allow 防 dead_code 警告。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuEntry {
     Item {
         title: &'static str,
+        /// 叶子项选择回传标识。
+        ///
+        /// -1 保留为未选择哨兵,构造方不得使用。
         tag: i64,
         enabled: bool,
     },
-    #[allow(dead_code)]
     Separator,
-    #[allow(dead_code)]
     Submenu {
         title: &'static str,
         items: Vec<MenuEntry>,
@@ -394,7 +392,6 @@ pub fn popup_menu(
 /// 打开/更新 Quick Look 预览面板(主线程;始终置前,不承担关闭语义)。
 ///
 /// `paths` 为空 = no-op。非 macOS / 非主线程 / 面板不可用 → Err。
-#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
 pub fn quick_look_show(paths: &[String], frame: &eframe::Frame) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -408,7 +405,6 @@ pub fn quick_look_show(paths: &[String], frame: &eframe::Frame) -> anyhow::Resul
 }
 
 /// 空格语义:面板未显示 → 打开;已显示 → 关闭并归还焦点。
-#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
 pub fn quick_look_toggle(paths: &[String], frame: &eframe::Frame) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -422,7 +418,6 @@ pub fn quick_look_toggle(paths: &[String], frame: &eframe::Frame) -> anyhow::Res
 }
 
 /// Quick Look 面板当前是否可见(非 macOS 恒 false)。
-#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
 pub fn quick_look_visible() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -435,7 +430,6 @@ pub fn quick_look_visible() -> bool {
 }
 
 /// 每帧轮询:系统侧关闭面板后归还结果窗口焦点(非 macOS:no-op)。
-#[allow(dead_code)] // Task 3 才接菜单/空格;接线前无调用点。
 pub fn quick_look_poll(frame: &eframe::Frame) {
     #[cfg(target_os = "macos")]
     mac_quicklook::poll(frame);
@@ -445,7 +439,6 @@ pub fn quick_look_poll(frame: &eframe::Frame) {
 
 /// 把选中文件写入通用剪贴板(语义 = Finder「拷贝」;主线程)。
 /// 空列表 = no-op;非 macOS / 非主线程 / 写入失败 → Err。
-#[allow(dead_code)] // Task 3 才接菜单/快捷键;接线前无调用点。
 pub fn copy_files(paths: &[String]) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {

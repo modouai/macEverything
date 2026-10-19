@@ -3,9 +3,6 @@
 //! QLPreviewPanel 是进程单例;dataSource 为弱引用,故由本模块 thread_local 保活。
 //! 面板由系统自行关闭(空格/Esc/关闭按钮)时,`poll` 检测可见性变化并归还焦点。
 
-// Task 3 才把本模块接到菜单/空格处理;接线前这些入口无调用点,定向静音。
-#![allow(dead_code)]
-
 use std::cell::{Cell, RefCell};
 
 use anyhow::{anyhow, Result};
