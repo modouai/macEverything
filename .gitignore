@@ -8,3 +8,5 @@
 
 # 官网部署产物：DMG 由发布流程复制，不入库
 /site/downloads/
+tmp/
+.playwright-mcp/
