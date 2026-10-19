@@ -803,6 +803,11 @@ pub fn copy_files(paths: &[String]) -> Result<()> {
 // ---------------------------------------------------------------------------
 // 托盘菜单自弹(2026-10-16 实机修复:副屏点击 → 菜单落在主屏)
 
+/// 根窗是否 key(egui viewport focused 状态补正用;未接句柄 = None)。
+pub(super) fn root_is_key() -> Option<bool> {
+    PALETTE.with(|cell| cell.borrow().root.as_ref().map(|root| root.isKeyWindow()))
+}
+
 /// 托盘菜单的 NSMenu 句柄(主队列块跨线程只携带「调用本模块函数」的意图,
 /// 指针经本静态取回——裸指针非 Send,故以 usize 存)。
 static TRAY_MENU: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

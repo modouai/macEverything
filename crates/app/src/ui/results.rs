@@ -442,6 +442,15 @@ impl ResultsState {
         icons.begin_frame(&ctx);
         self.track_ime(ui);
 
+        // 切换应用/窗口回来后,egui 的 viewport focused 可能滞后为 false(原生根窗
+        // 已是 key、按键也能到达),而 TextEdit 只在 focused=true 时绘制光标。
+        // 用原生 key 状态补正,避免「能输入但看不到光标」。
+        let egui_focused = ui.input(|i| i.focused);
+        let synced_focused = sync_viewport_focus(egui_focused, platform::root_is_key());
+        if synced_focused != egui_focused {
+            ui.ctx().input_mut(|i| i.focused = synced_focused);
+        }
+
         // Quick Look 系统侧关闭 -> 归还焦点;面板可见期间每 200ms 唤醒轮询。
         // 绘制期已在 winit 事件处理中:AppKit 通知排队投递,不会同步重入(锁纪律)。
         if let Some(frame) = frame {
@@ -1756,6 +1765,12 @@ fn converge_selection(selection: &mut BTreeSet<usize>, anchor: &mut Option<usize
         selection.insert(row);
         *anchor = Some(row);
     }
+}
+
+/// egui 的 viewport focused 与原生 key 状态同步:
+/// 原生根窗已是 key 时,egui 即使仍报 false 也按 true 处理(否则 TextEdit 不画光标)。
+fn sync_viewport_focus(egui_focused: bool, root_is_key: Option<bool>) -> bool {
+    egui_focused || root_is_key == Some(true)
 }
 
 /// 消费一个**修饰键精确匹配**的按下事件。
@@ -5128,6 +5143,15 @@ mod tests {
         assert_eq!(stepped_row(Some(2), 5, -1), Some(1));
         assert_eq!(stepped_row(Some(4), 5, 1), Some(4), "末行下移保持");
         assert_eq!(stepped_row(Some(0), 5, -1), Some(0), "首行上移保持");
+    }
+
+    /// egui 焦点状态滞后:原生根窗已是 key 时补正,否则光标不绘制。
+    #[test]
+    fn viewport_focus_syncs_only_when_root_is_key() {
+        assert!(sync_viewport_focus(false, Some(true)), "滞后 false 应补正");
+        assert!(sync_viewport_focus(true, Some(true)));
+        assert!(!sync_viewport_focus(false, Some(false)));
+        assert!(!sync_viewport_focus(false, None), "未接窗保持原状");
     }
 
     /// 搜索框内 Shift/Alt+↓ 归文本编辑;只有裸 ↓ 才进入表格。

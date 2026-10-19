@@ -494,6 +494,19 @@ pub fn attached() -> bool {
     }
 }
 
+/// 根窗当前是否为 key window(egui viewport focused 状态补正用;
+/// 非 macOS/未接句柄恒 None)。
+pub fn root_is_key() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::root_is_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// 根窗当前原生可见性(首帧纠偏核对;非 macOS/未接句柄恒 None)。
 pub fn root_visible() -> Option<bool> {
     #[cfg(target_os = "macos")]
