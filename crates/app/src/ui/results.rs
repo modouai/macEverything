@@ -418,6 +418,7 @@ impl ResultsState {
         self.track_ime(ui);
 
         // Quick Look 系统侧关闭 -> 归还焦点;面板可见期间每 200ms 唤醒轮询。
+        // 绘制期已在 winit 事件处理中:AppKit 通知排队投递,不会同步重入(锁纪律)。
         if let Some(frame) = frame {
             platform::quick_look_poll(frame);
             if platform::quick_look_visible() {
@@ -435,41 +436,17 @@ impl ResultsState {
 
         // 空格:表格有焦点(点击过行)且搜索框未聚焦 -> Quick Look 开关。
         // 搜索框聚焦时空格照常输入;忽略自动重复(长按只 toggle 一次)。
-        let space_gate = !self.input_focused
-            && !self.ime_composing
-            && self.table_focused
-            && !self.selection.is_empty();
-        let space_pressed = space_gate
-            && ui.input(|i| {
-                i.events.iter().any(|ev| {
-                    matches!(
-                        ev,
-                        egui::Event::Key {
-                            key: egui::Key::Space,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if modifiers.is_none()
-                    )
-                })
-            });
+        let space_gate = space_activation_allowed(
+            self.input_focused,
+            self.ime_composing,
+            self.table_focused,
+            !self.selection.is_empty(),
+        );
+        let space_pressed = space_gate && ui.input(|i| initial_space_press(&i.events));
         if space_gate {
             // 门控成立即消费所有无修饰 Space(含自动重复),避免漏给其他控件;
             // 但只在首次按下(space_pressed)时触发 toggle。
-            ui.input_mut(|i| {
-                i.events.retain(|ev| {
-                    !matches!(
-                        ev,
-                        egui::Event::Key {
-                            key: egui::Key::Space,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } if modifiers.is_none()
-                    )
-                });
-            });
+            ui.input_mut(|i| consume_unmodified_space_presses(&mut i.events));
         }
 
         let mut sort_click: Option<SortKey> = None;
@@ -721,7 +698,15 @@ impl ResultsState {
         if space_pressed {
             if let Some(frame) = frame {
                 let paths = self.selected_paths();
-                if let Err(err) = platform::quick_look_toggle(&paths, frame) {
+                // 仅打开方向做整批存在性校验(与菜单路径一致);关闭方向不校验,
+                // 保证空格始终能关掉已打开的面板。
+                let result = if platform::quick_look_visible() {
+                    platform::quick_look_toggle(&paths, frame)
+                } else {
+                    menu_actions::ensure_existing(&paths)
+                        .and_then(|()| platform::quick_look_toggle(&paths, frame))
+                };
+                if let Err(err) = result {
                     self.status_note = Some(StatusNote::Raw(err.to_string()));
                     self.status_note_is_error = true;
                 }
@@ -869,7 +854,8 @@ impl ResultsState {
     }
 
     /// 右键菜单(Task 18):标准表格语义先把点击行并入选中(不在选中集 → 单选它),
-    /// 按选中类型收敛菜单项(product §2 表),弹原生菜单并执行所选动作。
+    /// 固定最终菜单五段(v2.3 §3:打开 / 在访达中显示 / 快速查看 / 分隔线 / 拷贝▸),
+    /// 弹原生菜单并执行所选动作。
     /// 弹出阻塞(嵌套 run loop,期间本帧冻结——PoC-3 定论);执行失败落状态栏。
     fn open_context_menu(&mut self, row: usize, pos: egui::Pos2, frame: Option<&eframe::Frame>) {
         converge_selection(&mut self.selection, &mut self.anchor, row);
@@ -901,9 +887,14 @@ impl ResultsState {
                         }
                         menu_actions::MenuAction::CopyFile => menu_actions::ensure_existing(&paths)
                             .and_then(|()| platform::copy_files(&paths)),
-                        _ => action
-                            .shell()
-                            .map_or(Ok(()), |shell| menu_actions::execute(shell, &paths)),
+                        _ => match action.shell() {
+                            Some(shell) => menu_actions::execute(shell, &paths),
+                            None => {
+                                debug_assert!(false, "未分派的平台动作:{action:?}");
+                                log::error!("菜单动作 {action:?} 未接平台分派");
+                                Ok(())
+                            }
+                        },
                     };
                     match result {
                         Ok(()) => log::info!("右键菜单:执行 {action:?}({} 项)", paths.len()),
@@ -942,6 +933,7 @@ impl ResultsState {
     /// ⌘A:全选当前结果 K 行(product §2「⌘A 全选」;K = 实际返回条数)。
     fn select_all(&mut self) {
         self.selection = (0..self.results.len()).collect();
+        self.table_focused = true;
         log::info!("⌘A 全选 {} 行", self.selection.len());
     }
 
@@ -1551,6 +1543,47 @@ fn converge_selection(selection: &mut BTreeSet<usize>, anchor: &mut Option<usize
         selection.insert(row);
         *anchor = Some(row);
     }
+}
+
+/// 空格 Quick Look 门控(纯逻辑):搜索框未聚焦、非 IME 组合、表格持焦、有选中。
+fn space_activation_allowed(
+    input_focused: bool,
+    ime_composing: bool,
+    table_focused: bool,
+    has_selection: bool,
+) -> bool {
+    !input_focused && !ime_composing && table_focused && has_selection
+}
+
+/// 本帧是否存在首次按下(非自动重复)的无修饰 Space。
+fn initial_space_press(events: &[egui::Event]) -> bool {
+    events.iter().any(|ev| {
+        matches!(
+            ev,
+            egui::Event::Key {
+                key: egui::Key::Space,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } if modifiers.is_none()
+        )
+    })
+}
+
+/// 消费所有无修饰 Space 按下事件(含自动重复);释放与带修饰 Space 保留。
+fn consume_unmodified_space_presses(events: &mut Vec<egui::Event>) {
+    events.retain(|ev| {
+        !matches!(
+            ev,
+            egui::Event::Key {
+                key: egui::Key::Space,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.is_none()
+        )
+    });
 }
 
 /// 界面方向(asc = 期望升序显示)→ 协议 desc(反转自然方向,见 protocol::Request::Query
@@ -4341,6 +4374,123 @@ mod tests {
         println!(
             "[实机] 单帧绘制:{big_rows} 行 {big_ms:.2}ms / 40 行 {small_ms:.2}ms(可见行数同,比值 {:.2})",
             big_ms / small_ms.max(1e-6)
+        );
+    }
+
+    fn key_event(
+        key: egui::Key,
+        pressed: bool,
+        repeat: bool,
+        modifiers: egui::Modifiers,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers,
+        }
+    }
+
+    /// 空格门控真值表:搜索框聚焦 / IME 组合 / 表格未聚焦 / 无选中,任一为真即拒绝。
+    #[test]
+    fn space_activation_gate_truth_table() {
+        assert!(space_activation_allowed(false, false, true, true));
+        assert!(
+            !space_activation_allowed(true, false, true, true),
+            "搜索框聚焦时空格归输入框"
+        );
+        assert!(
+            !space_activation_allowed(false, true, true, true),
+            "IME 组合中不触发"
+        );
+        assert!(
+            !space_activation_allowed(false, false, false, true),
+            "表格未持焦不触发"
+        );
+        assert!(
+            !space_activation_allowed(false, false, true, false),
+            "无选中不触发"
+        );
+    }
+
+    /// 首次按下才触发:repeat=true / release / Shift+Space 均不算。
+    #[test]
+    fn initial_space_press_excludes_repeat_and_modifiers() {
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        assert!(initial_space_press(&[key_event(
+            egui::Key::Space,
+            true,
+            false,
+            none
+        )]));
+        assert!(
+            !initial_space_press(&[key_event(egui::Key::Space, true, true, none)]),
+            "自动重复不触发 toggle"
+        );
+        assert!(
+            !initial_space_press(&[key_event(egui::Key::Space, false, false, none)]),
+            "释放不触发"
+        );
+        assert!(
+            !initial_space_press(&[key_event(egui::Key::Space, true, false, shift)]),
+            "Shift+Space 不触发"
+        );
+    }
+
+    /// 消费语义:无修饰 Space 的 press 与 repeat 都移除;release、Shift+Space、其他键保留。
+    #[test]
+    fn consume_unmodified_space_presses_only_press_events() {
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let mut events = vec![
+            key_event(egui::Key::Space, true, false, none),
+            key_event(egui::Key::Space, true, true, none),
+            key_event(egui::Key::Space, false, false, none),
+            key_event(egui::Key::Space, true, false, shift),
+            key_event(egui::Key::A, true, false, none),
+        ];
+        consume_unmodified_space_presses(&mut events);
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(
+                &events[0],
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    pressed: false,
+                    ..
+                }
+            ),
+            "Space 释放保留"
+        );
+        assert!(
+            matches!(
+                &events[1],
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.shift
+            ),
+            "Shift+Space 保留"
+        );
+        assert!(
+            matches!(
+                &events[2],
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    ..
+                }
+            ),
+            "其他键保留"
         );
     }
 }

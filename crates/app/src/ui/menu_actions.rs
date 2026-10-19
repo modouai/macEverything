@@ -184,6 +184,14 @@ fn plan(action: ShellAction, paths: &[String]) -> Result<Vec<Step>> {
     }
 }
 
+/// 拷贝步骤失败文案(CopyFileName 与路径拷贝分别提示)。
+fn pipe_failure_text(action: ShellAction) -> &'static str {
+    match action {
+        ShellAction::CopyFileName => i18n::s().copy_name_failed,
+        _ => i18n::s().menu_copy_failed,
+    }
+}
+
 pub fn execute(action: ShellAction, paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         log::warn!("菜单动作 {action:?}:路径集为空,忽略");
@@ -194,11 +202,7 @@ pub fn execute(action: ShellAction, paths: &[String]) -> Result<()> {
         match step {
             Step::Run { program, args } => spawn_run(program, args)?,
             Step::Pipe { text } => {
-                let failure = match action {
-                    ShellAction::CopyFileName => i18n::s().copy_name_failed,
-                    _ => i18n::s().menu_copy_failed,
-                };
-                copy_to_clipboard(text, failure)?;
+                copy_to_clipboard(text, pipe_failure_text(action))?;
             }
         }
     }
@@ -355,9 +359,35 @@ mod tests {
         assert_eq!(MenuAction::CopyFile.shell(), None);
         assert_eq!(MenuAction::Open.shell(), Some(ShellAction::Open));
         assert_eq!(
+            MenuAction::RevealInFinder.shell(),
+            Some(ShellAction::RevealInFinder)
+        );
+        assert_eq!(MenuAction::CopyPaths.shell(), Some(ShellAction::CopyPaths));
+        assert_eq!(
             MenuAction::CopyFileName.shell(),
             Some(ShellAction::CopyFileName)
         );
+    }
+
+    #[test]
+    fn pipe_failure_text_matches_action_and_language() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(
+                pipe_failure_text(ShellAction::CopyFileName),
+                "拷贝文件名失败"
+            );
+            assert_eq!(pipe_failure_text(ShellAction::CopyPaths), "拷贝路径失败");
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(
+                pipe_failure_text(ShellAction::CopyFileName),
+                "Failed to copy file name"
+            );
+            assert_eq!(
+                pipe_failure_text(ShellAction::CopyPaths),
+                "Failed to copy path"
+            );
+        });
     }
 
     #[test]
@@ -375,13 +405,11 @@ mod tests {
     fn plan_command_lines() {
         let base = std::env::temp_dir().join(format!("mce-menu-plan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("dir_a")).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
         let f1 = base.join("a.txt");
         let f2 = base.join("b.txt");
-        let g1 = base.join("dir_a/c.txt");
         std::fs::write(&f1, b"x").unwrap();
         std::fs::write(&f2, b"x").unwrap();
-        std::fs::write(&g1, b"x").unwrap();
         let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
         let run = |args: Vec<String>| Step::Run {
             program: "open",

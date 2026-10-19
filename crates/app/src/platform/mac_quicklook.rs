@@ -182,6 +182,8 @@ pub fn poll(frame: &eframe::Frame) {
     let visible = panel.isVisible();
     let was = PANEL_WAS_VISIBLE.with(|v| v.replace(visible));
     if was && !visible {
+        // 与 close 一致:系统侧关闭后清空 URL,避免面板/回调残留旧预览项。
+        QL_URLS.with(|slot| slot.borrow_mut().clear());
         log::info!("快速查看:面板已由系统关闭,归还焦点");
         restore_focus(frame);
     }
