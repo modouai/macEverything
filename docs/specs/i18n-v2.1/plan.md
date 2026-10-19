@@ -1683,6 +1683,8 @@ pub fn menu_entries() -> Vec<MenuEntry> {
 
 错误文案（整批存在性校验前置；快速查看/拷贝文件由平台层执行）：
 
+> 历史片段；最终实现见 `menu_actions.rs` 的 `ensure_exists` 与 `copy_to_clipboard(text, failure)`。
+
 ```rust
 return Err(anyhow!("{}", i18n::s().menu_file_missing));
 Err(e) => Err(anyhow!("{}: {e}", i18n::s().menu_open_failed)),

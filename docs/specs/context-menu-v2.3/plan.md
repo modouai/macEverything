@@ -2,6 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **实施状态（2026-10-19）：** Task 1–3 已实现并通过双审；Task 4 文档已回填；Task 4 Step 6 实机验收待人工确认。已完成步骤已勾选。
+> **实施偏差（以代码为准）：** Quick Look 用 existing_panel 避免查询时创建面板；show 校验 isVisible；poll 在 App 非 active 时跳过，系统关闭时清空 URL。空格仅打开方向做存在性校验，关闭方向不校验；select_all 置 table_focused。菜单分派对 shell()==None 用 debug_assert! + log::error!。拷贝路径不校验存在性，其余动作整批校验。dead_code allow 已全部删除。下文代码块为计划稿，与最终实现有差异时以本节为准。
+
 **Goal:** 把完整结果窗口的右键菜单落地为 v2.3 最终形态：删除「在访达中打开」，加入快速查看、拷贝文件/路径/文件名子菜单，并完成菜单 i18n。
 
 **Architecture:** 纯逻辑（菜单结构、tag、文本载荷）留在 `ui/menu_actions.rs` 并可单测；AppKit 桥接（NSMenu 子菜单、target/action、QLPreviewPanel、NSPasteboard）集中在 `platform/`；`ui/results.rs` 只做焦点/选择语义与动作分派。
@@ -32,7 +35,7 @@
 - Modify: `crates/app/src/platform/mac.rs`
 - Modify: `crates/app/src/ui/results.rs`
 
-- [ ] **Step 1: 在 facade 定义 `MenuEntry` 并改 `popup_menu` 签名**
+- [x] **Step 1: 在 facade 定义 `MenuEntry` 并改 `popup_menu` 签名**
 
 `crates/app/src/platform/mod.rs`，在 `popup_menu` 前加类型：
 
@@ -73,7 +76,7 @@ pub fn popup_menu(
 }
 ```
 
-- [ ] **Step 2: 在 `mac.rs` 增加 target 类与选择落点**
+- [x] **Step 2: 在 `mac.rs` 增加 target 类与选择落点**
 
 在 `SpaceChange` 相关静态附近加：
 
@@ -112,7 +115,7 @@ impl MenuTarget {
 
 在 `use super::{...}` 里加入 `MenuEntry`。
 
-- [ ] **Step 3: 递归构建菜单并改写 `popup_menu`**
+- [x] **Step 3: 递归构建菜单并改写 `popup_menu`**
 
 替换 `build_context_menu` 为：
 
@@ -196,7 +199,7 @@ fn fill_menu(mtm: MainThreadMarker, menu: &NSMenu, items: &[MenuEntry], target: 
 
 日志把 `items.len()` 改为 `"{} 个顶层项"`，并在末尾带上 `choice`。
 
-- [ ] **Step 4: 结果窗口临时适配新签名（本任务不改变菜单内容）**
+- [x] **Step 4: 结果窗口临时适配新签名（本任务不改变菜单内容）**
 
 `crates/app/src/ui/results.rs` 的 `open_context_menu` 中：
 
@@ -218,7 +221,7 @@ fn fill_menu(mtm: MainThreadMarker, menu: &NSMenu, items: &[MenuEntry], target: 
 
 弹出调用改为 `platform::popup_menu(&items, (pos.x as f64, pos.y as f64), frame)`。
 
-- [ ] **Step 5: 编译与回归**
+- [x] **Step 5: 编译与回归**
 
 Run: `cargo test -p macEverything-app`
 Expected: 现有测试全部通过（菜单内容仍是旧四项）。
@@ -226,7 +229,7 @@ Expected: 现有测试全部通过（菜单内容仍是旧四项）。
 Run: `cargo clippy -p macEverything-app --all-targets -- -D warnings`
 Expected: 零警告。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/app/src/platform/mod.rs crates/app/src/platform/mac.rs crates/app/src/ui/results.rs
@@ -243,7 +246,7 @@ git commit -m "refactor(menu): 原生菜单桥接支持子菜单与 target/actio
 - Modify: `crates/app/src/platform/mac.rs`
 - Modify: `crates/app/src/platform/mod.rs`
 
-- [ ] **Step 1: 加依赖与 feature**
+- [x] **Step 1: 加依赖与 feature**
 
 `crates/app/Cargo.toml`：
 
@@ -258,7 +261,7 @@ objc2-quick-look-ui = { version = "0.3.2", default-features = false, features = 
     "NSPasteboard",
 ```
 
-- [ ] **Step 2: 新建 `mac_quicklook.rs`**
+- [x] **Step 2: 新建 `mac_quicklook.rs`**
 
 `crates/app/src/platform/mac_quicklook.rs` 全文：
 
@@ -445,7 +448,7 @@ fn restore_focus(frame: &eframe::Frame) {
 }
 ```
 
-- [ ] **Step 3: 暴露 `frame_view` 并注册模块**
+- [x] **Step 3: 暴露 `frame_view` 并注册模块**
 
 `crates/app/src/platform/mac.rs`：
 
@@ -462,7 +465,7 @@ pub mod mac;
 pub mod mac_quicklook;
 ```
 
-- [ ] **Step 4: facade 增加快速查看与拷贝文件**
+- [x] **Step 4: facade 增加快速查看与拷贝文件**
 
 `platform/mod.rs`：
 
@@ -527,7 +530,7 @@ pub fn copy_files(paths: &[String]) -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 5: 在 `mac.rs` 实现 `copy_files`**
+- [x] **Step 5: 在 `mac.rs` 实现 `copy_files`**
 
 导入补充：
 
@@ -568,7 +571,7 @@ pub fn copy_files(paths: &[String]) -> Result<()> {
 }
 ```
 
-- [ ] **Step 6: 编译**
+- [x] **Step 6: 编译**
 
 Run: `cargo check -p macEverything-app`
 Expected: 通过。
@@ -576,7 +579,7 @@ Expected: 通过。
 Run: `cargo test -p macEverything-app`
 Expected: 现有测试全部通过。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/app/Cargo.toml crates/app/src/platform
@@ -592,7 +595,7 @@ git commit -m "feat(menu): 接入 Quick Look 面板与文件剪贴板"
 - Modify: `crates/app/src/i18n/catalog.rs`
 - Modify: `crates/app/src/ui/results.rs`
 
-- [ ] **Step 1: 先写失败测试**
+- [x] **Step 1: 先写失败测试**
 
 把 `crates/app/src/ui/menu_actions.rs` 的 `#[cfg(test)] mod tests` 整体替换为：
 
@@ -802,12 +805,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p macEverything-app menu_actions`
 Expected: 编译失败（`menu_entries` / `ShellAction` / `names_text` 尚不存在）。
 
-- [ ] **Step 3: 重写 `menu_actions.rs` 的非测试部分**
+- [x] **Step 3: 重写 `menu_actions.rs` 的非测试部分**
 
 完整替换为：
 
@@ -1078,7 +1081,7 @@ fn copy_to_clipboard(text: &str, failure: &str) -> Result<()> {
 }
 ```
 
-- [ ] **Step 4: 更新 i18n 目录**
+- [x] **Step 4: 更新 i18n 目录**
 
 `crates/app/src/i18n/catalog.rs` 的右键菜单段替换为：
 
@@ -1101,7 +1104,7 @@ fn copy_to_clipboard(text: &str, failure: &str) -> Result<()> {
 
 删除 `menu_open_in_finder` 与 `menu_locate_failed`。
 
-- [ ] **Step 5: 更新 `results.rs` 的焦点、空格与动作分派**
+- [x] **Step 5: 更新 `results.rs` 的焦点、空格与动作分派**
 
 1）`ResultsState` 增加字段（`input_focused` 旁）：
 
@@ -1255,7 +1258,7 @@ fn copy_to_clipboard(text: &str, failure: &str) -> Result<()> {
     }
 ```
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `cargo test -p macEverything-app menu_actions`
 Expected: 全部 PASS。
@@ -1266,7 +1269,7 @@ Expected: 全部 PASS。
 Run: `cargo clippy -p macEverything-app --all-targets -- -D warnings`
 Expected: 零警告。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/app/src/ui/menu_actions.rs crates/app/src/ui/results.rs crates/app/src/i18n/catalog.rs
@@ -1286,7 +1289,7 @@ git commit -m "feat(menu): v2.2/v2.3 最终菜单、快速查看与拷贝增强"
 - Modify: `docs/specs/context-menu-v2.2/design.md`
 - Modify: `docs/specs/context-menu-v2.3/design.md`
 
-- [ ] **Step 1: `docs/usage.md`**
+- [x] **Step 1: `docs/usage.md`**
 
 完整窗口表格段替换为：
 
@@ -1306,7 +1309,7 @@ git commit -m "feat(menu): v2.2/v2.3 最终菜单、快速查看与拷贝增强"
 - 表格有焦点(点击过行)且搜索框未聚焦时,按**空格**打开/关闭快速查看。
 ```
 
-- [ ] **Step 2: `docs/specs/v2-ui/product.md`**
+- [x] **Step 2: `docs/specs/v2-ui/product.md`**
 
 §2 右键菜单表替换为同一张表（保留「多选」列语义，可写成「逐项 / 画廊 / 全部写入」）；删除「文件/目录 / 四项」描述。验收清单中「四项语义」改为：
 
@@ -1315,15 +1318,15 @@ git commit -m "feat(menu): v2.2/v2.3 最终菜单、快速查看与拷贝增强"
 - [ ] 空格在表格焦点下打开/关闭 Quick Look;搜索框聚焦时只输入空格
 ```
 
-- [ ] **Step 3: i18n 文档**
+- [x] **Step 3: i18n 文档**
 
 `docs/specs/i18n-v2.1/design.md`：删除「在访达中打开 / Open in Finder」行；菜单列表改为最终六项。`plan.md` Step 4 的文案表同步 Task 3 Step 4；删除 `menu_locate_failed` 与 `menu_items(files, dirs)` 的计数分支。
 
-- [ ] **Step 4: 其他计划文档**
+- [x] **Step 4: 其他计划文档**
 
 `docs/specs/full-window-visual/plan.md` 第 93 行菜单描述改为最终菜单。`docs/specs/context-menu-v2.2/design.md` 状态改为「已实现(v2.3 合并落地)」；`docs/specs/context-menu-v2.3/design.md` 状态改为「已实现(2026-10-19)」，并在 §4.4 后追加实施记录：平台层 polling 方案、菜单 target/action、单测覆盖点。
 
-- [ ] **Step 5: 全量门禁**
+- [x] **Step 5: 全量门禁**
 
 Run: `cargo fmt --check`
 Expected: 无输出。
@@ -1350,10 +1353,10 @@ open release/macEverything.app
 - 右键:六个叶子项 tag 正确;取消不误触;子菜单可展开。
 - 拷贝文件:粘到 Finder 生成副本、粘到邮件为附件;多选全部写入。
 - 拷贝路径/文件名:单/多选文本正确;根目录回退完整路径。
-- 缺失文件:快速查看与拷贝类动作整批拒绝并提示。
+- 缺失文件:打开、在访达中显示、快速查看（打开方向）、拷贝文件、拷贝文件名整批拒绝并提示;拷贝路径不校验存在性,空格关闭方向不校验。
 - 中英文界面下菜单与错误文案正确;无新增 TCC 权限弹窗。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs

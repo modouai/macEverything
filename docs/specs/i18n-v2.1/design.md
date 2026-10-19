@@ -234,7 +234,9 @@ cargo test --workspace
 
 ---
 
-## 八、英文术语表（待辉哥审阅）
+## 八、英文术语表（已定稿）
+
+> 本表列出新增/变更术语；`menu_file_missing`、`menu_open_failed`、`menu_copy_failed` 等既有文案见 `catalog.rs`。
 
 | 中文 | English |
 |---|---|
