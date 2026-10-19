@@ -911,12 +911,12 @@ pub(super) fn frame_view(frame: &eframe::Frame) -> Option<Retained<NSView>> {
     let handle = match frame.window_handle() {
         Ok(h) => h,
         Err(e) => {
-            log::warn!("右键菜单:窗口句柄取不到({e})");
+            log::warn!("原生取窗:窗口句柄取不到({e})");
             return None;
         }
     };
     let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-        log::warn!("右键菜单:非 AppKit 窗口句柄");
+        log::warn!("原生取窗:非 AppKit 窗口句柄");
         return None;
     };
     // SAFETY:h.ns_view 指向 winit 为本 app 创建、当前存活的 NSView(主线程持有),

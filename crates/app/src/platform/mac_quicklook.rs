@@ -26,11 +26,16 @@ thread_local! {
 }
 
 define_class!(
+    // SAFETY(define_class 的 unsafe 契约):超类 NSObject 可子类化;无新增实例变量
+    // (ivars 缺省 `()`);本类不实现 Drop;下方两个 dataSource 方法签名与
+    // QLPreviewPanelDataSource 协议一致。
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "MaceQLDataSource"]
     struct QlDataSource;
 
+    // SAFETY: 方法签名与 QLPreviewPanelDataSource 协议一致;数据源由本模块
+    // thread_local 保活(面板对 dataSource 为弱引用),面板存续期内始终有效。
     unsafe impl QLPreviewPanelDataSource for QlDataSource {
         #[unsafe(method(numberOfPreviewItemsInPreviewPanel:))]
         unsafe fn number_of_preview_items(&self, _panel: Option<&QLPreviewPanel>) -> NSInteger {
@@ -68,6 +73,18 @@ fn shared_panel(mtm: MainThreadMarker) -> Option<Retained<QLPreviewPanel>> {
     unsafe { QLPreviewPanel::sharedPreviewPanel(mtm) }
 }
 
+/// 取**已存在**的共享面板(不存在时不创建;轮询/查询路径用)。
+///
+/// `sharedPreviewPanel` 会按需创建面板,故每帧查询不能直接用它;先问
+/// `sharedPreviewPanelExists`,存在才取实例。
+fn existing_panel(mtm: MainThreadMarker) -> Option<Retained<QLPreviewPanel>> {
+    // SAFETY: 仅查询单例是否已创建;主线程凭 mtm 访问。
+    if !unsafe { QLPreviewPanel::sharedPreviewPanelExists(mtm) } {
+        return None;
+    }
+    shared_panel(mtm)
+}
+
 fn install_data_source(mtm: MainThreadMarker, panel: &QLPreviewPanel) {
     QL_DATA_SOURCE.with(|slot| {
         if slot.borrow().is_none() {
@@ -98,12 +115,19 @@ pub fn show(paths: &[String], _frame: &eframe::Frame) -> Result<()> {
         .collect();
     QL_URLS.with(|slot| *slot.borrow_mut() = urls);
     NSApplication::sharedApplication(mtm).activate();
-    // SAFETY: 主线程;数据源与 URL 已就位后 reloadData/设置索引是协议允许顺序。
+    // SAFETY: 主线程;数据源与 URL 已就位且非空(上面已剔除空列表)。reloadData
+    // 的 numberOfPreviewItems 回调同步读取 thread_local,不产生重入。
     unsafe {
         panel.reloadData();
         panel.setCurrentPreviewItemIndex(0);
     }
     panel.makeKeyAndOrderFront(None);
+    if !panel.isVisible() {
+        // 面板未能显示(如系统拒绝/排序失败):不能报成功,复位可见性跟踪。
+        PANEL_WAS_VISIBLE.with(|v| v.set(false));
+        log::warn!("快速查看:面板未显示(makeKeyAndOrderFront 后 isVisible=false)");
+        return Err(anyhow!("{}", i18n::s().quick_look_failed));
+    }
     PANEL_WAS_VISIBLE.with(|v| v.set(true));
     log::info!(
         "快速查看:打开 {} 项 panelVisible={} panelKey={}",
@@ -119,9 +143,11 @@ pub fn close(frame: &eframe::Frame) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    if let Some(panel) = shared_panel(mtm) {
+    if let Some(panel) = existing_panel(mtm) {
         panel.orderOut(None);
     }
+    // 设计 §4.2:关闭后清空 URL,避免面板/回调残留旧预览项。
+    QL_URLS.with(|slot| slot.borrow_mut().clear());
     PANEL_WAS_VISIBLE.with(|v| v.set(false));
     restore_focus(frame);
 }
@@ -139,7 +165,7 @@ pub fn toggle(paths: &[String], frame: &eframe::Frame) -> Result<()> {
 /// 面板当前是否可见(非主线程/不可用 = false)。
 pub fn visible() -> bool {
     MainThreadMarker::new()
-        .and_then(shared_panel)
+        .and_then(existing_panel)
         .is_some_and(|panel| panel.isVisible())
 }
 
@@ -148,7 +174,12 @@ pub fn poll(frame: &eframe::Frame) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let Some(panel) = shared_panel(mtm) else {
+    let app = NSApplication::sharedApplication(mtm);
+    if !app.isActive() {
+        // 面板随 App 失活被系统隐藏,不是用户关闭;保留 was 状态。
+        return;
+    }
+    let Some(panel) = existing_panel(mtm) else {
         return;
     };
     let visible = panel.isVisible();
