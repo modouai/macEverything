@@ -435,10 +435,11 @@ impl ResultsState {
 
         // 空格:表格有焦点(点击过行)且搜索框未聚焦 -> Quick Look 开关。
         // 搜索框聚焦时空格照常输入;忽略自动重复(长按只 toggle 一次)。
-        let space_pressed = !self.input_focused
+        let space_gate = !self.input_focused
             && !self.ime_composing
             && self.table_focused
-            && !self.selection.is_empty()
+            && !self.selection.is_empty();
+        let space_pressed = space_gate
             && ui.input(|i| {
                 i.events.iter().any(|ev| {
                     matches!(
@@ -453,10 +454,21 @@ impl ResultsState {
                     )
                 })
             });
-        if space_pressed {
-            // 消费掉(含自动重复),避免传给其他控件。
+        if space_gate {
+            // 门控成立即消费所有无修饰 Space(含自动重复),避免漏给其他控件;
+            // 但只在首次按下(space_pressed)时触发 toggle。
             ui.input_mut(|i| {
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+                i.events.retain(|ev| {
+                    !matches!(
+                        ev,
+                        egui::Event::Key {
+                            key: egui::Key::Space,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.is_none()
+                    )
+                });
             });
         }
 
