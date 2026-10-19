@@ -300,6 +300,7 @@ fn palette_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, reason: &str
 /// 返回 true = 已处理（调用方负责落盘窗口尺寸）。
 fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+        crate::platform::quick_look_dismiss();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         true
     } else {
