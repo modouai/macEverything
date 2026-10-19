@@ -171,7 +171,7 @@ language = "system"   # "system" | "zh-hans" | "en"
 
 ### 5.2 原生右键菜单与确认弹窗
 
-- 右键菜单（打开 / 在访达中打开 / 在访达中显示 / 拷贝路径）与「恢复默认排除目录」确认弹窗均为**每次调用时新建**，直接从 `i18n::s()` 取文案，天然跟随当前语言。
+- 右键菜单（打开 / 在访达中显示 / 快速查看 / 拷贝文件 / 拷贝路径 / 拷贝文件名）与「恢复默认排除目录」确认弹窗均为**每次调用时新建**，直接从 `i18n::s()` 取文案，天然跟随当前语言。
 - 弹窗按钮顺序与默认按钮语义不变：第一按钮「取消」为默认 Return，第二按钮「恢复默认」须显式点击。
 - 注：AppKit 只对标题恰为 `Cancel` 的按钮自动绑定 Esc；英文界面下 `Cancel` 会自动获得 Esc（语义等同取消），中文「取消」仍不绑定——两者都只会取消，不会误触「恢复默认」。
 
@@ -211,7 +211,7 @@ language = "system"   # "system" | "zh-hans" | "en"
 
 ### 7.2 Headless UI
 
-- 两语言下：设置页三组六项全部标签、语言下拉三项、字号三档；悬浮条占位/空态；结果窗口列头/状态/空态/缺口面板；右键菜单四项；托盘状态与缺口文案。
+- 两语言下：设置页三组六项全部标签、语言下拉三项、字号三档；悬浮条占位/空态；结果窗口列头/状态/空态/缺口面板；右键菜单六项；托盘状态与缺口文案。
 - 英文下设置页关键文本宽度不超过控件宽度；结果状态栏按既有规则截断不溢出。
 - 现有中文断言默认 zh-Hans 保持通过；英文用例统一 `with_lang`。
 
@@ -259,9 +259,15 @@ cargo test --workspace
 | 无匹配项 | No matches |
 | 换个关键词试试 | Try a different keyword |
 | 打开 | Open |
-| 在访达中打开 | Open in Finder |
 | 在访达中显示 | Show in Finder |
+| 快速查看 | Quick Look |
+| 拷贝 | Copy |
+| 拷贝文件 | Copy File |
 | 拷贝路径 | Copy Path |
+| 拷贝文件名 | Copy File Name |
+| 无法预览该项目 | Could not preview this item |
+| 拷贝文件失败 | Failed to copy file |
+| 拷贝文件名失败 | Failed to copy file name |
 | 取消 | Cancel |
 | 退出 | Quit |
 | 打开搜索 | Open Quick Search |
