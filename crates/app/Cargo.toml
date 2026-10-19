@@ -87,7 +87,18 @@ objc2-foundation = { version = "0.3", features = [
     "NSURL",
     # i18n：NSLocale.preferredLanguages() 读取系统首选语言。
     "NSLocale",
+    # v2.4 发现新版本：NSURLSession 拉取官网 version.json。
+    "NSData",
+    "NSURLRequest",
+    "NSURLResponse",
+    "NSURLSession",
+    "block2",
+    # 离线单测构造 NSHTTPURLResponse：其初始化器以 NSDictionary 入参为门控。
+    "NSDictionary",
 ] }
+# v2.4 发现新版本：NSURLSession completion handler 需要 block2；
+# 版本号直通 Cargo.lock 中已有 0.6.2（与 objc2 0.6 同代）。
+block2 = "0.6"
 # Task 5 结果行真实图标:扩展名 → UTI(目录/无扩展名回落 UTCoreTypes)。
 # 0.3.2 与 objc2 0.6 / objc2-foundation 0.3 同代;UTCoreTypes 提供 UTTypeFolder/UTTypeData。
 objc2-uniform-type-identifiers = { version = "0.3.2", features = ["UTType", "UTCoreTypes"] }
@@ -117,6 +128,8 @@ anyhow = "1"
 # v2.1 Task 2:设置持久化(`settings.toml`;字号 + 两个全局快捷键)。
 serde.workspace = true
 toml.workspace = true
+# 版本清单解析。
+serde_json.workspace = true
 # Task 17:完整窗口「修改时间」列按本地时区显示(localtime_r;cli 的 fmt_time 是 UTC)。
 libc.workspace = true
 log = { workspace = true, features = ["std"] }

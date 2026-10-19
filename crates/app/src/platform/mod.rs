@@ -543,6 +543,28 @@ pub fn settings_visible() -> Option<bool> {
     }
 }
 
+/// 拉取 HTTPS 资源（发现新版本）。
+///
+/// 同步返回响应体；超时、非 HTTPS、非 200、最终主机不符、超过 `max_bytes`
+/// 或网络错误均返回可读错误。非 macOS 直接失败。
+///
+/// 同步阻塞至多 `timeout + 2s`：调用方须在非 UI 线程调用（不得阻塞 egui 主线程）。
+pub fn fetch_url_bytes(
+    url: &str,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::fetch_url_bytes(url, timeout, max_bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (url, timeout, max_bytes);
+        Err("非 macOS:网络不可用".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

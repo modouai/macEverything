@@ -201,6 +201,12 @@ pub const SUPPORT_FONT: f32 = 11.0;
 /// 辅助说明/行内错误与标签间距（§2.3：2）。
 pub const LABEL_SUPPORT_GAP: f32 = 2.0;
 
+// —— 关于 / 版本行（更新检查）——
+/// 「关于」版本行右侧集群内，版本号 / 分隔线 / 状态说明 / 按钮的间距。
+pub const UPDATE_CLUSTER_GAP: f32 = 10.0;
+/// 版本号与状态说明之间的竖向分隔线高。
+pub const UPDATE_SEP_H: f32 = 12.0;
+
 // —— 字号分段（§2.4）——
 pub const SEG_W: f32 = 180.0;
 pub const SEG_H: f32 = 28.0;
@@ -570,6 +576,12 @@ mod tests {
             ),
             (16.0, 8.0, 14.0, 1.2, 1.0)
         );
+    }
+
+    #[test]
+    fn update_row_tokens_are_pinned() {
+        assert_eq!(UPDATE_CLUSTER_GAP, 10.0);
+        assert_eq!(UPDATE_SEP_H, 12.0);
     }
 
     /// `palette(is_dark)` 按主题取表。

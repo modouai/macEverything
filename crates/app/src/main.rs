@@ -15,6 +15,7 @@ mod settings;
 mod single_instance;
 mod tray;
 mod ui;
+mod update;
 mod window_state;
 
 use eframe::egui;

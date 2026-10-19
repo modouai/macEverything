@@ -48,10 +48,16 @@ scripts/
 cargo build --release      # 产物 target/release/macEverything
 cargo fmt --check          # 格式门禁
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查门禁(零容忍)
-cargo test --workspace     # 全量测试(79 项:引擎 71 + 对拍 2 + CLI 6)
+cargo test --workspace     # 全量测试
 
 # FSEvents 实机集成(需真实文件系统事件;CI 默认跳过)
 cargo test -p engine --test fsevents_live -- --ignored
+
+# 网络层实机校验(拉取官网首页,不校验 version.json;可选,需能访问官网)
+cargo test -p macEverything-app platform::mac::tests::live_fetch_returns_bytes -- --ignored
+
+# 开发时临时覆盖清单地址(HTTPS;仅用于验收)
+MACEEVERYTHING_UPDATE_URL=https://example.com/version.json cargo run -p macEverything-app
 ```
 
 **声明完成前必须全绿**:`fmt --check && clippy -D warnings && test`。涉及 FSEvents/守护进程的改动,另跑实机链路(见下)。
@@ -148,6 +154,7 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 本地预览：`cd site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
 - 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
 - 发布前必须运行 `python3 scripts/site/check_seo.py`，退出码 0 才能部署。检查项包括 canonical/hreflang、sitemap 覆盖、JSON-LD、字体引用、站内链接、版本与 DMG 一致性。
+- `scripts/release.sh` 生成 DMG 后会同步写入 `site/version.json`；`check_seo.py` 会校验它与 Cargo 版本一致。该文件随 `site/` 一起部署，`_headers` 为它设置 `Cache-Control: no-cache`。
 - 分享图源文件：`scripts/site/og-image.html`，渲染为 `site/assets/og-image.png`（1200×630）。
 - 官网不写源码构建、终端安装和开发文档入口，只提供成品 DMG。
 

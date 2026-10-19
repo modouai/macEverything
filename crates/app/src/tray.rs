@@ -2,7 +2,7 @@
 //!
 //! 形态:菜单栏常驻图标(代码生成 RGBA,免 asset 文件);**左键** = 唤起/隐藏悬浮条
 //! (切换语义);**右键** = 菜单[引擎状态(§7 表六态)/⚠ N 个目录未收录(有缺口才挂)/
-//! ── / 打开搜索 / 打开完整窗口 / ── / 开机自启(勾选)/ 设置… / ── / 退出]。
+//! ── / 打开搜索 / 打开完整窗口 / ── / 开机自启(勾选)/ 设置… / 检查更新… / ── / 退出]。
 //! 结构与 `settings-visual.md` §4.2 一致;「设置…」打开 v2.1 设置窗口(与齿轮同路径)。
 //! 状态项在「未运行」时可点击拉起引擎;状态项与缺口项随引擎快照动态刷新。
 //!
@@ -50,6 +50,7 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 
 use crate::i18n;
 use crate::platform;
+use crate::update::{self, UpdatePhase};
 
 /// 菜单项 id(分派键;字符串常量集中本处,禁散落)。
 mod ids {
@@ -59,6 +60,7 @@ mod ids {
     pub const OPEN_WINDOW: &str = "open-window";
     pub const AUTOSTART: &str = "autostart";
     pub const SETTINGS: &str = "settings";
+    pub const CHECK_UPDATE: &str = "check-update";
     pub const QUIT: &str = "quit";
 }
 
@@ -89,6 +91,8 @@ pub enum TrayMsg {
     ToggleAutostart,
     /// 菜单「设置…」:打开设置窗口(v2.1;与完整窗口齿轮同一开窗路径)。
     OpenSettings,
+    /// 「检查更新…」/「有新版本…」:由 UI 按当前阶段决定检查或打开下载页。
+    UpdateAction,
     /// 菜单「退出」:退 App(引擎常驻,product §5)。
     Quit,
     /// 状态项点击(仅未运行时可点):拉起引擎。
@@ -139,6 +143,7 @@ fn dispatch(menu_id: &MenuId) -> Option<TrayMsg> {
         ids::OPEN_WINDOW => TrayMsg::OpenResults,
         ids::AUTOSTART => TrayMsg::ToggleAutostart,
         ids::SETTINGS => TrayMsg::OpenSettings,
+        ids::CHECK_UPDATE => TrayMsg::UpdateAction,
         ids::QUIT => TrayMsg::Quit,
         _ => return None,
     })
@@ -163,6 +168,10 @@ pub struct TrayRuntime {
     autostart: CheckMenuItem,
     /// 「设置…」静态项(语言切换后 `relabel` 原地改写文案)。
     settings: MenuItem,
+    /// 「检查更新…」动态项。
+    update_item: MenuItem,
+    /// 已落到菜单的更新阶段(变化才改文案与可用性)。
+    applied_update: UpdatePhase,
     /// 「退出」静态项(同上)。
     quit: MenuItem,
     /// 动作消息(泵线程 → 帧内 `poll`)。
@@ -210,7 +219,25 @@ impl TrayRuntime {
         if let Some(item) = &self.gaps_item {
             item.set_text(gaps_label(self.applied.gaps));
         }
+        self.apply_update_label();
         log::info!("托盘菜单文案已按当前语言刷新");
+    }
+
+    /// 主线程每帧调用:阶段变化时改写更新项文案/可用性。
+    pub fn sync_update(&mut self, phase: UpdatePhase) {
+        if phase == self.applied_update {
+            return;
+        }
+        self.applied_update = phase;
+        self.apply_update_label();
+    }
+
+    /// 按已应用阶段重写更新项(同步与语言切换共用)。
+    fn apply_update_label(&self) {
+        let label = update::tray_text(&self.applied_update);
+        self.update_item.set_text(&label);
+        self.update_item
+            .set_enabled(update::tray_enabled(&self.applied_update));
     }
 
     /// 主线程每帧调用:快照有变才动菜单项(状态文本/可点击性、缺口项增删)。
@@ -286,11 +313,12 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         None,
     );
     let settings = MenuItem::with_id(ids::SETTINGS, s.tray_settings, true, None);
+    let update_item = MenuItem::with_id(ids::CHECK_UPDATE, s.tray_check_update, true, None);
     let quit = MenuItem::with_id(ids::QUIT, s.tray_quit, true, None);
     let sep1 = PredefinedMenuItem::separator();
     let sep2 = PredefinedMenuItem::separator();
     let sep3 = PredefinedMenuItem::separator();
-    // 分组与原型一致:状态 / 打开类 / 自启 + 设置 / 退出。缺口项动态插在状态项后
+    // 分组与原型一致:状态 / 打开类 / 自启 + 设置 + 检查更新 / 退出。缺口项动态插在状态项后
     // (`apply_gaps` 的 index 1),因此仍在第一组内。
     menu.append_items(&[
         &state_item,
@@ -300,6 +328,7 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         &sep2,
         &autostart,
         &settings,
+        &update_item,
         &sep3,
         &quit,
     ])
@@ -341,6 +370,8 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         gaps_item: None,
         autostart,
         settings,
+        update_item,
+        applied_update: UpdatePhase::Idle,
         quit,
         rx: msg_rx,
         refresh_tx,
@@ -642,6 +673,7 @@ mod tests {
             (ids::OPEN_WINDOW, TrayMsg::OpenResults),
             (ids::AUTOSTART, TrayMsg::ToggleAutostart),
             (ids::SETTINGS, TrayMsg::OpenSettings),
+            (ids::CHECK_UPDATE, TrayMsg::UpdateAction),
             (ids::QUIT, TrayMsg::Quit),
         ];
         for (id, expected) in cases {
@@ -683,5 +715,30 @@ mod tests {
     fn px(buf: &[u8], size: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * size + x) * 4) as usize;
         [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    /// 更新项文案/可点性随阶段变化。
+    #[test]
+    fn update_labels_follow_phase() {
+        with_lang(Lang::ZhHans, || {
+            assert_eq!(update::tray_text(&UpdatePhase::Idle), "检查更新…");
+            assert_eq!(update::tray_text(&UpdatePhase::Checking), "检查中…");
+            assert!(update::tray_enabled(&UpdatePhase::Idle));
+            assert!(!update::tray_enabled(&UpdatePhase::Checking));
+            assert_eq!(
+                update::tray_text(&UpdatePhase::Available {
+                    version: "2.4.0".into()
+                }),
+                "有新版本 v2.4.0 — 前往下载"
+            );
+        });
+        with_lang(Lang::En, || {
+            assert_eq!(
+                update::tray_text(&UpdatePhase::Available {
+                    version: "2.4.0".into()
+                }),
+                "Version 2.4.0 Available — Download"
+            );
+        });
     }
 }

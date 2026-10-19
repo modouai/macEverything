@@ -18,7 +18,7 @@ use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
 use crate::ui::{
     font as ui_font, hotkey_keys,
-    settings::{AutostartError, ExcludeError, LanguageError, SettingsError},
+    settings::{AutostartError, ExcludeError, LanguageError, SettingsError, UpdateError},
     settings_layout::{card_height, take_row, RowSpec},
     settings_tokens::{
         self, SettingsPalette, ADD_BUTTON_FONT, ADD_BUTTON_H, ADD_BUTTON_PAD_X, ADD_BUTTON_RADIUS,
@@ -29,9 +29,10 @@ use crate::ui::{
         REMOVE_ICON_STROKE, RESET_BUTTON_GAP, RESET_BUTTON_PAD_X, RESET_BUTTON_RADIUS, ROW_H,
         ROW_PAD_X, SEG_FONT, SEG_GAP, SEG_H, SEG_ITEM_RADIUS, SEG_PAD, SEG_RADIUS, SEG_W,
         SUPPORT_FONT, SWITCH_KNOB, SWITCH_KNOB_SHADOW_OFFSET, SWITCH_KNOB_SHADOW_SIZE,
-        SWITCH_RADIUS, SWITCH_SIZE, TITLEBAR_H,
+        SWITCH_RADIUS, SWITCH_SIZE, TITLEBAR_H, UPDATE_CLUSTER_GAP, UPDATE_SEP_H,
     },
 };
+use crate::update::{self, UpdatePhase};
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -65,6 +66,12 @@ pub(crate) struct SettingsData {
     pub(crate) exclude_busy_list: bool,
     /// 排除目录加载/变更失败原因（daemon 原始文案原样显示，其余本地化）。
     pub(crate) exclude_error: Option<ExcludeError>,
+    /// 启动时自动检查更新开关。
+    pub(crate) check_updates: bool,
+    /// 当前更新阶段。
+    pub(crate) update: crate::update::UpdatePhase,
+    /// 关于分组内联错误。
+    pub(crate) update_error: Option<UpdateError>,
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
@@ -96,6 +103,12 @@ pub(crate) enum SettingsAction {
     RemoveExclude(String),
     /// 点击「恢复默认」：设置 pass 先弹原生确认弹窗；确认后启动 reset 工作线程。
     ResetExcludes,
+    /// 切换「启动时自动检查更新」。
+    SetAutoCheck(bool),
+    /// 手动检查更新。
+    CheckUpdate,
+    /// 打开官网下载页。
+    OpenUpdatePage,
 }
 
 /// 一帧绘制结果：动作队列（通常为空或单条）。
@@ -142,6 +155,8 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             draw_general_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(GROUP_GAP);
             draw_index_group(ui, full_w, data, &palette, extra_h, &mut actions);
+            ui.add_space(GROUP_GAP);
+            draw_about_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(CONTENT_PAD.0);
         });
     BodyOutput { actions }
@@ -198,6 +213,8 @@ enum RowKind<'a> {
     ExcludeHeader,
     Exclusion { index: usize, path: &'a str },
     ExcludedEmpty,
+    Version,
+    AutoCheck,
 }
 
 /// 外观组：分组标题 + 单行卡片（字号分段 + 可选的保存错误）。
@@ -367,6 +384,185 @@ fn draw_index_group(
     );
 }
 
+/// 关于组：版本行（版本号 + 状态 + 操作）与自动检查开关。
+fn draw_about_group(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let version_error = match data.update_error {
+        Some(UpdateError::OpenFailed) => Some(UpdateError::OpenFailed.text()),
+        _ => None,
+    };
+    let auto_check_error = match data.update_error {
+        Some(UpdateError::SaveFailed) => Some(UpdateError::SaveFailed.text()),
+        _ => None,
+    };
+
+    let rows = [
+        GroupRow {
+            kind: RowKind::Version,
+            spec: RowSpec::new(ROW_H).with_extra(extra_for(version_error.is_some(), extra_h)),
+            error: version_error,
+            note: None,
+            hint: None,
+        },
+        GroupRow {
+            kind: RowKind::AutoCheck,
+            spec: RowSpec::new(ROW_H).with_extra(extra_for(auto_check_error.is_some(), extra_h)),
+            error: auto_check_error,
+            note: None,
+            hint: None,
+        },
+    ];
+    draw_card(
+        ui,
+        full_w,
+        i18n::s().group_about,
+        &rows,
+        data,
+        palette,
+        actions,
+    );
+}
+
+/// 版本行：左侧「版本」，右侧「版本号 · 状态说明 · 操作按钮」。
+fn draw_version_row(
+    ui: &mut egui::Ui,
+    body: egui::Rect,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let phase = &data.update;
+    let action_label = update::action_text(phase);
+    let button_w = text_width(ui, action_label, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X;
+    let version = format!("v{}", update::CURRENT_VERSION);
+    let version_w = text_width(ui, &version, LABEL_FONT);
+    let status = update::status_text(phase);
+    let label = i18n::s().row_version;
+    let label_w = text_width(ui, label, LABEL_FONT);
+    let natural_status_w = text_width(ui, &status, SUPPORT_FONT);
+    let fixed_w =
+        version_w + UPDATE_CLUSTER_GAP + 1.0 + UPDATE_CLUSTER_GAP + LABEL_CONTROL_GAP + button_w;
+    // 极端字号倍率 / 英文长文案下优先保住「版本」标签与按钮，状态说明截断。
+    let max_cluster_w = (body.width() - 2.0 * ROW_PAD_X - label_w - LABEL_CONTROL_GAP).max(0.0);
+    let status_w = natural_status_w.min((max_cluster_w - fixed_w).max(0.0));
+    let cluster_w = fixed_w + status_w;
+    let control = draw_row_label(
+        ui,
+        body,
+        label,
+        egui::vec2(cluster_w, ADD_BUTTON_H),
+        palette,
+    );
+
+    let button = egui::Rect::from_min_size(
+        egui::pos2(
+            control.right() - button_w,
+            control.center().y - ADD_BUTTON_H / 2.0,
+        ),
+        egui::vec2(button_w, ADD_BUTTON_H),
+    );
+    let status_right = button.left() - LABEL_CONTROL_GAP;
+    let status_rect = egui::Rect::from_min_max(
+        egui::pos2(status_right - status_w, control.top()),
+        egui::pos2(status_right, control.bottom()),
+    );
+    let sep_x = status_rect.left() - UPDATE_CLUSTER_GAP;
+    let sep = egui::Rect::from_center_size(
+        egui::pos2(sep_x, control.center().y),
+        egui::vec2(1.0, UPDATE_SEP_H),
+    );
+    let version_rect = egui::Rect::from_min_max(
+        egui::pos2(control.left(), control.top()),
+        egui::pos2(sep_x - 1.0 - UPDATE_CLUSTER_GAP, control.bottom()),
+    );
+
+    draw_text(
+        ui,
+        version_rect,
+        &version,
+        LABEL_FONT,
+        palette.text_primary,
+        egui::Align2::RIGHT_CENTER,
+    );
+    let status_color = match phase {
+        UpdatePhase::Available { .. } => palette.switch_on,
+        UpdatePhase::Failed => palette.error_text,
+        _ => palette.text_secondary,
+    };
+    draw_text(
+        ui,
+        status_rect,
+        &status,
+        SUPPORT_FONT,
+        status_color,
+        egui::Align2::RIGHT_CENTER,
+    );
+    ui.painter()
+        .rect_filled(sep, egui::CornerRadius::ZERO, palette.divider);
+
+    if draw_update_button(ui, button, phase, palette) {
+        actions.push(match phase {
+            UpdatePhase::Available { .. } => SettingsAction::OpenUpdatePage,
+            _ => SettingsAction::CheckUpdate,
+        });
+    }
+}
+
+/// 版本行操作按钮：有新版 = 主按钮；其余 = 次要按钮；检查中禁用。
+fn draw_update_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    phase: &UpdatePhase,
+    palette: &SettingsPalette,
+) -> bool {
+    let enabled = update::action_enabled(phase);
+    let response = ui.interact(
+        rect,
+        ui.scope_id().with("settings-update-action"),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let primary = matches!(phase, UpdatePhase::Available { .. });
+    let (base_fill, base_text) = if primary {
+        (palette.switch_on, palette.switch_knob)
+    } else {
+        (palette.control_fill, palette.control_text)
+    };
+    let (fill, text_color) = if !enabled {
+        (base_fill.gamma_multiply(0.5), base_text.gamma_multiply(0.5))
+    } else if response.is_pointer_button_down_on() {
+        (base_fill.gamma_multiply(0.85), base_text)
+    } else if response.hovered() {
+        (base_fill.gamma_multiply(1.15), base_text)
+    } else {
+        (base_fill, base_text)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(ADD_BUTTON_RADIUS), fill);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        update::action_text(phase),
+        ui_font::id(ADD_BUTTON_FONT),
+        text_color,
+    );
+    if enabled {
+        response.clicked()
+    } else {
+        let _ = response.on_hover_cursor(egui::CursorIcon::NotAllowed);
+        false
+    }
+}
+
 /// 卡片：分组标题 + 底色；行高度与绘制共用同一行模型，末尾校对游标。
 fn draw_card(
     ui: &mut egui::Ui,
@@ -467,7 +663,7 @@ fn draw_row_body(
                 egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1),
                 palette,
             );
-            if draw_switch(ui, control, data.autostart, palette) {
+            if draw_switch(ui, control, data.autostart, "settings-autostart", palette) {
                 actions.push(SettingsAction::SetAutostart(!data.autostart));
             }
         }
@@ -526,6 +722,25 @@ fn draw_row_body(
             }
         }
         RowKind::ExcludedEmpty => draw_excluded_empty(ui, body, palette),
+        RowKind::Version => draw_version_row(ui, body, data, palette, actions),
+        RowKind::AutoCheck => {
+            let control = draw_row_label(
+                ui,
+                body,
+                i18n::s().row_auto_check,
+                egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1),
+                palette,
+            );
+            if draw_switch(
+                ui,
+                control,
+                data.check_updates,
+                "settings-auto-check",
+                palette,
+            ) {
+                actions.push(SettingsAction::SetAutoCheck(!data.check_updates));
+            }
+        }
     }
 }
 
@@ -679,14 +894,17 @@ fn draw_segmented(
     clicked
 }
 
-/// 开机自启开关（38×22、圆角 11；钮 18 白色 + 三层柔和投影）。
+/// 设置开关（38×22、圆角 11；钮 18 白色 + 三层柔和投影）。
+/// 每行必须传入唯一 `id`，否则同帧多个开关会因交互 id 冲突互相抢占。
 /// 返回是否点击（目标态由调用方取反）。
-fn draw_switch(ui: &mut egui::Ui, rect: egui::Rect, on: bool, palette: &SettingsPalette) -> bool {
-    let response = ui.interact(
-        rect,
-        ui.scope_id().with("settings-autostart"),
-        egui::Sense::click(),
-    );
+fn draw_switch(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    on: bool,
+    id: &'static str,
+    palette: &SettingsPalette,
+) -> bool {
+    let response = ui.interact(rect, ui.scope_id().with(id), egui::Sense::click());
     let base = if on {
         palette.switch_on
     } else {
@@ -1387,6 +1605,9 @@ mod tests {
     use crate::ui::settings_tokens::{SETTINGS_H, SETTINGS_W};
     use global_hotkey::hotkey::{Code, Modifiers};
 
+    /// 关于组在默认 600px 窗口下需滚动才能命中；交互测试用该画布高让整页可见。
+    const TALL_TEST_H: f32 = 900.0;
+
     /// headless 布局数据:默认键帽（经快照填充） + 三项目录（不触 Shared）。
     fn layout_test_data() -> SettingsData {
         let hotkeys = HotkeySnapshot {
@@ -1415,6 +1636,9 @@ mod tests {
             exclude_busy: false,
             exclude_busy_list: false,
             exclude_error: None,
+            check_updates: true,
+            update: crate::update::UpdatePhase::Idle,
+            update_error: None,
         }
     }
 
@@ -1489,10 +1713,22 @@ mod tests {
         data: &SettingsData,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, BodyOutput) {
+        run_frame_sized(ctx, data, events, SETTINGS_H)
+    }
+
+    /// 指定画布高的帧。关于组在 620×600 下位于滚动区，超出视口的控件会被
+    /// egui 裁剪交互；测试用同宽更高画布让整页可见（内容自上而下排布，
+    /// 坐标与滚动前一致）。
+    fn run_frame_sized(
+        ctx: &egui::Context,
+        data: &SettingsData,
+        events: Vec<egui::Event>,
+        height: f32,
+    ) -> (egui::FullOutput, BodyOutput) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(SETTINGS_W, SETTINGS_H),
+                egui::vec2(SETTINGS_W, height),
             )),
             events,
             ..Default::default()
@@ -1523,15 +1759,27 @@ mod tests {
 
     /// 点击 = 前帧按下 + 后帧释放（同一 widget 命中）。
     fn click_at(ctx: &egui::Context, data: &SettingsData, pos: egui::Pos2) -> BodyOutput {
-        run_frame(
+        click_at_sized(ctx, data, pos, SETTINGS_H)
+    }
+
+    /// 指定画布高的点击（用于默认 600px 下需滚动才能命中的关于组）。
+    fn click_at_sized(
+        ctx: &egui::Context,
+        data: &SettingsData,
+        pos: egui::Pos2,
+        height: f32,
+    ) -> BodyOutput {
+        run_frame_sized(
             ctx,
             data,
             vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+            height,
         );
-        run_frame(
+        run_frame_sized(
             ctx,
             data,
             vec![egui::Event::PointerMoved(pos), pointer_button(pos, false)],
+            height,
         )
         .1
     }
@@ -1632,8 +1880,8 @@ mod tests {
             .unwrap_or_else(|| panic!("缺少文本 {needle:?}"))
     }
 
-    /// Task 4 布局:三组标题、六项标签、字号三段、语言、添加按钮与目录行齐全;
-    /// 内容自标题栏下起排且标准字号下不超过 620×600。
+    /// 布局:四组标题、行标签、字号三段、语言、添加按钮与目录行齐全;
+    /// 内容自标题栏下起排；关于组追加后标准字号下整页滚动，前三组仍在首屏内。
     #[test]
     fn settings_layout_has_all_rows() {
         let data = layout_test_data();
@@ -1657,10 +1905,24 @@ mod tests {
             "大",
             "跟随系统",
             "＋ 添加目录…",
+            "关于",
+            "版本",
+            "启动时自动检查更新",
         ] {
             assert!(
                 labels.contains(&expected),
                 "缺少文本 {expected:?};实际 {labels:?}"
+            );
+        }
+        let version = format!("v{}", update::CURRENT_VERSION);
+        for expected in [
+            version.as_str(),
+            i18n::s().update_status_idle,
+            i18n::s().update_action_check,
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "缺少更新文案 {expected:?};实际 {labels:?}"
             );
         }
         for path in &data.excluded {
@@ -1678,13 +1940,22 @@ mod tests {
             min_top >= TITLEBAR_H,
             "内容不得侵入固定标题栏(最早文本 y={min_top})"
         );
-        let max_bottom = texts
+        // 关于组为第四组，标准字号下整页需要滚动；其之前的内容仍须完整落在
+        // 620×600 首屏内（含底部留白）。
+        let about_y = find_text(&texts, i18n::s().group_about).pos.y;
+        let index_y = find_text(&texts, i18n::s().group_index).pos.y;
+        assert!(
+            about_y > index_y,
+            "关于组须排在索引组之后(索引 y={index_y}, 关于 y={about_y})"
+        );
+        let max_before_about = texts
             .iter()
+            .filter(|text| text.pos.y < about_y)
             .map(|text| text.pos.y + text.galley.size().y)
             .fold(0.0_f32, f32::max);
         assert!(
-            max_bottom <= SETTINGS_H - CONTENT_PAD.0,
-            "标准字号下内容须在 620×600 内(最低文本底 {max_bottom} > {})",
+            max_before_about <= SETTINGS_H - CONTENT_PAD.0,
+            "关于组之前的内容须在 620×600 首屏内(最低文本底 {max_before_about} > {})",
             SETTINGS_H - CONTENT_PAD.0
         );
     }
@@ -2182,6 +2453,66 @@ mod tests {
         );
         let output = click_at(&ctx, &data, switch);
         assert_eq!(output.actions, vec![SettingsAction::SetAutostart(true)]);
+    }
+
+    /// 关于组自动检查开关中心（开关右对齐，与自启开关同一几何公式）。
+    fn auto_check_switch_center(out: &egui::FullOutput) -> egui::Pos2 {
+        let label = text_center(find_text(&all_texts(out), i18n::s().row_auto_check));
+        egui::pos2(
+            SETTINGS_W - CONTENT_PAD.1 - ROW_PAD_X - SWITCH_SIZE.0 / 2.0,
+            label.y,
+        )
+    }
+
+    /// 点击自动检查开关 → 回传目标态（开→关、关→开两个方向）。
+    #[test]
+    fn auto_check_click_emits_toggle_action() {
+        for (current, expected) in [(true, false), (false, true)] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut data = layout_test_data();
+            data.check_updates = current;
+            let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
+            let output = click_at_sized(&ctx, &data, auto_check_switch_center(&out), TALL_TEST_H);
+            assert_eq!(
+                output.actions,
+                vec![SettingsAction::SetAutoCheck(expected)],
+                "当前 {current} 应请求 {expected}"
+            );
+        }
+    }
+
+    /// 版本行按钮：有新版 → 打开下载页；其余可点阶段 → 检查更新；检查中禁用。
+    #[test]
+    fn update_action_button_emits_phase_specific_action() {
+        let cases = [
+            (
+                UpdatePhase::Available {
+                    version: "9.9.9".into(),
+                },
+                Some(SettingsAction::OpenUpdatePage),
+            ),
+            (UpdatePhase::UpToDate, Some(SettingsAction::CheckUpdate)),
+            (UpdatePhase::Checking, None),
+        ];
+        for (phase, expected) in cases {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut data = layout_test_data();
+            data.update = phase.clone();
+            let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
+            // 按钮文案在按钮矩形内居中，文本中心即点击点。
+            let pos = text_center(find_text(&all_texts(&out), update::action_text(&phase)));
+            let output = click_at_sized(&ctx, &data, pos, TALL_TEST_H);
+            match expected {
+                Some(action) => assert_eq!(output.actions, vec![action], "phase {phase:?}"),
+                None => assert!(
+                    output.actions.is_empty(),
+                    "phase {phase:?} 按钮须禁用: {:?}",
+                    output.actions
+                ),
+            }
+        }
     }
 
     fn recording_data(slot: HotkeySlot) -> SettingsData {

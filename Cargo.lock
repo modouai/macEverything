@@ -1206,6 +1206,7 @@ name = "macEverything-app"
 version = "2.3.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "client",
  "dispatch2",
  "eframe",
@@ -1224,6 +1225,7 @@ dependencies = [
  "protocol",
  "raw-window-handle",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "tray-icon",

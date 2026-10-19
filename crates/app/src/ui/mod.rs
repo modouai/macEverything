@@ -94,6 +94,8 @@ use crate::platform;
 use crate::settings as store;
 use crate::single_instance::Incoming;
 use crate::tray::{self, TrayMsg};
+use crate::update;
+use crate::update::UpdatePhase;
 use crate::window_state::{self, SizeUpdate, WindowSize, WindowSizeTracker};
 
 /// 系统 CJK 字体候选路径(探测用;结论见模块注释「中文字体」)。
@@ -224,6 +226,7 @@ fn show_root_window(ctx: &egui::Context) {
 // 状态读写收窄为短锁;`send_viewport_cmd`(只入 egui 队列,无 AppKit 调用)可持锁。
 
 /// 取共享锁(毒锁兜底;锁内无 panic 期望)。主线程短占用。
+/// 调用方不得已持有 `Shared` 锁（std `Mutex` 非重入）。
 fn lock_shared(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
     match shared.lock() {
         Ok(g) => g,
@@ -362,6 +365,48 @@ fn open_settings(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
     );
 }
 
+/// 工作线程退出即叫帧：正常/panic/断连都让根帧 tick 一次（看门狗/断连路径不至于无人唤醒）。
+struct RepaintOnDrop(egui::Context);
+
+impl Drop for RepaintOnDrop {
+    fn drop(&mut self) {
+        self.0.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+/// 启动一次后台检查（同一时刻至多一个；检查中重复调用直接返回）。
+/// 调用方不得已持有 `Shared` 锁（std `Mutex` 非重入）。
+pub(crate) fn spawn_update_check(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
+    let tx = {
+        let mut guard = lock_shared(shared);
+        match guard.update.begin() {
+            Some(tx) => tx,
+            None => return,
+        }
+    };
+    let ctx = ctx.clone();
+    // 立即叫一帧：根帧 tick 后把托盘/设置切到「检查中…」，不必等网络结果。
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    let failure_ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("update-check".to_owned())
+        .spawn(move || {
+            // panic 展开/断连同走 Drop：根帧必被唤醒，tick 的断连分支可把状态收敛。
+            let _repaint = RepaintOnDrop(ctx.clone());
+            let outcome = update::fetch_and_evaluate();
+            if tx.send(outcome).is_ok() {
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+        });
+    if let Err(err) = spawned {
+        log::error!("检查更新线程启动失败: {err}");
+        let mut guard = lock_shared(shared);
+        guard.update.spawn_failed(err.to_string());
+        drop(guard);
+        failure_ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
 /// 打开完整窗口(托盘「打开完整窗口」/「缺口面板」/⌥⇧F 直达共用):
 /// 聚焦搜索框 + 补查引擎状态后原生唤到前台(原生调用在锁外,见锁纪律)。
 fn results_open(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
@@ -429,6 +474,8 @@ pub struct Shared {
     pub settings: settings::SettingsState,
     /// 主题跟随(节流 + 已应用值;Task 13 起为局部状态,Task 14 收进共享态)。
     pub theme: theme::ThemeFollow,
+    /// 发现新版本状态（托盘与设置页唯一真源）。
+    pub update: update::UpdateState,
     /// 悬浮条可见标志(真源;排帧门禁与按钮态都读它)。
     pub palette_visible: bool,
 }
@@ -461,6 +508,8 @@ impl App {
         platform::install_space_repaint(cc.egui_ctx.clone());
         let hotkey_snapshot = hotkey.snapshot();
         let hotkey_note = hotkey.note().cloned();
+        // 自动检查更新（默认开启）：先记账再移动 settings_file。
+        let auto_update = settings_file.check_updates;
         let shared = Arc::new(Mutex::new(Shared {
             palette: palette::PaletteState::new(
                 cc.egui_ctx.clone(),
@@ -475,8 +524,12 @@ impl App {
                 hotkey_snapshot,
             ),
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
+            update: update::UpdateState::new(),
             palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
         }));
+        if auto_update {
+            spawn_update_check(&shared, &cc.egui_ctx);
+        }
         // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
         // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,
         // 动作转帧内兜底队列,不阻塞。预检通过后,实际实现内部短锁读写、
@@ -616,6 +669,27 @@ impl App {
                     // 设置窗口(v2.1 Task 1):与完整窗口齿轮同一开窗路径。
                     log::info!("托盘:打开设置");
                     open_settings(&self.shared, ctx);
+                }
+                TrayMsg::UpdateAction => {
+                    let phase = { self.shared().update.phase().clone() };
+                    match phase {
+                        UpdatePhase::Available { .. } => {
+                            log::info!("托盘:打开下载页");
+                            if let Err(err) = update::open_download_page() {
+                                log::warn!("打开下载页失败: {err}");
+                            }
+                        }
+                        UpdatePhase::Checking => {
+                            log::debug!("托盘:检查进行中,忽略重复点击");
+                        }
+                        _ => {
+                            log::info!("托盘:检查更新");
+                            spawn_update_check(&self.shared, ctx);
+                            if self.shared().settings.open {
+                                ctx.request_repaint_of(settings::viewport_id());
+                            }
+                        }
+                    }
                 }
                 TrayMsg::ToggleAutostart => {
                     // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按**操作后真实状态**
@@ -1014,6 +1088,22 @@ impl eframe::App for App {
 
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
+
+        // 发现新版本：非阻塞收结果/看门狗；变化时唤醒设置页；托盘条目每帧同步。
+        let (phase, changed, settings_open) = {
+            let mut s = self.shared();
+            let changed = s.update.tick();
+            (s.update.phase().clone(), changed, s.settings.open)
+        };
+        if changed {
+            log::info!("更新状态: {phase:?}");
+            if settings_open {
+                ctx.request_repaint_of(settings::viewport_id());
+            }
+        }
+        if let Some(tray) = &mut self.tray {
+            tray.sync_update(phase);
+        }
 
         // 完整窗口(Task 17):结果会话推进——防抖到期发查询、收两路回投。
         // 放 logic(而非 ui)使根窗隐藏期(close=隐藏)也经 eframe run_logic 收响应,

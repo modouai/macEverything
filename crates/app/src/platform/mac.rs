@@ -35,8 +35,10 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use block2::RcBlock;
 use eframe::egui;
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
@@ -53,8 +55,9 @@ use objc2_app_kit::{
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
-    NSArray, NSLocale, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString,
-    NSURLCustomIconKey, NSURL,
+    NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSNotification, NSObject, NSPoint,
+    NSRect, NSSize, NSString, NSURLCustomIconKey, NSURLRequest, NSURLRequestCachePolicy,
+    NSURLResponse, NSURLSession, NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1615,6 +1618,118 @@ fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
     Some(resized.to_rgba8().into_raw())
 }
 
+/// 拉取 HTTPS 资源：同步返回响应体；非 200/非 HTTPS/超大/超时 = Err。
+///
+/// 会话为系统共享 `NSURLSession`（走系统 TLS 与代理）。completion 回调可能在
+/// 其他线程执行，因此回调只捕获 `Sender`/`String`/`usize`（均为 Send），不触碰
+/// UI。本函数同步阻塞至多 `timeout + 2s`，调用方须在非 UI 线程调用。
+pub fn fetch_url_bytes(url: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let ns_url =
+        NSURL::URLWithString(&NSString::from_str(url)).ok_or_else(|| format!("URL 非法: {url}"))?;
+    let scheme = ns_url.scheme().map(|s| s.to_string()).unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(format!("仅允许 HTTPS: {scheme}"));
+    }
+    // 主机必须在请求前确定且非空，否则回调侧「最终主机」比较可能在两侧都缺失时
+    // 通过（失效开放）。此后 expected_host 恒为非空字符串。
+    let Some(expected_host) = ns_url
+        .host()
+        .map(|h| h.to_string().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+    else {
+        return Err("URL 缺少主机".to_owned());
+    };
+    let request = NSURLRequest::requestWithURL_cachePolicy_timeoutInterval(
+        &ns_url,
+        NSURLRequestCachePolicy::ReloadIgnoringLocalCacheData,
+        timeout.as_secs_f64(),
+    );
+    let session = NSURLSession::sharedSession();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    let block: RcBlock<dyn Fn(*mut NSData, *mut NSURLResponse, *mut NSError)> = RcBlock::new(
+        move |data: *mut NSData, response: *mut NSURLResponse, error: *mut NSError| {
+            // SAFETY: Foundation 只会传入有效对象或 null；handle_fetch_result 内部
+            // 逐个判空，并且只在回调期间读取，不把借用带出。
+            let result =
+                unsafe { handle_fetch_result(data, response, error, &expected_host, max_bytes) };
+            let _ = tx.send(result);
+        },
+    );
+    // SAFETY: completionHandler 由 NSURLSession 复制并在其回调队列执行；捕获的
+    // Sender/String/usize 均为 Send，符合该 API 的 sendable 要求。
+    let task = unsafe { session.dataTaskWithRequest_completionHandler(&request, &block) };
+    task.resume();
+    match rx.recv_timeout(timeout.saturating_add(Duration::from_secs(2))) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // 请求超时按「空闲」计时：持续滴流的服务器可让任务长期存活。超时返回前
+            // 显式取消，避免任务在后台继续占用连接/内存。
+            task.cancel();
+            Err("请求超时(未收到回调)".to_owned())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // 发送端已释放且无待收消息（回调不会再来）：任务已不可等待，同样取消。
+            task.cancel();
+            Err("检查线程通道已关闭".to_owned())
+        }
+    }
+}
+
+/// 校验并读取 NSURLSession 回调结果。
+///
+/// # Safety
+/// 三个指针来自 Foundation 回调：要么为 null，要么指向在回调期间有效的对象。
+unsafe fn handle_fetch_result(
+    data: *mut NSData,
+    response: *mut NSURLResponse,
+    error: *mut NSError,
+    expected_host: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(error) = error.as_ref() {
+        return Err(format!("网络错误: {}", error.localizedDescription()));
+    }
+    let Some(response) = response.as_ref() else {
+        return Err("响应为空".to_owned());
+    };
+    let final_url = response.URL().ok_or_else(|| "响应缺少 URL".to_owned())?;
+    let scheme = final_url
+        .scheme()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(format!("最终地址非 HTTPS: {scheme}"));
+    }
+    // 最终主机缺失按空串参与比较：expected_host 非空，故缺失恒失败（失效关闭）。
+    let host = final_url
+        .host()
+        .map(|h| h.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    if host != expected_host {
+        return Err(format!("最终主机不符: {host:?}"));
+    }
+    // objc2 0.6 的 `downcast_ref` 只定义在 `AnyObject` 上；NSURLResponse 与
+    // NSHTTPURLResponse 都是 Objective-C 对象（repr(C)、超类为零大小标记），
+    // 故先按 AnyObject 解释，再由 `isKindOfClass` 判定。
+    // SAFETY: response 在回调期间有效；AnyObject 可与任意 Objective-C 对象互解释。
+    let response_obj: &AnyObject = &*(response as *const NSURLResponse).cast::<AnyObject>();
+    let Some(http) = response_obj.downcast_ref::<NSHTTPURLResponse>() else {
+        return Err("非 HTTP 响应".to_owned());
+    };
+    let status = http.statusCode();
+    if status != 200 {
+        return Err(format!("HTTP 状态 {status}"));
+    }
+    let Some(data) = data.as_ref() else {
+        return Err("响应体为空".to_owned());
+    };
+    let len = data.length();
+    if len > max_bytes {
+        return Err(format!("响应体过大: {len} 字节"));
+    }
+    Ok(data.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1849,5 +1964,121 @@ mod tests {
         assert!(window_title_matches("Settings", titles[1]));
         assert!(!window_title_matches("设置窗口", titles[0]));
         assert!(!window_title_matches("", titles[0]));
+    }
+
+    /// 构造离线 `NSHTTPURLResponse`（不触网；URL/状态码可控）。
+    fn http_response(url: &str, status: NSInteger) -> Retained<NSHTTPURLResponse> {
+        let ns_url = NSURL::URLWithString(&NSString::from_str(url)).expect("test URL");
+        // HTTPVersion/headerFields 传 nil 是初始化器允许的用法。
+        NSHTTPURLResponse::initWithURL_statusCode_HTTPVersion_headerFields(
+            NSHTTPURLResponse::alloc(),
+            &ns_url,
+            status,
+            None,
+            None,
+        )
+        .expect("NSHTTPURLResponse")
+    }
+
+    /// 直接驱动回调侧校验（离线；不创建网络任务）。
+    fn call_handler(
+        url: &str,
+        status: NSInteger,
+        expected_host: &str,
+        body: &[u8],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        let response = http_response(url, status);
+        let data = NSData::with_bytes(body);
+        let response_ptr: *mut NSURLResponse = Retained::as_ptr(&response)
+            .cast_mut()
+            .cast::<NSURLResponse>();
+        // SAFETY: 指针指向本函数内保活的对象，仅在校验期间使用；error 传 null。
+        unsafe {
+            handle_fetch_result(
+                Retained::as_ptr(&data).cast_mut(),
+                response_ptr,
+                std::ptr::null_mut(),
+                expected_host,
+                max_bytes,
+            )
+        }
+    }
+
+    /// 回调侧拒绝：最终地址非 HTTPS（含请求前 HTTPS、响应被降级的情况）。
+    #[test]
+    fn fetch_rejects_non_https_final_url() {
+        let err = call_handler("http://example.com/x", 200, "example.com", b"{}", 64)
+            .expect_err("最终地址非 HTTPS 必须拒绝");
+        assert!(err.contains("最终地址非 HTTPS"), "{err}");
+    }
+
+    /// 回调侧拒绝：最终主机不符或缺失（失效关闭）。
+    #[test]
+    fn fetch_rejects_host_mismatch_or_missing() {
+        let err = call_handler("https://evil.example/x", 200, "example.com", b"{}", 64)
+            .expect_err("跨主机必须拒绝");
+        assert!(err.contains("最终主机不符"), "{err}");
+        let err = call_handler("https:///x", 200, "example.com", b"{}", 64)
+            .expect_err("最终主机缺失必须拒绝");
+        assert!(err.contains("最终主机不符"), "{err}");
+    }
+
+    /// 回调侧拒绝：非 200 状态。
+    #[test]
+    fn fetch_rejects_non_200_status() {
+        let err = call_handler("https://example.com/x", 404, "example.com", b"{}", 64)
+            .expect_err("非 200 必须拒绝");
+        assert!(err.contains("HTTP 状态 404"), "{err}");
+    }
+
+    /// 回调侧拒绝：响应体超过 `max_bytes`；恰等于上限仍接受。
+    #[test]
+    fn fetch_enforces_max_bytes() {
+        let err = call_handler("https://example.com/x", 200, "example.com", b"12345", 4)
+            .expect_err("超过上限必须拒绝");
+        assert!(err.contains("响应体过大"), "{err}");
+        let ok = call_handler("https://example.com/x", 200, "example.com", b"1234", 4)
+            .expect("恰等于上限应接受");
+        assert_eq!(ok, b"1234");
+    }
+
+    /// 回调侧成功路径：HTTPS + 主机相符 + 200 + 限内 → 原样返回字节。
+    #[test]
+    fn fetch_accepts_valid_response() {
+        let ok = call_handler("https://example.com/x", 200, "example.com", b"[]", 64)
+            .expect("合法响应应通过");
+        assert_eq!(ok, b"[]");
+    }
+
+    /// 请求前校验：非 HTTPS 在触网前即拒绝。
+    #[test]
+    fn fetch_rejects_non_https_before_request() {
+        let err = fetch_url_bytes("http://example.com/", Duration::from_millis(50), 64)
+            .expect_err("非 HTTPS 必须拒绝");
+        assert!(err.contains("仅允许 HTTPS"), "{err}");
+    }
+
+    /// 请求前校验：缺失/空主机在触网前即拒绝（失效关闭）。
+    #[test]
+    fn fetch_rejects_missing_or_empty_host_before_request() {
+        for url in ["https:///path", "https:", "https://@/path"] {
+            let err = fetch_url_bytes(url, Duration::from_millis(50), 64)
+                .expect_err("缺失/空主机必须拒绝");
+            assert!(err.contains("URL 缺少主机"), "{url}: {err}");
+        }
+    }
+
+    /// 实机网络校验：拉取官网首页（不依赖 version.json 是否已部署）。
+    #[test]
+    #[ignore = "requires network"]
+    fn live_fetch_returns_bytes() {
+        let bytes = fetch_url_bytes(
+            "https://maceverything.modouai.dev/",
+            Duration::from_secs(10),
+            1024 * 1024,
+        )
+        .expect("live fetch");
+        assert!(!bytes.is_empty());
     }
 }
