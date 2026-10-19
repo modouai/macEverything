@@ -128,6 +128,33 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 产物：`release/macEverything-<version>.dmg`（+ `.sha256`）与 `.zip`（公证中间产物）。
 - 验收：`spctl --assess --type execute`（App）、`spctl --assess --type open --context context:primary-signature`（DMG）、`xcrun stapler validate`、`hdiutil verify`。
 
+## 官网(site/)
+
+官网是单页静态站，源文件 `site/index.html`（CSS/JS 内联，应用图标内嵌），不参与 Rust 构建。
+
+- 语言：导航右侧 `EN / 中文` 切换；文案、搜索演示数据、结果窗口标签同步切换。选择写入 localStorage，默认跟随浏览器语言。
+- 本地预览：`cd site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
+- 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
+- 演示数据：中英文示例文件分别在脚本的 `DEMO_FILES`、`WIN_FILES` 中；改示例时两份都要改。
+- 官网不写源码构建、终端安装和开发文档入口，只提供成品 DMG。
+
+### Cloudflare Pages
+
+- 项目：`maceverything`；生产分支：`main`；地址：`https://maceverything.pages.dev`。
+- 首次创建（新版 Pages 会尝试委派到 Workers，`--force` 使用经典 Pages）：
+  `npx wrangler pages project create maceverything --production-branch main --force`
+- 发布：
+
+  ```bash
+  cd site
+  npx wrangler pages deploy . --project-name maceverything --branch main --commit-dirty=true
+  ```
+
+- 未登录先 `npx wrangler login`。OAuth 凭据可能在登录与部署之间过期，直接串联：
+  `npx wrangler login && npx wrangler pages deploy . --project-name maceverything --branch main --commit-dirty=true`
+- `site/_headers` 给 `/downloads/*` 设置一年缓存。
+- 自定义域名：Cloudflare Pages 控制台 → Custom domains。`pages.dev` 与 Cloudflare 免费节点在国内访问不稳定；国内速度用阿里云 OSS + 已备案二级域名，上传同一份 `site/` 内容，绑定 CNAME 与 HTTPS 证书。
+
 ## v2 方向(未排期)
 
 - 图形界面:悬浮条(全局快捷键唤起)+ 完整窗口 + 设置;菜单栏常驻
