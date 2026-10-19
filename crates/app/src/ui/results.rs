@@ -819,11 +819,19 @@ impl ResultsState {
             return; // 理论不可达(selection 行号只在 results 内维护,两者同步清空)
         }
         let (files, dirs) = menu_actions::count_types(&paths);
-        let items = menu_actions::menu_items(files, dirs);
-        if items.is_empty() {
+        let menu_items = menu_actions::menu_items(files, dirs);
+        if menu_items.is_empty() {
             return; // 空选(理论不可达,见上)——不弹空菜单
         }
-        let menu: Vec<(&str, i64)> = items.iter().map(|(title, a)| (*title, a.tag())).collect();
+        // 本任务只升级平台桥接:旧四项平铺内容暂原样转换(菜单内容改动在后续任务)。
+        let items: Vec<platform::MenuEntry> = menu_items
+            .into_iter()
+            .map(|(title, action)| platform::MenuEntry::Item {
+                title,
+                tag: action.tag(),
+                enabled: true,
+            })
+            .collect();
         log::info!(
             "右键菜单:选中 {} 行(文件 {files} · 目录 {dirs}),弹出于 ({:.0},{:.0})",
             paths.len(),
@@ -835,7 +843,7 @@ impl ResultsState {
             log::warn!("右键菜单:无 eframe Frame(测试路径),不弹出");
             return;
         };
-        let choice = platform::popup_menu(&menu, (pos.x as f64, pos.y as f64), frame);
+        let choice = platform::popup_menu(&items, (pos.x as f64, pos.y as f64), frame);
         // 4. 执行(未知 tag 留痕;失败落状态栏,不静默)
         match choice {
             None => log::info!("右键菜单:取消(未选择)"),

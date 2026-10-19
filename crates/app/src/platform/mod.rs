@@ -349,11 +349,32 @@ pub fn revert_class() {
     mac::revert_class();
 }
 
-/// 弹出原生右键菜单(阻塞;主线程)。`items` = (标题, tag);返回所选项 tag
-/// (None = 取消)。位置为视图坐标(与 egui 坐标同值,PoC-3 实测;见 mac.rs)。
+/// 原生菜单项(支持分隔线与子菜单;`tag` 只用于叶子项)。
+///
+/// 本任务菜单内容仍为旧四项平铺,`Separator`/`Submenu` 由原生桥接消费但尚无
+/// 构造点(后续菜单任务会构造),故局部 allow 防 dead_code 警告。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Item {
+        title: &'static str,
+        tag: i64,
+        enabled: bool,
+    },
+    #[allow(dead_code)]
+    Separator,
+    #[allow(dead_code)]
+    Submenu {
+        title: &'static str,
+        items: Vec<MenuEntry>,
+    },
+}
+
+/// 弹出原生右键菜单(阻塞;主线程)。`items` = 菜单项树;叶子项经 target/action
+/// 回传 tag,子菜单父项无 action。返回所选项 tag(None = 取消)。
+/// 位置为视图坐标(与 egui 坐标同值,PoC-3 实测;见 mac.rs)。
 /// 非 macOS / 非主线程 / 取窗失败返回 None(留痕,调用方按取消处理)。
 pub fn popup_menu(
-    items: &[(&str, i64)],
+    items: &[MenuEntry],
     at_view_pos: (f64, f64),
     frame: &eframe::Frame,
 ) -> Option<i64> {

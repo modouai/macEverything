@@ -59,7 +59,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
 use super::{
-    monotonic_ms, palette_width, settings_window_titles, SpaceChange, ICON_PX, PALETTE_TITLE,
+    monotonic_ms, palette_width, settings_window_titles, MenuEntry, SpaceChange, ICON_PX,
+    PALETTE_TITLE,
 };
 
 /// 面板顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
@@ -216,6 +217,44 @@ pub fn last_space_change() -> Option<SpaceChange> {
     match SPACE_CHANGE.lock() {
         Ok(g) => *g,
         Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 原生菜单 target/action(叶子项选择回传;子菜单下不依赖 highlightedItem)
+
+/// 菜单选择 tag 的进程内落点(target/action 回传;-1 = 未选择)。
+static MENU_CHOICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+const NO_MENU_CHOICE: i64 = -1;
+
+// 菜单 target:叶子项 action 的接收者(仅记录选择落点,不碰窗口状态)。
+define_class!(
+    // SAFETY(define_class 的 unsafe 契约):超类 NSObject 无子类化约束;
+    // 无新增实例变量(ivars 缺省 `()`);方法签名与 AppKit 一致(单参 NSMenuItem,
+    // 可为 nil);无 Drop。
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MaceMenuTarget"]
+    struct MenuTarget;
+
+    impl MenuTarget {
+        #[unsafe(method(menuItemChosen:))]
+        fn menu_item_chosen(&self, sender: Option<&NSMenuItem>) {
+            let tag = sender.map_or(NO_MENU_CHOICE, |item| item.tag() as i64);
+            MENU_CHOICE.store(tag, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    unsafe impl NSObjectProtocol for MenuTarget {}
+);
+
+impl MenuTarget {
+    /// 创建 target 实例(主线程;实例由调用方持有——NSMenuItem.target 为弱引用,
+    /// 须活到 `popUpMenuPositioningItem` 返回)。
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY:this 为主线程刚分配、ivars 已置的实例;本类未覆写 init,走 NSObject。
+        unsafe { msg_send![super(this), init] }
     }
 }
 
@@ -663,28 +702,31 @@ pub fn confirm_action(title: &str, message: &str, action_label: &str) -> bool {
 
 /// 显示原生右键菜单(阻塞;仅主线程调用——调用点在结果窗口绘制内,即 egui 主线程)。
 ///
-/// `items` = (标题, tag);返回所选项的 tag(None = 取消/Esc/未选中)。
+/// `items` = 菜单项树([`MenuEntry`]):叶子项经 target/action(`menuItemChosen:`)
+/// 回传 tag,子菜单父项无 action;返回所选项的 tag(None = 取消/Esc/未选中)。
 /// 位置为视图坐标(左上原点、y 向下);PoC-3 实测视图坐标与 egui 坐标同值可直接
 /// 互用,此处保留换算核对(弹出前把鼠标窗口坐标经 `convertPoint_fromView` 换算
 /// 一份并入日志),以实机观测验证该结论。
 ///
 /// 三个 PoC-3 必知坑在此落地:
-/// ① 无 action 的项默认被自动验证判禁用 → `setAutoenablesItems(false)` +
-///    逐项 `setEnabled(true)`;
+/// ① 无 action 的项默认被自动验证判禁用(子菜单父项亦然)→ 根/子菜单
+///    `setAutoenablesItems(false)`,叶子按 `enabled`、子菜单父项显式启用;
 /// ② `NSMenu`/`NSMenuItem` 均 MainThreadOnly(alloc 需 mtm 凭证);
 /// ③ `popUpMenuPositioningItem` 返回值 bool 语义不稳定(24 次成功选择里 1 次
-///    false)→ **判定一律用 `highlightedItem()`**。
+///    false)→ **判定一律用 target/action 回传的 tag**(`MENU_CHOICE`),不读返回值。
+///    旧路径 `highlightedItem()` 在子菜单下不可靠,已弃用。
+///
+/// target/action:`NSMenuItem.target` 为**弱引用**,故 `MenuTarget` 必须是本函数
+/// 局部变量并活到 `popUpMenuPositioningItem` 返回(声明在 menu 之前,作用域覆盖)。
 ///
 /// 弹出期间 egui 冻结(嵌套 run loop 走菜单跟踪模式;winit 对 modal 期事件排队
 /// 至默认模式、关闭后投递,PoC-3 实测「关闭当帧恢复」)——已判定可接受。
-/// 桥接不接 target/action:模态语义天然同步,阻塞返回 + 读 highlightedItem 即够
-/// (PoC-3 定稿,见 plan Task 18)。
 ///
 /// 弹出位置 = 点击点(不偏移):菜单左上角落在点击点,指针停在首项上会被预高亮
 /// (PoC-3 观测)——与系统菜单同观感,产品接受(偏移放右下会让菜单脱离光标,
 /// 反倒不像系统菜单;实机手感终验随 Task 18 人工清单)。
 pub fn popup_menu(
-    items: &[(&str, i64)],
+    items: &[MenuEntry],
     at_view_pos: (f64, f64),
     frame: &eframe::Frame,
 ) -> Option<i64> {
@@ -693,7 +735,11 @@ pub fn popup_menu(
         return None;
     };
     let view = frame_view(frame)?;
-    let menu = build_context_menu(mtm, items);
+    // 选择落点先复位:本次未选择(取消/Esc)必须与「选了 tag = -1」区分开。
+    MENU_CHOICE.store(NO_MENU_CHOICE, std::sync::atomic::Ordering::SeqCst);
+    // target 为弱引用目标:须活到阻塞弹出返回(本函数作用域自然覆盖)。
+    let target = MenuTarget::new(mtm);
+    let menu = build_context_menu(mtm, items, &target);
     let location = NSPoint::new(at_view_pos.0, at_view_pos.1);
     let mouse_view = view
         .window()
@@ -701,10 +747,10 @@ pub fn popup_menu(
     let t0 = std::time::Instant::now();
     // 阻塞调用:内部为嵌套 run loop(菜单跟踪模式),返回即菜单关闭。
     let popped = menu.popUpMenuPositioningItem_atLocation_inView(None, location, Some(&view));
-    // NSInteger = isize(64 位 mac 上无损;tag 恒为小整数,边界处转换一次)
-    let choice = menu.highlightedItem().map(|item| item.tag() as i64);
+    let raw = MENU_CHOICE.load(std::sync::atomic::Ordering::SeqCst);
+    let choice = (raw != NO_MENU_CHOICE).then_some(raw);
     log::info!(
-        "右键菜单:{} 项,位置=({:.1},{:.1}) 鼠标换算={:?},阻塞 {}ms,返回值={popped}(仅留痕),选择 tag={choice:?}",
+        "右键菜单:顶层 {} 项,位置=({:.1},{:.1}) 鼠标换算={:?},阻塞 {}ms,返回值={popped}(仅留痕),选择 tag={choice:?}",
         items.len(),
         location.x,
         location.y,
@@ -847,29 +893,79 @@ fn frame_view(frame: &eframe::Frame) -> Option<Retained<NSView>> {
     unsafe { Retained::retain(h.ns_view.as_ptr().cast::<NSView>()) }
 }
 
-/// 构建右键菜单(标题 + tag;无 action——见 `popup_menu` 桥接方式)。
-fn build_context_menu(mtm: MainThreadMarker, items: &[(&str, i64)]) -> Retained<NSMenu> {
+/// 构建右键菜单(递归:叶子 target/action、分隔线、子菜单)。
+///
+/// 子菜单父项 action = None、显式启用;`NSMenuItem.target` 为弱引用,由调用方
+/// (`popup_menu`)保活 `target` 到弹出返回。
+fn build_context_menu(
+    mtm: MainThreadMarker,
+    items: &[MenuEntry],
+    target: &MenuTarget,
+) -> Retained<NSMenu> {
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(""));
-    // 无 action 的项会被自动验证判为禁用;关掉自动验证并显式启用
-    // (项可高亮、可选择,highlightedItem 才有值——PoC-3 实锤)。
+    // 无 action 的项会被自动验证判为禁用(子菜单父项同理);关掉自动验证,
+    // 逐项显式启用——项可高亮、可选择(PoC-3 实锤)。
     menu.setAutoenablesItems(false);
-    for (title, tag) in items {
-        // SAFETY:selector 传 None(无 action,非「无效 selector」);标题与键等价串
-        // 为本次调用内构造的 NSString 临时值,AppKit 拷贝入项;tag/setEnabled 为
-        // 普通属性赋值。
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        item.setTag(*tag as NSInteger); // i64 → isize(边界转换,见 popup_menu)
-        item.setEnabled(true);
-        menu.addItem(&item);
-    }
+    add_menu_entries(mtm, &menu, items, target);
     menu
+}
+
+/// 递归填充菜单项:叶子(标题 + tag + enabled + target/action)、分隔线、子菜单。
+fn add_menu_entries(
+    mtm: MainThreadMarker,
+    menu: &NSMenu,
+    items: &[MenuEntry],
+    target: &MenuTarget,
+) {
+    for entry in items {
+        match entry {
+            MenuEntry::Item {
+                title,
+                tag,
+                enabled,
+            } => {
+                // SAFETY:selector 为本类实装的 menuItemChosen:(签名匹配,AppKit 在
+                // 菜单跟踪期于主线程投递);标题与键等价串为本次调用内构造的
+                // NSString 临时值,AppKit 拷贝入项;target 为弱引用(调用方保活)。
+                let item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(title),
+                        Some(objc2::sel!(menuItemChosen:)),
+                        &NSString::from_str(""),
+                    )
+                };
+                item.setTag(*tag as NSInteger); // i64 → isize(边界转换,见 popup_menu)
+                item.setEnabled(*enabled);
+                let target_obj: &AnyObject = target.as_super().as_ref();
+                // SAFETY:target_obj 指向调用方保活的 MenuTarget;setTarget 为
+                // 弱引用赋值,selector 与目标类方法签名匹配。
+                unsafe { item.setTarget(Some(target_obj)) };
+                menu.addItem(&item);
+            }
+            MenuEntry::Separator => {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+            }
+            MenuEntry::Submenu { title, items } => {
+                // SAFETY:selector 传 None(子菜单父项无 action);标题/键等价串
+                // 为本次调用内构造的 NSString 临时值,AppKit 拷贝入项。
+                let item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(title),
+                        None,
+                        &NSString::from_str(""),
+                    )
+                };
+                item.setEnabled(true); // 父项无 action,防自动验证判禁用
+                let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
+                submenu.setAutoenablesItems(false);
+                add_menu_entries(mtm, &submenu, items, target);
+                item.setSubmenu(Some(&submenu));
+                menu.addItem(&item);
+            }
+        }
+    }
 }
 
 /// 重锚:窗口高度变化(结果列表出现/收起)时保持顶边不动。
