@@ -226,6 +226,23 @@ pub fn download_page(lang: crate::i18n::Lang) -> &'static str {
     }
 }
 
+/// 用默认浏览器打开官网下载页；失败返回可读错误（调用方决定是否显示）。
+pub fn open_download_page() -> Result<(), String> {
+    let page = download_page(crate::i18n::lang());
+    log::info!("打开下载页: {page}");
+    match std::process::Command::new("open").arg(page).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                Ok(st) if !st.success() => log::warn!("open 退出异常({st}):{page}"),
+                Ok(_) => {}
+                Err(err) => log::warn!("等待 open 退出失败: {err}"),
+            });
+            Ok(())
+        }
+        Err(err) => Err(format!("启动 open 失败: {err}")),
+    }
+}
+
 /// 设置页版本行状态说明。
 pub fn status_text(phase: &UpdatePhase) -> String {
     let s = crate::i18n::s();

@@ -95,6 +95,7 @@ use crate::settings as store;
 use crate::single_instance::Incoming;
 use crate::tray::{self, TrayMsg};
 use crate::update;
+use crate::update::UpdatePhase;
 use crate::window_state::{self, SizeUpdate, WindowSize, WindowSizeTracker};
 
 /// 系统 CJK 字体候选路径(探测用;结论见模块注释「中文字体」)。
@@ -669,6 +670,27 @@ impl App {
                     log::info!("托盘:打开设置");
                     open_settings(&self.shared, ctx);
                 }
+                TrayMsg::UpdateAction => {
+                    let phase = { self.shared().update.phase().clone() };
+                    match phase {
+                        UpdatePhase::Available { .. } => {
+                            log::info!("托盘:打开下载页");
+                            if let Err(err) = update::open_download_page() {
+                                log::warn!("打开下载页失败: {err}");
+                            }
+                        }
+                        UpdatePhase::Checking => {
+                            log::debug!("托盘:检查进行中,忽略重复点击");
+                        }
+                        _ => {
+                            log::info!("托盘:检查更新");
+                            spawn_update_check(&self.shared, ctx);
+                            if self.shared().settings.open {
+                                ctx.request_repaint_of(settings::viewport_id());
+                            }
+                        }
+                    }
+                }
                 TrayMsg::ToggleAutostart => {
                     // Task 20:勾选动作已由 muda 在菜单侧翻转;此处按**操作后真实状态**
                     // 校准:仅 Enabled 勾选;RequiresApproval / NotRegistered / NotFound
@@ -1067,7 +1089,7 @@ impl eframe::App for App {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
-        // 发现新版本：非阻塞收结果/看门狗；变化时唤醒设置页（托盘同步在 Task 6 接）。
+        // 发现新版本：非阻塞收结果/看门狗；变化时唤醒设置页；托盘条目每帧同步。
         let (phase, changed, settings_open) = {
             let mut s = self.shared();
             let changed = s.update.tick();
@@ -1078,6 +1100,9 @@ impl eframe::App for App {
             if settings_open {
                 ctx.request_repaint_of(settings::viewport_id());
             }
+        }
+        if let Some(tray) = &mut self.tray {
+            tray.sync_update(phase);
         }
 
         // 完整窗口(Task 17):结果会话推进——防抖到期发查询、收两路回投。
