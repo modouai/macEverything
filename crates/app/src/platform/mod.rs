@@ -549,8 +549,6 @@ pub fn settings_visible() -> Option<bool> {
 /// 或网络错误均返回可读错误。非 macOS 直接失败。
 ///
 /// 同步阻塞至多 `timeout + 2s`：调用方须在非 UI 线程调用（不得阻塞 egui 主线程）。
-// Task 5 接线 update.rs/UI 后移除（与 `mod update` 的临时 allow 同）。
-#[allow(dead_code)]
 pub fn fetch_url_bytes(
     url: &str,
     timeout: std::time::Duration,

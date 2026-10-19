@@ -1623,8 +1623,6 @@ fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
 /// 会话为系统共享 `NSURLSession`（走系统 TLS 与代理）。completion 回调可能在
 /// 其他线程执行，因此回调只捕获 `Sender`/`String`/`usize`（均为 Send），不触碰
 /// UI。本函数同步阻塞至多 `timeout + 2s`，调用方须在非 UI 线程调用。
-// Task 5 接线 update.rs/UI 后移除（与 `mod update` 的临时 allow 同）。
-#[allow(dead_code)]
 pub fn fetch_url_bytes(url: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
     let ns_url =
         NSURL::URLWithString(&NSString::from_str(url)).ok_or_else(|| format!("URL 非法: {url}"))?;

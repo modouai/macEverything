@@ -203,6 +203,16 @@ pub fn evaluate(bytes: &[u8], current: &str) -> CheckOutcome {
     }
 }
 
+/// 执行一次真实检查（工作线程调用）：拉取清单并判定。
+pub fn fetch_and_evaluate() -> CheckOutcome {
+    let url = manifest_url();
+    log::info!("检查更新: {url}");
+    match crate::platform::fetch_url_bytes(&url, REQUEST_TIMEOUT, MAX_BODY) {
+        Ok(bytes) => evaluate(&bytes, CURRENT_VERSION),
+        Err(err) => CheckOutcome::Failed(err),
+    }
+}
+
 /// 清单地址（开发覆盖：`MACEEVERYTHING_UPDATE_URL`）。
 pub fn manifest_url() -> String {
     std::env::var("MACEEVERYTHING_UPDATE_URL").unwrap_or_else(|_| MANIFEST_URL.to_owned())

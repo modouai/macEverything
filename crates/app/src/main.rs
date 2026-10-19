@@ -15,7 +15,8 @@ mod settings;
 mod single_instance;
 mod tray;
 mod ui;
-// Task 2 只交付纯逻辑；清单拉取与 UI 接线在后续任务，接线前公开 API 暂无调用方。
+// 剩余未接线的公开 API 是托盘/设置页文案与下载页地址，待 Task 6-7 接入；
+// 全部消费后必须移除本模块级 allow。
 #[allow(dead_code)]
 mod update;
 mod window_state;
