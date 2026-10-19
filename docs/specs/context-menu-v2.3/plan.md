@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **实施状态（2026-10-19）：** Task 1–3 已实现并通过双审；Task 4 文档已回填；Task 4 Step 6 实机验收待人工确认。已完成步骤已勾选。
-> **实施偏差（以代码为准）：** Quick Look 用 existing_panel 避免查询时创建面板；show 校验 isVisible；poll 在 App 非 active 时跳过，系统关闭时清空 URL。空格仅打开方向做存在性校验，关闭方向不校验；select_all 置 table_focused。菜单分派对 shell()==None 用 debug_assert! + log::error!。拷贝路径不校验存在性，其余动作整批校验。dead_code allow 已全部删除。下文代码块为计划稿，与最终实现有差异时以本节为准。
+> **实施偏差（以代码为准）：** Quick Look 用 existing_panel 避免查询时创建面板；show 校验 isVisible；poll 在 App 非 active 时跳过，系统关闭时清空 URL。空格仅打开方向做存在性校验，关闭方向不校验；select_all 置 table_focused。菜单分派对 shell()==None 用 debug_assert! + log::error!。拷贝路径不校验存在性，其余动作整批校验。Task 2 为未接线入口加的 dead_code allow 已全部删除。下文代码块为计划稿，与最终实现有差异时以本节为准。
 
 **Goal:** 把完整结果窗口的右键菜单落地为 v2.3 最终形态：删除「在访达中打开」，加入快速查看、拷贝文件/路径/文件名子菜单，并完成菜单 i18n。
 

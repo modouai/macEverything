@@ -115,7 +115,7 @@
     重新激活结果窗口；具体路径由 PoC 决定（见 §4.3）。最终实现见 §4.5：每 200ms 轮询 `isVisible`，未监听 `NSWindowWillCloseNotification`/delegate。
   - 面板与 AppKit 调用全部主线程；unsafe 集中 + SAFETY 注释。
 - 空格键处理在 `results.rs`：
-  - 仅当结果表格获得焦点、搜索框未聚焦、选中非空；
+  - 仅当结果表格获得焦点、搜索框未聚焦、选中非空、非中文输入法组字态时；
   - 忽略按键自动重复（一次按下只 toggle 一次）；
   - 调用 `platform::quick_look(paths, frame)`；失败落状态栏。
 - 右键项与空格共用同一平台入口。
