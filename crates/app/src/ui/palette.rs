@@ -338,6 +338,8 @@ pub struct PaletteState {
     last_focused: Option<bool>,
     /// selected 变更后把该行滚入可见区。
     scroll_to_selected: bool,
+    /// 本帧双击了结果行:键盘动作块之后统一执行「打开并隐藏」。
+    pending_row_open: bool,
     /// 当前面板宽(唤起时按屏幕回填;`PANEL_W` = 最大宽/非窄屏)。
     panel_w: f32,
     /// 测试探针:最近一帧搜索行关键矩形(headless 越界断言用;生产不编译)。
@@ -458,6 +460,7 @@ impl PaletteState {
             focus_pending_since: None,
             last_focused: None,
             scroll_to_selected: false,
+            pending_row_open: false,
             panel_w: PANEL_W,
             #[cfg(test)]
             search_probe: None,
@@ -516,6 +519,7 @@ impl PaletteState {
         self.ime_busy = false;
         self.needs_focus = true;
         self.scroll_to_selected = false;
+        self.pending_row_open = false;
         // 每次唤起重新「武装」失焦门:窗口常驻(隐藏走 orderOut 不销毁),
         // 但唤起瞬间尚未成 key(报 unfocused)时不隐藏,待观察到聚焦后失焦才隐藏。
         self.seen_focus = false;
@@ -993,7 +997,7 @@ impl PaletteState {
                     let icons = &mut self.icons;
                     let selected = self.selected;
                     let scroll_sel = self.scroll_to_selected;
-                    let mut clicked: Option<usize> = None;
+                    let mut pointer: Option<(usize, RowPointerAction)> = None;
                     let out = egui::ScrollArea::vertical()
                         .max_height(LIST_MAX_H) // 行数少时收缩到内容高
                         .id_salt("palette-list")
@@ -1011,16 +1015,21 @@ impl PaletteState {
                                     panel_w,
                                     texture,
                                 );
-                                if row.clicked() {
-                                    clicked = Some(i);
+                                let action =
+                                    row_pointer_action(row.clicked(), row.double_clicked());
+                                if action != RowPointerAction::None {
+                                    pointer = Some((i, action));
                                 }
                                 if is_sel && scroll_sel {
                                     ui.scroll_to_rect(row.rect, None);
                                 }
                             }
                         });
-                    if let Some(i) = clicked {
+                    if let Some((i, action)) = pointer {
                         self.selected = i;
+                        if action == RowPointerAction::Open {
+                            self.pending_row_open = true;
+                        }
                     }
                     // 滚到底 → 本地增量渲染（+20，至 K；不重查）
                     at_bottom = rows < self.results.len()
@@ -1227,6 +1236,14 @@ impl PaletteState {
             action = Some(Action::FullWindow);
         } else if keys.esc {
             action = Some(Action::Hide);
+        }
+
+        // 双击结果行 = 与 ↵ 相同:默认应用打开(目录进访达),成功后隐藏悬浮条。
+        if self.pending_row_open {
+            if action.is_none() {
+                action = self.open_selected(false);
+            }
+            self.pending_row_open = false;
         }
 
         // —— 失焦隐藏 + 切 Space 豁免(product §1 键位表 2026-10-16 定)——
@@ -1697,6 +1714,24 @@ fn result_row_text_and_hint_rights(rect_right: f32, hint_measured: f32) -> (f32,
 
 /// 结果行（§2.4）：高 56 / 圆角 8 / 内边距 12 / 图标 32 裸放 / 文本列 15+12 /
 /// 动作提示 12pt 仅选中行。悬停 = 选中态约 50% 强度；鼠标移动不改键盘选中。
+/// 结果行的指针动作(双击优先于单击;打开语义与 ↵ 相同)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowPointerAction {
+    None,
+    Select,
+    Open,
+}
+
+fn row_pointer_action(clicked: bool, double_clicked: bool) -> RowPointerAction {
+    if double_clicked {
+        RowPointerAction::Open
+    } else if clicked {
+        RowPointerAction::Select
+    } else {
+        RowPointerAction::None
+    }
+}
+
 fn draw_result_row(
     ui: &mut egui::Ui,
     e: &HitEntry,
@@ -3198,6 +3233,19 @@ mod tests {
             assert_eq!(badge_text_fit(ui, "补齐中", text_max_w), "补齐中");
         });
         out.textures_delta.clear(); // headless：不做纹理上传，清掉免得 Drop 告警
+    }
+
+    /// 行指针动作:双击优先于单击(双击 = 选中并打开,单击 = 仅选中)。
+    #[test]
+    fn row_pointer_action_prefers_double_click() {
+        assert_eq!(row_pointer_action(false, false), RowPointerAction::None);
+        assert_eq!(row_pointer_action(true, false), RowPointerAction::Select);
+        assert_eq!(row_pointer_action(false, true), RowPointerAction::Open);
+        assert_eq!(
+            row_pointer_action(true, true),
+            RowPointerAction::Open,
+            "双击帧同时报 clicked 时仍按打开处理"
+        );
     }
 
     /// 行点击命中:点击视觉行中心应选中该行(不偏上/偏下)。
