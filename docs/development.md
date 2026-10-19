@@ -140,8 +140,10 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 | Mac 文件搜索指南 | `/mac-file-search-guide/` | `/en/mac-file-search-guide/` |
 
 - 语言：`/` 固定中文，`/en/` 固定英文；语言切换是普通链接，不再依赖 `localStorage`。
-- 共享资源：`site/assets/`（CSS、首页 JS、字体、图标、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
-- 字体：Latin 字体由 `scripts/site/fetch_fonts.sh` 从 Fontsource 下载并自托管；中文使用系统 PingFang SC，不加载 Google Fonts。
+- 共享资源：`site/assets/`（CSS、首页 JS、图标、吉祥物、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
+- 字体：全站使用系统字体栈（SF Pro / PingFang SC / SF Mono），不加载 Web 字体。
+- 视觉：站点沿用 App 的 token（靛蓝选中色 `#5B6FD9`、深色 `#1A1D22`、12/8/6/4 圆角）；悬浮条演示为 700 宽、结果窗口为 1080×627。
+- 演示图标：`site/assets/file-icons/` 由 macOS `NSWorkspace` 按文件类型渲染为 PNG（与访达一致），不是图标库字形；吉祥物为 `site/assets/mascot.png`（透明 PNG）。
 - SEO：每页包含 canonical、hreflang、Open Graph、Twitter 卡片与 JSON-LD；`site/sitemap.xml` 与页面 hreflang 互指。
 - 本地预览：`cd site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
 - 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
