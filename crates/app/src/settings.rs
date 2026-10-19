@@ -43,7 +43,7 @@ impl FontSize {
 ///
 /// 两个快捷键 `None` = 沿用内置默认（⌥Space 降级链 / ⌥⇧F），不写死到文件，
 /// 以便以后调整默认键时老用户跟随新默认。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsFile {
     #[serde(default)]
     pub font_size: FontSize,
@@ -53,6 +53,26 @@ pub struct SettingsFile {
     pub palette_hotkey: Option<HotKey>,
     #[serde(default)]
     pub window_hotkey: Option<HotKey>,
+    /// 启动时自动检查官网版本清单（默认开启）。
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+}
+
+/// serde 缺字段默认值：自动检查更新默认开启。
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        Self {
+            font_size: FontSize::default(),
+            language: LanguageSetting::default(),
+            palette_hotkey: None,
+            window_hotkey: None,
+            check_updates: true,
+        }
+    }
 }
 
 /// 设置文件路径（`data_dir/settings.toml`）。
@@ -114,6 +134,7 @@ mod tests {
 
         let f = SettingsFile::default();
         assert_eq!(f.font_size, FontSize::Standard);
+        assert!(f.check_updates);
         assert!(f.palette_hotkey.is_none());
         assert!(f.window_hotkey.is_none());
         save(dir.path(), &f).unwrap();
@@ -128,6 +149,7 @@ mod tests {
                 Some(Modifiers::ALT | Modifiers::SHIFT),
                 Code::KeyF,
             )),
+            check_updates: true,
         };
         save(dir.path(), &custom).unwrap();
         assert_eq!(load(dir.path()), custom);
@@ -166,6 +188,7 @@ mod tests {
             language: LanguageSetting::System,
             palette_hotkey: Some("Alt+Space".parse().unwrap()),
             window_hotkey: Some("Alt+Shift+F".parse().unwrap()),
+            check_updates: true,
         };
         let text = toml::to_string(&f).unwrap();
         assert!(text.contains("palette_hotkey = \"alt+Space\""), "{text}");
@@ -253,5 +276,27 @@ mod tests {
         };
         save(dir.path(), &f).unwrap();
         assert_eq!(load(dir.path()).language, LanguageSetting::En);
+    }
+
+    /// 自动检查更新默认开启；缺字段读为 true，显式 false 往返保持。
+    #[test]
+    fn check_updates_defaults_true_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(SettingsFile::default().check_updates, "Default 必须为 true");
+        assert!(load(dir.path()).check_updates, "无文件 = 默认开启");
+
+        // 旧文件缺字段 → true（前向兼容）。
+        std::fs::write(path(dir.path()), "font_size = \"large\"\n").unwrap();
+        let loaded = load(dir.path());
+        assert!(loaded.check_updates, "缺字段必须默认开启");
+        assert_eq!(loaded.font_size, FontSize::Large);
+
+        // 显式 false 往返。
+        let f = SettingsFile {
+            check_updates: false,
+            ..SettingsFile::default()
+        };
+        save(dir.path(), &f).unwrap();
+        assert!(!load(dir.path()).check_updates);
     }
 }
