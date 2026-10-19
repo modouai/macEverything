@@ -101,7 +101,7 @@ crates/client/   客户端承载层(连接/按需 stat 读取/离线降级/状�
 crates/app/      GUI(eframe/egui):悬浮条 / 完整结果窗口 / 菜单栏托盘 / 全局热键 / 开机自启
 scripts/         五项基准(bench.sh)/ .app 组装(bundle.sh)/ 平台 PoC 与 spike
 docs/            使用 / 架构 / 开发文档 + 规格档案(v1-core / v2-ui)
-site/            官网(单页静态站;Cloudflare Pages 部署见 docs/development.md)
+site/            官网(静态多页站;SEO 与 Cloudflare Pages 部署见 docs/development.md)
 ```
 
 核心设计一句话:**事件只当信号,目录级 diff 才是真相**——增量正确性建立在磁盘比对之上,FSEvents 的粗粒度语义(丢事件、合并、单边改名)全部内建兜底。

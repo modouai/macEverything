@@ -130,12 +130,23 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 
 ## 官网(site/)
 
-官网是单页静态站，源文件 `site/index.html`（CSS/JS 内联，应用图标内嵌），不参与 Rust 构建。
+官网是静态多页站，源文件都在 `site/`，不参与 Rust 构建。页面清单：
 
-- 语言：导航右侧 `EN / 中文` 切换；文案、搜索演示数据、结果窗口标签同步切换。选择写入 localStorage，默认跟随浏览器语言。
+| 页面 | 中文 | 英文 |
+|---|---|---|
+| 首页 | `/` | `/en/` |
+| Mac 版 Everything | `/everything-for-mac/` | `/en/everything-for-mac/` |
+| Spotlight 搜不到文件 | `/spotlight-not-finding-files/` | `/en/spotlight-not-finding-files/` |
+| Mac 文件搜索指南 | `/mac-file-search-guide/` | `/en/mac-file-search-guide/` |
+
+- 语言：`/` 固定中文，`/en/` 固定英文；语言切换是普通链接，不再依赖 `localStorage`。
+- 共享资源：`site/assets/`（CSS、首页 JS、字体、图标、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
+- 字体：Latin 字体由 `scripts/site/fetch_fonts.sh` 从 Fontsource 下载并自托管；中文使用系统 PingFang SC，不加载 Google Fonts。
+- SEO：每页包含 canonical、hreflang、Open Graph、Twitter 卡片与 JSON-LD；`site/sitemap.xml` 与页面 hreflang 互指。
 - 本地预览：`cd site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
-- 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
-- 演示数据：中英文示例文件分别在脚本的 `DEMO_FILES`、`WIN_FILES` 中；改示例时两份都要改。
+- 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
+- 发布前必须运行 `python3 scripts/site/check_seo.py`，退出码 0 才能部署。检查项包括 canonical/hreflang、sitemap 覆盖、JSON-LD、字体引用、站内链接、版本与 DMG 一致性。
+- 分享图源文件：`scripts/site/og-image.html`，渲染为 `site/assets/og-image.png`（1200×630）。
 - 官网不写源码构建、终端安装和开发文档入口，只提供成品 DMG。
 
 ### Cloudflare Pages
