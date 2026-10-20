@@ -10,3 +10,8 @@
 /site/downloads/
 /tmp/
 /.playwright-mcp/
+
+# Twikoo 评论后端：依赖与本地构建产物不入库
+/infra/twikoo/node_modules/
+/infra/twikoo/.wrangler/
+/infra/twikoo/.dev.vars

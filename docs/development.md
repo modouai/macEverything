@@ -144,6 +144,7 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 | Mac 版 Everything | `/everything-for-mac/` | `/en/everything-for-mac/` |
 | Spotlight 搜不到文件 | `/spotlight-not-finding-files/` | `/en/spotlight-not-finding-files/` |
 | Mac 文件搜索指南 | `/mac-file-search-guide/` | `/en/mac-file-search-guide/` |
+| 交流与反馈 | `/community/` | `/en/community/` |
 
 - 语言：`/` 固定中文，`/en/` 固定英文；语言切换是普通链接，不再依赖 `localStorage`。
 - 共享资源：`site/assets/`（CSS、首页 JS、图标、吉祥物、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
