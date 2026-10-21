@@ -11,6 +11,8 @@ use engine::persist::{self, IndexMeta, SharedView};
 use engine::query::{MetaRow, SortKey};
 use engine::reconcile;
 use engine::watcher::{self, DirBatcher};
+
+mod volumes;
 use protocol::{self, Gap, HitEntry, Request, Response};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -119,6 +121,9 @@ pub struct EngineState {
     dir_map: Mutex<HashMap<PathBuf, u32>>,
     roots: Mutex<Vec<PathBuf>>,
     cfg: Mutex<config::Config>,
+    /// 运行期挂载卷的按卷 FSEvents 流(external-volumes):卸载时显式 stop。
+    /// 主流(HOME+/Applications)不在此列,由 consume_events 持有至退出。
+    volume_streams: Mutex<HashMap<PathBuf, FseStream>>,
     /// 排除目录跨连接变更锁:add/remove/reset 的「校验 → 内存 → 落盘 → 重扫」
     /// 必须整体串行。`serve` 每连接一线程;没有此锁时 reset 与 CLI add/remove
     /// 交错会写出「配置含自定义条目、内存却已重置」的错位状态,并并发全量重扫。
@@ -131,6 +136,7 @@ impl EngineState {
         Self {
             holder: RwLock::new(IndexHolder::Empty),
             state_name: Mutex::new(state::BUILDING),
+            volume_streams: Mutex::new(HashMap::new()),
             gaps: Mutex::new(vec![]),
             io_errors: AtomicU32::new(0),
             built_at: AtomicU64::new(0),
@@ -143,7 +149,11 @@ impl EngineState {
             flush_lock: Mutex::new(()),
             dir_map: Mutex::new(HashMap::new()),
             roots: Mutex::new(vec![]),
-            cfg: Mutex::new(config::Config { excluded: vec![] }),
+            cfg: Mutex::new(config::Config {
+                excluded: vec![],
+                auto_index_volumes: false,
+                volumes_excluded: vec![],
+            }),
             exclude_op_lock: Mutex::new(()),
         }
     }
@@ -510,17 +520,24 @@ fn should_flush(state: &EngineState) -> bool {
 /// 应用一批目录 diff,全部完成后推进已应用水位。
 /// 水位快照在 diff **之前**取:本批目录对应的全部事件此刻必已入 batcher,
 /// 快照覆盖它们且不含后续未入批事件(水位只落后、绝不超前于索引内容)。
-fn apply_batch(state: &EngineState, dirs: Vec<String>) {
+fn apply_batch(state: &EngineState, dirs: Vec<String>, track_watermark: bool) {
     if dirs.is_empty() {
         return;
     }
-    let batch_water = state.seen_event_id.load(Ordering::Relaxed);
+    // 水位快照在 diff **之前**取:本批目录对应的全部事件此刻必已入 batcher,
+    // 快照覆盖它们且不含后续未入批事件(水位只落后、绝不超前于索引内容)。
+    // 卷流(volume_owned=false→track=false)不推进水位:多流共享见 volumes.rs。
+    let batch_water = if track_watermark {
+        Some(state.seen_event_id.load(Ordering::Relaxed))
+    } else {
+        None
+    };
     for dir in &dirs {
         diff_one(state, Path::new(dir));
     }
-    state
-        .applied_event_id
-        .fetch_max(batch_water, Ordering::Relaxed);
+    if let Some(w) = batch_water {
+        state.applied_event_id.fetch_max(w, Ordering::Relaxed);
+    }
     maybe_compact(state);
 }
 
@@ -547,14 +564,18 @@ fn maybe_compact(state: &EngineState) {
 /// 事件消费循环(重放与增量共用):批量 diff + 落盘节流 + 降级判定。
 /// 水位语义:接收(`seen_event_id`)与已应用(`applied_event_id`)分离,
 /// 落盘只取已应用水位(见 EngineState 字段注释)。
+#[allow(clippy::too_many_arguments)]
 fn consume_events(
     state: Arc<EngineState>,
     paths: DaemonPaths,
-    stream: FseStream,
+    stream: Option<FseStream>,
     rx: std::sync::mpsc::Receiver<fsevents::FseEvent>,
     is_replay: bool,
     replayed_from_disk: bool,
+    volume_owned: bool,
 ) {
+    // 主流由本线程持有,尾部 drop(stream) 即停流;卷流的流本体在
+    // state.volume_streams,卸载时显式 stop 后此处为 None。
     let mut batcher = DirBatcher::new(BATCH_WINDOW, watcher::system_now());
     let mut replay_events: u64 = 0;
     let mut stream_errored = false;
@@ -572,12 +593,16 @@ fn consume_events(
                 if event_covered_by_rescan(ev.id, state.rescan_floor.load(Ordering::Relaxed)) {
                     continue;
                 }
-                state.seen_event_id.fetch_max(ev.id, Ordering::Relaxed);
+                // 卷流不写全局水位:多流共享会让 applied 越过主消费方实际进度,
+                // 重启重放从该水位起步将漏掉主流未应用事件(见 volumes.rs 模块注释)。
+                if !volume_owned {
+                    state.seen_event_id.fetch_max(ev.id, Ordering::Relaxed);
+                }
                 if fsevents::is_history_done(ev.flags) {
                     if is_replay {
                         // 追平前强制应用窗口内 pending 事件:否则「就绪」早于索引追上,
                         // 紧随的查询会漏停机窗口内的变更(实机重放抽验曾因此为空)。
-                        apply_batch(&state, batcher.drain_all());
+                        apply_batch(&state, batcher.drain_all(), !volume_owned);
                         // 判定一:零事件 + 停机超阈 → 重放不可信(spike 证实无可观测
                         // 信号,此为唯一确定性防线;原先该判定只在循环退出后执行,
                         // 常驻 daemon 下永不触发)。
@@ -632,7 +657,7 @@ fn consume_events(
                 break;
             }
         }
-        apply_batch(&state, batcher.drain_ready());
+        apply_batch(&state, batcher.drain_ready(), !volume_owned);
         if should_flush(&state) {
             flush(&state, &paths);
         }
@@ -640,7 +665,7 @@ fn consume_events(
 
     // 退出前强制排空 pending:停止路径(或流断开)若跳过这一步,窗口内已收未应用的
     // 变更会因水位停在 diff 完成点而被正确重放,但此处仍排空以让落盘内容尽量新。
-    apply_batch(&state, batcher.drain_all());
+    apply_batch(&state, batcher.drain_all(), !volume_owned);
 
     // 降级判定(统一走 reconcile::should_degrade,契约见其 doc):
     // 流断开 / 保守判定(零事件且停机超阈)——信号路径已由 spike 排除(ADR-5)。
@@ -649,6 +674,7 @@ fn consume_events(
     let stopping = state.stopping.load(Ordering::Relaxed);
     let downtime = now_secs().saturating_sub(state.built_at.load(Ordering::Relaxed));
     if !stopping
+        && !volume_owned
         && reconcile::should_degrade(
             false,
             stream_errored,
@@ -736,10 +762,18 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
 
 /// 冷启动编排(独立线程):有索引 → Shared 秒开 → 物化 → 重放;无/损坏 → 首扫。
 fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
-    let roots = default_roots()?;
-    *state.roots.lock().unwrap() = roots.clone();
     let cfg = config::load(&paths.config_file());
-    *state.cfg.lock().unwrap() = cfg;
+    *state.cfg.lock().unwrap() = cfg.clone();
+    // 外接卷(external-volumes):挂载中的期望卷并入初始 roots——落盘索引路径
+    // 由此获得流覆盖(停机窗口重放追平卷内漂移);首扫路径一并纳入首扫。
+    let desired_volumes = volumes::desired_roots(&cfg);
+    for v in &desired_volumes {
+        log::info!("启动挂载卷并入扫描根: {}", v.display());
+    }
+    let desired_set: std::collections::HashSet<PathBuf> = desired_volumes.iter().cloned().collect();
+    let mut roots = default_roots()?;
+    roots.extend(desired_volumes.iter().cloned());
+    *state.roots.lock().unwrap() = roots.clone();
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -766,6 +800,9 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             };
             *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
             rebuild_dir_map(&state);
+            // 启动清除:上次会话的卷前缀中,本次未挂载(或已停用)的移除——
+            // 落盘索引不重扫,脏卷条目无自然消亡机制,必须在建流/就绪前清掉。
+            volumes::purge_unmounted(&state, &desired_set);
             (last_id, true)
         }
         Err(e) => {
@@ -831,7 +868,23 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     }
     let st = state.clone();
     let p = paths.clone();
-    std::thread::spawn(move || consume_events(st, p, stream, rx, is_replay, replayed_from_disk));
+    std::thread::spawn(move || {
+        consume_events(
+            st,
+            p,
+            Some(stream),
+            rx,
+            is_replay,
+            replayed_from_disk,
+            false,
+        )
+    });
+    // 卷监听:挂载/卸载对账(主流已建;运行期新挂载的卷用按卷流,不写全局水位)
+    {
+        let st = state.clone();
+        let p = paths.clone();
+        std::thread::spawn(move || volumes::monitor_loop(st, p));
+    }
     Ok(())
 }
 
@@ -1163,7 +1216,11 @@ mod tests {
         );
 
         // 应用一批 → 水位追上,且 diff 真实生效(新文件入索引)
-        apply_batch(&state, vec![dir.path().to_string_lossy().into_owned()]);
+        apply_batch(
+            &state,
+            vec![dir.path().to_string_lossy().into_owned()],
+            true,
+        );
         assert_eq!(
             state.applied_event_id.load(Ordering::Relaxed),
             100,
@@ -1182,7 +1239,7 @@ mod tests {
     fn empty_batch_does_not_advance_watermark() {
         let state = EngineState::new();
         state.seen_event_id.store(7, Ordering::Relaxed);
-        apply_batch(&state, vec![]);
+        apply_batch(&state, vec![], true);
         assert_eq!(state.applied_event_id.load(Ordering::Relaxed), 0);
     }
 
@@ -1305,6 +1362,8 @@ mod tests {
         *state.roots.lock().unwrap() = vec![root];
         *state.cfg.lock().unwrap() = config::Config {
             excluded: excluded.iter().map(|e| (*e).to_string()).collect(),
+            auto_index_volumes: true,
+            volumes_excluded: vec![],
         };
         let paths = DaemonPaths {
             data_dir: tmp.path().join("data"),

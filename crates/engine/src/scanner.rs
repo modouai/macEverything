@@ -269,6 +269,27 @@ pub fn apply_records(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, rec
     }
 }
 
+/// 清除以 `prefix` 为路径前缀的整棵子树(卷卸载/停用路径,external-volumes §4)。
+///
+/// 取 dir_map 中前缀匹配(含前缀自身)的条目,**浅者先**调 `Index::remove`——
+/// 其子树级联墓碑(「活条目的父必活」不变量)保证后代无遗漏,深键重复删除
+/// 对墓碑短路,天然幂等;dir_map 同步清掉前缀下全部键。返回清除的活条目数
+/// (含目录)。无匹配键返回 0(从未索引/重复清除,幂等)。
+pub fn remove_prefix(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, prefix: &Path) -> u32 {
+    let before = index.entry_count();
+    let mut victims: Vec<u32> = dir_map
+        .iter()
+        .filter(|(p, _)| p.starts_with(prefix))
+        .map(|(_, &idx)| idx)
+        .collect();
+    victims.sort_unstable_by_key(|&idx| index.full_path(idx).components().count());
+    for idx in victims {
+        index.remove(idx);
+    }
+    dir_map.retain(|p, _| !p.starts_with(prefix));
+    before.saturating_sub(index.entry_count())
+}
+
 /// 并行扫描入口(一次性):遍历 → 深度排序 → 聚合。
 fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
     let (recs, gaps) = collect_records(roots, excludes, threads);
@@ -316,6 +337,46 @@ mod tests {
             })
             .map(|i| String::from_utf8_lossy(index.display_name_of(i)).into_owned())
             .collect()
+    }
+
+    /// 卷卸载清除(external-volumes §4):前缀清除只动卷子树,
+    /// HOME 侧条目幸存;重复调用幂等返回 0。
+    #[test]
+    fn remove_prefix_purges_volume_subtree_and_map() {
+        let mut index = Index::new();
+        let mut dir_map: HashMap<PathBuf, u32> = HashMap::new();
+        let home = PathBuf::from("/Users/t");
+        let usb = PathBuf::from("/Volumes/U");
+        seed_roots(&mut index, &mut dir_map, &[home.clone(), usb.clone()]);
+        let home_idx = dir_map[&home];
+        let usb_idx = dir_map[&usb];
+        let note = index.insert("note.txt", home_idx, false);
+        // U 盘侧:docs 目录(入 map)+ 两个文件 + 顶层散文件
+        let docs = index.insert("docs", usb_idx, true);
+        dir_map.insert(usb.join("docs"), docs);
+        index.insert("a.pdf", docs, false);
+        index.insert("b.txt", docs, false);
+        index.insert("loose.dat", usb_idx, false);
+        assert_eq!(
+            index.entry_count(),
+            7,
+            "两根 + note + docs + 2 文件 + loose"
+        );
+
+        let removed = remove_prefix(&mut index, &mut dir_map, &usb);
+        assert_eq!(removed, 5, "U 根 + docs + a/b + loose,级联墓碑");
+        assert_eq!(index.entry_count(), 2, "只剩两根条目");
+        assert!(!dir_map.contains_key(&usb), "卷根键已清");
+        assert!(!dir_map.contains_key(&usb.join("docs")), "子目录键已清");
+        assert!(dir_map.contains_key(&home), "HOME 键不受影响");
+        assert_eq!(
+            index.full_path(note),
+            home.join("note.txt"),
+            "幸存条目路径可复原(未误伤)"
+        );
+        // 幂等:再清一遍无匹配、无副作用
+        assert_eq!(remove_prefix(&mut index, &mut dir_map, &usb), 0);
+        assert_eq!(index.entry_count(), 2);
     }
 
     #[test]

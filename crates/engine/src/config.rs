@@ -16,6 +16,16 @@ pub struct Config {
     /// 排除目录列表(条目语义由扫描侧解释)。
     #[serde(default)]
     pub excluded: Vec<String>,
+    /// 外接磁盘自动索引主开关(external-volumes spec;默认开)。
+    #[serde(default = "default_true")]
+    pub auto_index_volumes: bool,
+    /// 不自动索引的卷目录名列表(如 ["BackupU"];按 /Volumes/<名> 的名键控)。
+    #[serde(default)]
+    pub volumes_excluded: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 默认配置(product §1)。
@@ -26,7 +36,15 @@ pub fn default_config() -> Config {
             "node_modules".into(),
             ".git".into(),
             "~/.Trash".into(),
+            // 卷元数据目录(external-volumes):每个 APFS/HFS+ 卷自动生成,
+            // 名字式排除对任意卷内同名生效
+            ".fseventsd".into(),
+            ".Trashes".into(),
+            ".Spotlight-V100".into(),
+            ".DocumentRevisions-V100".into(),
         ],
+        auto_index_volumes: true,
+        volumes_excluded: vec![],
     }
 }
 
@@ -81,8 +99,20 @@ mod tests {
     fn default_config_excludes_home_trash() {
         assert_eq!(
             default_config().excluded,
-            vec!["~/Library", "node_modules", ".git", "~/.Trash"]
+            vec![
+                "~/Library",
+                "node_modules",
+                ".git",
+                "~/.Trash",
+                // 卷元数据目录(external-volumes):名字式,对任意卷内同名生效
+                ".fseventsd",
+                ".Trashes",
+                ".Spotlight-V100",
+                ".DocumentRevisions-V100",
+            ]
         );
+        assert!(default_config().auto_index_volumes);
+        assert!(default_config().volumes_excluded.is_empty());
     }
 
     #[test]
