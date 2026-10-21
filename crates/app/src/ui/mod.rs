@@ -305,6 +305,7 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
         crate::platform::quick_look_dismiss();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        platform::set_dock_icon(false);
         true
     } else {
         false
@@ -1253,6 +1254,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 platform::quick_look_dismiss();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                platform::set_dock_icon(false);
             }
         }
 

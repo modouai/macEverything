@@ -45,13 +45,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType,
-    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSImage, NSMenu,
-    NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel,
-    NSPanel, NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView,
-    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
+    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSEventModifierFlags,
+    NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem, NSModalResponseAbort,
+    NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPanel, NSPasteboard,
+    NSPasteboardWriting, NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
@@ -541,6 +541,32 @@ pub fn show_palette(top_inset: f64) -> Result<f64> {
 /// 单发 `ViewportCommand::Visible(true)`(winit `makeKeyAndOrderFront`)不切 Space——
 /// 根窗在别的 Space 时「命令生效但看不到窗口」,故此处先 `NSApp.activate`
 /// (激活即带窗口切回其所在 Space)再置前。
+/// Dock 图标显隐(external 需求:完整窗口期给用户「永远找得回」的入口)。
+///
+/// App 是 LSUIElement(Accessory,菜单栏应用形态,无常驻 Dock 图标);完整窗口
+/// 可见期切 Regular 让 Dock 图标出现——点击即置前、⌘Tab 可见、可最小化到
+/// 程序坞;窗口隐藏后切回 Accessory 收回图标。运行时切换 Accessory↔Regular
+/// 是 AppKit 明确允许的转换(仅 Prohibited 受限)。
+pub fn set_dock_icon(show: bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let target = if show {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    };
+    if app.activationPolicy() != target {
+        let ok = app.setActivationPolicy(target);
+        log::info!(
+            "Dock 图标{}:{}",
+            if show { "显示" } else { "收回" },
+            if ok { "ok" } else { "失败" }
+        );
+    }
+}
+
 pub fn show_root_window() -> Result<()> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("show_root_window 非主线程调用"));
@@ -568,6 +594,7 @@ pub fn show_root_window() -> Result<()> {
     root.orderFrontRegardless();
     root.makeKeyAndOrderFront(None);
     root.makeMainWindow();
+    set_dock_icon(true);
     let f = root.frame();
     log::info!(
         "完整窗口(根窗)唤起:isVisible={} isKey={} frame={:.0}x{:.0}@({:.0},{:.0})",
