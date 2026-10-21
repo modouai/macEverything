@@ -408,6 +408,26 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
     }
 }
 
+/// 查询运行中引擎的版本(升级路径偏差检测)。
+/// 离线/失败/旧引擎(响应缺字段)→ `None`,调用方按「需重启」处理。
+pub fn daemon_version(paths: &DaemonPaths) -> Option<String> {
+    let mut s = connect(paths)?;
+    match call(
+        &mut s,
+        &Request::Status {
+            v: protocol::PROTOCOL_VERSION,
+        },
+    ) {
+        Ok(resp) => match resp {
+            Response::Status { daemon_version, .. } if !daemon_version.is_empty() => {
+                Some(daemon_version)
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
 /// 卷偏好结果(external-volumes):message 为落盘失败等可操作提示(成功为 None)。
 #[derive(Debug)]
 pub struct VolumePrefsOutcome {
@@ -422,7 +442,13 @@ fn volumes_call(paths: &DaemonPaths, req: Request) -> Result<VolumePrefsOutcome>
     let Some(mut s) = connect(paths) else {
         bail!("daemon 未在运行;卷偏好需引擎在线,先执行 macEverything start");
     };
-    let resp = call(&mut s, &req)?;
+    // 版本偏差可操作提示:旧引擎不认识卷变体,解码失败即断连(客户端只看到
+    // EOF/解码错误)。与 exclude reset 同款兜底文案。
+    let resp = call(&mut s, &req).map_err(|err| {
+        anyhow!(
+            "{err:#};若引擎为旧版本,请重启引擎:macEverything stop && macEverything start(或托盘拉起)"
+        )
+    })?;
     match expect_ok(resp)? {
         Response::VolumesPrefs {
             auto,

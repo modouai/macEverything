@@ -193,6 +193,24 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
         Err(e) => log::warn!("卷流建立失败({e}),该卷仅静态索引无实时监听: {vol_str}"),
     }
 
+    scan_volume_into(state, paths, vol);
+}
+
+/// 卷根种子 + 全量扫入索引(批间检查卷仍在)→ flush。
+///
+/// **前缀清除前置**:上次会话/上次挂载可能残留该卷条目,直接 seed+apply 会与
+/// 残留重复(每文件双条目);先清后扫,确定性收敛。运行期挂载与启动补扫共用。
+pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
+    {
+        let mut h = state.holder.write().unwrap();
+        let IndexHolder::Mutable(idx) = &mut *h else {
+            log::warn!("卷扫描推迟(主索引非可变态),下轮重试: {}", vol.display());
+            return;
+        };
+        let mut map = state.dir_map.lock().unwrap();
+        engine::scanner::remove_prefix(idx, &mut map, vol);
+        engine::scanner::seed_roots(idx, &mut map, std::slice::from_ref(&vol.to_path_buf()));
+    }
     let cfg = state.cfg.lock().unwrap().clone();
     let excludes = engine::reconcile::expand_excludes(&cfg.excluded);
     let threads = std::thread::available_parallelism()
@@ -201,7 +219,7 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     let (recs, gaps) = engine::scanner::collect_records(&[vol.to_path_buf()], &excludes, threads);
     let mut applied = 0usize;
     for chunk in recs.chunks(SCAN_CHUNK) {
-        // 批间检查:扫描中途拔盘 → 中止,清除由本函数尾部的对账路径兜底
+        // 批间检查:扫描中途拔盘 → 中止,清除由下一轮对账兜底
         if !vol.exists() {
             log::warn!("卷扫描中消失,中止: {}", vol.display());
             unmount_volume(state, paths, vol);

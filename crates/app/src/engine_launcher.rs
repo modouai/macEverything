@@ -105,8 +105,24 @@ fn is_executable(path: &Path) -> bool {
 /// 全失败 → Err(消息含全部候选路径逐行)。
 pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
     if client::connect(paths).is_some() {
-        log::info!("引擎已在运行,跳过拉起");
-        return Ok(());
+        // 版本偏差自动重启(升级路径):引擎常驻不随 App 退出,App 升级后老引擎
+        // 仍在——新协议能力(如卷偏好)会整体不可用。daemon_version 由新引擎
+        // 上报;空(旧引擎无此字段)或不等(App 与引擎须同源同版)即重启。
+        // 重启先落盘再退出(stop 语义),随后走下方常规拉起。
+        let skew = match client::daemon_version(paths) {
+            Some(v) if v == env!("CARGO_PKG_VERSION") => {
+                log::info!("引擎已在运行,版本匹配({v}),跳过拉起");
+                return Ok(());
+            }
+            other => other,
+        };
+        log::warn!(
+            "引擎版本偏差(运行 {skew:?},App {}),自动重启引擎",
+            env!("CARGO_PKG_VERSION")
+        );
+        if let Err(err) = client::stop(paths) {
+            log::warn!("重启引擎:停止旧引擎失败({err:#}),仍尝试拉起");
+        }
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,

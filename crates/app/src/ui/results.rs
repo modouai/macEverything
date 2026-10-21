@@ -4148,6 +4148,7 @@ mod tests {
                     },
                     // 其余(状态补查):构建中快照
                     _ => protocol::Response::Status {
+                        daemon_version: String::new(),
                         state: client::state::BUILDING.into(),
                         entry_count: 0,
                         gaps: Vec::new(),

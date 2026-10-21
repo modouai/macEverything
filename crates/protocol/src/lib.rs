@@ -106,6 +106,10 @@ pub enum Response {
         io_error_count: u32,
         built_at: u64,
         index_file: String,
+        /// 引擎版本(升级路径的偏差检测:App 比对该值与自身版本,不一致即自动
+        /// 重启引擎)。`#[serde(default)]` 兼容旧引擎(缺字段 = 空 = 旧)。
+        #[serde(default)]
+        daemon_version: String,
     },
     Stop {
         ok: bool,

@@ -976,6 +976,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
                 io_error_count: state.io_errors.load(Ordering::Relaxed),
                 built_at: state.built_at.load(Ordering::Relaxed),
                 index_file: paths.index_file().to_string_lossy().into_owned(),
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             }
         }
         Request::Stop { .. } => {
