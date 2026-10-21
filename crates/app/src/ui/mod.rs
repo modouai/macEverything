@@ -529,6 +529,27 @@ impl App {
         }));
         if auto_update {
             spawn_update_check(&shared, &cc.egui_ctx);
+            // 挂机期定时重查(update::AUTO_CHECK_INTERVAL,默认 24h):启动检查只覆盖
+            // 一次,常驻形态此后全靠它。每轮到点重读 settings.toml 的 check_updates
+            // ——用户运行中关掉「自动检查更新」即时不再发起;Checking 期到点由
+            // UpdateState::begin 防重入闸吞掉,不叠加。常驻线程与热键事件泵同型。
+            let shared_for_timer = Arc::clone(&shared);
+            let ctx_for_timer = cc.egui_ctx.clone();
+            let data_dir_for_timer = paths.data_dir.clone();
+            let timer = std::thread::Builder::new()
+                .name("update-auto-check".to_owned())
+                .spawn(move || loop {
+                    std::thread::sleep(update::AUTO_CHECK_INTERVAL);
+                    if !crate::settings::load(&data_dir_for_timer).check_updates {
+                        log::info!("定时检查更新:设置已关闭,跳过本轮");
+                        continue;
+                    }
+                    log::info!("定时检查更新(每 24h)");
+                    spawn_update_check(&shared_for_timer, &ctx_for_timer);
+                });
+            if let Err(err) = timer {
+                log::error!("定时检查更新线程启动失败:{err}");
+            }
         }
         // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
         // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,

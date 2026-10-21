@@ -203,6 +203,13 @@ pub fn evaluate(bytes: &[u8], current: &str) -> CheckOutcome {
     }
 }
 
+/// 挂机期定时自动检查间隔。
+///
+/// 启动检查只覆盖一次；常驻形态此后靠本间隔重查。到点时重读
+/// `settings.toml` 的 `check_updates`（运行中关闭即时生效），
+/// Checking 期到点由 [`UpdateState::begin`] 的防重入闸吞掉。
+pub const AUTO_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// 执行一次真实检查（工作线程调用）：拉取清单并判定。
 pub fn fetch_and_evaluate() -> CheckOutcome {
     let url = manifest_url();
@@ -286,6 +293,12 @@ pub fn tray_enabled(phase: &UpdatePhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 钉住：定时自动检查间隔 = 24h（防手滑改成秒/分级对官网疯狂请求）。
+    #[test]
+    fn auto_check_interval_is_daily() {
+        assert_eq!(AUTO_CHECK_INTERVAL, std::time::Duration::from_secs(86_400));
+    }
 
     #[test]
     fn parses_and_orders_versions() {
