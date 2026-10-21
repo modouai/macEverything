@@ -408,6 +408,62 @@ pub fn exclude(paths: &DaemonPaths, action: &str, arg: Option<&str>) -> Result<E
     }
 }
 
+/// 卷偏好结果(external-volumes):message 为落盘失败等可操作提示(成功为 None)。
+#[derive(Debug)]
+pub struct VolumePrefsOutcome {
+    pub auto: bool,
+    pub excluded: Vec<String>,
+    pub message: Option<String>,
+}
+
+/// 卷偏好读/写共用管道;旧 daemon 不认识卷变体会直接断连,客户端只看到
+/// EOF/解码错误——调用方(设置页)按操作失败如实展示。
+fn volumes_call(paths: &DaemonPaths, req: Request) -> Result<VolumePrefsOutcome> {
+    let Some(mut s) = connect(paths) else {
+        bail!("daemon 未在运行;卷偏好需引擎在线,先执行 macEverything start");
+    };
+    let resp = call(&mut s, &req)?;
+    match expect_ok(resp)? {
+        Response::VolumesPrefs {
+            auto,
+            excluded,
+            message,
+        } => Ok(VolumePrefsOutcome {
+            auto,
+            excluded,
+            message,
+        }),
+        other => bail!("意外响应: {other:?}"),
+    }
+}
+
+/// 读当前卷偏好(设置页回显)。
+pub fn volumes_prefs(paths: &DaemonPaths) -> Result<VolumePrefsOutcome> {
+    volumes_call(
+        paths,
+        Request::VolumesPrefs {
+            v: protocol::PROTOCOL_VERSION,
+        },
+    )
+}
+
+/// 写卷偏好(主开关 + 不索引卷名列表);daemon 落盘后卷监听 ≤3s 对账生效
+/// (关主开关即清除全部卷条目,重开即立即索引放行卷)。
+pub fn set_volume_prefs(
+    paths: &DaemonPaths,
+    auto: bool,
+    excluded: Vec<String>,
+) -> Result<VolumePrefsOutcome> {
+    volumes_call(
+        paths,
+        Request::VolumesSet {
+            v: protocol::PROTOCOL_VERSION,
+            auto,
+            excluded,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

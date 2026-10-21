@@ -72,6 +72,25 @@ pub(crate) struct SettingsData {
     pub(crate) update: crate::update::UpdatePhase,
     /// 关于分组内联错误。
     pub(crate) update_error: Option<UpdateError>,
+    /// 外接磁盘卷偏好(external-volumes):daemon 回显 + App 侧挂载枚举。
+    pub(crate) volumes: VolumesData,
+}
+
+/// 卷偏好视图数据(整块 Default,测试字面量与状态拷贝共用)。
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct VolumesData {
+    /// daemon 偏好已回显(首次成功 VolumesPrefs 前 false,开关行按缺省渲染)。
+    pub(crate) loaded: bool,
+    /// 主开关(自动索引外接磁盘)。
+    pub(crate) auto: bool,
+    /// 不索引卷名列表(daemon 真源)。
+    pub(crate) excluded: Vec<String>,
+    /// 当前挂载的本地外接卷名(App 侧 statfs 枚举,打开设置时刷新)。
+    pub(crate) mounted: Vec<String>,
+    /// 后台读/写进行中。
+    pub(crate) busy: bool,
+    /// 加载/写入失败文案(daemon message 或本地错误)。
+    pub(crate) error: Option<String>,
 }
 
 /// 设置页产生的用户动作（绘制后在锁外执行）。
@@ -105,6 +124,10 @@ pub(crate) enum SettingsAction {
     ResetExcludes,
     /// 切换「启动时自动检查更新」。
     SetAutoCheck(bool),
+    /// 切换「自动索引外接磁盘」主开关。
+    SetVolumesAuto(bool),
+    /// 切换单卷索引开关(卷名;开 = 移出排除集[主开关随之开],关 = 加入排除集)。
+    ToggleVolume(String),
     /// 手动检查更新。
     CheckUpdate,
     /// 打开官网下载页。
@@ -157,6 +180,9 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             draw_index_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(GROUP_GAP);
             draw_about_group(ui, full_w, data, &palette, extra_h, &mut actions);
+            ui.add_space(GROUP_GAP);
+            // 外接磁盘放末位:关于组与既有首屏预算钉住不变(测试 settings_layout_has_all_rows)
+            draw_volumes_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(CONTENT_PAD.0);
         });
     BodyOutput { actions }
@@ -211,10 +237,23 @@ enum RowKind<'a> {
     PaletteKeys,
     WindowKeys,
     ExcludeHeader,
-    Exclusion { index: usize, path: &'a str },
+    Exclusion {
+        index: usize,
+        path: &'a str,
+    },
     ExcludedEmpty,
     Version,
     AutoCheck,
+    /// 卷主开关行(自动索引外接磁盘)。
+    VolumesAuto,
+    /// 单卷行:on = 已纳入索引;mounted = 卷当前挂载中(未挂载的排除卷也列出)。
+    Volume {
+        name: &'a str,
+        on: bool,
+        mounted: bool,
+    },
+    /// 无挂载卷且排除集为空的空态行。
+    VolumesEmpty,
 }
 
 /// 外观组：分组标题 + 单行卡片（字号分段 + 可选的保存错误）。
@@ -377,6 +416,83 @@ fn draw_index_group(
         ui,
         full_w,
         i18n::s().group_index,
+        &rows,
+        data,
+        palette,
+        actions,
+    );
+}
+
+/// 外接磁盘组(external-volumes):主开关行 + 挂载卷行(开关)+ 未挂载排除卷行 +
+/// 空态行。加载中/错误经 Header extra 展示,同排除目录组的挂载模式。
+fn draw_volumes_group(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let loading = data.volumes.busy && !data.volumes.loaded;
+    let error = data.volumes.error.as_deref();
+    let extra = extra_for(error.is_some(), extra_h) + extra_for(loading, extra_h);
+    let mut rows = vec![GroupRow {
+        kind: RowKind::VolumesAuto,
+        spec: RowSpec::new(ROW_H).with_extra(extra),
+        error,
+        note: loading.then_some(i18n::s().volumes_loading),
+        hint: None,
+    }];
+    if !data.volumes.loaded && !data.volumes.busy {
+        // 从未成功回显(daemon 离线等):只给主开关缺省态,不列卷,附错误已在 extra
+    } else {
+        let mut listed = 0usize;
+        for name in &data.volumes.mounted {
+            let on = data.volumes.auto && !data.volumes.excluded.iter().any(|x| x == name);
+            rows.push(GroupRow {
+                kind: RowKind::Volume {
+                    name,
+                    on,
+                    mounted: true,
+                },
+                spec: RowSpec::new(EXCLUDE_ROW_H),
+                error: None,
+                note: None,
+                hint: None,
+            });
+            listed += 1;
+        }
+        for name in &data.volumes.excluded {
+            if data.volumes.mounted.iter().any(|m| m == name) {
+                continue;
+            }
+            rows.push(GroupRow {
+                kind: RowKind::Volume {
+                    name,
+                    on: false,
+                    mounted: false,
+                },
+                spec: RowSpec::new(EXCLUDE_ROW_H),
+                error: None,
+                note: None,
+                hint: None,
+            });
+            listed += 1;
+        }
+        if listed == 0 {
+            rows.push(GroupRow {
+                kind: RowKind::VolumesEmpty,
+                spec: RowSpec::new(EXCLUDE_ROW_H),
+                error: None,
+                note: None,
+                hint: None,
+            });
+        }
+    }
+    draw_card(
+        ui,
+        full_w,
+        i18n::s().group_volumes,
         &rows,
         data,
         palette,
@@ -741,6 +857,43 @@ fn draw_row_body(
                 actions.push(SettingsAction::SetAutoCheck(!data.check_updates));
             }
         }
+        RowKind::VolumesAuto => {
+            let control = draw_row_label(
+                ui,
+                body,
+                i18n::s().row_volumes_auto,
+                egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1),
+                palette,
+            );
+            if draw_switch(
+                ui,
+                control,
+                data.volumes.auto,
+                "settings-volumes-auto",
+                palette,
+            ) {
+                actions.push(SettingsAction::SetVolumesAuto(!data.volumes.auto));
+            }
+        }
+        RowKind::Volume { name, on, mounted } => {
+            let label = if mounted {
+                name.to_owned()
+            } else {
+                format!("{name}（{}）", i18n::s().volumes_unmounted)
+            };
+            let control = draw_row_label(
+                ui,
+                body,
+                &label,
+                egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1),
+                palette,
+            );
+            let switch_id = ui.scope_id().with("settings-vol").with(name);
+            if draw_switch_with_id(ui, control, on, switch_id, palette) {
+                actions.push(SettingsAction::ToggleVolume((*name).to_owned()));
+            }
+        }
+        RowKind::VolumesEmpty => draw_volumes_empty(ui, body, palette),
     }
 }
 
@@ -904,7 +1057,18 @@ fn draw_switch(
     id: &'static str,
     palette: &SettingsPalette,
 ) -> bool {
-    let response = ui.interact(rect, ui.scope_id().with(id), egui::Sense::click());
+    draw_switch_with_id(ui, rect, on, ui.scope_id().with(id), palette)
+}
+
+/// 同 [`draw_switch`],id 用动态 [`egui::Id`](卷行按卷名生成,非 'static)。
+fn draw_switch_with_id(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    on: bool,
+    id: egui::Id,
+    palette: &SettingsPalette,
+) -> bool {
+    let response = ui.interact(rect, id, egui::Sense::click());
     let base = if on {
         palette.switch_on
     } else {
@@ -1487,6 +1651,18 @@ fn draw_dir_row(
 }
 
 /// 排除目录空态（真实列表为空时显示；加载/错误提示可与之并存）。
+/// 卷空态行(文案与排除目录空态不同:挂载语义)。
+fn draw_volumes_empty(ui: &egui::Ui, row: egui::Rect, palette: &SettingsPalette) {
+    draw_text(
+        ui,
+        row.shrink2(egui::vec2(ROW_PAD_X, 0.0)),
+        i18n::s().volumes_none,
+        LABEL_FONT,
+        palette.text_secondary,
+        egui::Align2::CENTER_CENTER,
+    );
+}
+
 fn draw_excluded_empty(ui: &egui::Ui, row: egui::Rect, palette: &SettingsPalette) {
     draw_text(
         ui,
@@ -1639,6 +1815,7 @@ mod tests {
             check_updates: true,
             update: crate::update::UpdatePhase::Idle,
             update_error: None,
+            volumes: VolumesData::default(),
         }
     }
 

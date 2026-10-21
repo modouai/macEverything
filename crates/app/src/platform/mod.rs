@@ -338,6 +338,18 @@ pub fn reanchor() {
 /// `top_inset` = 窗口顶部的形象条高;垫窗只覆盖面板,不含形象条(Task 9)。
 /// `visible_panel_h` = 本帧可见面板高(动画期为 `clip_h`):垫窗顶边钉面板顶、
 /// 高度随可见面板走,避免过渡期磨砂带伸出可见面板底。
+/// 当前挂载的本地外接卷名(设置页「外接磁盘」;非 macOS 恒空)。
+pub fn local_volume_names() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::local_volume_names()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 pub fn sync_blur(visible: bool, corner_radius: f64, top_inset: f64, visible_panel_h: f64) {
     #[cfg(target_os = "macos")]
     mac::sync_blur(visible, corner_radius, top_inset, visible_panel_h);

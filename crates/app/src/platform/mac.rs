@@ -62,6 +62,56 @@ use objc2_foundation::{
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+/// 枚举当前挂载的本地外接卷名(设置页「外接磁盘」分组;与 daemon 同判定,
+/// 副本实现——app 不依赖 daemon 内部模块):非 dot 目录 + MNT_LOCAL +
+/// 非 MNT_DONTBROWSE + 自挂载校验(挂载点须为该 /Volumes 路径本身,剔除
+/// Firmlink 数据卷入口与系统卷)+ 非网络文件系统。
+pub fn local_volume_names() -> Vec<String> {
+    const NETWORK_FSTYPES: [&[u8]; 6] = [b"smbfs", b"nfs", b"afp", b"cifs", b"webdav", b"ftp"];
+    let Ok(rd) = std::fs::read_dir("/Volumes") else {
+        return vec![];
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| match p.file_name().and_then(|n| n.to_str()) {
+            Some(n) if n.starts_with('.') => false,
+            Some(_) => true,
+            None => false,
+        })
+        .filter_map(|p| {
+            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+            // SAFETY:statfs 只读路径字符串;输出结构栈上全量初始化。
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+                return None;
+            }
+            let (flags, mnt_len) = (
+                st.f_flags as i32,
+                st.f_mntonname.iter().position(|&x| x == 0)?,
+            );
+            if flags & libc::MNT_LOCAL == 0
+                || flags & libc::MNT_DONTBROWSE != 0
+                || st.f_mntonname[..mnt_len]
+                    .iter()
+                    .map(|&x| x as u8)
+                    .collect::<Vec<u8>>()
+                    != p.as_os_str().as_encoded_bytes()
+            {
+                return None;
+            }
+            let ty_len = st.f_fstypename.iter().position(|&x| x == 0)?;
+            let fstype: Vec<u8> = st.f_fstypename[..ty_len].iter().map(|&x| x as u8).collect();
+            if NETWORK_FSTYPES.contains(&fstype.as_slice()) {
+                return None;
+            }
+            p.file_name()?.to_str().map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
 use super::{
     monotonic_ms, palette_width, settings_window_titles, MenuEntry, SpaceChange, ICON_PX,

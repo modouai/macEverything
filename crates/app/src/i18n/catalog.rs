@@ -43,6 +43,12 @@ catalog! {
     row_palette_hotkey: "唤起快捷键" / "Quick Search Shortcut",
     row_window_hotkey: "完整窗口快捷键" / "Full Window Shortcut",
     row_excluded: "排除目录" / "Excluded Folders",
+    group_volumes: "外接磁盘" / "External Disks",
+    row_volumes_auto: "自动索引外接磁盘" / "Index External Disks Automatically",
+    volumes_none: "未挂载本地外接磁盘" / "No local external disks mounted",
+    volumes_unmounted: "未挂载" / "Not mounted",
+    volumes_loading: "加载中…" / "Loading…",
+    volumes_worker_exited: "卷偏好工作线程异常退出" / "Volume preferences worker exited unexpectedly",
     // 关于 / 更新
     group_about: "关于" / "About",
     row_version: "版本" / "Version",

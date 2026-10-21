@@ -183,6 +183,28 @@ pub(crate) struct ExcludeResult {
     pub(crate) error: Option<ExcludeError>,
 }
 
+/// 卷偏好后台结果(daemon 回显或本地错误;error 存在时旧值保留)。
+pub(crate) struct VolumePrefsResult {
+    pub(crate) auto: bool,
+    pub(crate) excluded: Vec<String>,
+    pub(crate) error: Option<String>,
+}
+
+fn volumes_result(outcome: anyhow::Result<client::VolumePrefsOutcome>) -> VolumePrefsResult {
+    match outcome {
+        Ok(o) => VolumePrefsResult {
+            auto: o.auto,
+            excluded: o.excluded,
+            error: o.message,
+        },
+        Err(e) => VolumePrefsResult {
+            auto: false,
+            excluded: vec![],
+            error: Some(format!("{e:#}")),
+        },
+    }
+}
+
 /// `client::exclude` 结果 → UI 结果：仅 ok=true 覆盖列表；失败/离线保留旧列表。
 fn exclude_result(outcome: anyhow::Result<client::ExcludeOutcome>) -> ExcludeResult {
     match outcome {
@@ -252,6 +274,12 @@ pub struct SettingsState {
     pub(crate) exclude_refresh_pending: bool,
     /// 在途操作的唯一回投通道（one-op；不跨操作复用）。
     pub(crate) exclude_rx: Option<Receiver<ExcludeResult>>,
+    /// 外接磁盘卷偏好(external-volumes;daemon 回显 + App 侧挂载枚举)。
+    pub(crate) volumes: settings_view::VolumesData,
+    /// 卷偏好后台结果通道(读/写共用,同一时刻至多一个在途)。
+    pub(crate) volumes_rx: Option<Receiver<VolumePrefsResult>>,
+    /// 打开设置时挂起的卷偏好刷新(隐藏期可能被 CLI/其他实例改动)。
+    pub(crate) volumes_refresh_pending: bool,
     /// 全局热键运行时快照（H2 启动种子；键帽展示/查重的唯一真源）。
     pub(crate) hotkey_snapshot: HotkeySnapshot,
     /// 当前录制槽（None = 未录制）；录制期全局热键已挂起。
@@ -296,6 +324,9 @@ impl SettingsState {
             exclude_loaded: false,
             exclude_refresh_pending: false,
             exclude_rx: None,
+            volumes: settings_view::VolumesData::default(),
+            volumes_rx: None,
+            volumes_refresh_pending: false,
             hotkey_snapshot,
             recording: None,
             viewport_focused: None,
@@ -321,6 +352,7 @@ impl SettingsState {
         if !was_open {
             // 每次真正打开都重取 daemon 列表（隐藏期可能被 CLI 改动）。
             self.exclude_refresh_pending = true;
+            self.volumes_refresh_pending = true;
         }
         first_open
     }
@@ -410,6 +442,58 @@ impl SettingsState {
                 self.exclude_loaded = false;
             }
         }
+    }
+
+    /// 设置 pass 的卷偏好推进：非阻塞收结果，返回 true = 锁外应启动一次读。
+    /// 挂起位语义与 exclude 相同（spawn 成功才清，被拒保留待下次推进）。
+    pub(crate) fn advance_volumes(&mut self, open: bool) -> bool {
+        self.tick_volumes();
+        open && self.volumes_refresh_pending && !self.volumes.busy
+    }
+
+    /// 工作线程无法启动：清 busy/通道并落内联错误。
+    pub(crate) fn volumes_spawn_failed(&mut self, detail: String) {
+        log::warn!("卷偏好工作线程启动失败:{detail}");
+        self.volumes.busy = false;
+        self.volumes_rx = None;
+        self.volumes.error = Some(i18n::s().volumes_worker_exited.to_owned());
+    }
+
+    /// 非阻塞收取卷偏好后台结果（设置 pass 锁内调用）。
+    /// 成功覆盖 auto/excluded 并清错误；失败(message/离线)保留旧值 + 内联错误。
+    pub(crate) fn tick_volumes(&mut self) {
+        let Some(rx) = self.volumes_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.volumes.busy = false;
+                if let Some(error) = result.error {
+                    self.volumes.error = Some(error);
+                } else {
+                    self.volumes.auto = result.auto;
+                    self.volumes.excluded = result.excluded;
+                    self.volumes.error = None;
+                    self.volumes.loaded = true;
+                }
+            }
+            Err(TryRecvError::Empty) => self.volumes_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {
+                log::warn!("卷偏好工作线程异常退出(无结果)");
+                self.volumes.busy = false;
+                self.volumes.error = Some(i18n::s().volumes_worker_exited.to_owned());
+            }
+        }
+    }
+
+    /// 卷偏好后台操作开始(锁内):busy 防重入;返回 false = 已有操作在途。
+    pub(crate) fn begin_volumes(&mut self, rx: Receiver<VolumePrefsResult>) -> bool {
+        if self.volumes.busy {
+            return false;
+        }
+        self.volumes.busy = true;
+        self.volumes_rx = Some(rx);
+        true
     }
 
     /// 入队一条快捷键命令（设置 pass；纯状态，运行时调用仍在 App）。
@@ -711,6 +795,7 @@ impl SettingsData {
             check_updates: state.file.check_updates,
             update: update.phase().clone(),
             update_error: state.update_error,
+            volumes: state.volumes.clone(),
         }
     }
 }
@@ -732,15 +817,41 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 与 palette/root 同模式——`maybe_apply` 按 CHECK_INTERVAL 节流探测；
     // 应用后本视口立即重绘，并在本 pass 末尾排下一帧（隐藏后不排，守 L4）。
     let focused = ctx.input(|i| i.viewport().focused);
-    let (open, theme_changed, focus_lost, load_exclude) = {
+    let (open, theme_changed, focus_lost, load_exclude, load_volumes) = {
         let mut s = lock_shared(shared);
         // 排除目录：先收后台结果（非阻塞），再按打开挂起位决定是否补一次 list。
         let open = s.settings.open;
         let load_exclude = s.settings.advance_exclude(open);
+        let load_volumes = s.settings.advance_volumes(open);
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
         let focus_lost = s.settings.observe_focus(focused, open);
-        (open, theme_changed, focus_lost, load_exclude)
+        (open, theme_changed, focus_lost, load_exclude, load_volumes)
     };
+    if load_volumes {
+        // 挂载枚举(App 侧 statfs,快) + 后台读 daemon 偏好;读成功才清挂起位。
+        {
+            let mut s = lock_shared(shared);
+            s.settings.volumes.mounted = platform::local_volume_names();
+        }
+        let (tx, rx) = mpsc::channel::<VolumePrefsResult>();
+        let started = {
+            let mut s = lock_shared(shared);
+            if !s.settings.begin_volumes(rx) {
+                false
+            } else {
+                let data_dir = s.settings.data_dir.clone();
+                drop(s);
+                let result =
+                    volumes_result(client::volumes_prefs(&client::DaemonPaths { data_dir }));
+                let _ = tx.send(result);
+                true
+            }
+        };
+        if started {
+            lock_shared(shared).settings.volumes_refresh_pending = false;
+        }
+        ctx.request_repaint_of(viewport_id());
+    }
     if load_exclude {
         // 工作线程执行阻塞的 client 调用；锁内只落 busy/通道，spawn 在锁外。
         // 只有 begin/spawn 真正成功才清挂起位；被拒时保留，下一 pass 重试。
@@ -870,6 +981,14 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             ctx.request_repaint_of(viewport_id());
         }
         SettingsAction::SetAutoCheck(enabled) => apply_auto_check(shared, ctx, enabled),
+        SettingsAction::SetVolumesAuto(auto) => {
+            let excluded = {
+                let s = lock_shared(shared);
+                s.settings.volumes.excluded.clone()
+            };
+            apply_volumes_set(shared, ctx, auto, excluded);
+        }
+        SettingsAction::ToggleVolume(name) => apply_volume_toggle(shared, ctx, &name),
         SettingsAction::CheckUpdate => {
             super::spawn_update_check(shared, ctx);
             ctx.request_repaint_of(viewport_id());
@@ -951,6 +1070,83 @@ fn spawn_exclude(
         ctx.request_repaint_of(viewport_id());
     }
     true
+}
+
+/// 启动一次卷偏好后台操作(读/写共用)。
+/// 共享锁只落 busy/通道;client 调用与线程启动都在锁外(同 spawn_exclude 纪律)。
+/// 返回 true = 操作已开始;false = 已有操作在途。
+fn spawn_volumes(
+    ctx: &egui::Context,
+    shared: &Arc<Mutex<Shared>>,
+    auto: bool,
+    excluded: Vec<String>,
+) -> bool {
+    let (tx, rx) = mpsc::channel::<VolumePrefsResult>();
+    let data_dir = {
+        let mut s = lock_shared(shared);
+        if !s.settings.begin_volumes(rx) {
+            log::warn!("卷偏好操作被忽略:已有操作在途");
+            return false;
+        }
+        s.settings.data_dir.clone()
+    };
+    ctx.request_repaint_of(viewport_id());
+    let thread_ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("settings-volumes".to_owned())
+        .spawn(move || {
+            let result = volumes_result(client::set_volume_prefs(
+                &client::DaemonPaths { data_dir },
+                auto,
+                excluded,
+            ));
+            match &result.error {
+                Some(error) => log::warn!("卷偏好写入失败:{error}"),
+                None => log::info!(
+                    "卷偏好写入完成:auto={} excluded={:?}",
+                    result.auto,
+                    result.excluded
+                ),
+            }
+            if let Err(err) = tx.send(result) {
+                log::warn!("卷偏好结果回投失败(设置页可能已退出):{err}");
+            }
+            thread_ctx.request_repaint_of(viewport_id());
+        });
+    if let Err(err) = spawned {
+        lock_shared(shared)
+            .settings
+            .volumes_spawn_failed(err.to_string());
+        return false;
+    }
+    true
+}
+
+/// 主开关切换:保留当前排除集,写 auto。
+fn apply_volumes_set(
+    shared: &Arc<Mutex<Shared>>,
+    ctx: &egui::Context,
+    auto: bool,
+    excluded: Vec<String>,
+) {
+    spawn_volumes(ctx, shared, auto, excluded);
+}
+
+/// 单卷开关:开 = 主开关随之开 + 移出排除集;关 = 加入排除集(主开关不动)。
+fn apply_volume_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, name: &str) {
+    let (auto, excluded) = {
+        let s = lock_shared(shared);
+        (s.settings.volumes.auto, s.settings.volumes.excluded.clone())
+    };
+    let turning_on = !excluded.iter().any(|x| x == name);
+    let mut next_excluded = excluded;
+    if turning_on {
+        next_excluded.retain(|x| x != name);
+        spawn_volumes(ctx, shared, true, next_excluded);
+    } else {
+        next_excluded.push(name.to_owned());
+        spawn_volumes(ctx, shared, auto, next_excluded);
+    }
 }
 
 /// 快捷键命令入队（设置 pass 的唯一动作路径；不调用运行时 manager）。

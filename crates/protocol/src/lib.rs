@@ -52,6 +52,18 @@ pub enum Request {
     ExcludeReset {
         v: u32,
     },
+    /// 外接磁盘卷偏好(external-volumes):主开关 + 不索引卷名列表。
+    /// 卷目录名键控(/Volumes/<名> 的名);写入由 daemon 卷监听 3s 内对账生效。
+    /// 旧 daemon 解码未知变体失败并拒绝请求,设置页按错误展示。
+    VolumesSet {
+        v: u32,
+        auto: bool,
+        excluded: Vec<String>,
+    },
+    /// 读当前卷偏好(设置页回显)。
+    VolumesPrefs {
+        v: u32,
+    },
 }
 
 impl Request {
@@ -63,7 +75,9 @@ impl Request {
             | Request::ExcludeAdd { v, .. }
             | Request::ExcludeRemove { v, .. }
             | Request::ExcludeList { v }
-            | Request::ExcludeReset { v } => *v,
+            | Request::ExcludeReset { v }
+            | Request::VolumesSet { v, .. }
+            | Request::VolumesPrefs { v } => *v,
         }
     }
 }
@@ -101,6 +115,14 @@ pub enum Response {
         ok: bool,
         excluded: Vec<String>,
         /// 失败原因(ok=false 时给出可操作提示);成功时缺省不序列化。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// 卷偏好回显(VolumesSet 的应答与 VolumesPrefs 的读应答共用)。
+    VolumesPrefs {
+        auto: bool,
+        excluded: Vec<String>,
+        /// 失败原因(落盘失败等);成功时缺省不序列化。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -320,6 +342,32 @@ mod tests {
     }
 
     /// E5:恢复默认是纯版本化无参请求;线上 tag 固定为 `exclude_reset`,往返无损。
+    /// 卷偏好消息往返 + 线上 tag 形态(external-volumes)。
+    #[test]
+    fn volumes_prefs_roundtrip_and_version() {
+        let r = Request::VolumesSet {
+            v: PROTOCOL_VERSION,
+            auto: false,
+            excluded: vec!["BackupU".into()],
+        };
+        let bytes = encode(&r).unwrap();
+        assert_eq!(decode_request(&bytes[4..]).unwrap(), r);
+        assert_eq!(r.version(), PROTOCOL_VERSION);
+        let body = serde_json::to_string(&r).unwrap();
+        assert!(
+            body.contains(r#""msg":"volumes_set""#),
+            "线上 tag 应为 volumes_set:{body}"
+        );
+        let q = Request::VolumesPrefs {
+            v: PROTOCOL_VERSION,
+        };
+        let bytes = encode(&q).unwrap();
+        assert_eq!(decode_request(&bytes[4..]).unwrap(), q);
+        assert!(serde_json::to_string(&q)
+            .unwrap()
+            .contains(r#""msg":"volumes_prefs""#));
+    }
+
     /// 旧 daemon 不认识该 tag → 解码失败并拒绝(协议版本号刻意不 bump)。
     #[test]
     fn exclude_reset_roundtrip_and_version() {

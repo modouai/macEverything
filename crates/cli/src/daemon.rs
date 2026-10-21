@@ -998,6 +998,59 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
             exclude_response(state, paths, &path, ExcludeOp::Remove)
         }
         Request::ExcludeReset { .. } => reset_excludes(state, paths),
+        Request::VolumesSet { auto, excluded, .. } => volumes_set(state, paths, auto, excluded),
+        Request::VolumesPrefs { .. } => volumes_prefs_response(state),
+    }
+}
+
+/// 卷偏好写入(external-volumes):卷名清洗(去空白/去空串/排序去重)→
+/// 内存 + 落盘 → VolumeMonitor 下一轮(≤3s)对账生效(关主开关即清除全部卷,
+/// 重开即立即索引挂载中的放行卷)。
+fn volumes_set(
+    state: &Arc<EngineState>,
+    paths: &DaemonPaths,
+    auto: bool,
+    excluded: Vec<String>,
+) -> Response {
+    let mut cleaned: Vec<String> = excluded
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    cleaned.sort();
+    cleaned.dedup();
+    let (auto_now, excluded_now, message) = {
+        let mut c = state.cfg.lock().unwrap();
+        c.auto_index_volumes = auto;
+        c.volumes_excluded = cleaned.clone();
+        match config::save(&c, &paths.config_file()) {
+            Ok(()) => (auto, cleaned, None),
+            Err(e) => {
+                log::error!("卷偏好落盘失败: {e}");
+                // 内存已生效(监听对账用内存态),落盘失败如实告知(重启会丢)
+                (
+                    c.auto_index_volumes,
+                    c.volumes_excluded.clone(),
+                    Some(format!("已临时生效但写入配置失败: {e}")),
+                )
+            }
+        }
+    };
+    log::info!("卷偏好更新:auto={auto_now} excluded={excluded_now:?}");
+    Response::VolumesPrefs {
+        auto: auto_now,
+        excluded: excluded_now,
+        message,
+    }
+}
+
+/// 卷偏好读(设置页回显)。
+fn volumes_prefs_response(state: &Arc<EngineState>) -> Response {
+    let c = state.cfg.lock().unwrap();
+    Response::VolumesPrefs {
+        auto: c.auto_index_volumes,
+        excluded: c.volumes_excluded.clone(),
+        message: None,
     }
 }
 
@@ -1186,6 +1239,53 @@ mod tests {
     use super::*;
 
     /// 构造:空索引 + 一条指向 tempdir 的根目录条目,dir_map 键为 canonical 形态。
+    /// 卷偏好写入:内存态更新 + 配置落盘 + 回显清洗(external-volumes)。
+    #[test]
+    fn volumes_set_persists_and_echoes_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let paths = DaemonPaths {
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let resp = volumes_set(
+            &state,
+            &paths,
+            false,
+            vec![
+                "  BackupU ".into(),
+                String::new(),
+                "BackupU".into(),
+                "OD".into(),
+            ],
+        );
+        let Response::VolumesPrefs { auto, excluded, .. } = resp else {
+            panic!("应答应为 VolumesPrefs");
+        };
+        assert!(!auto, "主开关回显");
+        assert_eq!(
+            excluded,
+            vec!["BackupU", "OD"],
+            "清洗:去空白/去空串/排序去重"
+        );
+        {
+            let c = state.cfg.lock().unwrap();
+            assert!(
+                !c.auto_index_volumes && c.volumes_excluded == excluded,
+                "内存态生效"
+            );
+        }
+        // 落盘可读回(旧文件 serde default 兜底语义同时被覆盖)
+        let reloaded = config::load(&paths.config_file());
+        assert!(!reloaded.auto_index_volumes);
+        assert_eq!(reloaded.volumes_excluded, excluded);
+        // 读应答
+        let Response::VolumesPrefs { auto, excluded, .. } = volumes_prefs_response(&state) else {
+            panic!("读应答应为 VolumesPrefs");
+        };
+        assert!(!auto && excluded == vec!["BackupU", "OD"]);
+    }
+
     fn mounted_state(dir: &Path) -> Arc<EngineState> {
         let state = Arc::new(EngineState::new());
         let mut idx = Index::new();
