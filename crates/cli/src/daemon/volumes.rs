@@ -201,6 +201,9 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
 /// **前缀清除前置**:上次会话/上次挂载可能残留该卷条目,直接 seed+apply 会与
 /// 残留重复(每文件双条目);先清后扫,确定性收敛。运行期挂载与启动补扫共用。
 pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
+    // 本轮扫描的世代快照:任一卸载(含本轮自己的中止路径)推进世代即失效,
+    // 批间校验不过直接放弃,不与新一轮扫描交错应用。
+    let my_epoch = state.volume_scan_epoch.load(Ordering::Relaxed);
     {
         let mut h = state.holder.write().unwrap();
         let IndexHolder::Mutable(idx) = &mut *h else {
@@ -219,10 +222,15 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     let (recs, gaps) = engine::scanner::collect_records(&[vol.to_path_buf()], &excludes, threads);
     let mut applied = 0usize;
     for chunk in recs.chunks(SCAN_CHUNK) {
-        // 批间检查:扫描中途拔盘 → 中止,清除由下一轮对账兜底
+        // 批间检查:扫描中途拔盘 → 中止,清除由下一轮对账兜底;
+        // 世代漂移(拔出又重插,新一轮扫描已接管)同样放弃本轮残余批次。
         if !vol.exists() {
             log::warn!("卷扫描中消失,中止: {}", vol.display());
             unmount_volume(state, paths, vol);
+            return;
+        }
+        if state.volume_scan_epoch.load(Ordering::Relaxed) != my_epoch {
+            log::info!("卷扫描世代漂移,放弃本轮残余批次: {}", vol.display());
             return;
         }
         let mut h = state.holder.write().unwrap();
@@ -245,6 +253,10 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
 /// 卸载/停用:停卷流 → 前缀清除 → roots 移除 → flush。幂等。
 fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     log::info!("卷卸载,清除索引: {}", vol.display());
+    // 世代推进:使该卷任何在途扫描批次失效——「扫盘中拔出又立刻重插」时,
+    // 旧线程的 vol.exists() 检查对重插后的卷恒真,无世代则残余批次会在
+    // 新扫之后继续应用,产生重复/陈旧条目(自审 2026-10-21)。
+    state.volume_scan_epoch.fetch_add(1, Ordering::Relaxed);
     if let Some(mut stream) = state.volume_streams.lock().unwrap().remove(vol) {
         stream.stop(); // Drop 内 stop;卷消费线程因 rx 断开退出,volume_owned 不触发降级
     }

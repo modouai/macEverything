@@ -121,6 +121,9 @@ pub struct EngineState {
     dir_map: Mutex<HashMap<PathBuf, u32>>,
     roots: Mutex<Vec<PathBuf>>,
     cfg: Mutex<config::Config>,
+    /// 卷扫描世代:每次卷卸载推进,使在途扫描批次失效(防「拔出即重插」时
+    /// 旧批次与新扫交错应用产生重复条目,见 volumes.rs scan_volume_into)。
+    volume_scan_epoch: AtomicU64,
     /// 运行期挂载卷的按卷 FSEvents 流(external-volumes):卸载时显式 stop。
     /// 主流(HOME+/Applications)不在此列,由 consume_events 持有至退出。
     volume_streams: Mutex<HashMap<PathBuf, FseStream>>,
@@ -137,6 +140,7 @@ impl EngineState {
             holder: RwLock::new(IndexHolder::Empty),
             state_name: Mutex::new(state::BUILDING),
             volume_streams: Mutex::new(HashMap::new()),
+            volume_scan_epoch: AtomicU64::new(0),
             gaps: Mutex::new(vec![]),
             io_errors: AtomicU32::new(0),
             built_at: AtomicU64::new(0),
