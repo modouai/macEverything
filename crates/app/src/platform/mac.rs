@@ -1067,10 +1067,29 @@ pub fn revert_class() {
         class_name(old)
     );
     PALETTE.with(|cell| cell.borrow_mut().orig_class = None);
-    // 垫窗一并收掉(orderOut + 释放;进程退出前保持桌面干净)
+    // 垫窗一并收掉(orderOut + 还原类 + 释放;进程退出前保持桌面干净)。
+    // 类必须先于释放还原:垫窗在 `create_blur` 里换成了 NSPanel(换类时机实验),
+    // 带 NSPanel 类释放会走 NSPanel 的 teardown 路径,AppKit KVO 记账对不上——
+    // removeObserver `_windowLayerContext` 抛 `NSRangeException`(未注册即移除,
+    // 2026-10-21 实机退出必现)。与面板窗同因(PoC-1b:「改类窗口被 drop → abort,
+    // 还原即干净退出」),同药方。
     let blur = PALETTE.with(|cell| cell.borrow_mut().blur.take());
     if let Some(blur) = blur {
         blur.orderOut(None);
+        let obj: *mut AnyObject = (Retained::as_ptr(&blur) as *const NSWindow)
+            .cast_mut()
+            .cast();
+        let window_cls = NSWindow::class();
+        let before = obj_class(obj);
+        if !std::ptr::eq(before, window_cls) {
+            // SAFETY:垫窗由普通 NSWindow 构造(`create_blur`),换回即逆操作;
+            // NSWindow/NSPanel 实例大小已在换类时断言一致,类对象由运行时持有。
+            unsafe {
+                objc2::ffi::object_setClass(obj, window_cls as *const AnyClass);
+            }
+            log::info!("垫窗窗口类还原:{} → NSWindow(退出前)", class_name(before));
+        }
+        drop(blur); // 类已还原,释放走 NSWindow teardown,不再触发异常
     }
     PALETTE.with(|cell| {
         let mut st = cell.borrow_mut();
