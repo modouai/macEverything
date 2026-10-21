@@ -1195,7 +1195,10 @@ fn create_blur(
     // 材质选型（2026-10-17 实机迭代）：面板底 alpha 到 40% 仍「看不出变化」——
     // 该观感由 material 自身的半透明层主导（Popover 偏亮偏实）。改窗口底色级材质
     // `UnderWindowBackground`（最通透的一档），把「透明感」的杠杆交还材质。
-    vib.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
+    // 材质 = Popover(PoC-7 实机验收材质;2026-10-21 定版——UnderWindowBackground 奶白层
+    // 近乎不透明,叠面板底后「发实无玻璃感」,弃用)。
+    vib.setMaterial(NSVisualEffectMaterial::Popover);
+    // win.setAlphaValue 不用:低于1会锐利漏背景(看到后面的字)
     vib.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     vib.setState(NSVisualEffectState::Active);
     let size = win.frame().size;
@@ -1237,7 +1240,7 @@ fn create_blur(
         st.blur_visible = true;
     });
     log::info!(
-        "毛玻璃垫窗已建（普通 NSWindow/PoC-7 形态；material=UnderWindowBackground，面板之下；panel#{}）",
+        "毛玻璃垫窗已建（普通 NSWindow/PoC-7 形态；material=Popover，面板之下；panel#{}）",
         panel.windowNumber()
     );
 }

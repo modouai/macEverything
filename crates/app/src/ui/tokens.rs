@@ -47,7 +47,7 @@ pub struct Palette {
 
 pub fn dark() -> Palette {
     Palette {
-        panel_fill: c(0x191C2166),
+        panel_fill: c(0x191C2199),
         panel_stroke: c(0xFFFFFF29),
         search_icon: c(0x8B929AFF),
         query_text: c(0xF2F4F7FF),
@@ -75,7 +75,7 @@ pub fn dark() -> Palette {
 
 pub fn light() -> Palette {
     Palette {
-        panel_fill: c(0xFFFFFF66),
+        panel_fill: c(0xFFFFFF99),
         panel_stroke: c(0x0F172A1F),
         search_icon: c(0x6B7280FF),
         query_text: c(0x1A1D22FF),
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn tokens_match_spec_table() {
         let rows: [(egui::Color32, u32, u32, &str); 23] = [
-            (dark().panel_fill, 0x191C2166, 0xFFFFFF66, "面板底"),
+            (dark().panel_fill, 0x191C2199, 0xFFFFFF99, "面板底"),
             (dark().panel_stroke, 0xFFFFFF29, 0x0F172A1F, "面板描边"),
             (dark().search_icon, 0x8B929AFF, 0x6B7280FF, "搜索图标"),
             (dark().query_text, 0xF2F4F7FF, 0x1A1D22FF, "查询文本"),

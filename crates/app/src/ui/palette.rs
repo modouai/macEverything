@@ -789,7 +789,7 @@ impl PaletteState {
         let bg_idx = ui.painter().add(egui::Shape::Noop);
         // 设计 token（visual.md §四；本文件禁散落色值/字号）
         let t = tk::palette(ui.visuals().dark_mode);
-        // 面板底 = 设计 token 的 alpha（深 `#191C21CC` / 浅 `#FFFFFFD6`），叠在垫窗
+        // 面板底 = 设计 token 的 alpha（深 `#191C2199` / 浅 `#FFFFFF99`），叠在垫窗
         // （平台层 NSVisualEffectView，PoC-7 定案）之上。若毛玻璃不可用（降级路径，
         // 见 visual.md §6.1 路线①），此处改 `t.panel_fill.to_opaque()` 走实底。
         let panel_fill = t.panel_fill;
