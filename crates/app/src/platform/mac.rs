@@ -55,8 +55,8 @@ use objc2_app_kit::{
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSNotification, NSObject, NSPoint,
-    NSRect, NSSize, NSString, NSURLCustomIconKey, NSURLRequest, NSURLRequestCachePolicy,
+    NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest, NSNotification,
+    NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey, NSURLRequestCachePolicy,
     NSURLResponse, NSURLSession, NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
@@ -1738,11 +1738,15 @@ pub fn fetch_url_bytes(url: &str, timeout: Duration, max_bytes: usize) -> Result
     else {
         return Err("URL 缺少主机".to_owned());
     };
-    let request = NSURLRequest::requestWithURL_cachePolicy_timeoutInterval(
+    // 可变请求:附加 UA(macEverything/<版本>)——版本清单端按其聚合计数
+    // 活跃安装分布(仅版本号,无设备标识;见 usage.md 隐私承诺)。
+    let request = NSMutableURLRequest::requestWithURL_cachePolicy_timeoutInterval(
         &ns_url,
         NSURLRequestCachePolicy::ReloadIgnoringLocalCacheData,
         timeout.as_secs_f64(),
     );
+    let ua = NSString::from_str(concat!("macEverything/", env!("CARGO_PKG_VERSION")));
+    request.setValue_forHTTPHeaderField(Some(&ua), &NSString::from_str("User-Agent"));
     let session = NSURLSession::sharedSession();
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     let block: RcBlock<dyn Fn(*mut NSData, *mut NSURLResponse, *mut NSError)> = RcBlock::new(
