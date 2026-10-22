@@ -345,6 +345,9 @@ impl SettingsState {
     pub(crate) fn request_open(&mut self) -> bool {
         let was_open = self.open;
         self.open = true;
+        // Dock 图标跟随「任一主窗口可见」:设置窗打开即显示(调用点均在主线程;
+        // AppKit 调用打破本函数此前的纯状态语义,有意为之)。
+        crate::platform::set_dock_icon(true);
         let first_open = !was_open && !self.positioned_once;
         if first_open {
             self.positioned_once = true;
@@ -1333,6 +1336,11 @@ fn apply_autostart(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bo
 /// 录制取消挂起由 `App::logic` 消费：录制中恢复旧热键，未录制则无操作。
 fn hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
     hide_with_command(&mut lock_shared(shared).settings, ctx);
+    // Dock 图标互查:根窗(完整窗口)仍可见则保留图标,否则收回
+    // (图标跟随「任一主窗口可见」,与完整窗口的显示/隐藏点共用语义)。
+    if crate::platform::root_visible() != Some(true) {
+        crate::platform::set_dock_icon(false);
+    }
     log::info!("设置窗口隐藏(open=false;录制取消挂起)");
 }
 

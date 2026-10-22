@@ -305,7 +305,10 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
         crate::platform::quick_look_dismiss();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        platform::set_dock_icon(false);
+        // 图标互查:设置窗口仍可见则保留(图标跟随「任一主窗口可见」)
+        if platform::settings_visible() != Some(true) {
+            platform::set_dock_icon(false);
+        }
         true
     } else {
         false
@@ -1254,7 +1257,10 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 platform::quick_look_dismiss();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                platform::set_dock_icon(false);
+                // 图标互查:设置窗口仍可见则保留
+                if platform::settings_visible() != Some(true) {
+                    platform::set_dock_icon(false);
+                }
             }
         }
 
