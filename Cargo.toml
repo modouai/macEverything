@@ -6,6 +6,7 @@ exclude = ["scripts/spike-readdir", "scripts/poc/poc1_window", "scripts/poc/poc1
 [workspace.package]
 version = "2.4.3"
 edition = "2021"
+license = "MIT"
 
 [workspace.dependencies]
 memchr = "2"
