@@ -5,7 +5,7 @@
 > **规格依据:** `docs/specs/floatbar-visual/visual.md` §三 / §4.2 / §4.3 / §6.2 / §八；设置齿轮见 `settings-visual.md` §3.1（设置窗口本身属 v2.1，本批不实现）。
 > **技术依据:** `v2-ui/tech.md`、eframe/egui 0.37（`fullsize_content_view` + `titlebar_shown(false)` + `title_shown(false)`）。
 
-## 已定决策（2026-10-17，辉哥）
+## 已定决策（2026-10-17）
 
 - **标题栏**：保留**原生交通灯**（系统行为：拖拽/关闭/最小化/缩放/阴影/双击 zoom）；`with_titlebar_shown(false)` 透明标题栏 + `with_fullsize_content_view(true)` + `with_title_shown(false)`，内容绘制到标题栏下方；视觉与原型一致（只有三个圆点 + 右侧齿轮）。双击与绿灯缩放均归原生（Task 1 实测第二次 release 不进 egui）。
 - **图标列**：本次进入——名称列 16×16 系统图标（复用悬浮条图标 worker 的 UTI 缓存）。
@@ -78,8 +78,8 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 
 - [x] **Step 1:** `visual.md` §八「结构 · 完整结果窗口」逐条核对（1080×627、标题栏/搜索行/表头/行/状态栏高度、列宽、圆角/阴影、图标 16、状态栏 28、缺口徽标）。
   - 2026-10-18 代码核对 + release 实机走查：结构 7 项达标；圆角/阴影按既定方案由系统原生窗口提供（§6.2 / §6.3 已回填）。
-- [ ] **Step 2:** 实机清单（辉哥）：窗口默认尺寸与记忆 / 原生交通灯与齿轮 / 搜索与排序 / 列宽拖拽 / 多选四式 / 双击打开 / 右键菜单 / 缺口徽标与面板 / 深浅色 / 大结果集滚动 / 空态五态。
-  - 2026-10-18 已代跑并留证：默认尺寸与记忆、原生交通灯（关闭=隐藏）与齿轮占位提示、搜索与排序、列宽拖拽、多选（单击/shift 实机；⌘ 点选与 ⌘A 由 `apply_click`/`select_all` 测试覆盖）、右键菜单结构、缺口徽标与面板、大结果集滚动（虚拟化）、Idle/Empty 空态。**待辉哥**：双击打开、右键菜单最终六项动作实点（v2.2/v2.3）、深浅色实时切换、其余空态（EngineStarting / Offline / Warming）。
+- [ ] **Step 2:** 实机清单（维护者）：窗口默认尺寸与记忆 / 原生交通灯与齿轮 / 搜索与排序 / 列宽拖拽 / 多选四式 / 双击打开 / 右键菜单 / 缺口徽标与面板 / 深浅色 / 大结果集滚动 / 空态五态。
+  - 2026-10-18 已代跑并留证：默认尺寸与记忆、原生交通灯（关闭=隐藏）与齿轮占位提示、搜索与排序、列宽拖拽、多选（单击/shift 实机；⌘ 点选与 ⌘A 由 `apply_click`/`select_all` 测试覆盖）、右键菜单结构、缺口徽标与面板、大结果集滚动（虚拟化）、Idle/Empty 空态。**待维护者**：双击打开、右键菜单最终六项动作实点（v2.2/v2.3）、深浅色实时切换、其余空态（EngineStarting / Offline / Warming）。
 - [x] **Step 3:** 验收偏差回填 `visual.md` 与 `settings-visual.md`（齿轮行为）。
 
 **Task 5 实机记录（2026-10-18，release bundle）**

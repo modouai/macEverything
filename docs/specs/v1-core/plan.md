@@ -159,7 +159,7 @@ git add -A && git commit -m "feat: workspace 脚手架(engine+cli 双 crate,ADR-
 - Create: `scripts/spike-readdir/`(`Cargo.toml` 独立小 crate,不进 workspace members)
 - Modify: `docs/specs/v1-core/tech.md`(回填基线数字)
 
-**Why:** tech.md 性能预算表首扫行:基线为工具实测参考值未在本机锁定;预算推导 ≤5s 红线必须以实测收口,推不出则回辉哥重谈目标 1。此 Task 不可跳过。
+**Why:** tech.md 性能预算表首扫行:基线为工具实测参考值未在本机锁定;预算推导 ≤5s 红线必须以实测收口,推不出则回维护者重谈目标 1。此 Task 不可跳过。
 
 - [ ] **Step 1: 写合成树生成 + 吞吐测量程序 `scripts/spike-readdir/src/main.rs`**
 
@@ -215,7 +215,7 @@ cargo run --release -- gen /tmp/mce-bench 1000000
 for i in 1 2 3; do cargo run --release -- scan /tmp/mce-bench; done
 ```
 
-- [ ] **Step 3: 结论回填 tech.md 预算表首扫行(单线程实测吞吐 → 8 线程推导 → ≤5s 是否成立);若推不出红线,停下回辉哥重谈目标 1**
+- [ ] **Step 3: 结论回填 tech.md 预算表首扫行(单线程实测吞吐 → 8 线程推导 → ≤5s 是否成立);若推不出红线,停下回维护者重谈目标 1**
 - [ ] **Step 4: 清理基准树 + 提交**
 
 ```bash
@@ -2409,7 +2409,7 @@ fn parity_zero_diff() { /* 生成 1000 文件树 → scan_roots → 集合比对
 ```
 
 - [ ] **Step 2: `scripts/bench.sh`(合成百万树复用 Task 2 生成器;五项:首扫/查询 P99(100 次取 P99)/增量(新建 100 文件到可查)/落盘耗时/停机重放(stop 前记 last_event_id、改 10000 文件、start 计补齐时长))**
-- [ ] **Step 3: 跑五项基准,数字对照 product.md「目标」;任何红线不达 → 停下分析回辉哥,不带病提交**
+- [ ] **Step 3: 跑五项基准,数字对照 product.md「目标」;任何红线不达 → 停下分析回维护者,不带病提交**
 - [ ] **Step 4: 提交**
 
 ```bash

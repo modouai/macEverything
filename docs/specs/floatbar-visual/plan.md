@@ -7,7 +7,7 @@
 **规格依据:** `docs/specs/floatbar-visual/visual.md` v1.6（§2 悬浮条 / §四 token / §五 图标 / §六 实现注意 / §八 验收清单）+ 五份导出稿（`导出-悬浮条-*.html`，数值真源）。
 **技术依据:** `v2-ui/tech.md`（含 PoC-6 高度行）；毛玻璃为本批新赌注（spec §6.1 标注「未验证」）。
 
-**已定决策（2026-10-17，辉哥拍板）:** 顶边 = 距屏幕可见区顶**固定 110**；面板底 = **② 系统毛玻璃**（vibrancy，须 PoC-7 验证，不过则回落 ① 实底）；**本批只做悬浮条**，完整结果窗口另批。
+**已定决策（2026-10-17，维护者确认）:** 顶边 = 距屏幕可见区顶**固定 110**；面板底 = **② 系统毛玻璃**（vibrancy，须 PoC-7 验证，不过则回落 ① 实底）；**本批只做悬浮条**，完整结果窗口另批。
 
 **Scope 外:** 完整结果窗口全部；键盘导航语义（沿用 product §1，本批不改）；窄屏断点以下的下限 480 之外的新形态。
 
@@ -30,7 +30,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 **Files:**
 - Create: `scripts/poc/poc7_vibrancy/Cargo.toml` + `src/main.rs`（独立 crate；根 Cargo.toml `[workspace] exclude` 追加）
 
-**Why:** ② 系统毛玻璃是辉哥定案；spec 明确「GL 图层与 vibrancy 的叠加未验证，别假设可行」。失败 → 回落 ① 实底（回头拍板）。
+**Why:** ② 系统毛玻璃是维护者定案；spec 明确「GL 图层与 vibrancy 的叠加未验证，别假设可行」。失败 → 回落 ① 实底（回头拍板）。
 
 **验证内容:**
 - 不透明/透明两种 egui 清屏 × NSVisualEffectView（`material` 循环：hudWindow / popover / underWindowBackground）× 面板底三种 alpha（0 / 60% / 80%）；
@@ -38,7 +38,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 - 判定口径：**模糊底透出且面板文字对比度可读** = 通过；GL 面盖死 vibrancy = 不通过。
 
 - [ ] **Step 1:** 写探针（键位：`V` 切 vibrancy 视图，`M` 循环 material，`1/2/3` 面板 alpha，`Q` 退出；stderr 打 contentView/subviews 层级与 material 读回）
-- [ ] **Step 2:** 我启动，辉哥看；结论回填 `v2-ui/poc-results.md`「PoC-7」；不过则回落 ① 并更新本计划与 `visual.md` §6.1。
+- [ ] **Step 2:** 我启动，维护者看；结论回填 `v2-ui/poc-results.md`「PoC-7」；不过则回落 ① 并更新本计划与 `visual.md` §6.1。
 
 ## 阶段 B：悬浮条重绘
 
@@ -118,10 +118,10 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 ### Task 12: 验收（对照导出稿 + 实机）
 
 - [x] **Step 1:** `visual.md` §八「结构 · 悬浮条」逐条核对（含形象 34/60/≥12 三条、空态两屏、页脚四组）。（代码/单测级已核对；视觉实机项见 Step 2）
-- [ ] **Step 2:** 实机清单（辉哥）：唤起位置 110 / 打字与删字（高度链回归）/ 空词与无匹配两屏 / 六态角标（可停引擎看 offline 与未运行）/ 形象四动作 / 深浅色切换 / 窄屏裁减 / 毛玻璃观感。
+- [ ] **Step 2:** 实机清单（维护者）：唤起位置 110 / 打字与删字（高度链回归）/ 空词与无匹配两屏 / 六态角标（可停引擎看 offline 与未运行）/ 形象四动作 / 深浅色切换 / 窄屏裁减 / 毛玻璃观感。
 - [ ] **Step 3:** 验收偏差回填 `visual.md`（如有）。
 
-**已知项（待辉哥验收拍板）：** ① 形象条 700×70 区域属悬浮条窗口，点击不穿透到背后应用；② `.app/.pages/.rtfd` 等包被 `is_dir` 当目录（图标文件夹、提示「进入」，Enter 实为启动/打开）；③ 自定义图标缓存不复查源图标移除/修改；④ 首屏图标 cold load（worker 异步、UI 不阻塞，后续优化）。
+**已知项（待维护者验收拍板）：** ① 形象条 700×70 区域属悬浮条窗口，点击不穿透到背后应用；② `.app/.pages/.rtfd` 等包被 `is_dir` 当目录（图标文件夹、提示「进入」，Enter 实为启动/打开）；③ 自定义图标缓存不复查源图标移除/修改；④ 首屏图标 cold load（worker 异步、UI 不阻塞，后续优化）。
 
 ## 交付顺序与依赖
 

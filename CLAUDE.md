@@ -40,7 +40,7 @@ cargo test -p engine --test fsevents_live -- --ignored    # FSEvents 实机集�
 - `cli` — daemon（冷启动编排/增量循环/落盘锁）+ 五子命令 `start/stop/query/status/exclude`（含离线降级）。
 - `app` — GUI：悬浮条（⌥Space）+ 完整结果窗口（⌥⇧F）双视口、托盘、全局热键、开机自启、引擎拉起（`engine_launcher.rs`）、发现新版本（`update.rs`）、i18n。
 
-核心设计一句话：**事件只当信号，目录 diff 才是真相**——FSEvents 事件只当「门铃」，收到后重读该目录与索引 diff，以磁盘为唯一真相；任何增量改动不得信任 FSEvents 的单事件语义。
+核心设计：FSEvents 事件只是提示，daemon 收到后重读该目录、与索引 diff，始终以磁盘为准；任何增量改动不得信任 FSEvents 的单事件语义。
 
 GUI 平台层（ADR-8，改动前先读 `docs/specs/v2-ui/tech.md`）：悬浮条 = eframe 单栈 + 运行期 `object_setClass` 换成自定义 NSPanel 子类，五要素组合（canBecomeKeyWindow/NonactivatingPanel/Floating/CanJoinAllSpaces/orderFrontRegardless）缺一不可；改类后窗口销毁前必须还原窗口类（否则 winit drop abort）。unsafe 集中在 `crates/app/src/platform/mac.rs` 单模块。
 

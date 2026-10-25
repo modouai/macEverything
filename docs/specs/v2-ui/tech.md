@@ -36,7 +36,7 @@
 - **Context**:悬浮条需要 NSPanel 级行为(跨 Space 可见、浮动级别、失焦隐藏、多屏定位)。egui/eframe 官方覆盖无边框/透明/置顶/失焦事件/窗口定位;跨 Space 与窗口级别 winit 公开 API 不提供(文档查证)。**PoC-1 实测**:普通 NSWindow 即使设 `CanJoinAllSpaces|FullScreenAuxiliary`,`setLevel` 任意档,**进不了他人全屏 Space**(四组合对照 + CoreGraphics 清单取证;外证 tauri#11488)。
 - **Decision**(PoC-1 续 spike 定稿,`scripts/poc/poc1b_nspanel`):eframe 单技术栈 + **运行期 NSPanel 改类**——`object_setClass` 把 winit 窗口换成自定义 NSPanel 子类;生效组合**五要素缺一不可**:①自定义子类覆写 `canBecomeKeyWindow`→true(裸 NSPanel 跨 Space 可但收不到键盘)②`setStyleMask(原 mask | NSWindowStyleMaskNonactivatingPanel)`(跨全屏硬条件)③`setLevel(Floating)` ④`setCollectionBehavior(CanJoinAllSpaces|FullScreenAuxiliary)` ⑤显示走 `orderFrontRegardless`/`makeKeyWindow`(成 key 而不夺前台)。**两必带补丁**:a) 改 styleMask 后补 `makeFirstResponder(contentView)`(否则键盘链路断,winit 源码注释同款修法);b) **关窗前还原窗口类**(否则 `ViewportCommand::Close` → winit Window drop → `panic in a function that cannot unwind` abort;spike 三方对照实证)。unsafe 集中于 `platform/mac.rs` 单模块。
 - **Alternatives Considered**:普通 NSWindow 纯补丁(Rejected:PoC-1 实证不可行);原生 NSPanel 壳(Rejected:集成成本/双栈维护);SwiftUI 壳 + socket(Rejected:第二语言;v1 阶段已评过同类)。
-- **Consequences**:跨全屏 Space 通过(双取证);**KVO 副作用**:winit 的主题监听(NSKVONotifying_WinitWindow)随换类失效——深浅色跟随**自建探测**(渲染帧查询系统外观),Task 13 按此实现;真键盘 HID 路径与 Chrome 全屏复核留人工验证(辉哥执行,poc-results 有步骤)。
+- **Consequences**:跨全屏 Space 通过(双取证);**KVO 副作用**:winit 的主题监听(NSKVONotifying_WinitWindow)随换类失效——深浅色跟随**自建探测**(渲染帧查询系统外观),Task 13 按此实现;真键盘 HID 路径与 Chrome 全屏复核留人工验证(人工执行,poc-results 有步骤)。
 
 ## 变更方案
 
@@ -123,7 +123,7 @@ pub fn execute_sorted(
 | 多屏定位 | 唤起时取鼠标所在屏(`NSEvent.mouseLocation` + `NSScreen.visibleFrame`)→ 宽度 `min(700, 可见宽−48)`、下限 480;可见区水平居中、**面板**顶边距可见区顶**固定 110**(2026-10-17 定案,替代上 1/4);形象条 70(Task 9,`show_palette(top_inset)`):屏幕坐标 y 向下时窗口顶 = 面板顶 − 70,AppKit y 向上时窗口顶 y = 面板顶 y + 70;平台层原生 `setContentSize` + `setFrameOrigin`(不经 winit `set_outer_position`);高度随内容变化时「顶边钉住」重锚 |
 | 高度变化呈现(**PoC-6 定案 2026-10-17**) | **窗内平滑**:窗口先在目标高一侧就位(增长先撑到目标、收缩等动画完成再收),面板高动画(120ms)全在 egui 窗内绘制;**静止时窗口 = 面板 + 形象条 70(Task 9;垫窗只覆盖面板,不含形象条)**,过渡期瞬时透明区约 0.12–0.2s;每次变化**只发 1 次原生 resize**(对照实测:逐帧驱动窗口高=134–175 次/变化,即抖动来源);配套 **`NSView.layerContentsPlacement=TopLeft`**(旧帧钉左上、裁切而非拉伸)。取证与判读见 poc-results.md「PoC-6」 |
 | 形象条点击(**已知限制**,Task 9) | 形象条区域(窗口顶部 70px)属悬浮条窗口,点击落到窗口而非背后应用;ghost/失焦判定按整窗 frame,暂不区分条带。改为独立穿透窗口的架构代价大,不由本任务承担;待实机验收拍板(验收清单一节已列「实机确认是否接受」) |
-| 包(package)语义(**已知项**,Task 9) | `.app/.pages/.rtfd` 等包被协议 `is_dir` 当目录:图标走文件夹、提示「进入」,但 `open` 实为启动/打开。待辉哥验收拍板;可选修法:按扩展名或 `NSWorkspace.isFilePackageAtPath` 走文件语义 |
+| 包(package)语义(**已知项**,Task 9) | `.app/.pages/.rtfd` 等包被协议 `is_dir` 当目录:图标走文件夹、提示「进入」,但 `open` 实为启动/打开。待维护者验收拍板;可选修法:按扩展名或 `NSWorkspace.isFilePackageAtPath` 走文件语义 |
 | 排帧纪律(L4) | 只在悬浮条可见期排帧(悬浮条 pass 自排 `CHECK_INTERVAL` 上限,含主题跟随检查);全隐藏期不排帧 → 事件循环回 Wait(隐藏态 CPU 0% 红线;Task 14 实测 60s 累计 CPU 零增量);唤起时 `ThemeFollow::check_now` 立即补查外观 |
 | 根窗(完整窗口)唤起 | `NSApp.activate()` + `orderFrontRegardless` + `makeKeyAndOrderFront`;根窗 `collectionBehavior` 增加 `MoveToActiveSpace`,从悬浮条 ⌥↵ 进入时跟随当前 Space(2026-10-19 实机);`orderFrontRegardless` 保留「激活未完成也置顶」的历史保证 |
 | 根窗关闭 | 取消关闭(`CancelClose`)+ 隐藏窗口(关闭窗口不退出 App,product §2);真退出走托盘「退出」(Task 16) |

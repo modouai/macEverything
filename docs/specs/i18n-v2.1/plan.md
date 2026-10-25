@@ -2042,7 +2042,7 @@ cargo test --workspace
 
 Expected: 全绿。
 
-- [ ] **Step 3: 实机验收（辉哥）**
+- [ ] **Step 3: 实机验收（维护者）**
 
 ```bash
 bash scripts/bundle.sh
@@ -2103,7 +2103,7 @@ git commit -m "docs(i18n): 验收记录与文档回填"
 - `cargo test --workspace`：全绿；app 测试 **357 passed / 0 failed / 3 ignored**（含 Task 7 新增 `english_rows_fit_fixed_controls`）。
 - Task 7 Step 1 的英文行宽断言按实际标签列取 **372px**（620 窗宽 − 2×24 内容内边距 − 2×16 行内边距 − 152 控件宽 − 16 标签/控件间距），并同时断言 `Galley::elided == false`，避免截断让宽度断言失去意义。
 
-实机验收：**待辉哥**（Task 7 Step 3 清单；所有实机项均未勾选，不以 headless 结果代替实机）。
+实机验收：**待维护者**（Task 7 Step 3 清单；所有实机项均未勾选，不以 headless 结果代替实机）。
 
 已知非阻塞项（来自审查）：
 

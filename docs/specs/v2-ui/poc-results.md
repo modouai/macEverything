@@ -20,10 +20,10 @@
 | --- | --- | --- | --- |
 | 0 | eframe 取 NSWindow + objc2 补丁施加 | ✅ 通过 | 主路径 `cc.window_handle() → NSView::window()` 取窗成功（回退路径已实现但未触发）；补丁后回读 `level=3`、`CanJoinAllSpaces=true`、`FullScreenAuxiliary=true`；每 500ms 核对漂移，长时运行漂移计数 0 |
 | 1 | 跨 Space 可见（他人全屏应用新建的 Space） | ❌ 失败 | 全屏 Space 激活期间本窗不在屏（`CGWindowList` 无本窗条目、截图无本窗）；退出全屏后立即回屏。四种组合（Floating / Floating+Accessory / Status(25) / 无补丁对照组）全为「不在屏」 |
-| 1b | 跨 Space 可见（多桌面 Space 间切换） | ⚠️ 未验证 | 本机每屏仅 1 个桌面 Space + 若干全屏 Space；三指滑动/快捷键注入无权限（System Events 未授权），需辉哥手动一测 |
+| 1b | 跨 Space 可见（多桌面 Space 间切换） | ⚠️ 未验证 | 本机每屏仅 1 个桌面 Space + 若干全屏 Space；三指滑动/快捷键注入无权限（System Events 未授权），需维护者手动一测 |
 | 2 | 浮动级别（浮在普通窗口 / 铺满屏幕窗口之上） | ✅ 通过 | 截图本窗压在所有普通窗口最前（其他应用主窗、Chrome、Edge、Finder 均被压住）；清单佐证本窗 `layer=3`，与铺满主屏的 `layer=0` 窗口同时 onscreen（层级更低故在其上）。对「他人全屏 Space」不成立（见 #1，同一根因） |
 | 3 | 无标题栏 + 黑底半透明 | ✅ 通过 | 截图无标题栏/圆角装饰；像素取证：窗内 (30,32,35) 对窗下浅色内容、窗内 (35,33,32) 对窗下暖色横幅——回算 ≈0.137×底层色，即 alpha 220/255 的真半透明合成，非不透明黑 |
-| 4 | 基本键盘焦点 | ✅ 通过（人工） | 辉哥实机按 F1/F2/L/ESC 均被本窗接收并生效（见日志） |
+| 4 | 基本键盘焦点 | ✅ 通过（人工） | 实机按 F1/F2/L/ESC 均被本窗接收并生效（见日志） |
 | 5 | 隐藏 / 自动再显示（`ViewportCommand::Visible` 双向） | ✅ 通过 | F1 隐藏后 3 秒自动 `Visible(true)` 回屏（后台线程定时；与产品里全局热键唤醒同构）；隐藏期 eframe 不跑 `ui`，逻辑走 `logic` 补跑 |
 
 ### 现象细节
@@ -52,7 +52,7 @@
 - **机制推断**：macOS 的全屏 Space 只允许 NSPanel 类窗口加入；普通 NSWindow 即使带 `CanJoinAllSpaces | FullScreenAuxiliary` 也被排除（本机实测与外部证据一致）。
 - **winit 已自带 Floating 档**：winit 0.30.13 `always_on_top` 走 `set_window_level(kCGFloatingWindowLevel=3)`（源码 `platform_impl/macos/window_delegate.rs:1533`）。即「浮动级别」的 Floating 档由 eframe 官方 API 即可覆盖，objc2 补丁在级别维度只在 Status 档有增量；补丁的真正增量是 collectionBehavior。
 
-### 降级决策（待辉哥拍板，未擅自改 spec）
+### 降级决策（待维护者确认，未擅自改 spec）
 
 触发 tech 风险表预置的降级路径「当前 Space 可见，产品文档标注」。但本机实测显示该降级会削弱产品目标 7 的部分场景（用户切到任意全屏应用的 Space 时悬浮条不可见）。可选后续路线：
 
@@ -60,7 +60,7 @@
 2. 原生 NSPanel 壳 + egui 渲染（ADR-8 已 Rejected：集成成本高）；
 3. 接受降级「当前 Space 可见」。
 
-补充：桌面多 Space 场景（1b）尚未定论，建议辉哥做一次 10 秒人工验证：`POC1_POS=200,200 ./target/debug/poc1-window` 启动后三指左右滑动切桌面 Space，观察窗口是否跟随（这是「跨 Space」最日常的用法；若该场景通过，产品可用性显著好于 #1 的结论）。
+补充：桌面多 Space 场景（1b）尚未定论，建议维护者做一次 10 秒人工验证：`POC1_POS=200,200 ./target/debug/poc1-window` 启动后三指左右滑动切桌面 Space，观察窗口是否跟随（这是「跨 Space」最日常的用法；若该场景通过，产品可用性显著好于 #1 的结论）。
 
 ### 复现步骤
 
@@ -170,13 +170,13 @@ bash verify.sh follow                       # 面板先可见 → 他人全屏�
 ```
 
 - 取证口径：`screencapture -x -D 1 /tmp/poc1b-*.png` 截图 + `/tmp/winlist.swift onscreen|all`（CGWindowList，`verify.sh` 缺脚本时自动重建）；前台应用用 `lsappinfo front`。
-- 手动项（留给辉哥）：① 真键盘打字（本 spike 的输入验证走进程内合成事件，未覆盖 HID 路径）；② 系统深/浅色切换下主题跟随（见「已知副作用」）。
+- 手动项（留给维护者）：① 真键盘打字（本 spike 的输入验证走进程内合成事件，未覆盖 HID 路径）；② 系统深/浅色切换下主题跟随（见「已知副作用」）。
 
 ---
 
 ## Task 2：PoC-2 — ⌥Space 族全局热键注册（中文输入法环境）
 
-**状态：自动化部分完成（三候选注册 3/3 成功 + 事件投递链经合成按键验证通过）；中文/英文输入法态下的真键盘按键实效「人工验证待辉哥执行」（步骤见本节文末，结论表 #4/#5 待回填）。**
+**状态：自动化部分完成（三候选注册 3/3 成功 + 事件投递链经合成按键验证通过）；中文/英文输入法态下的真键盘按键实效「人工验证待人工执行」（步骤见本节文末，结论表 #4/#5 待回填）。**
 
 - **日期**：2026-10-16
 - **实锁版本**：global-hotkey 0.6.4（plan 示意 0.6 系，crates.io 当前最新为 0.8.0，本次锁 0.6.4）、objc2 0.6.5、objc2-app-kit 0.3.2、objc2-foundation 0.3.2；传递依赖 keyboard-types 0.7.0、crossbeam-channel 0.5.17
@@ -189,8 +189,8 @@ bash verify.sh follow                       # 面板先可见 → 他人全屏�
 | 1 | 三候选注册（自动化） | ✅ 3/3 成功 | 原始输出见「现象细节」#1；组合↔id：⌥Space=65598、⌥⇧Space=33620030、⌃⌥⇧Space=34144318 |
 | 2 | 系统符号热键占用盘点（原始数据） | ⌃Space / ⌃⌥Space / ⌘Space / ⌘⌥Space 占用；三候选空闲 | `defaults read com.apple.symbolichotkeys AppleSymbolicHotKeys`（53 条中涉 Space 的仅四条，均 enabled=1）：#60 输入法上一源=⌃Space、#61 下一源=⌃⌥Space、#64 Spotlight=⌘Space、#65 Spotlight 窗口=⌘⌥Space；三个候选无对应条目 |
 | 3 | 事件投递链（自动化；合成按键注入） | ✅ 三候选均送达 | 隔离实验三例见「现象细节」#2；注入轮 ⌥⇧Space + ⌥Space×2 全数到达终端（3/3 打印 pressed） |
-| 4 | 中文（拼音）输入法态下真键盘按键 | ⏳ 人工验证待辉哥执行 | 见文末「人工验证步骤」 |
-| 5 | 英文输入法态下真键盘按键 | ⏳ 人工验证待辉哥执行 | 同上 |
+| 4 | 中文（拼音）输入法态下真键盘按键 | ⏳ 人工验证待人工执行 | 见文末「人工验证步骤」 |
+| 5 | 英文输入法态下真键盘按键 | ⏳ 人工验证待人工执行 | 同上 |
 | 6 | 前台应用/输入法吞键（旁证，未定性） | ⚠️ 观察到 1 例未送达 | 注入轮 A：⌥Space 首发送达失败（当时前台 = WPS Office，活动输入源 = 微信输入法拼音）；注入轮 B 同机同法对照 ⌥Space 2/2 送达。原因待 #4/#5 定性 |
 
 ### 现象细节
@@ -233,7 +233,7 @@ cargo run --release --config 'source.crates-io.replace-with="rsproxy"' \
 ./target/release/poc2-hotkey
 ```
 
-### 人工验证步骤（辉哥执行；中文/英文两态 × 三候选）
+### 人工验证步骤（人工执行；中文/英文两态 × 三候选）
 
 > 自动化部分无法替真人切输入法与按真键盘；以下步骤执行后把结果回填结论表 #4/#5。
 
@@ -249,7 +249,7 @@ cargo run --release --config 'source.crates-io.replace-with="rsproxy"' \
 
 - **⌥Space 两态均有效** → 按 product §1 用 ⌥Space，保留降级链（⌥⇧Space → ⌃⌥⇧Space）。
 - **⌥Space 仅中文态失效** → 默认改 **⌥⇧Space**（本机实测注册与投递均通、无系统符号热键占用；与输入法自带快捷键的撞车面留待 Task 15 实机回归观察），⌃⌥⇧Space 作兜底。降级触发方式建议：注册成功但观察到「输入法态下按了没反应」时，Task 15 加一次可见提示并允许切备选。
-- **三候选全部注册失败** → 回报辉哥扩池。本机实测三候选注册全 OK，该分支未触发。
+- **三候选全部注册失败** → 上报维护者扩池。本机实测三候选注册全 OK，该分支未触发。
 - 旁证 #6（前台应用/输入法偶发吞键）提示：即使注册成功，唤起居也可能偶发无响应；Task 15 建议保留托盘唤起兜底，并在无响应场景给一次可见提示（v2.0 无设置页，提示即可）。
 
 ---
@@ -451,7 +451,7 @@ bash measure.sh visible native
 
 ## Task 5：PoC-5 — SMAppService 自启（ad-hoc 签名）
 
-**状态：✅ 通过——ad-hoc 签名的 .app 可成功 register，status 转 enabled(1)；open 与直接执行两种启动方式均有效；无需 sudo。SMAppService 可用，无需启用 LaunchAgent 兜底。重启实测留辉哥（终态已注册，见文末人工步骤）。**
+**状态：✅ 通过——ad-hoc 签名的 .app 可成功 register，status 转 enabled(1)；open 与直接执行两种启动方式均有效；无需 sudo。SMAppService 可用，无需启用 LaunchAgent 兜底。重启实测留维护者（终态已注册，见文末人工步骤）。**
 
 - **日期**：2026-10-16
 - **环境**：macOS 27.0（26A428）、Apple Silicon（arm64）、Swift 6.4（swiftc 1.168.6）
@@ -546,11 +546,11 @@ Could not find service "application.com.example.maceverything.poc5" in domain fo
 4. **更新后行为**：cdhash 改变不影响已注册条目的 status（#9）；重新打包但代码不变时 cdhash 可复现（同内容同哈希），无需重复注册；稳妥做法仍是 App 启动时 `status == .notRegistered/.notFound` 就补 register（幂等）。
 5. **LaunchAgent 兜底（本次未启用，差异留档）**：plist 兜底不要求签名/bundle，任何二进制可跑；代价是需手写 plist、与 App 更新无联动、开关需自行 bootstrap/bootout。既然 ad-hoc 路线可用，**建议不作为主路径**；仅当重启验证发现 BTM 不拉起时再回退。
 
-### 人工重启验证步骤（辉哥执行；脚本侧已完成到「终态已注册」）
+### 人工重启验证步骤（人工执行；脚本侧已完成到「终态已注册」）
 
 终态：登录项已注册（`enabled(1)`），指向 `~/Applications/poc5.app`（cdhash `fbc77b29…`，与仓库源码一致）；该二进制无参数启动即进 daemon 600 秒，便于观察。
 
-1. 重启 Mac，用辉哥账号登录。
+1. 重启 Mac，用维护者账号登录。
 2. 登录后 1 分钟内执行：`ps aux | grep poc5-binary` —— 预期出现 `~/Applications/poc5.app/Contents/MacOS/poc5-binary`（无参数）进程。
 3. 双证据：`tail -5 /tmp/poc5.log` —— 预期新增一行 `cmd=<none>` 且 `ppid=1`（由 launchd 拉起）的启动记录。
 4. 旁证：`launchctl list | grep -i poc5`（进程存活期间可见 `application.com.example.maceverything.poc5.<n>`）；「系统设置 → 通用 → 登录项与扩展」中应有 poc5 条目；首次登录若弹「允许在后台」类提示，点允许后重登再看。
@@ -582,7 +582,7 @@ tail -f /tmp/poc5.log                 # 输出日志（open 方式唯一取证�
 
 ### 遗留
 
-1. **注册后的 BTM 原始 dump 未取得**（sfltool 授权门禁）；如需补证，辉哥在终端跑 `sudo sfltool dumpbtm | grep -i poc5`（会要求输入密码）或看「系统设置 → 登录项与扩展」。
+1. **注册后的 BTM 原始 dump 未取得**（sfltool 授权门禁）；如需补证，维护者在终端跑 `sudo sfltool dumpbtm | grep -i poc5`（会要求输入密码）或看「系统设置 → 登录项与扩展」。
 2. **`requiresApproval(2)` 状态未在本机观察到**（首登审批路径）；重启验证时留意是否出现提示。
 3. **DR 不匹配时的登录拉起行为未验证**（改二进制后再重启的场景，即「App 更新后登录项是否仍能拉起」）——本 PoC 终态已用与源码一致的 cdhash 注册，该场景待后续版本实测。
 
@@ -605,7 +605,7 @@ tail -f /tmp/poc5.log                 # 输出日志（open 方式唯一取证�
 | 1 | 逐帧跟随（现状路径）每次高度变化的原生 resize 次数 | ❌ **134–175 次** | 阶段结算（行 0→6：153；6→2：134；顶左变体 144 / 175）；时间戳 `#1@1344ms → #120@1430ms`：119 次落在 86ms 内（≈ **1380 次/秒**） |
 | 2 | 瞬跳（内容与窗口同时到位） | ✅ 1 次/变化 | 4 阶段各 1 次 |
 | 3 | 窗内平滑（增长先撑、收缩后收；动画在窗内绘制） | ✅ 1 次/变化 | 4 阶段各 1 次 |
-| 4 | 实机观感（辉哥判读） | ✅ 「顺」 | 定格 `POC6_MODE=inwindow POC6_G=1 POC6_AUTO=1` 逐次伸缩判「顺」；轮播中逐帧跟随（③）可见抖动 |
+| 4 | 实机观感（维护者判读） | ✅ 「顺」 | 定格 `POC6_MODE=inwindow POC6_G=1 POC6_AUTO=1` 逐次伸缩判「顺」；轮播中逐帧跟随（③）可见抖动 |
 | 5 | 顶左钉住 `NSView.layerContentsPlacement=TopLeft` | ✅ 随 ② 定案启用 | 启动诊断：`wantsLayer=true`、默认 placement=**0**（缩放拉伸）、redrawPolicy=2；设 TopLeft 后读回 **11** |
 | 6 | 渲染循环节拍（附加发现） | ⚠️ 未按 vsync 节流（实测 ≈1250–1400 帧/秒） | resize 间隔 0.6–1.6ms/次；`egui_glow::GlowOptions::default().vsync=true` 下仍如此（机制未深究）。逐帧跟随因此以超过刷新率约 10× 的频率冲击 WindowServer——③ 抖动的机制注脚；实现期应把动画重绘节流到显示节拍 |
 
@@ -652,7 +652,7 @@ POC6_MODE=inwindow POC6_G=1 POC6_AUTO=1 \
 - **日期**：2026-10-17
 - **实锁版本**：eframe / egui 0.37.0、winit 0.30.13、objc2 0.6.5、objc2-app-kit 0.3.2
 - **代码**：`scripts/poc/poc7_vibrancy/`（独立 crate，根 Cargo.toml `[workspace] exclude` 已追加）
-- **起因**：`floatbar-visual` §6.1 —— 面板底走 ② 系统毛玻璃（辉哥定案）；spec 标注「GL 图层与 vibrancy 的叠加未验证，别假设可行」。
+- **起因**：`floatbar-visual` §6.1 —— 面板底走 ② 系统毛玻璃（维护者定案）；spec 标注「GL 图层与 vibrancy 的叠加未验证，别假设可行」。
 
 ### 结论表
 
@@ -660,7 +660,7 @@ POC6_MODE=inwindow POC6_G=1 POC6_AUTO=1 \
 | --- | --- | --- | --- |
 | 1 | **层级约束（关键事实）** | winit 视图就是窗口 contentView，**不可换容器 / 加兄弟层** | 运行时实证 `panel.contentView = "WinitView"`；winit 0.30.13 `window_delegate.rs:656` 直接 `setContentView(WinitView)`，且 `WindowDelegate::view()` 恒把 contentView 按 `WinitView` 解释（含 ivars 读取）——换层级会把 ivars 读成垃圾（UB） |
 | 2 | 可行路线 | **面板窗下挂同级毛玻璃窗**：borderless + `ignoresMouseEvents` + `addChildWindow:ordered:Below`，每帧同步 frame | 实机开关两态对比：未遮挡区（探针右半）桌面**模糊** ✓ |
-| 3 | 面板底 alpha | **80%（设计稿 `#191C21CC`）** | 辉哥实机判读：80% 观感 OK |
+| 3 | 面板底 alpha | **80%（设计稿 `#191C21CC`）** | 实机判读：80% 观感 OK |
 | 4 | material 循环（HUDWindow / Popover / Sidebar / UnderWindowBackground） | 80% 面板底下**肉眼不可辨** | 日志 20 次切换均生效（material 读回随动）——差异过小，非切换失效。落实现按「随系统外观自适应」取 `Popover`（备选 `UnderWindowBackground`），一行可换 |
 | 5 | 附：无边框窗键盘可达 | 需覆写 `canBecomeKeyWindow` / `canBecomeMainWindow → true` | 探针首版点走焦点后键盘失灵（无边框窗默认 false）；补覆写 + `activate` + `makeKeyWindow` 后恢复正常 |
 
@@ -718,7 +718,7 @@ cargo run --release --manifest-path scripts/poc/poc7_vibrancy/Cargo.toml
 | 2 | 多桌面 Space 切换跟随 | ✅ 通过（带焦点条件） | 显示中 ⌃→ 切 Space（窗口清单指纹变化佐证已切换）→ 面板仍在屏同位置；**若目标 Space 的应用接管焦点则按「失焦隐藏」隐藏**（actor 退出触发 Space 回切那轮实测到）——见「与 PoC 结论的出入」#2 |
 | 3 | 失焦隐藏 | ✅ 通过 | 显示中激活他应用（Finder/Chrome）→ 日志「悬浮条隐藏（Esc/打开成功/失焦）」+ 清单转空；多次往返稳定 |
 | 4 | 多屏定位 | ✅ 通过 | 鼠标移至副屏 (2700,500) 触发唤起 → 日志 `origin=(2580, 743)`、清单 `bounds=(2580,294 600x44)`（副屏水平居中、顶边同主屏相对位）；`screencapture -D 2` 截图副屏见面板；鼠标回主屏再唤起 → 回主屏居中 |
-| 5 | 键盘（唤起即打字，不点） | ✅ 通过 | 面板成 key（`isKeyWindow=true`）后，合成 HID 键（CGEvent unicode 注入/键码 Esc/⌥↵）直达面板：键入即出结果、Esc 隐藏、⌥↵ 打开完整窗口；**中文**：辉哥实机用输入法检索并打开文件（应用日志「默认应用打开：/Users/alex/TeamDrive/…pdf」+ 输入法 IMK 与进程交互记录） |
+| 5 | 键盘（唤起即打字，不点） | ✅ 通过 | 面板成 key（`isKeyWindow=true`）后，合成 HID 键（CGEvent unicode 注入/键码 Esc/⌥↵）直达面板：键入即出结果、Esc 隐藏、⌥↵ 打开完整窗口；**中文**：实机用输入法检索并打开文件（应用日志「默认应用打开：（路径省略）」+ 输入法 IMK 与进程交互记录） |
 | 6 | CPU 红线复核（悬浮条隐藏 + 主窗隐藏 60s） | ✅ 通过 | `top -l 2 -s 1 -pid <pid> -stats cpu` 12/12 = 0.0%；`ps -o time=` 累计 CPU 0:01.55 → 0:01.55（60s 零增量） |
 | 7 | L1 复现（主窗被完全遮挡 → 唤起可用） | ✅ 通过 | 主窗被全屏应用 Space 覆盖/不在当前 Space 时触发唤起 → 面板出现并可搜（同 #1 取证，主窗全程不在屏） |
 | 8 | 关窗不崩（往返压测） | ✅ 通过 | 20 轮「唤起 → Esc 隐藏」循环（另加多轮显隐）：进程存活、日志零 `abort/panic`；退出路径日志「悬浮条窗口类还原：MacePalettePanel → NSKVONotifying_WinitWindow」+ 进程干净退出（补丁 b 生效） |
@@ -735,14 +735,14 @@ cargo run --release --manifest-path scripts/poc/poc7_vibrancy/Cargo.toml
 ### 与 PoC 结论的出入
 
 1. **失焦语义（PoC-1b 遗留的实测问题）→ `focused` 仍可靠**。non-activating panel 下 winit `WindowEvent::Focused` 取自 `windowDidBecomeKey/DidResignKey`（winit 0.30.13 `window_delegate.rs:207-227`），面板成 key 即 focused=true、被他窗夺 key 即 false；#3 多次往返稳定，无需改「点击外部检测」。
-2. **「显示中切 Space → 跟随可见」带条件（与 PoC-1b #10 口径的差异）**。PoC-1b #10 的「跟随」只验窗口可见性（其面板无失焦门槛）；本产品有「失焦 → 隐藏」（product §1），而 macOS 切 Space 时目标 Space 的窗口接管 key ⇒ 面板 resignKey ⇒ 按失焦隐藏。实测两种分支都出现过（同一 Space 家族内切换保持可见；目标 Space 他应用接管焦点则隐藏）。**tech.md 平台行为表「失焦隐藏」行已补注此边界**；是否要为「切 Space」开特例（如 Space 切换通知 + 短窗豁免）待辉哥定：当前实现按产品原文「失焦 → 隐藏」，不擅自加特例。
+2. **「显示中切 Space → 跟随可见」带条件（与 PoC-1b #10 口径的差异）**。PoC-1b #10 的「跟随」只验窗口可见性（其面板无失焦门槛）；本产品有「失焦 → 隐藏」（product §1），而 macOS 切 Space 时目标 Space 的窗口接管 key ⇒ 面板 resignKey ⇒ 按失焦隐藏。实测两种分支都出现过（同一 Space 家族内切换保持可见；目标 Space 他应用接管焦点则隐藏）。**tech.md 平台行为表「失焦隐藏」行已补注此边界**；是否要为「切 Space」开特例（如 Space 切换通知 + 短窗豁免）待维护者定：当前实现按产品原文「失焦 → 隐藏」，不擅自加特例。
 3. **根窗 `Visible(true)` 不切 Space（PoC 未覆盖路径）**：非激活 app 下 winit `makeKeyAndOrderFront` 不把窗口带回当前 Space —— 悬浮条 ⌥↵ 打开完整窗口时「命令生效但窗口在别的 Space 不可见」。解法：平台层 `NSApp.activate()` + `orderFrontRegardless` + `makeKeyWindow`（常规 App 窗口语义，与悬浮条「不夺前台」相反）。实测 #8 退出轮次中「完整窗口(根窗)唤起」日志 + 窗口回屏。
 4. **视口常驻对「补丁漂移」的影响**：窗口不再每轮重建，漂移核对只需「可见期每帧」做（隐藏期零开销）；实测全程 0 次漂移（与 spike 同）。
 
 ### 复现步骤
 
 ```bash
-cd /Users/alex/project/macEverything
+cd <仓库根目录>
 cargo build -p macEverything-app && ./target/debug/macEverything-app   # 主窗(dev 入口)启动;悬浮条隐藏
 ./target/debug/macEverything-app                                       # 二次启动 = app.sock 唤起悬浮条
 # 独立「他人全屏应用」:
@@ -753,7 +753,7 @@ touch /tmp/poc1b-actor-quit                                            # 收尾
 - 取证工具(前序会话留下,可复用):`/tmp/winlist.swift onscreen|all`(CGWindowList)、`/tmp/mce12_drive.swift {click x y|key kc [mod]|type 文本|sleep ms}`(CGEvent HID 注入)、`/tmp/front_app.swift`(前台应用)、`/tmp/mce14_move.swift x y`(鼠标移动)、`/tmp/mce14_util.swift`(屏与鼠标)。
 - 截图存本机 `/tmp/mce14-*.png`(重启后可能被系统清理)。
 
-## Task 14b:切 Space 失焦豁免(辉哥定案落地)
+## Task 14b:切 Space 失焦豁免(维护者定案落地)
 
 **结论**:✅ 五验证全过(切 Space 保持可见 ≥8 轮 / 点击他应用当帧隐藏 / 3 轮往返一致 / 主流程回归 / 126 测试全绿)。
 
@@ -776,7 +776,7 @@ touch /tmp/poc1b-actor-quit                                            # 收尾
 **状态**:✅ 自动化可及部分全过——启动形态修复 ✅、⌥⇧F 补实现 ✅、性能 ①✅(中位 95ms,4/5 轮 <100ms)②✅(59~71ms)③❌(136~138M,超 <100MB 预算,栈基线所致)④✅(0.0%);全链路六项 ✅(离线项 UI 层与真键盘/真鼠标项转「终验收人工清单」)。
 
 **环境**:macOS 27.0(Apple Silicon)、真实数据目录(**1,278,754 条目**)、终版 release 构建(`release/macEverything.app`,ad-hoc 签名)。
-**测量时状态注记**:本轮大部分测量在**屏幕锁定**期间完成(会话锁 `CGSSessionScreenIsLocked=1` → 真热键/CGEvent 均不可达);真热键项在辉哥解锁后补测(见①)。锁定期测量用**主队列直调探针**(与热键泵完全同路径,见下)与 app.sock 触发,已如实标注口径。
+**测量时状态注记**:本轮大部分测量在**屏幕锁定**期间完成(会话锁 `CGSSessionScreenIsLocked=1` → 真热键/CGEvent 均不可达);真热键项在维护者解锁后补测(见①)。锁定期测量用**主队列直调探针**(与热键泵完全同路径,见下)与 app.sock 触发,已如实标注口径。
 
 ### 一、启动形态修复(Task 9 遗留:根窗 `with_visible(true)` 打包后登录自启弹窗)
 
@@ -849,7 +849,7 @@ CGWindowList 观测到 onscreen=true      +106.7ms  ← WindowServer 合成 + 1m
 3. **热键投递 ~51ms** 为系统侧(HID→Carbon),真键盘同路径;若未来要求更严,只能换更底层的触发面(超出本任务)。
 4. **屏幕锁定期的测量口径**:真热键/真键盘项部分由进程内直调探针代跑(与热键泵同路径,已标注);解屏后已用真 ⌥Space 复测①、真键盘复测②。
 
-### 终验收人工清单(辉哥执行;每条 = 操作 → 预期)
+### 终验收人工清单(人工执行;每条 = 操作 → 预期)
 
 > 前置:从 `release/macEverything.app` 启动(App 在跑时先托盘退出)。屏锁无法测的真键盘/真鼠标项集中在此。
 

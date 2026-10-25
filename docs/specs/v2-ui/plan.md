@@ -101,7 +101,7 @@ impl eframe::App for PocApp {
 3. 窗口无标题栏圆角黑底 = 透明+无边框 ✓
 4. 点窗口输入框(如加个 TextEdit 测试)→ 能聚焦输入 = LSUIElement 场景键盘焦点路径(完整验证留到 Task 13 打包后;此处确认一般焦点 OK)
 
-**Step 4: 记录结论**——把每个子项的通过/失败/现象写入 `docs/specs/v2-ui/poc-results.md`(新建);失败项写明降级决策。**若跨 Space 失败 → 立即回报辉哥**(产品目标 7 依赖它),不擅自改 spec。
+**Step 4: 记录结论**——把每个子项的通过/失败/现象写入 `docs/specs/v2-ui/poc-results.md`(新建);失败项写明降级决策。**若跨 Space 失败 → 立即上报维护者**(产品目标 7 依赖它),不擅自改 spec。
 
 **Step 5: 提交**
 
@@ -161,7 +161,7 @@ fn main() {
 
 - [ ] **Step 2: 实机验证**:运行后**切到中文输入法(拼音)状态**,依次按三个候选键——观察终端是否打印 `pressed`。同时验证:输入法候选窗弹出时按键是否仍触发(冲突的典型形态)。
 
-- [ ] **Step 3: 记录结论到 `poc-results.md`**:哪个键可用、输入法状态下是否失效;若 ⌥Space 在中文态失效 → 默认键的最终选择写入报告(可能需在 App 里做「输入法态探测提示」——记录实测现象即可,方案 Task 15 定)。**若全候选失败 → 回报辉哥**(需给更多候选取舍)。
+- [ ] **Step 3: 记录结论到 `poc-results.md`**:哪个键可用、输入法状态下是否失效;若 ⌥Space 在中文态失效 → 默认键的最终选择写入报告(可能需在 App 里做「输入法态探测提示」——记录实测现象即可,方案 Task 15 定)。**若全候选失败 → 上报维护者**(需给更多候选取舍)。
 
 - [ ] **Step 4: 提交**
 
@@ -177,7 +177,7 @@ git commit -m "chore(poc): PoC-2 ⌥Space 全局注册与中文输入法冲突�
 **Files:**
 - Create: `scripts/poc/poc3_nsmenu/`
 
-**Why:** 右键菜单用原生 NSMenu(辉哥明确要求);`popUpContextMenu` 是嵌套 run loop(阻塞),与 eframe 主循环的兼容性未验证。失败 → 独立线程弹出或非模态 API(tech 风险表)。
+**Why:** 右键菜单用原生 NSMenu(产品要求);`popUpContextMenu` 是嵌套 run loop(阻塞),与 eframe 主循环的兼容性未验证。失败 → 独立线程弹出或非模态 API(tech 风险表)。
 
 - [ ] **Step 1: 最小验证**
 
@@ -240,7 +240,7 @@ git commit -m "chore(poc): PoC-3 原生 NSMenu 与 egui 主循环兼容性验证
 # b) 观察 30 次自动切换的间隔日志:显示侧延迟须 <100ms
 ```
 
-- [ ] **Step 3: 记录**:隐藏态 CPU 实测值、切换延迟分布(中位/P99);若隐藏态 CPU 非 0 → 排查 repaint 源;若唤起 >100ms → 记录首帧成本,评估「keep-warm 预渲染」折中(隐藏但保留最小 repaint 的取舍要回报辉哥)。
+- [ ] **Step 3: 记录**:隐藏态 CPU 实测值、切换延迟分布(中位/P99);若隐藏态 CPU 非 0 → 排查 repaint 源;若唤起 >100ms → 记录首帧成本,评估「keep-warm 预渲染」折中(隐藏但保留最小 repaint 的取舍要上报维护者)。
 
 - [ ] **Step 4: 提交**
 
@@ -1077,7 +1077,7 @@ git commit -m "feat(app): 完整结果窗口——表格虚拟化/列排序/多�
 - Create: `crates/app/src/ui/menu_actions.rs`(行→动作执行:打开/访达/拷贝)
 - Modify: `crates/app/src/ui/results.rs`(右键触发)
 
-**Why:** product §2 菜单四语义(按选中类型收敛)+ 辉哥明确要求原生菜单;PoC-3 已验证弹窗可行,本任务产品化。
+**Why:** product §2 菜单四语义(按选中类型收敛)+ 产品要求原生菜单;PoC-3 已验证弹窗可行,本任务产品化。
 
 - [ ] **Step 1: 菜单构建(按选中类型收敛,规格直抄 product 表)**
 
