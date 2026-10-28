@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 注入的 `stat` 错误码(`None` = 不注入)。用原始 errno 而非 `ErrorKind`
-/// 构造,保证 `kind()` 走系统错误映射(如 ELOOP → FilesystemLoop)。
+/// 注入的 `stat` 错误码。用原始 errno 而非 `ErrorKind` 构造,保证 `kind()`
+/// 走系统错误映射(如 ELOOP → FilesystemLoop)。
 pub(crate) type StatErrno = libc::c_int;
 
 #[derive(Default)]
@@ -34,7 +34,9 @@ pub(crate) struct FakeFs {
     state: RefCell<State>,
     fail_symlink: Cell<bool>,
     access_w: Cell<bool>,
-    stat_errno: Cell<Option<StatErrno>>,
+    /// 按路径限定的 stat 错误注入(只打条目路径,不动随包 CLI——
+    /// 否则分类在入口的 bundle stat 处短路,测不到目标分支)。
+    stat_errno: RefCell<HashMap<PathBuf, StatErrno>>,
 }
 
 impl FakeFs {
@@ -43,7 +45,7 @@ impl FakeFs {
             state: RefCell::new(State::default()),
             fail_symlink: Cell::new(false),
             access_w: Cell::new(true),
-            stat_errno: Cell::new(None),
+            stat_errno: RefCell::new(HashMap::new()),
         }
     }
 
@@ -130,8 +132,9 @@ impl FakeFs {
         self.access_w.set(v);
     }
 
-    pub(crate) fn set_stat_errno(&mut self, e: Option<StatErrno>) {
-        self.stat_errno.set(e);
+    /// 按路径注入 stat 错误(如 `libc::ELOOP`);未注入的路径照常工作。
+    pub(crate) fn set_stat_errno_for(&mut self, p: &Path, e: StatErrno) {
+        self.stat_errno.borrow_mut().insert(p.to_path_buf(), e);
     }
 
     pub(crate) fn set_no_volumes(&mut self, v: bool) {
@@ -174,7 +177,7 @@ impl InstallerFs for FakeFs {
     }
 
     fn stat(&self, p: &Path) -> io::Result<Meta> {
-        if let Some(e) = self.stat_errno.get() {
+        if let Some(&e) = self.stat_errno.borrow().get(p) {
             return Err(io::Error::from_raw_os_error(e));
         }
         let s = self.state.borrow();
@@ -261,6 +264,10 @@ impl InstallerFs for FakeFs {
         s.stat.insert(to.to_path_buf(), m);
         if let Some(t) = s.link.remove(from) {
             s.link.insert(to.to_path_buf(), t);
+        } else {
+            // 非链接覆盖到旧链接上:必须先清掉 to 的旧目标,
+            // 否则 stat(to) 会继续跟随幽灵链接。
+            s.link.remove(to);
         }
         // link_override 按路径固定,不随 rename 移动(竞态桩语义)。
         Ok(())
@@ -286,5 +293,30 @@ impl InstallerFs for FakeFs {
         Ok(StatFs {
             read_only: s.read_only,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// POSIX 覆盖语义:普通文件 rename 盖到旧符号链接上后,stat 必须看到
+    /// 普通文件本体——旧的链接目标条目必须随之清除,不得被幽灵跟随。
+    #[test]
+    fn rename_plain_file_over_link_clears_ghost_target() {
+        let mut fs = FakeFs::new();
+        fs.file("/real/other-tool", 8, 8);
+        fs.link("/bin/macEverything", "/nowhere/ghost");
+        fs.rename(
+            Path::new("/real/other-tool"),
+            Path::new("/bin/macEverything"),
+        )
+        .unwrap();
+        let m = fs.stat(Path::new("/bin/macEverything")).unwrap();
+        assert!(
+            m.is_file && !m.is_symlink,
+            "普通文件覆盖后 stat 不得再跟随旧链接目标"
+        );
+        assert_eq!((m.dev, m.ino), (8, 8));
     }
 }

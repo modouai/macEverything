@@ -599,13 +599,15 @@ mod tests {
         }
     }
 
-    /// ELOOP 不是「断链」:stat 非 ENOENT 错误必须归 Unreadable 并置 unknown。
+    /// ELOOP 不是「断链」:条目级 stat 的非 ENOENT 错误必须归 Unreadable
+    /// 并置 unknown。errno 注入按条目路径限定(随包 CLI 照常可读),否则
+    /// 分类会在入口的 bundle stat 处短路,测不到符号链接分支的错误臂。
     #[test]
     fn eloop_is_unreadable() {
         let mut fs = FakeFs::new();
         fs.file(BUNDLE, 9, 9);
         fs.link("/bin/macEverything", BUNDLE);
-        fs.set_stat_errno(Some(libc::ELOOP));
+        fs.set_stat_errno_for(Path::new("/bin/macEverything"), libc::ELOOP);
         let (hits, _, unknown) = scan_path(&fs, OsStr::new("/bin"), Path::new(BUNDLE));
         assert!(unknown);
         assert!(matches!(hits[0], EntryState::Unreadable { .. }));
