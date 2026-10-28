@@ -1185,9 +1185,20 @@ fn apply_exclude_change(
     Ok(())
 }
 
+/// 数据目录 0700(索引/日志/配置均含全盘路径,属敏感数据);已存在目录也
+/// 强制 0700——目录可能由旧版本以默认 0644 建过,每次启动收敛到位。
+pub fn ensure_data_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true).mode(0o700);
+    b.create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 /// 服务循环(主线程):accept → 每连接一线程;stop 处理后退出进程。
 pub fn serve(paths: DaemonPaths) -> Result<()> {
-    std::fs::create_dir_all(&paths.data_dir).context("创建数据目录失败")?;
+    ensure_data_dir(&paths.data_dir).context("创建数据目录失败")?;
     init_logger(&paths);
     let listener = bind_single_instance(&paths.socket())?;
     let state = Arc::new(EngineState::new());
@@ -1241,16 +1252,26 @@ fn init_logger(paths: &DaemonPaths) {
     }
     if log::set_boxed_logger(Box::new(Dual(
         log::LevelFilter::Info,
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(paths.log_file())
-            .ok(),
+        open_log_file(&paths.log_file()),
     )))
     .is_ok()
     {
         log::set_max_level(log::LevelFilter::Info);
     }
+}
+
+/// 打开日志文件:新建按 0600;已存在文件先补 chmod 0600(旧版曾以默认 0644
+/// 落盘,open 的 mode 只作用于新建,存量文件须显式收敛)。
+/// 打开失败返回 None(stderr 仍在,日志降级不致命)。
+fn open_log_file(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .ok()
 }
 
 #[cfg(test)]
@@ -1758,6 +1779,28 @@ mod tests {
             config::load(&paths.config_file()).excluded,
             vec![inside],
             "加入结果应落盘"
+        );
+    }
+
+    /// 数据目录 0700、日志文件 0600:索引与日志都含全盘路径,属敏感数据。
+    /// 突变「沿用 create_dir_all/OpenOptions 默认 0644」时两个断言必红。
+    #[test]
+    fn data_dir_is_0700_and_log_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        ensure_data_dir(&data).unwrap();
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        init_logger(&DaemonPaths {
+            data_dir: data.clone(),
+        });
+        let log = data.join("daemon.log");
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }

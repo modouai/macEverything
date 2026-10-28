@@ -2,6 +2,7 @@
 //! last_event_id 供停机重放(ADR-5);写 = 临时文件 + fsync + rename 原子替换。
 //! 读侧:load_mmap 产出 SharedView(mmap 只读视图,立即可查),materialize 物化为可变 Index。
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::arena::ArenaBuilder;
@@ -94,7 +95,13 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
 
     let tmp = tmp_path_for(path)?;
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        // 0600:索引含全盘路径,属敏感数据(umask 只兜 create 初始位,显式 mode 防放宽)
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(&buf)?;
         f.sync_all()?;
     }
@@ -435,6 +442,23 @@ mod tests {
         assert_ne!(
             tmp_path_for(Path::new("/data/index.bin")).unwrap(),
             Path::new("/data/index.bin")
+        );
+    }
+
+    /// 索引文件 0600:含全盘路径,属敏感数据(数据目录 0700 的同源约束;
+    /// umask 只兜 create 初始位,显式 mode 防父目录 umask 放宽)。
+    /// 突变「File::create 默认 0644」此测必红。
+    #[test]
+    fn saved_index_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut i = Index::new();
+        i.insert("a.txt", crate::entry::NO_PARENT, false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.bin");
+        write_atomic(&i, &IndexMeta::default(), &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }

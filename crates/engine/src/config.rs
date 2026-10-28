@@ -6,6 +6,8 @@
 //! 保护,不排除会成为 status 里永久的权限缺口噪音。
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// 应用配置。
@@ -71,8 +73,16 @@ pub fn save(cfg: &Config, path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(p)?;
     }
     let tmp = crate::persist::tmp_path_for(path)?;
+    // 0600:配置与索引/日志同目录同源(排除清单等用户数据),不应对同组可读
+    // (umask 只兜 create 初始位,显式 mode 防放宽)。tmp 名唯一,create+truncate 安全。
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
     // Vec<String> 结构序列化不会失败,unwrap 安全
-    std::fs::write(&tmp, toml::to_string_pretty(cfg).unwrap())?;
+    f.write_all(toml::to_string_pretty(cfg).unwrap().as_bytes())?;
     std::fs::rename(&tmp, path)
 }
 
@@ -140,5 +150,19 @@ mod tests {
         let p = dir.path().join("a/b/config.toml");
         save(&default_config(), &p).unwrap();
         assert_eq!(load(&p), default_config());
+    }
+
+    /// config.toml 0600:排除清单等用户数据与索引/日志同源,不应对同组可读。
+    /// 突变「std::fs::write 默认 0644」此测必红。
+    #[test]
+    fn saved_config_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        save(&default_config(), &p).unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

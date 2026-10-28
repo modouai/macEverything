@@ -97,6 +97,19 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// 组装引擎 spawn 命令:显式固定 MCE_DATA_DIR——App 固定默认目录,
+/// 外部环境(终端启动/launchctl setenv)若带同名变量,会让子 daemon 绑到
+/// 自定义目录而 App 仍连默认 socket,启动必超时(设计 §4.5)。
+fn engine_command(cand: &Path, paths: &client::DaemonPaths) -> std::process::Command {
+    let mut c = std::process::Command::new(cand);
+    c.arg("start")
+        .env("MCE_DATA_DIR", &paths.data_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    c
+}
+
 /// 拉起引擎,直到 daemon.sock 可连:
 /// ① 先 connect 探测(已在跑直接 Ok);
 /// ② 候选逐个「存在且可执行」检查,取首个;
@@ -144,13 +157,7 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
     };
     log::info!("拉起引擎: {}", cand.display());
 
-    let mut child = match std::process::Command::new(cand)
-        .arg("start")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+    let mut child = match engine_command(cand, paths).spawn() {
         Ok(child) => child,
         Err(err) => {
             log::error!("启动引擎失败({}): {err:#}", cand.display());
@@ -230,6 +237,21 @@ mod tests {
         // 空 PATH(POSIX 空段 = 当前目录):跳过空段,不产出相对路径候选
         assert_eq!(cands("/opt/mce", Some("")), only_bundled);
         assert_eq!(cands("/opt/mce", Some(":")), only_bundled);
+    }
+
+    /// spawn 命令钉:显式固定 MCE_DATA_DIR——外部环境(终端启动/launchctl
+    /// setenv)若带同名变量,会让子 daemon 绑到自定义目录而 App 仍连默认
+    /// socket,启动必超时(设计 §4.5)。突变「漏设 env」此测必红。
+    #[test]
+    fn engine_command_pins_data_dir() {
+        let paths = client::DaemonPaths {
+            data_dir: PathBuf::from("/tmp/app-data"),
+        };
+        let cmd = engine_command(Path::new("/tmp/macEverything"), &paths);
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(env.iter().any(|(k, v)| {
+            *k == OsStr::new("MCE_DATA_DIR") && *v == Some(OsStr::new("/tmp/app-data"))
+        }));
     }
 
     #[test]
