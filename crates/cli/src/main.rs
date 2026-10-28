@@ -1,5 +1,7 @@
 //! macEverything CLI:start/stop/query/status/exclude 五子命令(product §5)。
 //! 客户端能力(连接/离线降级/stat 读取)在 client crate;本文件只做参数分派与输出格式化。
+#[allow(dead_code)] // Task 4 接线后移除
+mod args;
 mod daemon;
 
 use anyhow::{anyhow, bail, Result};
