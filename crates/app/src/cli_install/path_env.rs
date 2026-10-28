@@ -30,12 +30,18 @@ pub trait CommandRunner {
     fn run(&self, shell: &Path, flag: &str, timeout: Duration) -> Option<Vec<u8>>;
 }
 
-/// 只认最后一个完整 `PATH=` 行;空值不算。
+/// 只认最后一个**完整** `PATH=` 行(以 `\n` 收尾);空值不算。
 ///
 /// 输出是原始字节(PATH 值允许非 UTF-8),按字节切行、按字节保留。
+/// 末尾没有换行的残余段不算完整行:64 KiB 读上限或超时 SIGKILL 都可能
+/// 把输出截在半路,截断尾巴可能是「写了一半的 `PATH=…`」,当完整行收下
+/// 会静默装错 PATH(设计 §5.0-A / §8 截断用例)。
 pub fn parse_path_env(bytes: &[u8]) -> Option<OsString> {
     let mut found = None;
-    for line in bytes.split(|&b| b == b'\n') {
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        let Some(line) = line.strip_suffix(b"\n") else {
+            continue; // 无换行收尾 = 截断尾巴,不认
+        };
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Some(v) = line.strip_prefix(b"PATH=") {
             if !v.is_empty() {
@@ -168,14 +174,50 @@ mod tests {
     #[test]
     fn empty_or_truncated_path_is_ignored() {
         assert_eq!(parse_path_env(b"PATH=\n"), None);
-        assert_eq!(
-            parse_path_env(b"PATH=/a:/b"),
-            Some(std::ffi::OsString::from("/a:/b"))
-        );
+        // 无换行收尾 = 截断尾巴,不算完整行(§8 截断用例)。
+        assert_eq!(parse_path_env(b"PATH=/a:/b"), None);
         assert_eq!(
             parse_path_env(b"PATH=/a:/b\nPATH="),
             Some(std::ffi::OsString::from("/a:/b"))
         );
+    }
+
+    /// 突变敏感:64 KiB 读上限 / 超时 SIGKILL 半路截出的尾巴不认——
+    /// 「写了一半的 `PATH=`」不是完整行;同一噪声后跟完整行则照常收。
+    #[test]
+    fn unterminated_tail_rejected_complete_line_kept() {
+        let mut noise = vec![b'x'; 64 * 1024];
+        noise.push(b'\n');
+
+        let mut truncated = noise.clone();
+        truncated.extend_from_slice(b"PATH=/x"); // 尾巴无换行:被截断
+        assert_eq!(parse_path_env(&truncated), None);
+
+        let mut complete = noise;
+        complete.extend_from_slice(b"PATH=/x\n"); // 完整行
+        assert_eq!(
+            parse_path_env(&complete),
+            Some(std::ffi::OsString::from("/x"))
+        );
+    }
+
+    /// 两路 shell 都失败且进程 PATH 缺失/空白 → Failed(三路全空)。
+    #[test]
+    fn failed_when_all_sources_missing() {
+        let r = FakeRunner::new(&[None, None]);
+        assert_eq!(probe_path_env(&r, None), (PathSource::Failed, None));
+        let r = FakeRunner::new(&[None, None]);
+        assert_eq!(probe_path_env(&r, Some("   ")), (PathSource::Failed, None));
+    }
+
+    /// `-lic` 有输出但没有 PATH 行 → 继续回落 `-lc`(两次调用,钉死调用数)。
+    #[test]
+    fn lic_output_without_path_falls_through_to_lc() {
+        let r = FakeRunner::new(&[Some(b"hello\n".as_slice()), Some(b"PATH=/b\n".as_slice())]);
+        let (source, path) = probe_path_env(&r, Some("/proc:/bin"));
+        assert_eq!(source, PathSource::LoginOnly);
+        assert_eq!(path, Some("/b".into()));
+        assert_eq!(r.cursor.get(), 2, "-lic 无 PATH 行应回落 -lc");
     }
 
     #[test]

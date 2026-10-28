@@ -1077,7 +1077,8 @@ mod tests {
     #[test]
     fn empty_or_truncated_path_is_ignored() {
         assert_eq!(parse_path_env(b"PATH=\n"), None);
-        assert_eq!(parse_path_env(b"PATH=/a:/b"), Some(std::ffi::OsString::from("/a:/b")));
+        // 无换行收尾 = 截断尾巴(64 KiB 上限 / 超时 SIGKILL 半路),不算完整行。
+        assert_eq!(parse_path_env(b"PATH=/a:/b"), None);
         assert_eq!(parse_path_env(b"PATH=/a:/b\nPATH="), Some(std::ffi::OsString::from("/a:/b")));
     }
 
@@ -1118,10 +1119,15 @@ pub trait CommandRunner {
     fn run(&self, shell: &Path, flag: &str, timeout: Duration) -> Option<Vec<u8>>;
 }
 
-/// 只认最后一个完整 `PATH=` 行；空值不算。
+/// 只认最后一个**完整** `PATH=` 行(以 `\n` 收尾);空值不算。
+/// 末尾无换行的残余段是截断尾巴(64 KiB 读上限 / 超时 SIGKILL 半路),
+/// 可能是「写了一半的 PATH=…」,不当完整行(设计 §5.0-A / §8)。
 pub fn parse_path_env(bytes: &[u8]) -> Option<OsString> {
     let mut found = None;
-    for line in bytes.split(|&b| b == b'\n') {
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        let Some(line) = line.strip_suffix(b"\n") else {
+            continue; // 截断尾巴,不认
+        };
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Some(v) = line.strip_prefix(b"PATH=") {
             if !v.is_empty() {
