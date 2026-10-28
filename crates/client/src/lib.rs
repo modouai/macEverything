@@ -133,6 +133,8 @@ pub struct QueryOutcome {
     /// 实际生效的排序键回显(relevance/name/size/mtime/path)。调用方比对请求键
     /// 与回显:不符(含旧 daemon 的空串)= 排序未生效,须提示而非静默展示错排序。
     pub sort_echo: String,
+    /// 绝对方向回显(true = 降序, false = 升序, None = relevance 或旧 daemon)。
+    pub desc_echo: Option<bool>,
     /// Some(落盘索引生成时刻) = 离线直读落盘索引;None = daemon 在线应答。
     pub offline_built_at: Option<u64>,
 }
@@ -191,13 +193,14 @@ pub fn query(
                 elapsed_ms,
                 stat_ms,
                 sort_echo,
-                desc_echo: _,
+                desc_echo,
             } => Ok(QueryOutcome {
                 entries,
                 total,
                 elapsed_ms,
                 stat_ms,
                 sort_echo,
+                desc_echo,
                 offline_built_at: None,
             }),
             // Error 不并进 expect_ok:错误码须上行到 UI(状态呈现按码分流)
@@ -242,6 +245,8 @@ pub fn offline_query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOu
         elapsed_ms: out.elapsed_ms,
         stat_ms,
         sort_echo: "relevance".into(),
+        // 离线只做 relevance:无方向可言(与 sort_echo 同口径如实回显)
+        desc_echo: None,
         offline_built_at: Some(view.meta.built_at),
     })
 }
@@ -267,15 +272,37 @@ pub enum StatusOutcome {
     NoIndex,
 }
 
+/// status 失败(带错误码);连接路径失败无码,离线索引不可读带 `index_unreadable`。
+#[derive(Debug)]
+pub struct StatusError {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatusError {}
+
 /// 状态:daemon 在线走 socket;不在则直读落盘索引离线降级。
-pub fn status(paths: &DaemonPaths) -> Result<StatusOutcome> {
+/// `Response::Error` 的错误码须保留上行(UI/CLI 按码分流),不经 expect_ok。
+pub fn status(paths: &DaemonPaths) -> Result<StatusOutcome, StatusError> {
+    let no_code = |e: anyhow::Error| StatusError {
+        code: None,
+        message: e.to_string(),
+    };
     if let Some(mut s) = connect(paths) {
-        match expect_ok(call(
+        let resp = call(
             &mut s,
             &Request::Status {
                 v: protocol::PROTOCOL_VERSION,
             },
-        )?)? {
+        )
+        .map_err(no_code)?;
+        match resp {
             Response::Status {
                 state,
                 entry_count,
@@ -293,16 +320,35 @@ pub fn status(paths: &DaemonPaths) -> Result<StatusOutcome> {
                 index_file,
                 offline: false,
             })),
-            other => bail!("意外响应: {other:?}"),
+            Response::Error { code, message } => Err(StatusError {
+                code: Some(code),
+                message,
+            }),
+            other => Err(StatusError {
+                code: None,
+                message: format!("意外响应: {other:?}"),
+            }),
         }
     } else {
         offline_status(paths)
     }
 }
 
-/// 离线状态:直读落盘索引;不可用 = 无索引。
-pub fn offline_status(paths: &DaemonPaths) -> Result<StatusOutcome> {
-    match persist::load_mmap(&paths.index_file()) {
+/// 离线状态:直读落盘索引。索引文件不存在 = 无索引(从未建过);
+/// 存在但读不出(损坏/权限)如实报 `index_unreadable`,不得伪装成无索引。
+pub fn offline_status(paths: &DaemonPaths) -> Result<StatusOutcome, StatusError> {
+    let index = paths.index_file();
+    match std::fs::metadata(&index) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StatusOutcome::NoIndex),
+        Err(e) => {
+            return Err(StatusError {
+                code: Some("index_unreadable".into()),
+                message: format!("索引不可读({}): {e}", index.display()),
+            })
+        }
+        Ok(_) => {}
+    }
+    match persist::load_mmap(&index) {
         Ok(v) => {
             let live = v.entries().iter().filter(|e| e.is_live()).count() as u32;
             let gaps: Vec<Gap> = vec![];
@@ -312,11 +358,14 @@ pub fn offline_status(paths: &DaemonPaths) -> Result<StatusOutcome> {
                 gaps,
                 io_error_count: 0,
                 built_at: v.meta.built_at,
-                index_file: paths.index_file().to_string_lossy().into_owned(),
+                index_file: index.to_string_lossy().into_owned(),
                 offline: true,
             }))
         }
-        Err(_) => Ok(StatusOutcome::NoIndex),
+        Err(e) => Err(StatusError {
+            code: Some("index_unreadable".into()),
+            message: format!("索引损坏或不可读({}): {e}", index.display()),
+        }),
     }
 }
 
@@ -494,6 +543,127 @@ pub fn set_volume_prefs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 单连接桩 daemon:读一次请求(4 字节长度头 + JSON 体),回固定 JSON 响应。
+    /// 句柄持有临时目录与后台线程,须绑定到变量活到测试结束。
+    struct StubDaemon {
+        _dir: tempfile::TempDir,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    fn stub_daemon(body: &[u8]) -> (DaemonPaths, StubDaemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let body = body.to_vec();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).unwrap();
+            let n = u32::from_le_bytes(len) as usize;
+            let mut req = vec![0u8; n];
+            s.read_exact(&mut req).unwrap();
+            let mut out = (body.len() as u32).to_le_bytes().to_vec();
+            out.extend_from_slice(&body);
+            s.write_all(&out).unwrap();
+            s.flush().unwrap();
+        });
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        (
+            paths,
+            StubDaemon {
+                _dir: dir,
+                _handle: handle,
+            },
+        )
+    }
+
+    /// 方向回显须原样读响应:真实 daemon 对 mtime + 协议 desc 位 true 回显
+    /// 绝对方向 false(mtime 自然降序,desc 位反转后为升序)。桩故意回与请求位
+    /// 相反的值——若实现拿请求 desc 冒充回显(而非读响应),此断言必红。
+    #[test]
+    fn query_passes_desc_echo_through() {
+        let (paths, _h) = stub_daemon(
+            br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"mtime","desc_echo":false}"#,
+        );
+        let out = query(&paths, "x", 10, Some("mtime"), true).unwrap();
+        assert_eq!(out.desc_echo, Some(false));
+        assert_eq!(out.sort_echo, "mtime");
+    }
+
+    /// status 失败须保留 daemon 错误码(UI/CLI 按码分流);不得经 expect_ok 丢码。
+    #[test]
+    fn status_keeps_daemon_error_code() {
+        let (paths, _h) = stub_daemon(br#"{"msg":"error","code":"version","message":"bad"}"#);
+        let err = status(&paths).unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("version"));
+        assert_eq!(err.message, "bad");
+    }
+
+    /// 在线 status 成功应答须正确映射(重构掉 expect_ok 后的在线分支钉):
+    /// offline 恒 false,状态/条目数/缺口逐字段透传。
+    #[test]
+    fn status_online_maps_reported_fields() {
+        let (paths, _h) = stub_daemon(
+            br#"{"msg":"status","state":"ready","entry_count":42,"gaps":[{"path":"/x","reason":"permission"}],"io_error_count":1,"built_at":123,"index_file":"/d/index.bin"}"#,
+        );
+        match status(&paths).unwrap() {
+            StatusOutcome::Reported(r) => {
+                assert!(!r.offline, "在线应答不得标离线");
+                assert_eq!(r.state, "ready");
+                assert_eq!(r.entry_count, 42);
+                assert_eq!(r.gaps.len(), 1);
+                assert_eq!(r.gaps[0].path, "/x");
+                assert_eq!(r.gaps[0].reason, "permission");
+                assert_eq!(r.io_error_count, 1);
+                assert_eq!(r.built_at, 123);
+                assert_eq!(r.index_file, "/d/index.bin");
+            }
+            StatusOutcome::NoIndex => panic!("在线成功应答不应是 NoIndex"),
+        }
+    }
+
+    /// 索引文件从未存在 = 无索引(NoIndex),不是错误。
+    #[test]
+    fn offline_status_missing_index_is_no_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        match offline_status(&paths).unwrap() {
+            StatusOutcome::NoIndex => {}
+            other => panic!("期望 NoIndex,得到 {other:?}"),
+        }
+    }
+
+    /// 落盘索引存在但损坏 ≠ 无索引:只有文件不存在才是 NoIndex,
+    /// 损坏须带 index_unreadable 码如实报错(否则调用方谎报「从未建索引」)。
+    #[test]
+    fn offline_status_corrupt_index_is_not_no_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        std::fs::write(paths.index_file(), b"not-an-index").unwrap();
+        let err = offline_status(&paths).unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("index_unreadable"));
+    }
+
+    /// stat 本身失败(ENOTDIR:data_dir 是普通文件)属「不可读」,
+    /// 不得折叠成 NoIndex——只有 NotFound 才是无索引。
+    #[test]
+    fn offline_status_stat_error_is_not_no_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let paths = DaemonPaths {
+            data_dir: not_a_dir,
+        };
+        let err = offline_status(&paths).unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("index_unreadable"));
+    }
 
     /// remove 缺参提示须反映 E1 语义:已有相对名条目也可移除(不再写「绝对路径」)。
     /// 该分支在连接 daemon 前返回,不会触发真实 client/daemon。
