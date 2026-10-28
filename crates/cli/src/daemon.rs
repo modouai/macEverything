@@ -201,6 +201,16 @@ fn parse_sort_key(sort: Option<&str>) -> (SortKey, &'static str) {
     }
 }
 
+/// 绝对方向回显:NAME/SIZE/PATH 自然升序,MTIME 自然降序;relevance 无方向。
+/// 协议 desc 位是「反转自然方向」,此处换算成绝对方向(降序 = true)。
+fn desc_echo(key: SortKey, desc: bool) -> Option<bool> {
+    match key {
+        SortKey::Relevance => None,
+        SortKey::Mtime => Some(!desc),
+        SortKey::Name | SortKey::Size | SortKey::Path => Some(desc),
+    }
+}
+
 /// 查询执行:匹配与排序在 holder 读锁内完成;结果行的 size/mtime 在**锁外**
 /// 并行读取——product 契约要求按需读取「并行执行、单独计时随输出给出」,
 /// 且 stat 不应持读锁阻塞增量 diff 的写锁获取。
@@ -210,12 +220,7 @@ fn parse_sort_key(sort: Option<&str>) -> (SortKey, &'static str) {
 /// desc(定案,Task 19b)= 反转自然方向,透传引擎;缺省(旧客户端)等价 false。
 fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc: bool) -> Response {
     let (key, key_str) = parse_sort_key(sort);
-    // 绝对方向回显:NAME/SIZE/PATH 自然升序,MTIME 自然降序。
-    let desc_echo = match key {
-        SortKey::Relevance => None,
-        SortKey::Mtime => Some(!desc),
-        SortKey::Name | SortKey::Size | SortKey::Path => Some(desc),
-    };
+    let desc_echo = desc_echo(key, desc);
     let Ok(plan) = engine::query::parse(q) else {
         return Response::Error {
             code: "parse".into(),
@@ -1401,6 +1406,30 @@ mod tests {
         assert!(state.applied_event_id.load(Ordering::Relaxed) >= floor);
         assert_eq!(*state.state_name.lock().unwrap(), state::READY);
         assert!(paths.index_file().exists(), "重扫后落盘");
+    }
+
+    /// desc_echo 绝对方向映射钉:NAME/SIZE/PATH 自然升序,MTIME 自然降序,
+    /// relevance 无方向;协议 desc 位 = 反转自然方向。
+    /// 突变 MTIME 分支(!desc → desc)或其余列分支,表内断言必红。
+    #[test]
+    fn desc_echo_maps_protocol_bit_to_absolute_direction() {
+        let cases: [(Option<&str>, bool, Option<bool>); 7] = [
+            (None, false, None),
+            (Some("name"), false, Some(false)),
+            (Some("name"), true, Some(true)),
+            (Some("mtime"), false, Some(true)),
+            (Some("mtime"), true, Some(false)),
+            (Some("size"), true, Some(true)),
+            (Some("path"), true, Some(true)),
+        ];
+        for (sort, desc, want) in cases {
+            let (key, _) = parse_sort_key(sort);
+            assert_eq!(
+                desc_echo(key, desc),
+                want,
+                "sort={sort:?} desc={desc} 应回显 {want:?}"
+            );
+        }
     }
 
     /// is_dir 组装路径钉:relevance 排序下排序轮 stat 缓存为空,两行都走锁外

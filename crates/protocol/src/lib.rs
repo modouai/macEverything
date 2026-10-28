@@ -339,16 +339,36 @@ mod tests {
             other => panic!("意外响应: {other:?}"),
         }
 
-        let new_resp = Response::Query {
-            entries: vec![],
-            total: 0,
-            elapsed_ms: 0.0,
-            stat_ms: 0.0,
-            sort_echo: "mtime".into(),
-            desc_echo: Some(true),
-        };
+        fn resp(desc_echo: Option<bool>) -> Response {
+            Response::Query {
+                entries: vec![],
+                total: 0,
+                elapsed_ms: 0.0,
+                stat_ms: 0.0,
+                sort_echo: "mtime".into(),
+                desc_echo,
+            }
+        }
+
+        let new_resp = resp(Some(true));
         let b = encode(&new_resp).unwrap();
         assert_eq!(decode_response(&b[4..]).unwrap(), new_resp);
+
+        // Some(false) 线上是 JSON false(不是字符串);None 不序列化该键。
+        let false_resp = resp(Some(false));
+        let b = encode(&false_resp).unwrap();
+        assert_eq!(decode_response(&b[4..]).unwrap(), false_resp);
+        assert!(
+            serde_json::to_string(&false_resp)
+                .unwrap()
+                .contains(r#""desc_echo":false"#),
+            "Some(false) 线上应为 JSON false"
+        );
+        let body = serde_json::to_string(&resp(None)).unwrap();
+        assert!(
+            !body.contains("desc_echo"),
+            "None 不应序列化 desc_echo 键:{body}"
+        );
     }
 
     /// sort/desc=None(CLI/App 不传)编码不含两键:v1 线上形态逐字节保持,
