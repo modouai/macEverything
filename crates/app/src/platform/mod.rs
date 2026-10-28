@@ -108,6 +108,22 @@ impl SpaceExemptDecider {
     }
 }
 
+/// 按进程组发信号(`kill(-pgid, sig)`;安装器探测 shell 超时整组终止用)。
+/// 非 macOS:no-op(本仓交付面仅 macOS,stub 只为保持 facade 可编译)。
+///
+/// `pid` 由 `Child::id()` 取得:子进程以 `process_group(0)` 自立新进程组,
+/// 组 id 即其 pid。
+pub fn kill_process_group(pid: u32, signal: i32) {
+    #[cfg(target_os = "macos")]
+    {
+        mac::kill_process_group(pid, signal)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, signal);
+    }
+}
+
 /// 系统首选语言列表；非 macOS 返回错误（调用方回落到简体中文）。
 pub fn preferred_languages() -> anyhow::Result<Vec<String>> {
     #[cfg(target_os = "macos")]

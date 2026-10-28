@@ -6,6 +6,8 @@
 //! → eframe 主循环(双视口壳,平台行为 Task 14 接)。
 
 mod autostart;
+#[allow(dead_code)] // Task 8 接线后移除(本任务只交付安装器类型 + PATH 探测,暂无生产调用点)
+mod cli_install;
 mod engine_launcher;
 mod hotkey;
 mod i18n;

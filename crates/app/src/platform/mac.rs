@@ -112,6 +112,16 @@ pub fn local_volume_names() -> Vec<String> {
     names
 }
 
+/// 按进程组发信号:`kill(-pid, sig)`(子进程以 `process_group(0)` 自立新组,
+/// 组 id 即其 pid)。安装器探测 shell 超时时整组终止,不留孤儿子进程。
+pub fn kill_process_group(pid: u32, signal: i32) {
+    // SAFETY: kill(2) 只作用于传入的进程组;pid 由 Child::id 取得,
+    // 调用方在超时路径上使用,不存在内存安全问题。
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
 use super::{
     monotonic_ms, palette_width, settings_window_titles, MenuEntry, SpaceChange, ICON_PX,
