@@ -210,6 +210,12 @@ fn parse_sort_key(sort: Option<&str>) -> (SortKey, &'static str) {
 /// desc(定案,Task 19b)= 反转自然方向,透传引擎;缺省(旧客户端)等价 false。
 fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc: bool) -> Response {
     let (key, key_str) = parse_sort_key(sort);
+    // 绝对方向回显:NAME/SIZE/PATH 自然升序,MTIME 自然降序。
+    let desc_echo = match key {
+        SortKey::Relevance => None,
+        SortKey::Mtime => Some(!desc),
+        SortKey::Name | SortKey::Size | SortKey::Path => Some(desc),
+    };
     let Ok(plan) = engine::query::parse(q) else {
         return Response::Error {
             code: "parse".into(),
@@ -264,6 +270,7 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc:
         elapsed_ms: out.elapsed_ms,
         stat_ms: out.stat_ms + complete_ms,
         sort_echo: key_str.into(),
+        desc_echo,
     }
 }
 
@@ -929,6 +936,7 @@ fn encode_response(resp: Response) -> serde_json::Result<Vec<u8>> {
         elapsed_ms,
         stat_ms,
         sort_echo,
+        desc_echo,
     } = resp
     else {
         // 非查询响应不该接近上限(状态/排除列表都是小对象):原样返回交 client 判定
@@ -942,6 +950,7 @@ fn encode_response(resp: Response) -> serde_json::Result<Vec<u8>> {
             elapsed_ms,
             stat_ms,
             sort_echo: sort_echo.clone(),
+            desc_echo,
         })?;
     }
     Ok(body)

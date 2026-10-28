@@ -191,6 +191,7 @@ pub fn query(
                 elapsed_ms,
                 stat_ms,
                 sort_echo,
+                desc_echo: _,
             } => Ok(QueryOutcome {
                 entries,
                 total,

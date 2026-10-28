@@ -98,6 +98,10 @@ pub enum Response {
         /// 提示「引擎版本过旧,排序未生效」,防静默错排序。
         #[serde(default)]
         sort_echo: String,
+        /// 绝对方向回显(true = 降序, false = 升序, None = relevance 或旧
+        /// daemon 未回显)。纯新增可选字段,不 bump 协议版本。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desc_echo: Option<bool>,
     },
     Status {
         state: String,
@@ -217,6 +221,7 @@ mod tests {
             elapsed_ms: 0.8,
             stat_ms: 1.2,
             sort_echo: "relevance".into(),
+            desc_echo: None,
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(decode_response(&bytes[4..]).unwrap(), r);
@@ -259,6 +264,7 @@ mod tests {
             elapsed_ms: 0.0,
             stat_ms: 0.0,
             sort_echo: "relevance".into(),
+            desc_echo: None,
         };
         let bytes = encode(&new_resp).unwrap();
         assert_eq!(decode_response(&bytes[4..]).unwrap(), new_resp);
@@ -317,9 +323,32 @@ mod tests {
             elapsed_ms: 0.0,
             stat_ms: 0.0,
             sort_echo: "size".into(),
+            desc_echo: None,
         };
         let b = encode(&p).unwrap();
         assert_eq!(decode_response(&b[4..]).unwrap(), p);
+    }
+
+    /// desc_echo 向后兼容钉+往返:旧 daemon 响应(无该键)缺省 None;新响应经
+    /// 线上编码无损保留 Some(true/false)。
+    #[test]
+    fn desc_echo_backward_compatible() {
+        let old_resp = br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"relevance"}"#;
+        match serde_json::from_slice::<Response>(old_resp).unwrap() {
+            Response::Query { desc_echo, .. } => assert_eq!(desc_echo, None),
+            other => panic!("意外响应: {other:?}"),
+        }
+
+        let new_resp = Response::Query {
+            entries: vec![],
+            total: 0,
+            elapsed_ms: 0.0,
+            stat_ms: 0.0,
+            sort_echo: "mtime".into(),
+            desc_echo: Some(true),
+        };
+        let b = encode(&new_resp).unwrap();
+        assert_eq!(decode_response(&b[4..]).unwrap(), new_resp);
     }
 
     /// sort/desc=None(CLI/App 不传)编码不含两键:v1 线上形态逐字节保持,
