@@ -76,6 +76,8 @@ pub enum UsageError {
     InvalidSort(String),
     DuplicateSort,
     DescWithoutSort,
+    InvalidExcludeAction(String),
+    MissingExcludePath,
     MissingQuery,
     UnexpectedArg(String),
 }
@@ -92,6 +94,10 @@ impl std::fmt::Display for UsageError {
             Self::InvalidSort(v) => write!(f, "非法排序键: {v}(可选 name|size|mtime|path)"),
             Self::DuplicateSort => f.write_str("--sort 重复"),
             Self::DescWithoutSort => f.write_str("--desc 必须与 --sort 同时使用"),
+            Self::InvalidExcludeAction(a) => {
+                write!(f, "未知排除操作: {a}(可选 add|remove|list|reset)")
+            }
+            Self::MissingExcludePath => f.write_str("exclude add/remove 缺少路径"),
             Self::MissingQuery => f.write_str("缺少查询关键词"),
             Self::UnexpectedArg(a) => write!(f, "意外参数: {a}"),
         }
@@ -205,7 +211,29 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args, UsageError
         "exclude" => {
             let action = it.next().unwrap_or_else(|| "list".into());
             let path = it.next();
-            if let Some(extra) = it.next() {
+            let extra = it.next();
+            // exclude 没有选项:以 '-' 开头的 token 不能当 action/path,
+            // 否则 `exclude --json` 会被当成未知操作、`exclude list --json` 会静默忽略。
+            if action.starts_with('-') {
+                return Err(UsageError::UnexpectedArg(action));
+            }
+            match action.as_str() {
+                "list" | "reset" => {
+                    if let Some(p) = path.as_deref() {
+                        return Err(UsageError::UnexpectedArg(p.into()));
+                    }
+                }
+                "add" | "remove" => {
+                    let Some(p) = path.as_deref() else {
+                        return Err(UsageError::MissingExcludePath);
+                    };
+                    if p.starts_with('-') {
+                        return Err(UsageError::UnexpectedArg(p.into()));
+                    }
+                }
+                _ => return Err(UsageError::InvalidExcludeAction(action)),
+            }
+            if let Some(extra) = extra {
                 return Err(UsageError::UnexpectedArg(extra));
             }
             Command::Exclude { action, path }
@@ -242,6 +270,8 @@ fn parse_query<I: Iterator<Item = String>>(mut it: I) -> Result<Command, UsageEr
             continue;
         }
         if !text.is_empty() {
+            // 选项必须出现在关键词之前:关键词开始后不再解析选项。
+            // 以 '-' 开头的关键词须用 `--` 分隔,否则按意外参数报错。
             if a.starts_with('-') {
                 return Err(UsageError::UnexpectedArg(a));
             }
@@ -352,8 +382,36 @@ mod tests {
     fn sort_translation_is_absolute() {
         assert!(SortKey::Name.protocol_desc(true));
         assert!(!SortKey::Name.protocol_desc(false));
+        assert!(SortKey::Size.protocol_desc(true));
+        assert!(!SortKey::Size.protocol_desc(false));
         assert!(!SortKey::Mtime.protocol_desc(true)); // 绝对降序 = 反转 mtime 自然降序
         assert!(SortKey::Mtime.protocol_desc(false));
+        assert!(SortKey::Path.protocol_desc(true));
+        assert!(!SortKey::Path.protocol_desc(false));
+    }
+
+    #[test]
+    fn parse_sort_maps_name_and_path() {
+        let name = parse(a(&["query", "--sort", "name", "x"])).unwrap();
+        assert_eq!(
+            name.command,
+            Command::Query {
+                json: false,
+                sort: Some(SortKey::Name),
+                desc: false,
+                query: "x".into()
+            }
+        );
+        let path = parse(a(&["query", "--sort=path", "x"])).unwrap();
+        assert_eq!(
+            path.command,
+            Command::Query {
+                json: false,
+                sort: Some(SortKey::Path),
+                desc: false,
+                query: "x".into()
+            }
+        );
     }
 
     // ---- 以下为补充边界用例 ----
@@ -466,6 +524,13 @@ mod tests {
     }
 
     #[test]
+    fn flag_wins_over_broken_env() {
+        let got =
+            resolve_data_dir(Some(PathBuf::from("/tmp/flag")), Some("rel".into()), None).unwrap();
+        assert_eq!(got, PathBuf::from("/tmp/flag"));
+    }
+
+    #[test]
     fn env_wins_over_home() {
         let got = resolve_data_dir(None, Some("/tmp/env".into()), Some("/Users/u".into())).unwrap();
         assert_eq!(got, PathBuf::from("/tmp/env"));
@@ -485,6 +550,14 @@ mod tests {
         assert_eq!(
             resolve_data_dir(None, None, None),
             Err(DataDirError::HomeUnset)
+        );
+    }
+
+    #[test]
+    fn status_rejects_non_json_args() {
+        assert_eq!(
+            parse(a(&["status", "--sort", "name"])),
+            Err(UsageError::UnexpectedArg("--sort".into()))
         );
     }
 
@@ -513,6 +586,68 @@ mod tests {
             parse(a(&["exclude", "add", "/tmp/x"])).unwrap().command,
             Command::Exclude {
                 action: "add".into(),
+                path: Some("/tmp/x".into())
+            }
+        );
+    }
+
+    #[test]
+    fn exclude_rejects_flag_like_tokens() {
+        assert_eq!(
+            parse(a(&["exclude", "--json"])),
+            Err(UsageError::UnexpectedArg("--json".into()))
+        );
+        assert_eq!(
+            parse(a(&["exclude", "list", "--json"])),
+            Err(UsageError::UnexpectedArg("--json".into()))
+        );
+        assert_eq!(
+            parse(a(&["exclude", "add", "--json"])),
+            Err(UsageError::UnexpectedArg("--json".into()))
+        );
+    }
+
+    #[test]
+    fn exclude_validates_action_arity() {
+        assert_eq!(
+            parse(a(&["exclude", "list", "/tmp/x"])),
+            Err(UsageError::UnexpectedArg("/tmp/x".into()))
+        );
+        assert_eq!(
+            parse(a(&["exclude", "reset", "/tmp/x"])),
+            Err(UsageError::UnexpectedArg("/tmp/x".into()))
+        );
+        assert_eq!(
+            parse(a(&["exclude", "add"])),
+            Err(UsageError::MissingExcludePath)
+        );
+        assert_eq!(
+            parse(a(&["exclude", "remove"])),
+            Err(UsageError::MissingExcludePath)
+        );
+        assert_eq!(
+            parse(a(&["exclude", "bogus"])),
+            Err(UsageError::InvalidExcludeAction("bogus".into()))
+        );
+        assert_eq!(
+            parse(a(&["exclude", "add", "/tmp/x", "extra"])),
+            Err(UsageError::UnexpectedArg("extra".into()))
+        );
+    }
+
+    #[test]
+    fn exclude_accepts_valid_forms() {
+        assert_eq!(
+            parse(a(&["exclude", "reset"])).unwrap().command,
+            Command::Exclude {
+                action: "reset".into(),
+                path: None
+            }
+        );
+        assert_eq!(
+            parse(a(&["exclude", "remove", "/tmp/x"])).unwrap().command,
+            Command::Exclude {
+                action: "remove".into(),
                 path: Some("/tmp/x".into())
             }
         );
