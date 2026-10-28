@@ -1,28 +1,91 @@
 //! macEverything CLI:start/stop/query/status/exclude 五子命令(product §5)。
 //! 客户端能力(连接/离线降级/stat 读取)在 client crate;本文件只做参数分派与输出格式化。
-#[allow(dead_code)] // Task 4 接线后移除
 mod args;
 mod daemon;
+mod json;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail};
+use args::{Command, DataDirError, SortKey, UsageError};
 use client::state;
 use protocol::Gap;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-fn data_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME 未设置"))?;
-    Ok(PathBuf::from(home).join("Library/Application Support/macEverything"))
+/// CLI 错误分两类:用法错误(退出码 2;只写 stderr,即使带 `--json` 也不输出 JSON,
+/// 因为参数尚未通过校验)与运行错误(退出码 1;`--json` 时 stdout 只写一个错误对象)。
+enum CliError {
+    Usage(UsageError),
+    Runtime {
+        code: Option<String>,
+        message: String,
+        json: bool,
+    },
+}
+
+impl CliError {
+    fn exit(self) -> ExitCode {
+        match self {
+            Self::Usage(e) => {
+                eprintln!("{e}\n\n{}", args::USAGE);
+                ExitCode::from(2)
+            }
+            Self::Runtime {
+                code,
+                message,
+                json,
+            } => {
+                if json {
+                    println!("{}", json::error_json(code.as_deref(), &message));
+                } else {
+                    eprintln!("{message}");
+                }
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+/// 运行期错误(无 daemon 错误码);anyhow 链用 `{:#}` 保留上下文。
+fn runtime(e: anyhow::Error) -> CliError {
+    CliError::Runtime {
+        code: None,
+        message: format!("{e:#}"),
+        json: false,
+    }
+}
+
+/// 数据目录:flag > MCE_DATA_DIR > HOME 默认;解析失败在连接 daemon 前报出。
+fn resolve_paths(flag: Option<PathBuf>, want_json: bool) -> Result<client::DaemonPaths, CliError> {
+    let env = std::env::var_os("MCE_DATA_DIR");
+    let home = std::env::var_os("HOME");
+    args::resolve_data_dir(flag, env, home)
+        .map(|data_dir| client::DaemonPaths { data_dir })
+        .map_err(|e: DataDirError| CliError::Runtime {
+            code: None,
+            message: e.to_string(),
+            json: want_json,
+        })
+}
+
+/// 该命令是否要求 stdout 为 JSON(决定运行错误的输出去向)。
+fn command_json(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Query { json: true, .. } | Command::Status { json: true }
+    )
 }
 
 /// 后台化:start 默认把引擎进程脱离终端(契约「后台运行」)。
 /// 实现 = spawn 自身带 MCE_FOREGROUND=1,父进程退出;stdio 接 /dev/null
 /// (日志走数据目录 daemon.log)。子进程由 launchd 接管,终端关闭不受影响。
 /// 调试可用 `MCE_FOREGROUND=1 macEverything start` 前台跑。
-fn spawn_background() -> Result<()> {
+fn spawn_background(paths: &client::DaemonPaths) -> anyhow::Result<()> {
     let exe = std::env::current_exe().map_err(|e| anyhow!("定位自身可执行文件失败: {e}"))?;
     let mut child = std::process::Command::new(exe)
         .arg("start")
         .env("MCE_FOREGROUND", "1")
+        // 显式固定目录:`--data-dir` 只存在于父进程 argv,子进程靠环境继承同一目录
+        .env("MCE_DATA_DIR", &paths.data_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -41,6 +104,80 @@ fn spawn_background() -> Result<()> {
             Ok(())
         }
         Err(e) => bail!("检查后台进程失败: {e}"),
+    }
+}
+
+fn start(paths: &client::DaemonPaths) -> Result<(), CliError> {
+    if std::env::var_os("MCE_FOREGROUND").is_some() {
+        return daemon::serve(paths.clone()).map_err(runtime);
+    }
+    spawn_background(paths).map_err(runtime)
+}
+
+fn run() -> Result<(), CliError> {
+    let parsed = args::parse(std::env::args().skip(1)).map_err(CliError::Usage)?;
+    let want_json = command_json(&parsed.command);
+    let paths = resolve_paths(parsed.data_dir, want_json)?;
+    match parsed.command {
+        Command::Start => start(&paths),
+        Command::Stop => {
+            let n = client::stop(&paths).map_err(runtime)?;
+            println!("已停止,最终条目数 {n}");
+            Ok(())
+        }
+        Command::Query {
+            json: want_json,
+            sort,
+            desc,
+            query,
+        } => {
+            // `--desc` 是绝对降序;协议位是「反转该键自然方向」,换算后才能得到用户要的方向。
+            let sort_str = sort.map(SortKey::as_str);
+            let protocol_desc = sort.map(|s| s.protocol_desc(desc)).unwrap_or(false);
+            match client::query(&paths, &query, 1000, sort_str, protocol_desc) {
+                Ok(out) if want_json => {
+                    println!("{}", json::query_json(&out));
+                    Ok(())
+                }
+                Ok(out) => {
+                    print_query(&out);
+                    Ok(())
+                }
+                Err(e) => Err(CliError::Runtime {
+                    code: e.code,
+                    message: e.message,
+                    json: want_json,
+                }),
+            }
+        }
+        Command::Status { json: want_json } => match client::status(&paths) {
+            Ok(outcome) if want_json => {
+                println!("{}", json::status_json(&outcome, &paths.data_dir));
+                Ok(())
+            }
+            Ok(outcome) => {
+                print_status_outcome(&outcome);
+                Ok(())
+            }
+            Err(e) => Err(CliError::Runtime {
+                code: e.code,
+                message: e.message,
+                json: want_json,
+            }),
+        },
+        Command::Exclude { action, path } => {
+            let out = client::exclude(&paths, &action, path.as_deref()).map_err(runtime)?;
+            println!("排除目录({} 条):", out.excluded.len());
+            for e in &out.excluded {
+                println!("  {e}");
+            }
+            if !out.ok {
+                return Err(runtime(anyhow!(out
+                    .message
+                    .unwrap_or_else(|| "操作未生效".into()))));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -65,6 +202,30 @@ fn print_hits(entries: &[protocol::HitEntry], total: u32, elapsed_ms: f64, stat_
     }
     if total as usize > entries.len() {
         println!("(仅展示前 {} 条)", entries.len());
+    }
+}
+
+/// 人类可读状态输出(`--json` 走 `json::status_json`,不经过这里)。
+fn print_status_outcome(outcome: &client::StatusOutcome) {
+    match outcome {
+        client::StatusOutcome::Reported(r) => {
+            print_status(
+                &r.state,
+                r.entry_count,
+                &r.gaps,
+                r.io_error_count,
+                r.built_at,
+                &r.index_file,
+                r.offline,
+            );
+            if r.offline {
+                // 缺口清单只在 daemon 内存中:离线时显式说明,不静默留白
+                println!("权限缺口与 IO 错误计数:需 daemon 在线查看(执行 macEverything start)");
+            }
+        }
+        client::StatusOutcome::NoIndex => {
+            println!("状态: 无索引(daemon 未运行且无落盘索引);执行 macEverything start 开始建索引");
+        }
     }
 }
 
@@ -146,91 +307,13 @@ fn fmt_time(secs: u64) -> String {
     )
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     // 管道下游提前关闭(如 query ... | head)时按 Unix 惯例静默退出,而非 panic。
     // SAFETY:signal 注册无内存安全影响;进程生命周期内有效。
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let paths = client::DaemonPaths {
-        data_dir: data_dir()?,
-    };
-    match args.first().map(String::as_str) {
-        Some("start") => {
-            if std::env::var_os("MCE_FOREGROUND").is_some() {
-                daemon::serve(paths)
-            } else {
-                spawn_background()
-            }
-        }
-        Some("stop") => {
-            let n = client::stop(&paths)?;
-            println!("已停止,最终条目数 {n}");
-            Ok(())
-        }
-        Some("query") => {
-            let q = args
-                .get(1)
-                .ok_or_else(|| anyhow!("用法: macEverything query \"关键词\""))?;
-            // CLI 查询无列排序入口:sort 传 None(= relevance)+ desc=false,行为与 v1 一致
-            let out = client::query(&paths, q, 1000, None, false)?;
-            print_query(&out);
-            Ok(())
-        }
-        Some("status") => {
-            match client::status(&paths)? {
-                client::StatusOutcome::Reported(r) => {
-                    print_status(
-                        &r.state,
-                        r.entry_count,
-                        &r.gaps,
-                        r.io_error_count,
-                        r.built_at,
-                        &r.index_file,
-                        r.offline,
-                    );
-                    if r.offline {
-                        // 缺口清单只在 daemon 内存中:离线时显式说明,不静默留白
-                        println!(
-                            "权限缺口与 IO 错误计数:需 daemon 在线查看(执行 macEverything start)"
-                        );
-                    }
-                }
-                client::StatusOutcome::NoIndex => {
-                    println!(
-                        "状态: 无索引(daemon 未运行且无落盘索引);执行 macEverything start 开始建索引"
-                    );
-                }
-            }
-            Ok(())
-        }
-        Some("exclude") => {
-            let out = client::exclude(
-                &paths,
-                args.get(1).map(String::as_str).unwrap_or("list"),
-                args.get(2).map(String::as_str),
-            )?;
-            println!("排除目录({} 条):", out.excluded.len());
-            for e in &out.excluded {
-                println!("  {e}");
-            }
-            if !out.ok {
-                bail!("{}", out.message.unwrap_or_else(|| "操作未生效".into()));
-            }
-            Ok(())
-        }
-        _ => {
-            eprintln!(
-                "macEverything — macOS 全盘文件名即时搜索\n\n\
-                 用法:\n  \
-                 macEverything start           启动常驻引擎(后台建索引)\n  \
-                 macEverything stop            停止引擎(落盘后退出)\n  \
-                 macEverything query \"关键词\"   查询(含语法:空格 AND、* ? 通配、path: case: whole:)\n  \
-                 macEverything status          查看索引状态与权限缺口\n  \
-                 macEverything exclude add|remove|list [路径]  管理排除目录(add 须扫描根内绝对路径;remove 接受已有条目原文)\n  \
-                 macEverything exclude reset     恢复默认排除项(~/Library、node_modules、.git、~/.Trash)"
-            );
-            std::process::exit(2);
-        }
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => e.exit(),
     }
 }
 
