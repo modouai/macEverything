@@ -596,8 +596,10 @@ fn draw_volumes_group(
 }
 
 /// 命令行工具行展示推导(设计 §5.1/§5.2):busy 或未探测 →「检查中…」;
-/// 运行环境不可用 → 只给原因;PATH 不可信 → 重试;其余按分类给
-/// 安装/卸载/修复。遮蔽(存在 Ours 但生效项不是它)时卸载按钮指向第一个 Ours。
+/// 运行环境不可用 → 原因 + 重试;PATH 不可信 → 重试;无生效命中且无受管
+/// 条目(含只剩会被终端跳过的残留)→ 未安装 + 安装;其余按分类给
+/// 卸载/修复或不给动作。遮蔽(存在 Ours 但生效项不是它)时卸载按钮指向
+/// 第一个 Ours。
 fn cli_row(data: &SettingsData) -> CliRow {
     let cli = &data.cli_install;
     let mut row = CliRow {
@@ -629,6 +631,12 @@ fn cli_row(data: &SettingsData) -> CliRow {
         }
     };
     if !row.status.is_empty() {
+        // Unavailable 只拒绝安装/修复/卸载;探测本身可重试(设计 §5.0-C)。
+        row.button = Some(CliButton {
+            label: i18n::s().cli_retry_button,
+            enabled: true,
+            action: SettingsAction::CliInstallRefresh,
+        });
         return row;
     }
     // PATH 不可信(来源非登录交互 shell / 扫描遇错):只给重试,不展示分类。
@@ -641,7 +649,29 @@ fn cli_row(data: &SettingsData) -> CliRow {
         });
         return row;
     }
+    // 未安装且可安装(设计 §5.1 Absent 定义):无生效可执行命中,也无
+    // Ours/OtherApp/BrokenApp。只剩不可执行/目录 Foreign 与 BrokenForeign
+    // 时仍按未安装处理——这些条目会被终端跳过,不得阻塞安装。
+    let has_managed = obs.hits.iter().any(|entry| {
+        matches!(
+            entry,
+            EntryState::Ours { .. } | EntryState::OtherApp { .. } | EntryState::BrokenApp { .. }
+        )
+    });
+    if obs.effective.is_none() && !has_managed {
+        row.status = i18n::s().cli_state_absent.to_owned();
+        if !obs.hits.is_empty() {
+            row.note = Some(i18n::s().cli_state_skipped.to_owned());
+        }
+        row.button = Some(CliButton {
+            label: i18n::s().cli_install_button,
+            enabled: true,
+            action: SettingsAction::CliInstallInstall,
+        });
+        return row;
+    }
     // 分类主状态:终端实际会执行的条目,否则第一个命中。
+    // (走到这里 hits 非空且含受管条目或有生效命中,primary 必为 Some。)
     let primary = obs
         .effective
         .and_then(|index| obs.hits.get(index))
@@ -652,14 +682,7 @@ fn cli_row(data: &SettingsData) -> CliRow {
         .find(|entry| matches!(entry, EntryState::Ours { .. }));
     let shadowed = ours.is_some() && !matches!(primary, Some(EntryState::Ours { .. }));
     match primary {
-        None => {
-            row.status = i18n::s().cli_state_absent.to_owned();
-            row.button = Some(CliButton {
-                label: i18n::s().cli_install_button,
-                enabled: true,
-                action: SettingsAction::CliInstallInstall,
-            });
-        }
+        None => {} // 不可达:见上;留空保穷尽。
         Some(EntryState::Ours { path, .. }) => {
             row.status = i18n::s().cli_state_ours.to_owned();
             row.note = Some(path.display().to_string());
@@ -2990,21 +3013,93 @@ mod tests {
         );
     }
 
-    /// 运行环境不可用(DevBuild):只给原因,不给按钮(安装/重试都不得出现)。
+    /// 运行环境不可用(DevBuild):原因 + 重试按钮(点击 → CliInstallRefresh);
+    /// 安装/卸载/修复仍不得出现(设计 §5.0-C)。
     #[test]
-    fn cli_row_devbuild_shows_reason_without_buttons() {
+    fn cli_row_devbuild_shows_reason_and_retry() {
         let mut data = layout_test_data();
         let mut obs = cli_ready_obs(vec![], None);
         obs.availability = Availability::DevBuild;
         data.cli_install.observation = Some(obs);
-        let out = run_body(&data);
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
         let texts = all_texts(&out);
         find_text(&texts, i18n::s().cli_unavailable_dev);
+        for label in [
+            i18n::s().cli_install_button,
+            i18n::s().cli_uninstall_button,
+            i18n::s().cli_repair_button,
+        ] {
+            assert!(
+                texts.iter().all(|text| text.galley.text() != label),
+                "DevBuild 不得出现动作按钮 {label:?}"
+            );
+        }
+        let pos = text_center(find_text(&texts, i18n::s().cli_retry_button));
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CliInstallRefresh],
+            "Unavailable 的重试按钮 → CliInstallRefresh"
+        );
+    }
+
+    /// 残留命中(断链/无执行位,无生效):仍按未安装处理——安装可用,
+    /// 并提示这些条目会被终端跳过(设计 §5.1,不得阻塞安装)。
+    #[test]
+    fn cli_row_junk_hits_stay_installable_with_skip_note() {
+        let junk = [
+            // 断链残留。
+            vec![EntryState::BrokenForeign {
+                path: "/opt/homebrew/bin/macEverything".into(),
+                target: "/nowhere/old-tool".into(),
+            }],
+            // 目录/无执行位残留(终端会跳过)。
+            vec![EntryState::Foreign {
+                path: "/opt/homebrew/bin/macEverything".into(),
+                executable: false,
+            }],
+        ];
+        for hits in junk {
+            let mut data = layout_test_data();
+            data.cli_install.observation = Some(cli_ready_obs(hits, None));
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let (out, _) = run_frame(&ctx, &data, Vec::new());
+            let texts = all_texts(&out);
+            find_text(&texts, i18n::s().cli_state_absent);
+            find_text(&texts, i18n::s().cli_state_skipped);
+            let pos = text_center(find_text(&texts, i18n::s().cli_install_button));
+            let output = click_at(&ctx, &data, pos);
+            assert_eq!(
+                output.actions,
+                vec![SettingsAction::CliInstallInstall],
+                "残留命中不得阻塞安装"
+            );
+        }
+    }
+
+    /// 可执行的 Foreign 是有效命中(effective 指向它):显示「其他来源」,
+    /// 不给安装(设计 §5.1:Absent 要求无有效可执行命中)。
+    #[test]
+    fn cli_row_executable_foreign_blocks_install() {
+        let mut data = layout_test_data();
+        data.cli_install.observation = Some(cli_ready_obs(
+            vec![EntryState::Foreign {
+                path: "/opt/homebrew/bin/macEverything".into(),
+                executable: true,
+            }],
+            Some(0),
+        ));
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        find_text(&texts, i18n::s().cli_state_foreign);
         assert!(
             texts
                 .iter()
                 .all(|text| text.galley.text() != i18n::s().cli_install_button),
-            "DevBuild 不得出现安装按钮"
+            "可执行 Foreign 不得出现安装按钮"
         );
     }
 

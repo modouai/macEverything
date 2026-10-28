@@ -63,11 +63,13 @@ catalog! {
     cli_state_foreign: "其他来源，不管理" / "Managed by another source",
     cli_state_broken: "链接失效" / "Link is broken",
     cli_state_broken_volume: "目标卷未挂载" / "Target volume is not mounted",
+    cli_state_skipped: "PATH 前部的同名条目会被终端跳过" / "Earlier same-name entries are skipped by the terminal",
     cli_state_unreadable: "无法读取：{err}" / "Cannot read: {err}",
     cli_unavailable_dev: "开发构建不提供安装" / "Not available in a development build",
     cli_unavailable_moved: "先移到 Applications 并重启 App" / "Move to Applications and relaunch the app",
     cli_unavailable_bundled: "App 内置命令行缺失或损坏" / "The bundled command-line tool is missing or damaged",
     cli_unknown_path: "无法读取登录 shell 的 PATH" / "Couldn't read the login shell PATH",
+    cli_hint_add_path: "PATH 中没有可用目录；先把 {dir} 加入 PATH（勿由 App 修改 shell 配置），然后重试安装" / "No usable directory in PATH; add {dir} to PATH (the app won't edit your shell config), then retry installation",
     cli_fda_hint: "首次在终端运行可能需要完全磁盘访问权限" / "The first terminal run may need Full Disk Access",
     // 关于 / 更新
     group_about: "关于" / "About",

@@ -21,9 +21,7 @@ use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 
 use crate::autostart::{self, Status};
-use crate::cli_install::actions::{
-    choose_install_dir, first_allowed_dir, manual_install_hint, ALLOWED_DIRS,
-};
+use crate::cli_install::actions::choose_install_dir;
 use crate::cli_install::{actions as cli_actions, classify, EntryState, Observation, RealFs};
 use crate::hotkey::{HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
@@ -1473,15 +1471,15 @@ fn run_cli_install(action: &CliInstallAction) -> (Result<Observation, String>, O
                         .map(|e| format!("{e:?}"))
                 }
                 None => {
-                    // 无可写白名单目录:给 PATH 中第一个允许目录的手动命令
-                    // (PATH 里没有允许目录时回落文档承诺顺序的第一个)。
-                    let fallback = first_allowed_dir(&fs, path_var, home.as_deref())
-                        .unwrap_or_else(|| PathBuf::from(ALLOWED_DIRS[0]));
-                    log::info!(
-                        "命令行工具:无可写安装目录,给手动命令({})",
-                        fallback.display()
-                    );
-                    Some(manual_install_hint(&fs, &fallback, bundle_cli))
+                    // 无可写白名单目录:按 PATH 里有无允许目录给手动命令或
+                    // 「先加入 PATH」指引(设计 §5.2)。
+                    log::info!("命令行工具:无可写安装目录,给手动提示");
+                    Some(cli_actions::manual_install_hint_for(
+                        &fs,
+                        path_var,
+                        home.as_deref(),
+                        bundle_cli,
+                    ))
                 }
             };
             (Ok(classify::observe()), error)

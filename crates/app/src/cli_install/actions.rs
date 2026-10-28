@@ -260,6 +260,29 @@ pub fn manual_install_hint(fs: &dyn InstallerFs, dir: &Path, cli: &Path) -> Stri
     manual_install_command(dir, cli, !fs.access_w(dir))
 }
 
+/// 无可写安装目录时的手动提示(设计 §5.2,按 PATH 里有无允许目录分流):
+/// - 有允许目录(不看可写性)→ 该目录的带守卫命令(必要时 sudo);
+/// - 没有任何允许目录 → 「先把允许目录加入 PATH」指引(App 不修改 shell
+///   配置,`{dir}` 取文档承诺顺序的第一个)+ 守卫命令作参考。
+pub fn manual_install_hint_for(
+    fs: &dyn InstallerFs,
+    path_var: &OsStr,
+    home: Option<&OsStr>,
+    cli: &Path,
+) -> String {
+    match first_allowed_dir(fs, path_var, home) {
+        Some(dir) => manual_install_hint(fs, &dir, cli),
+        None => {
+            let dir = Path::new(ALLOWED_DIRS[0]);
+            let guidance = crate::i18n::fill(
+                crate::i18n::s().cli_hint_add_path,
+                &[("dir", ALLOWED_DIRS[0])],
+            );
+            format!("{guidance} {}", manual_install_hint(fs, dir, cli))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +669,32 @@ mod tests {
         );
         let hint = manual_install_hint(&path_fs(), Path::new("/opt/homebrew/bin"), bundle);
         assert!(!hint.contains("sudo"), "可写目录不带 sudo: {hint}");
+    }
+
+    /// 突变敏感:PATH 中没有任何允许目录时给「先加入 PATH」指引(设计 §5.2,
+    /// App 不修改 shell 配置)+ 守卫命令作参考;若实现回落成对白名单目录的
+    /// 安装命令,本测试的「加入 PATH」断言变红。PATH 里有允许目录(即便
+    /// 不可写)仍走该目录的手动命令,不混入指引。
+    #[test]
+    fn manual_hint_guides_add_path_when_path_has_no_allowed_dir() {
+        let fs = path_fs();
+        let hint =
+            manual_install_hint_for(&fs, OsStr::new("/only/other"), home(), Path::new(BUNDLE));
+        assert!(
+            hint.contains("先把 /opt/homebrew/bin 加入 PATH"),
+            "指引须含首个允许目录:{hint}"
+        );
+        assert!(hint.contains("ln -s"), "须附守卫命令作参考:{hint}");
+
+        let mut fs = path_fs();
+        fs.set_access_w(false);
+        let hint = manual_install_hint_for(
+            &fs,
+            OsStr::new("/opt/homebrew/bin"),
+            home(),
+            Path::new(BUNDLE),
+        );
+        assert!(!hint.contains("加入 PATH"), "有允许目录不得给指引:{hint}");
+        assert!(hint.contains("sudo ln -s"), "{hint}");
     }
 }
