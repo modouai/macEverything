@@ -47,6 +47,9 @@ pub trait InstallerFs {
     /// 跟随符号链接。
     fn stat(&self, p: &Path) -> io::Result<Meta>;
     fn read_link(&self, p: &Path) -> io::Result<PathBuf>;
+    /// 解析真实路径(展开符号链接、`..` 与 `/var`→`/private/var` 这类
+    /// 前缀别名)。
+    fn canonicalize(&self, p: &Path) -> io::Result<PathBuf>;
     /// `access(2)` `X_OK`。
     fn access_x(&self, p: &Path) -> bool;
     /// `access(2)` `W_OK`(用于动作前的父目录可写预判)。
@@ -83,6 +86,9 @@ impl InstallerFs for RealFs {
     }
     fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
         std::fs::read_link(p)
+    }
+    fn canonicalize(&self, p: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(p)
     }
     fn access_x(&self, p: &Path) -> bool {
         access(p, libc::X_OK)

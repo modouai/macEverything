@@ -211,6 +211,11 @@ impl InstallerFs for FakeFs {
             .ok_or_else(|| io::ErrorKind::InvalidInput.into())
     }
 
+    // 测试里传入的都是合成路径,原样放回,使现有用例的路径断言不受影响。
+    fn canonicalize(&self, p: &Path) -> io::Result<PathBuf> {
+        Ok(p.to_path_buf())
+    }
+
     fn access_x(&self, p: &Path) -> bool {
         self.stat(p)
             .map(|m| m.is_file && m.mode & 0o111 != 0)

@@ -213,11 +213,23 @@ pub fn classify_entry(
     }))
 }
 
+/// 去尾斜杠(设计 §5.0-B 预处理):`/bin/` 与 `/bin` 是同一段,归一后再做
+/// 绝对路径判定与去重;只剥分隔符,其余保持原样(根 `/` 不动)。
+fn strip_trailing_seps(p: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut b = p.as_os_str().as_bytes();
+    while b.len() > 1 && b[b.len() - 1] == b'/' {
+        b = &b[..b.len() - 1];
+    }
+    PathBuf::from(std::ffi::OsStr::from_bytes(b))
+}
+
 /// 顺序扫描 PATH,返回 (全部命中, effective 下标, 是否出现不可读段)。
 ///
-/// 相对段跳过;重复段(按字面路径)只扫一次;分类出错(EACCES/ELOOP 等)
-/// 记 Unreadable 并置 unknown。effective 取第一个「stat 为普通文件且
-/// access(X_OK) 通过」的条目——终端实际会执行的那个。
+/// 相对段跳过;每段先去尾斜杠,重复段(按归一后的字面路径)只扫一次;
+/// 分类出错(EACCES/ELOOP 等)记 Unreadable 并置 unknown。effective 取
+/// 第一个「stat 为普通文件且 access(X_OK) 通过」的条目——终端实际会执行
+/// 的那个。
 pub fn scan_path(
     fs: &dyn InstallerFs,
     path_var: &std::ffi::OsStr,
@@ -228,6 +240,7 @@ pub fn scan_path(
     let mut unknown = false;
     let mut seen = std::collections::HashSet::new();
     for seg in std::env::split_paths(path_var) {
+        let seg = strip_trailing_seps(&seg);
         if !seg.is_absolute() {
             continue;
         }
@@ -262,10 +275,16 @@ pub fn scan_path(
 
 /// 从当前 App 可执行文件推导随包 CLI 与位置状态(设计 §5.0-C)。
 ///
-/// 要求 exe 父目录呈 `<...>.app/Contents/MacOS` 形态(大小写不敏感);
-/// 随包 CLI 必须 lstat 为**非空普通文件**(符号链接不算——App 自更新可能
-/// 换成链到别处)且可执行;再查 translocation 与只读卷。
+/// exe 先 canonicalize(设计:「并 canonicalize」):current_exe 可能带着
+/// `/var`→`/private/var` 之类的瞬时/别名前缀或符号链接化的 bundle 目录,
+/// 这些形态不解析成真实位置,就会泄漏进链接文本与 statfs 目标(例如把
+/// 随包 CLI 装成指向别名路径的链接,别名失效即断链)。解析失败视为无法
+/// 证明打包形态,按 DevBuild 处理(不给任何动作)。
 pub fn availability(fs: &dyn InstallerFs, exe: &Path) -> (Availability, Option<PathBuf>) {
+    let exe = match fs.canonicalize(exe) {
+        Ok(p) => p,
+        Err(_) => return (Availability::DevBuild, None),
+    };
     let Some(dir) = exe.parent() else {
         return (Availability::DevBuild, None);
     };
@@ -428,6 +447,10 @@ mod tests {
             fn read_link(&self, _: &Path) -> io::Result<PathBuf> {
                 Err(io::ErrorKind::PermissionDenied.into())
             }
+            // 本测试只走 scan_path/classify_entry,不会触达 canonicalize。
+            fn canonicalize(&self, _: &Path) -> io::Result<PathBuf> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
             fn access_x(&self, _: &Path) -> bool {
                 false
             }
@@ -494,6 +517,50 @@ mod tests {
         }
     }
 
+    /// OtherApp 钉死:链接指向**另一个** macEverything App(目标存在、
+    /// app 形态、dev+ino 不同)→ OtherApp 而非 Ours/Foreign。只有 dev+ino
+    /// 一致才算 Ours——丢掉该比较会把别人的 App 误认成自己。
+    #[test]
+    fn symlink_to_other_app_is_otherapp() {
+        let mut fs = FakeFs::new();
+        fs.file(BUNDLE, 9, 9);
+        fs.file_mode("/B/Real.app/Contents/MacOS/macEverything", 8, 8, 0o755);
+        fs.link(
+            "/bin/macEverything",
+            "/B/Real.app/Contents/MacOS/macEverything",
+        );
+        let s = classify_entry(&fs, Path::new("/bin/macEverything"), Path::new(BUNDLE))
+            .unwrap()
+            .unwrap();
+        match s {
+            EntryState::OtherApp {
+                executable, target, ..
+            } => {
+                assert!(executable);
+                assert_eq!(
+                    target,
+                    Path::new("/B/Real.app/Contents/MacOS/macEverything")
+                );
+            }
+            other => panic!("意外分类: {other:?}"),
+        }
+    }
+
+    /// 链接到已存在的非 app 目标 → Foreign(记录执行位)。
+    #[test]
+    fn symlink_to_existing_nonapp_target_is_foreign() {
+        let mut fs = FakeFs::new();
+        fs.file(BUNDLE, 9, 9);
+        fs.file_mode("/usr/bin/tool", 8, 8, 0o755);
+        fs.link("/bin/macEverything", "/usr/bin/tool");
+        let s = classify_entry(&fs, Path::new("/bin/macEverything"), Path::new(BUNDLE))
+            .unwrap()
+            .unwrap();
+        match s {
+            EntryState::Foreign { executable, .. } => assert!(executable),
+            other => panic!("意外分类: {other:?}"),
+        }
+    }
     /// effective = 第一个「stat 为普通文件且可执行」的条目:
     /// 断链(不可执行)与指向无执行位目标的 Ours 都被跳过。
     #[test]
@@ -555,6 +622,23 @@ mod tests {
         assert_eq!(hits.len(), 1);
     }
 
+    /// 去尾斜杠后去重:`/bin/` 与 `/bin` 是同一段,命中路径不带尾斜杠。
+    #[test]
+    fn trailing_slash_segment_dedups() {
+        let mut fs = FakeFs::new();
+        fs.file(BUNDLE, 9, 9);
+        fs.link("/bin/macEverything", BUNDLE);
+        let (hits, _, unknown) = scan_path(&fs, OsStr::new("/bin:/bin/"), Path::new(BUNDLE));
+        assert!(!unknown);
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            EntryState::Ours { path, .. } => {
+                assert_eq!(path, Path::new("/bin/macEverything"))
+            }
+            other => panic!("意外分类: {other:?}"),
+        }
+    }
+
     /// 相对段(如 `.` / `bin`)一律跳过。
     #[test]
     fn relative_segments_skipped() {
@@ -569,6 +653,64 @@ mod tests {
         let mut fs = FakeFs::new();
         fs.file(exe, 9, 9);
         fs
+    }
+
+    /// canonicalize 失败(exe 被并发替换/路径不可达)→ DevBuild,不给动作。
+    #[test]
+    fn availability_canonicalize_failure_is_devbuild() {
+        struct CanonErr;
+        impl InstallerFs for CanonErr {
+            fn lstat(&self, _: &Path) -> io::Result<Meta> {
+                Ok(Meta {
+                    dev: 9,
+                    ino: 9,
+                    len: 4096,
+                    is_file: true,
+                    is_symlink: false,
+                    mode: 0o755,
+                })
+            }
+            fn stat(&self, _: &Path) -> io::Result<Meta> {
+                Ok(Meta {
+                    dev: 9,
+                    ino: 9,
+                    len: 4096,
+                    is_file: true,
+                    is_symlink: false,
+                    mode: 0o755,
+                })
+            }
+            fn read_link(&self, _: &Path) -> io::Result<PathBuf> {
+                Err(io::ErrorKind::InvalidInput.into())
+            }
+            fn canonicalize(&self, _: &Path) -> io::Result<PathBuf> {
+                Err(io::ErrorKind::NotFound.into())
+            }
+            fn access_x(&self, _: &Path) -> bool {
+                true
+            }
+            fn access_w(&self, _: &Path) -> bool {
+                true
+            }
+            fn symlink(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn remove_file(&self, _: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn statfs(&self, _: &Path) -> io::Result<StatFs> {
+                Ok(StatFs { read_only: false })
+            }
+        }
+        let (a, cli) = availability(
+            &CanonErr,
+            Path::new("/A/Foo.app/Contents/MacOS/macEverything"),
+        );
+        assert_eq!(a, Availability::DevBuild);
+        assert!(cli.is_none());
     }
 
     #[test]
