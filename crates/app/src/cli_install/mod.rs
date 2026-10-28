@@ -13,10 +13,8 @@ pub mod path_env;
 #[cfg(test)]
 pub(crate) mod test_fs;
 
-#[allow(unused_imports)]
-// Task 8 接线后移除(重导出供设置页取分类类型与 PathSource,当前无消费点)
+// 重导出供设置页(Task 8 接线)取分类类型与 PATH 来源。
 pub use classify::{Availability, EntryState, Observation};
-#[allow(unused_imports)]
 pub use path_env::PathSource;
 
 use std::io;

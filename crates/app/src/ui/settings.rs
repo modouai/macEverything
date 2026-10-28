@@ -11,7 +11,8 @@
 //! 窗口交互：标题栏可拖拽（左侧预留原生交通灯）、红点/⌘W = 隐藏（不退出 App）。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,6 +21,10 @@ use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 
 use crate::autostart::{self, Status};
+use crate::cli_install::actions::{
+    choose_install_dir, first_allowed_dir, manual_install_hint, ALLOWED_DIRS,
+};
+use crate::cli_install::{actions as cli_actions, classify, EntryState, Observation, RealFs};
 use crate::hotkey::{HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::platform;
@@ -230,6 +235,125 @@ fn exclude_result(outcome: anyhow::Result<client::ExcludeOutcome>) -> ExcludeRes
     }
 }
 
+// ===== 命令行工具安装器(v2.5):纯状态机 + 后台动作 =====
+
+/// 安装器行的阶段(设计 §5.3):Idle=尚未探测;Resolving=探测中;
+/// Acting=动作(安装/修复/卸载)进行中;Ready=携最近一次观测可展示。
+#[derive(Debug, Clone)]
+pub(crate) enum CliInstallPhase {
+    Idle,
+    Resolving,
+    Acting,
+    Ready(Observation),
+}
+
+/// 一次后台动作(点击时定案载荷;dst 在线程内解析)。
+#[derive(Debug, Clone)]
+pub(crate) enum CliInstallAction {
+    /// 只读探测(登录 shell PATH + 全量分类)。
+    Refresh,
+    /// 安装:`dst=None` 时线程内按 PATH 白名单自选,仍无 → 手动命令。
+    Install {
+        dst: Option<PathBuf>,
+        bundle_cli: PathBuf,
+        path_var: Option<OsString>,
+    },
+    /// 修复第一个断链条目指向当前随包 CLI。
+    Repair {
+        entry: EntryState,
+        bundle_cli: PathBuf,
+    },
+    /// 卸载第一个本 App 链接。
+    Uninstall {
+        entry: EntryState,
+        bundle_cli: PathBuf,
+    },
+}
+
+/// 工作线程的一次回投(单飞通道;`generation` 丢弃陈旧结果)。
+pub(crate) struct CliInstallResult {
+    pub(crate) generation: u64,
+    /// 动作后/探测本身的观测;探测失败为 Err(动作失败仍携带新观测)。
+    pub(crate) result: Result<Observation, String>,
+    /// 动作本身的失败文案(探测结果不受影响,仍随 `result` 回投)。
+    pub(crate) action_error: Option<String>,
+}
+
+/// 安装器行状态机(设计 §5.3:单飞 + generation + 动作使在飞探测失效)。
+///
+/// - generation 单调递增;`apply` 丢弃比当前旧的回投(旧探测不得覆盖动作)。
+/// - `error` 保留最近一次失败直到下次开始;观测在探测失败时保留旧值。
+/// - 动作失败只置错误并解除 busy,阶段保持(旧观测继续展示)。
+#[derive(Debug, Clone)]
+pub(crate) struct CliInstallUi {
+    pub(crate) phase: CliInstallPhase,
+    pub(crate) error: Option<String>,
+    pub(crate) busy: bool,
+    pub(crate) generation: u64,
+    /// 最近一次成功观测(探测失败/动作错误时保留,供展示与动作载荷)。
+    pub(crate) last: Option<Observation>,
+}
+
+impl Default for CliInstallUi {
+    fn default() -> Self {
+        Self {
+            phase: CliInstallPhase::Idle,
+            error: None,
+            busy: false,
+            generation: 0,
+            last: None,
+        }
+    }
+}
+
+impl CliInstallUi {
+    /// 开始一次探测:代数 +1,阶段转 Resolving,busy 置位,清旧错误。
+    pub(crate) fn begin_resolve(&mut self) -> u64 {
+        self.generation += 1;
+        self.phase = CliInstallPhase::Resolving;
+        self.busy = true;
+        self.error = None;
+        self.generation
+    }
+
+    /// 开始一次动作:同 [`begin_resolve`] 但阶段转 Acting。
+    pub(crate) fn begin_action(&mut self) -> u64 {
+        self.generation += 1;
+        self.phase = CliInstallPhase::Acting;
+        self.busy = true;
+        self.error = None;
+        self.generation
+    }
+
+    /// 落地一次回投:旧代数丢弃;动作错误只置错误并解除 busy(阶段保持);
+    /// 观测成功覆盖 last;探测失败保留 last(无 last 回 Idle)。
+    pub(crate) fn apply(&mut self, r: CliInstallResult) {
+        if r.generation < self.generation {
+            return; // 旧刷新/旧动作结果丢弃
+        }
+        if let Some(e) = r.action_error {
+            self.error = Some(e);
+            self.busy = false;
+            return;
+        }
+        match r.result {
+            Ok(o) => {
+                self.last = Some(o.clone());
+                self.phase = CliInstallPhase::Ready(o);
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.phase = match &self.last {
+                    Some(o) => CliInstallPhase::Ready(o.clone()),
+                    None => CliInstallPhase::Idle,
+                };
+            }
+        }
+        self.busy = false;
+    }
+}
+
 /// 设置窗口运行期真源：开合 + 设置快照 + 自启/字号错误 + 渲染数据。
 ///
 /// 本结构持有运行期数据（不每帧重建 `engine::config::default_config()`）；
@@ -280,6 +404,12 @@ pub struct SettingsState {
     pub(crate) volumes_rx: Option<Receiver<VolumePrefsResult>>,
     /// 打开设置时挂起的卷偏好刷新(隐藏期可能被 CLI/其他实例改动)。
     pub(crate) volumes_refresh_pending: bool,
+    /// 命令行工具安装器行状态(Task 8;单飞 + generation)。
+    pub(crate) cli_install: CliInstallUi,
+    /// 安装器后台结果通道(one-op;不跨操作复用)。
+    pub(crate) cli_rx: Option<Receiver<CliInstallResult>>,
+    /// 打开设置时挂起的安装器探测(单飞:busy 中等本次结束)。
+    pub(crate) cli_refresh_pending: bool,
     /// 全局热键运行时快照（H2 启动种子；键帽展示/查重的唯一真源）。
     pub(crate) hotkey_snapshot: HotkeySnapshot,
     /// 当前录制槽（None = 未录制）；录制期全局热键已挂起。
@@ -327,6 +457,9 @@ impl SettingsState {
             volumes: settings_view::VolumesData::default(),
             volumes_rx: None,
             volumes_refresh_pending: false,
+            cli_install: CliInstallUi::default(),
+            cli_rx: None,
+            cli_refresh_pending: false,
             hotkey_snapshot,
             recording: None,
             viewport_focused: None,
@@ -356,6 +489,8 @@ impl SettingsState {
             // 每次真正打开都重取 daemon 列表（隐藏期可能被 CLI 改动）。
             self.exclude_refresh_pending = true;
             self.volumes_refresh_pending = true;
+            // 安装器行同步补一次探测(PATH/链接状态在隐藏期可能变化)。
+            self.cli_refresh_pending = true;
         }
         first_open
     }
@@ -497,6 +632,37 @@ impl SettingsState {
         self.volumes.busy = true;
         self.volumes_rx = Some(rx);
         true
+    }
+
+    /// 设置 pass 的安装器推进:非阻塞收结果;返回 true = 打开态且有挂起探测、
+    /// 当前空闲(调用方 spawn 成功后才清挂起位,语义同 exclude/volumes)。
+    pub(crate) fn advance_cli_install(&mut self, open: bool) -> bool {
+        self.tick_cli_install();
+        open && self.cli_refresh_pending && !self.cli_install.busy
+    }
+
+    /// 安装器工作线程无法启动:清 busy/通道并落内联错误(观测保留)。
+    pub(crate) fn cli_install_spawn_failed(&mut self, detail: String) {
+        log::warn!("命令行工具工作线程启动失败:{detail}");
+        self.cli_install.busy = false;
+        self.cli_rx = None;
+        self.cli_install.error = Some(detail);
+    }
+
+    /// 非阻塞收取安装器后台结果(设置 pass 锁内;空 = 保持 busy 等下一帧)。
+    /// 通道 one-op:结果/断链都消费掉回投端,不跨操作复用。
+    pub(crate) fn tick_cli_install(&mut self) {
+        let Some(rx) = self.cli_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => self.cli_install.apply(result),
+            Err(TryRecvError::Empty) => self.cli_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {
+                log::warn!("命令行工具工作线程异常退出(无结果)");
+                self.cli_install.busy = false;
+            }
+        }
     }
 
     /// 入队一条快捷键命令（设置 pass；纯状态，运行时调用仍在 App）。
@@ -799,6 +965,18 @@ impl SettingsData {
             update: update.phase().clone(),
             update_error: state.update_error,
             volumes: state.volumes.clone(),
+            cli_install: settings_view::CliInstallData {
+                // Ready 携带的观测即 last;其余阶段(探测/动作中或失败回退)
+                // 沿用 last,供动作载荷与展示。
+                observation: match &state.cli_install.phase {
+                    CliInstallPhase::Ready(obs) => Some(obs.clone()),
+                    CliInstallPhase::Idle
+                    | CliInstallPhase::Resolving
+                    | CliInstallPhase::Acting => state.cli_install.last.clone(),
+                },
+                busy: state.cli_install.busy,
+                error: state.cli_install.error.clone(),
+            },
         }
     }
 }
@@ -820,15 +998,23 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 与 palette/root 同模式——`maybe_apply` 按 CHECK_INTERVAL 节流探测；
     // 应用后本视口立即重绘，并在本 pass 末尾排下一帧（隐藏后不排，守 L4）。
     let focused = ctx.input(|i| i.viewport().focused);
-    let (open, theme_changed, focus_lost, load_exclude, load_volumes) = {
+    let (open, theme_changed, focus_lost, load_exclude, load_volumes, load_cli) = {
         let mut s = lock_shared(shared);
         // 排除目录：先收后台结果（非阻塞），再按打开挂起位决定是否补一次 list。
         let open = s.settings.open;
         let load_exclude = s.settings.advance_exclude(open);
         let load_volumes = s.settings.advance_volumes(open);
+        let load_cli = s.settings.advance_cli_install(open);
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
         let focus_lost = s.settings.observe_focus(focused, open);
-        (open, theme_changed, focus_lost, load_exclude, load_volumes)
+        (
+            open,
+            theme_changed,
+            focus_lost,
+            load_exclude,
+            load_volumes,
+            load_cli,
+        )
     };
     if load_volumes {
         // 挂载枚举(App 侧 statfs,快) + 后台读 daemon 偏好;读成功才清挂起位。
@@ -860,6 +1046,13 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         // 只有 begin/spawn 真正成功才清挂起位；被拒时保留，下一 pass 重试。
         if spawn_exclude(&ctx, shared, "list", None) {
             lock_shared(shared).settings.exclude_refresh_pending = false;
+        }
+        ctx.request_repaint_of(viewport_id());
+    }
+    if load_cli {
+        // 安装器行同纪律:spawn 成功才清挂起位(探测要跑登录 shell,可达数秒)。
+        if spawn_cli_install(&ctx, shared, CliInstallAction::Refresh) {
+            lock_shared(shared).settings.cli_refresh_pending = false;
         }
         ctx.request_repaint_of(viewport_id());
     }
@@ -992,6 +1185,56 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             apply_volumes_set(shared, ctx, auto, excluded);
         }
         SettingsAction::ToggleVolume(name) => apply_volume_toggle(shared, ctx, &name),
+        SettingsAction::CliInstallRefresh => {
+            spawn_cli_install(ctx, shared, CliInstallAction::Refresh);
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::CliInstallInstall => {
+            // dst 在线程内按 PATH 白名单自选;这里只取随包 CLI 与缓存 PATH。
+            let (bundle_cli, path_var) = {
+                let s = lock_shared(shared);
+                match s.settings.cli_install.last.as_ref() {
+                    Some(obs) => (obs.bundled_cli.clone(), obs.path_var.clone()),
+                    None => (None, None),
+                }
+            };
+            if let Some(bundle_cli) = bundle_cli {
+                spawn_cli_install(
+                    ctx,
+                    shared,
+                    CliInstallAction::Install {
+                        dst: None,
+                        bundle_cli,
+                        path_var,
+                    },
+                );
+            }
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::CliInstallRepair(path) => {
+            if let Some((entry, bundle_cli)) = {
+                let s = lock_shared(shared);
+                cli_entry(&s.settings, &path, |e| {
+                    matches!(e, EntryState::BrokenApp { .. })
+                })
+            } {
+                spawn_cli_install(ctx, shared, CliInstallAction::Repair { entry, bundle_cli });
+            }
+            ctx.request_repaint_of(viewport_id());
+        }
+        SettingsAction::CliInstallUninstall(path) => {
+            if let Some((entry, bundle_cli)) = {
+                let s = lock_shared(shared);
+                cli_entry(&s.settings, &path, |e| matches!(e, EntryState::Ours { .. }))
+            } {
+                spawn_cli_install(
+                    ctx,
+                    shared,
+                    CliInstallAction::Uninstall { entry, bundle_cli },
+                );
+            }
+            ctx.request_repaint_of(viewport_id());
+        }
         SettingsAction::CheckUpdate => {
             super::spawn_update_check(shared, ctx);
             ctx.request_repaint_of(viewport_id());
@@ -1150,6 +1393,140 @@ fn apply_volume_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, name: &
         next_excluded.push(name.to_owned());
         spawn_volumes(ctx, shared, auto, next_excluded);
     }
+}
+
+// ===== 命令行工具行:后台探测/动作(Task 8) =====
+
+/// 启动一次安装器后台操作(探测或动作)。
+///
+/// 共享锁只落代数/busy/回投通道,随即释放;分类、动作与登录 shell 探测都在
+/// 工作线程(observe 可耗时至数秒)。完成时请求设置视口重绘,由
+/// `tick_cli_install` 下帧收取。返回 true = 操作已开始;false = 已有操作在途。
+fn spawn_cli_install(
+    ctx: &egui::Context,
+    shared: &Arc<Mutex<Shared>>,
+    action: CliInstallAction,
+) -> bool {
+    let (tx, rx) = mpsc::channel::<CliInstallResult>();
+    let generation = {
+        let mut s = lock_shared(shared);
+        let g = match action {
+            CliInstallAction::Refresh => s.settings.cli_install.begin_resolve(),
+            _ => s.settings.cli_install.begin_action(),
+        };
+        s.settings.cli_rx = Some(rx);
+        g
+    };
+    // busy 立即出图(探测要跑登录 shell;动作按钮同步禁用)。
+    ctx.request_repaint_of(viewport_id());
+    let thread_ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("cli-install".into())
+        .spawn(move || {
+            let (result, action_error) = run_cli_install(&action);
+            match &action_error {
+                Some(error) => log::warn!("命令行工具动作失败:{error}"),
+                None => log::info!("命令行工具操作完成"),
+            }
+            if let Err(err) = tx.send(CliInstallResult {
+                generation,
+                result,
+                action_error,
+            }) {
+                log::warn!("命令行工具结果回投失败(设置页可能已退出):{err}");
+            }
+            thread_ctx.request_repaint_of(viewport_id());
+        });
+    if let Err(err) = spawned {
+        lock_shared(shared)
+            .settings
+            .cli_install_spawn_failed(err.to_string());
+        ctx.request_repaint_of(viewport_id());
+        return false;
+    }
+    true
+}
+
+/// 工作线程体:执行动作 + 全量复核观测(不持共享锁;observe 会 spawn 登录
+/// shell)。动作失败仍回投新观测——界面以复核结果为准,错误单独展示。
+fn run_cli_install(action: &CliInstallAction) -> (Result<Observation, String>, Option<String>) {
+    let fs = RealFs::new();
+    match action {
+        CliInstallAction::Refresh => (Ok(classify::observe()), None),
+        CliInstallAction::Install {
+            dst,
+            bundle_cli,
+            path_var,
+        } => {
+            let home = std::env::var_os("HOME");
+            let empty = OsString::new();
+            let path_var = path_var.as_deref().unwrap_or(&empty);
+            let error = match dst
+                .clone()
+                .or_else(|| choose_install_dir(&fs, path_var, home.as_deref()))
+            {
+                Some(dir) => {
+                    let link = dir.join("macEverything");
+                    log::info!("命令行工具:安装 → {}", link.display());
+                    cli_actions::install(&fs, &link, bundle_cli, bundle_cli)
+                        .err()
+                        .map(|e| format!("{e:?}"))
+                }
+                None => {
+                    // 无可写白名单目录:给 PATH 中第一个允许目录的手动命令
+                    // (PATH 里没有允许目录时回落文档承诺顺序的第一个)。
+                    let fallback = first_allowed_dir(&fs, path_var, home.as_deref())
+                        .unwrap_or_else(|| PathBuf::from(ALLOWED_DIRS[0]));
+                    log::info!(
+                        "命令行工具:无可写安装目录,给手动命令({})",
+                        fallback.display()
+                    );
+                    Some(manual_install_hint(&fs, &fallback, bundle_cli))
+                }
+            };
+            (Ok(classify::observe()), error)
+        }
+        CliInstallAction::Repair { entry, bundle_cli } => {
+            let error = cli_actions::repair(&fs, entry, bundle_cli, bundle_cli)
+                .err()
+                .map(|e| format!("{e:?}"));
+            (Ok(classify::observe()), error)
+        }
+        CliInstallAction::Uninstall { entry, bundle_cli } => {
+            let error = cli_actions::uninstall(&fs, entry, bundle_cli)
+                .err()
+                .map(|e| format!("{e:?}"));
+            (Ok(classify::observe()), error)
+        }
+    }
+}
+
+/// 条目在 PATH 里的位置(供动作分发按「类型 + 路径」取回点击时的条目)。
+fn entry_path(entry: &EntryState) -> Option<&Path> {
+    match entry {
+        EntryState::Ours { path, .. }
+        | EntryState::OtherApp { path, .. }
+        | EntryState::Foreign { path, .. }
+        | EntryState::BrokenApp { path, .. }
+        | EntryState::BrokenForeign { path, .. }
+        | EntryState::Unreadable { path, .. } => Some(path),
+    }
+}
+
+/// 从最近一次观测里取出与路径匹配、类型符合的条目与随包 CLI(锁内短查)。
+/// 观测缺失/类型不符/无随包 CLI 都返回 None(动作不发)。
+fn cli_entry(
+    state: &SettingsState,
+    path: &Path,
+    want: impl Fn(&EntryState) -> bool,
+) -> Option<(EntryState, PathBuf)> {
+    let obs = state.cli_install.last.as_ref()?;
+    let entry = obs
+        .hits
+        .iter()
+        .find(|e| want(e) && entry_path(e) == Some(path))?;
+    let bundle = obs.bundled_cli.clone()?;
+    Some((entry.clone(), bundle))
 }
 
 /// 快捷键命令入队（设置 pass 的唯一动作路径；不调用运行时 manager）。
@@ -1355,6 +1732,7 @@ fn hide_with_command(state: &mut SettingsState, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_install::{Availability, PathSource};
     use crate::settings::{FontSize, SettingsFile};
     use global_hotkey::hotkey::{Code, Modifiers};
 
@@ -1364,6 +1742,28 @@ mod tests {
             PathBuf::from("/tmp/mace-everything-settings-test"),
             HotkeySnapshot::default(),
         )
+    }
+
+    /// 探测成功的观测样例(Ready + 无命中;命中场景由视图测试覆盖)。
+    fn cli_obs() -> Observation {
+        Observation {
+            path_source: PathSource::LoginInteractive,
+            hits: vec![],
+            effective: None,
+            availability: Availability::Ready,
+            bundled_cli: Some("/A.app/Contents/MacOS/macEverything".into()),
+            path_unknown: false,
+            path_var: Some("/usr/local/bin:/opt/homebrew/bin".into()),
+        }
+    }
+
+    /// 通过通道落地一次回投(与真实 worker 同路径,顺带验证 one-op 通道)。
+    fn deliver_cli(state: &mut SettingsState, result: CliInstallResult) {
+        let (tx, rx) = mpsc::channel();
+        state.cli_rx = Some(rx);
+        tx.send(result).unwrap();
+        state.tick_cli_install();
+        assert!(state.cli_rx.is_none(), "one-op 通道用完即弃");
     }
 
     fn hotkey(mods: Modifiers, code: Code) -> HotKey {
@@ -1429,6 +1829,13 @@ mod tests {
         assert!(state.hotkey_commands.is_empty());
         assert!(!state.positioned_once, "首开前未定位");
         assert!(!state.cancel_recording_pending);
+        // 命令行工具行:构造时尚未探测,无挂起/通道。
+        assert!(matches!(state.cli_install.phase, CliInstallPhase::Idle));
+        assert!(!state.cli_install.busy);
+        assert!(state.cli_install.last.is_none());
+        assert!(state.cli_install.error.is_none());
+        assert!(state.cli_rx.is_none());
+        assert!(!state.cli_refresh_pending);
     }
 
     /// 关闭→打开才挂起一次列表刷新；已打开/重复 request_open 不重复挂起。
@@ -1452,6 +1859,23 @@ mod tests {
             state.exclude_refresh_pending,
             "重开须重取 daemon 列表(隐藏期可能被 CLI 改动)"
         );
+    }
+
+    /// 关闭→打开才挂起一次安装器探测;已打开重复请求不重挂。
+    #[test]
+    fn cli_refresh_pending_set_only_on_open_transition() {
+        let mut state = test_state();
+        assert!(!state.cli_refresh_pending, "启动未打开不探测");
+
+        state.request_open();
+        assert!(state.cli_refresh_pending, "打开设置须补一次探测");
+        state.cli_refresh_pending = false;
+        state.request_open();
+        assert!(!state.cli_refresh_pending, "已打开时重复请求不得重探测");
+
+        state.mark_hidden();
+        state.request_open();
+        assert!(state.cli_refresh_pending, "重开须重新探测(PATH 可能变化)");
     }
 
     /// 假通道：开始一次操作并拿到回投端（不启真实 client/daemon）。
@@ -1867,6 +2291,254 @@ mod tests {
             ),
             "{:?}",
             offline.error
+        );
+    }
+
+    // ===== 命令行工具行:纯状态机(Task 8) =====
+
+    /// 陈旧代数的结果丢弃:动作开始后迟到的旧探测不得覆盖 Acting 态。
+    #[test]
+    fn stale_generation_is_ignored() {
+        let mut ui = CliInstallUi::default();
+        let refresh = ui.begin_resolve();
+        let action = ui.begin_action();
+        ui.apply(CliInstallResult {
+            generation: refresh,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        assert!(
+            matches!(ui.phase, CliInstallPhase::Acting),
+            "旧探测结果必须被代数丢弃"
+        );
+        assert!(ui.busy, "丢弃的结果不得解除 busy");
+        ui.apply(CliInstallResult {
+            generation: action,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        assert!(matches!(ui.phase, CliInstallPhase::Ready(_)));
+        assert!(!ui.busy);
+    }
+
+    /// 探测失败保留旧观测(界面继续展示上次状态),错误落地,busy 结束。
+    #[test]
+    fn error_keeps_last_observation() {
+        let mut ui = CliInstallUi::default();
+        let g = ui.begin_resolve();
+        ui.apply(CliInstallResult {
+            generation: g,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        assert!(ui.last.is_some());
+        let g2 = ui.begin_resolve();
+        ui.apply(CliInstallResult {
+            generation: g2,
+            result: Err("probe failed".into()),
+            action_error: None,
+        });
+        assert!(matches!(ui.phase, CliInstallPhase::Ready(_)));
+        assert_eq!(ui.error.as_deref(), Some("probe failed"));
+        assert!(!ui.busy);
+    }
+
+    /// 动作在途时旧探测结果不得解除 busy(单飞:动作使在飞探测失效)。
+    #[test]
+    fn action_blocks_refresh_result() {
+        let mut ui = CliInstallUi::default();
+        let refresh = ui.begin_resolve();
+        let action = ui.begin_action();
+        ui.apply(CliInstallResult {
+            generation: refresh,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        assert!(ui.busy);
+        assert!(matches!(ui.phase, CliInstallPhase::Acting));
+        ui.apply(CliInstallResult {
+            generation: action,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        assert!(!ui.busy);
+    }
+
+    /// 动作错误:错误置位、busy 解除、阶段保持 Acting(旧观测继续展示)。
+    #[test]
+    fn action_error_shows_and_unblocks() {
+        let mut ui = CliInstallUi::default();
+        let g = ui.begin_action();
+        ui.apply(CliInstallResult {
+            generation: g,
+            result: Ok(cli_obs()),
+            action_error: Some("AlreadyExists".into()),
+        });
+        assert_eq!(ui.error.as_deref(), Some("AlreadyExists"));
+        assert!(!ui.busy, "动作错误须解除 busy");
+        assert!(
+            matches!(ui.phase, CliInstallPhase::Acting),
+            "动作错误保持动作期,旧观测不受影响"
+        );
+        assert!(ui.last.is_none(), "无前置观测时不得伪造 Ready");
+    }
+
+    /// 无 last 时探测失败:错误落地并回到 Idle(不得伪造 Ready)。
+    #[test]
+    fn idle_error_goes_to_idle() {
+        let mut ui = CliInstallUi::default();
+        ui.apply(CliInstallResult {
+            generation: 0,
+            result: Err("probe failed".into()),
+            action_error: None,
+        });
+        assert!(matches!(ui.phase, CliInstallPhase::Idle));
+        assert_eq!(ui.error.as_deref(), Some("probe failed"));
+        assert!(!ui.busy);
+    }
+
+    /// 同代数的动作结果正常落地:动作自己的复核观测覆盖 last。
+    #[test]
+    fn same_generation_action_lands() {
+        let mut ui = CliInstallUi::default();
+        let g = ui.begin_resolve();
+        ui.apply(CliInstallResult {
+            generation: g,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        let g2 = ui.begin_action();
+        ui.apply(CliInstallResult {
+            generation: g2,
+            result: Ok(cli_obs()),
+            action_error: None,
+        });
+        assert!(matches!(ui.phase, CliInstallPhase::Ready(_)));
+        assert!(ui.error.is_none(), "动作成功须清旧错误");
+        assert!(!ui.busy);
+    }
+
+    /// pass 推进:busy 中挂起位保留;结果落地后挂起位仍在则请求刷新。
+    #[test]
+    fn cli_install_pass_ticks_result_then_requests_refresh() {
+        let mut state = test_state();
+        state.cli_refresh_pending = true;
+        let g = state.cli_install.begin_resolve();
+        let (tx, rx) = mpsc::channel();
+        state.cli_rx = Some(rx);
+
+        assert!(!state.advance_cli_install(true), "busy 中不得重复启动探测");
+        assert!(state.cli_refresh_pending, "busy 时挂起位必须保留");
+
+        tx.send(CliInstallResult {
+            generation: g,
+            result: Ok(cli_obs()),
+            action_error: None,
+        })
+        .unwrap();
+        assert!(
+            state.advance_cli_install(true),
+            "结果落地解除 busy,残留挂起位应再请求一次"
+        );
+        assert!(state.cli_install.last.is_some(), "探测结果经 tick 落地");
+        assert!(!state.cli_install.busy);
+    }
+
+    /// 关闭期间动作结果落地,重开挂起探测;动作错误同样解除 busy。
+    #[test]
+    fn cli_install_close_reopen_and_action_error() {
+        let mut state = test_state();
+        state.request_open();
+        state.cli_refresh_pending = false;
+
+        let g = state.cli_install.begin_action();
+        state.mark_hidden();
+        state.request_open();
+        assert!(state.cli_refresh_pending, "重开须补探测");
+
+        deliver_cli(
+            &mut state,
+            CliInstallResult {
+                generation: g,
+                result: Ok(cli_obs()),
+                action_error: Some("手动命令: sudo ln -s …".into()),
+            },
+        );
+        assert!(!state.cli_install.busy, "动作错误解除 busy");
+        assert!(state.cli_install.error.is_some(), "错误保留到界面展示");
+    }
+
+    /// 快照复制观测/busy/错误(视图绘制的只读数据源)。
+    #[test]
+    fn cli_install_snapshot_copies_observation_error_busy() {
+        let mut state = test_state();
+        let g = state.cli_install.begin_resolve();
+        deliver_cli(
+            &mut state,
+            CliInstallResult {
+                generation: g,
+                result: Ok(cli_obs()),
+                action_error: None,
+            },
+        );
+        let update = crate::update::UpdateState::new();
+        let data = SettingsData::from_state(&state, &update);
+        assert!(data.cli_install.observation.is_some(), "Ready 态带观测");
+        assert!(!data.cli_install.busy);
+        assert!(data.cli_install.error.is_none());
+
+        state.cli_install.begin_action();
+        let data = SettingsData::from_state(&state, &update);
+        assert!(data.cli_install.busy, "动作在途须反映到快照");
+
+        state.cli_install.error = Some("手动命令".into());
+        let data = SettingsData::from_state(&state, &update);
+        assert_eq!(data.cli_install.error.as_deref(), Some("手动命令"));
+    }
+
+    /// 动作分发查找:按「类型 + 路径」从缓存观测取条目与随包 CLI。
+    #[test]
+    fn cli_entry_lookup_matches_kind_and_path() {
+        let mut state = test_state();
+        let g = state.cli_install.begin_resolve();
+        let mut obs = cli_obs();
+        obs.hits = vec![
+            EntryState::Foreign {
+                path: "/opt/homebrew/bin/macEverything".into(),
+                executable: true,
+            },
+            EntryState::Ours {
+                path: "/home/u/.local/bin/macEverything".into(),
+                target: "/A.app/Contents/MacOS/macEverything".into(),
+            },
+        ];
+        obs.effective = Some(1);
+        deliver_cli(
+            &mut state,
+            CliInstallResult {
+                generation: g,
+                result: Ok(obs),
+                action_error: None,
+            },
+        );
+
+        let (entry, bundle) =
+            cli_entry(&state, Path::new("/home/u/.local/bin/macEverything"), |e| {
+                matches!(e, EntryState::Ours { .. })
+            })
+            .expect("按类型+路径应取到 Ours 条目");
+        assert!(matches!(entry, EntryState::Ours { .. }));
+        assert_eq!(bundle, PathBuf::from("/A.app/Contents/MacOS/macEverything"));
+
+        // 类型不符(Foreign 位置找 Ours)取不到,动作不发。
+        assert!(
+            cli_entry(
+                &state,
+                Path::new("/opt/homebrew/bin/macEverything"),
+                |e| matches!(e, EntryState::Ours { .. })
+            )
+            .is_none(),
+            "类型不匹配不得取回条目"
         );
     }
 

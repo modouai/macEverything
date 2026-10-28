@@ -86,11 +86,17 @@ impl FakeFs {
 
     /// 放一个目录。
     pub(crate) fn dir(&mut self, p: &str) {
+        self.dir_at(p, 5, 5);
+    }
+
+    /// 放一个指定 dev/ino 的目录(目录身份判定用例需要互不相同的身份;
+    /// 默认 `dir()` 共用 (5,5))。
+    pub(crate) fn dir_at(&mut self, p: &str, dev: u64, ino: u64) {
         self.state.borrow_mut().stat.insert(
             PathBuf::from(p),
             Meta {
-                dev: 5,
-                ino: 5,
+                dev,
+                ino,
                 len: 0,
                 is_file: false,
                 is_symlink: false,

@@ -13,6 +13,7 @@
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 
+use crate::cli_install::{Availability, EntryState, Observation, PathSource};
 use crate::hotkey::{HotkeyNote, HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
@@ -33,6 +34,7 @@ use crate::ui::{
     },
 };
 use crate::update::{self, UpdatePhase};
+use std::path::PathBuf;
 
 /// 开关钮柔和投影：由外到内 3 层（扩边, 相对 token 20% 底色的倍率）。
 const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
@@ -74,6 +76,8 @@ pub(crate) struct SettingsData {
     pub(crate) update_error: Option<UpdateError>,
     /// 外接磁盘卷偏好(external-volumes):daemon 回显 + App 侧挂载枚举。
     pub(crate) volumes: VolumesData,
+    /// 命令行工具安装器行(v2.5):最近观测 + busy + 内联错误。
+    pub(crate) cli_install: CliInstallData,
 }
 
 /// 卷偏好视图数据(整块 Default,测试字面量与状态拷贝共用)。
@@ -90,6 +94,18 @@ pub(crate) struct VolumesData {
     /// 后台读/写进行中。
     pub(crate) busy: bool,
     /// 加载/写入失败文案(daemon message 或本地错误)。
+    pub(crate) error: Option<String>,
+}
+
+/// 命令行工具行的视图快照(从 `CliInstallUi` 出锁复制;`observation = None`
+/// 且非 busy 即尚未探测的 Idle)。
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct CliInstallData {
+    /// 最近一次成功观测(探测失败/动作错误时保留旧值)。
+    pub(crate) observation: Option<Observation>,
+    /// 探测/动作在途(按钮全禁,状态显示「检查中…」)。
+    pub(crate) busy: bool,
+    /// 最近一次探测/动作失败文案。
     pub(crate) error: Option<String>,
 }
 
@@ -128,6 +144,14 @@ pub(crate) enum SettingsAction {
     SetVolumesAuto(bool),
     /// 切换单卷索引开关(卷名;开 = 移出排除集[主开关随之开],关 = 加入排除集)。
     ToggleVolume(String),
+    /// 重新探测命令行工具(PATH 来源/链接状态)。
+    CliInstallRefresh,
+    /// 安装命令行工具(dst 由设置 pass 的线程按 PATH 白名单自选)。
+    CliInstallInstall,
+    /// 修复断链(载荷 = 断链路径;设置 pass 从缓存观测取回条目)。
+    CliInstallRepair(PathBuf),
+    /// 卸载本 App 链接(载荷 = 链接路径;遮蔽时指向第一个 Ours)。
+    CliInstallUninstall(PathBuf),
     /// 手动检查更新。
     CheckUpdate,
     /// 打开官网下载页。
@@ -221,12 +245,13 @@ fn hotkey_messages_extra(
 }
 
 /// 分组行模型：`kind` 决定控件，`spec` 同时驱动高度与游标；
-/// `error`（红色）、`note`（回落提示）、`hint`（录制提示）自上而下可同时显示。
+/// `error`（红色）、`note`、`note2`、`hint`（提示行）自上而下可同时显示。
 struct GroupRow<'a> {
     kind: RowKind<'a>,
     spec: RowSpec,
     error: Option<&'a str>,
     note: Option<&'a str>,
+    note2: Option<&'a str>,
     hint: Option<&'a str>,
 }
 
@@ -254,6 +279,47 @@ enum RowKind<'a> {
     },
     /// 无挂载卷且排除集为空的空态行。
     VolumesEmpty,
+    /// 命令行工具行(携带整行展示推导结果,行高与绘制读同一份)。
+    CliInstall(CliRow),
+}
+
+/// 命令行工具行的按钮(标签/可用性/点击动作)。
+struct CliButton {
+    label: &'static str,
+    enabled: bool,
+    action: SettingsAction,
+}
+
+/// 命令行工具行的展示推导(设计 §5.1/§5.2 动作矩阵):状态文案、支持行、
+/// 单个按钮一次算齐,行高与绘制共用,防两处判定漂移。
+struct CliRow {
+    /// 右侧主状态文案(分类/原因/检查中)。
+    status: String,
+    /// 内联错误(红)。
+    error: Option<String>,
+    /// 路径或断链旧目标。
+    note: Option<String>,
+    /// 遮蔽提示或「目标卷未挂载」:BrokenApp 主态优先卷未挂载(解释修复
+    /// 为何禁用);遮蔽提示与之同帧冲突时(陈旧观测的边角)以后者为准。
+    note2: Option<String>,
+    /// FDA 常驻提示(有观测即显示)。
+    hint: Option<&'static str>,
+    button: Option<CliButton>,
+}
+
+impl CliRow {
+    /// 支持行条数(行高增量的倍数)。
+    fn line_count(&self) -> usize {
+        [
+            self.error.is_some(),
+            self.note.is_some(),
+            self.note2.is_some(),
+            self.hint.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+    }
 }
 
 /// 外观组：分组标题 + 单行卡片（字号分段 + 可选的保存错误）。
@@ -272,6 +338,7 @@ fn draw_appearance_group(
         spec: RowSpec::new(ROW_H).with_extra(extra_for(error.is_some(), extra_h)),
         error,
         note: None,
+        note2: None,
         hint: None,
     }];
     draw_card(
@@ -285,7 +352,7 @@ fn draw_appearance_group(
     );
 }
 
-/// 通用组：四行卡片（自启 / 语言 / 两个快捷键）。
+/// 通用组：五行卡片（自启 / 语言 / 两个快捷键 / 命令行工具）。
 fn draw_general_group(
     ui: &mut egui::Ui,
     full_w: f32,
@@ -314,12 +381,22 @@ fn draw_general_group(
     let window_hint =
         (data.recording == Some(HotkeySlot::Window)).then_some(i18n::s().recording_hint);
 
+    // 命令行工具行:支持行(错误/路径/遮蔽或卷未挂载/FDA)计入行高;
+    // CliRow 整体搬进行模型,支持行先克隆/拷出(短字符串,每帧一次)。
+    let cli = cli_row(data);
+    let cli_extra = extra_h * cli.line_count() as f32;
+    let cli_error = cli.error.clone();
+    let cli_note = cli.note.clone();
+    let cli_note2 = cli.note2.clone();
+    let cli_hint = cli.hint;
+
     let rows = [
         GroupRow {
             kind: RowKind::Autostart,
             spec: RowSpec::new(ROW_H).with_extra(extra_for(has_message, extra_h)),
             error: autostart_error.as_deref(),
             note: autostart_note,
+            note2: None,
             hint: None,
         },
         GroupRow {
@@ -327,6 +404,7 @@ fn draw_general_group(
             spec: RowSpec::new(ROW_H).with_extra(extra_for(language_error.is_some(), extra_h)),
             error: language_error.as_deref(),
             note: None,
+            note2: None,
             hint: None,
         },
         GroupRow {
@@ -339,6 +417,7 @@ fn draw_general_group(
             )),
             error: palette_error,
             note: palette_note.as_deref(),
+            note2: None,
             hint: palette_hint,
         },
         GroupRow {
@@ -351,7 +430,16 @@ fn draw_general_group(
             )),
             error: window_error,
             note: window_note.as_deref(),
+            note2: None,
             hint: window_hint,
+        },
+        GroupRow {
+            kind: RowKind::CliInstall(cli),
+            spec: RowSpec::new(ROW_H).with_extra(cli_extra),
+            error: cli_error.as_deref(),
+            note: cli_note.as_deref(),
+            note2: cli_note2.as_deref(),
+            hint: cli_hint,
         },
     ];
     draw_card(
@@ -388,6 +476,7 @@ fn draw_index_group(
         spec: RowSpec::new(EXCLUDE_HEADER_H).with_extra(extra),
         error,
         note: busy_label,
+        note2: None,
         hint: None,
     }];
     if data.excluded.is_empty() {
@@ -396,6 +485,7 @@ fn draw_index_group(
             spec: RowSpec::new(EXCLUDE_ROW_H),
             error: None,
             note: None,
+            note2: None,
             hint: None,
         });
     } else {
@@ -408,6 +498,7 @@ fn draw_index_group(
                     spec: RowSpec::new(EXCLUDE_ROW_H),
                     error: None,
                     note: None,
+                    note2: None,
                     hint: None,
                 }),
         );
@@ -441,6 +532,7 @@ fn draw_volumes_group(
         spec: RowSpec::new(ROW_H).with_extra(extra),
         error,
         note: loading.then_some(i18n::s().volumes_loading),
+        note2: None,
         hint: None,
     }];
     if !data.volumes.loaded && !data.volumes.busy {
@@ -458,6 +550,7 @@ fn draw_volumes_group(
                 spec: RowSpec::new(EXCLUDE_ROW_H),
                 error: None,
                 note: None,
+                note2: None,
                 hint: None,
             });
             listed += 1;
@@ -475,6 +568,7 @@ fn draw_volumes_group(
                 spec: RowSpec::new(EXCLUDE_ROW_H),
                 error: None,
                 note: None,
+                note2: None,
                 hint: None,
             });
             listed += 1;
@@ -485,6 +579,7 @@ fn draw_volumes_group(
                 spec: RowSpec::new(EXCLUDE_ROW_H),
                 error: None,
                 note: None,
+                note2: None,
                 hint: None,
             });
         }
@@ -498,6 +593,190 @@ fn draw_volumes_group(
         palette,
         actions,
     );
+}
+
+/// 命令行工具行展示推导(设计 §5.1/§5.2):busy 或未探测 →「检查中…」;
+/// 运行环境不可用 → 只给原因;PATH 不可信 → 重试;其余按分类给
+/// 安装/卸载/修复。遮蔽(存在 Ours 但生效项不是它)时卸载按钮指向第一个 Ours。
+fn cli_row(data: &SettingsData) -> CliRow {
+    let cli = &data.cli_install;
+    let mut row = CliRow {
+        status: String::new(),
+        error: cli.error.clone(),
+        note: None,
+        note2: None,
+        hint: None,
+        button: None,
+    };
+    // 尚未探测或探测/动作在途:占位「检查中…」,不给按钮。
+    if cli.busy || cli.observation.is_none() {
+        row.status = i18n::s().cli_checking.to_owned();
+        return row;
+    }
+    let Some(obs) = cli.observation.as_ref() else {
+        return row;
+    };
+    row.hint = Some(i18n::s().cli_fda_hint);
+    // 运行环境不可用(设计 §5.2:Unavailable 拒绝一切动作)。
+    row.status = match obs.availability {
+        Availability::Ready => String::new(),
+        Availability::DevBuild => i18n::s().cli_unavailable_dev.to_owned(),
+        Availability::Translocated | Availability::ReadOnlyVolume => {
+            i18n::s().cli_unavailable_moved.to_owned()
+        }
+        Availability::BundledCliMissing | Availability::BundledCliNotExecutable => {
+            i18n::s().cli_unavailable_bundled.to_owned()
+        }
+    };
+    if !row.status.is_empty() {
+        return row;
+    }
+    // PATH 不可信(来源非登录交互 shell / 扫描遇错):只给重试,不展示分类。
+    if obs.path_source != PathSource::LoginInteractive || obs.path_unknown {
+        row.status = i18n::s().cli_unknown_path.to_owned();
+        row.button = Some(CliButton {
+            label: i18n::s().cli_retry_button,
+            enabled: true,
+            action: SettingsAction::CliInstallRefresh,
+        });
+        return row;
+    }
+    // 分类主状态:终端实际会执行的条目,否则第一个命中。
+    let primary = obs
+        .effective
+        .and_then(|index| obs.hits.get(index))
+        .or_else(|| obs.hits.first());
+    let ours = obs
+        .hits
+        .iter()
+        .find(|entry| matches!(entry, EntryState::Ours { .. }));
+    let shadowed = ours.is_some() && !matches!(primary, Some(EntryState::Ours { .. }));
+    match primary {
+        None => {
+            row.status = i18n::s().cli_state_absent.to_owned();
+            row.button = Some(CliButton {
+                label: i18n::s().cli_install_button,
+                enabled: true,
+                action: SettingsAction::CliInstallInstall,
+            });
+        }
+        Some(EntryState::Ours { path, .. }) => {
+            row.status = i18n::s().cli_state_ours.to_owned();
+            row.note = Some(path.display().to_string());
+            row.button = Some(uninstall_button(path));
+        }
+        Some(EntryState::BrokenApp {
+            path,
+            target,
+            volume_mounted,
+        }) => {
+            row.status = i18n::s().cli_state_broken.to_owned();
+            row.note = Some(target.display().to_string());
+            if !volume_mounted {
+                row.note2 = Some(i18n::s().cli_state_broken_volume.to_owned());
+            }
+            row.button = Some(CliButton {
+                label: i18n::s().cli_repair_button,
+                enabled: *volume_mounted,
+                action: SettingsAction::CliInstallRepair(path.clone()),
+            });
+        }
+        Some(EntryState::OtherApp { path, .. }) => {
+            row.status = i18n::s().cli_state_other_app.to_owned();
+            row.note = Some(path.display().to_string());
+        }
+        Some(EntryState::Foreign { path, .. } | EntryState::BrokenForeign { path, .. }) => {
+            row.status = i18n::s().cli_state_foreign.to_owned();
+            row.note = Some(path.display().to_string());
+        }
+        Some(EntryState::Unreadable { path, error }) => {
+            // 防御:正常路径下 path_unknown 已短路;真到达时展示 errno 细节。
+            row.status = i18n::fill(i18n::s().cli_state_unreadable, &[("err", error.as_str())]);
+            row.note = Some(path.display().to_string());
+        }
+    }
+    if shadowed {
+        // 卷未挂载的禁用原因优先展示;两者同帧只在陈旧观测的边角出现。
+        if row.note2.is_none() {
+            row.note2 = Some(i18n::s().cli_state_shadowed.to_owned());
+        }
+        if let Some(EntryState::Ours { path, .. }) = ours {
+            row.button = Some(uninstall_button(path));
+        }
+    }
+    row
+}
+
+/// 卸载按钮(始终可用;动作载荷 = 链接路径)。
+fn uninstall_button(path: &std::path::Path) -> CliButton {
+    CliButton {
+        label: i18n::s().cli_uninstall_button,
+        enabled: true,
+        action: SettingsAction::CliInstallUninstall(path.to_path_buf()),
+    }
+}
+
+/// 命令行工具行:左标签 + 右侧「状态(右对齐截断) · 可选按钮」簇,
+/// 按钮宽随文案(几何同版本行簇,简化为单按钮)。
+fn draw_cli_install_row(
+    ui: &mut egui::Ui,
+    body: egui::Rect,
+    cli: &CliRow,
+    palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let label = i18n::s().row_cli_tool;
+    let button = cli.button.as_ref();
+    let button_w =
+        button.map(|b| text_width(ui, b.label, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X);
+    let right_edge = body.right() - ROW_PAD_X;
+    let button_rect = button_w.map(|w| {
+        egui::Rect::from_min_size(
+            egui::pos2(right_edge - w, body.center().y - ADD_BUTTON_H / 2.0),
+            egui::vec2(w, ADD_BUTTON_H),
+        )
+    });
+    let status_right = right_edge - button_w.map(|w| w + LABEL_CONTROL_GAP).unwrap_or(0.0);
+    let label_left = body.left() + ROW_PAD_X;
+    let status_left = label_left + text_width(ui, label, LABEL_FONT) + LABEL_CONTROL_GAP;
+    let label_rect = egui::Rect::from_min_max(
+        egui::pos2(label_left, body.top()),
+        egui::pos2(status_left, body.bottom()),
+    );
+    draw_text(
+        ui,
+        label_rect,
+        label,
+        LABEL_FONT,
+        palette.text_primary,
+        egui::Align2::LEFT_CENTER,
+    );
+    let status_rect = egui::Rect::from_min_max(
+        egui::pos2(status_left, body.top()),
+        egui::pos2(status_right.max(status_left), body.bottom()),
+    );
+    draw_text(
+        ui,
+        status_rect,
+        &cli.status,
+        SUPPORT_FONT,
+        palette.text_secondary,
+        egui::Align2::RIGHT_CENTER,
+    );
+    if let (Some(rect), Some(button)) = (button_rect, button) {
+        if draw_reset_text_button(
+            ui,
+            rect,
+            "settings-cli-action",
+            button.label,
+            palette.text_secondary,
+            palette.text_primary,
+            button.enabled,
+            palette,
+        ) {
+            actions.push(button.action.clone());
+        }
+    }
 }
 
 /// 关于组：版本行（版本号 + 状态 + 操作）与自动检查开关。
@@ -524,6 +803,7 @@ fn draw_about_group(
             spec: RowSpec::new(ROW_H).with_extra(extra_for(version_error.is_some(), extra_h)),
             error: version_error,
             note: None,
+            note2: None,
             hint: None,
         },
         GroupRow {
@@ -531,6 +811,7 @@ fn draw_about_group(
             spec: RowSpec::new(ROW_H).with_extra(extra_for(auto_check_error.is_some(), extra_h)),
             error: auto_check_error,
             note: None,
+            note2: None,
             hint: None,
         },
     ];
@@ -699,7 +980,15 @@ fn draw_card(
                 .rect_filled(divider, egui::CornerRadius::ZERO, palette.divider);
         }
         draw_row_body(ui, rects.body, &row.kind, data, palette, actions);
-        draw_support_lines(ui, rects.extra, row.error, row.note, row.hint, palette);
+        draw_support_lines(
+            ui,
+            rects.extra,
+            row.error,
+            row.note,
+            row.note2,
+            row.hint,
+            palette,
+        );
     }
     debug_assert!(
         (y - card.bottom()).abs() < 0.01,
@@ -894,6 +1183,8 @@ fn draw_row_body(
             }
         }
         RowKind::VolumesEmpty => draw_volumes_empty(ui, body, palette),
+        // CliRow 非 Copy:显式按引用绑定(其余载荷均为 Copy,保持按值解引用)。
+        RowKind::CliInstall(ref cli) => draw_cli_install_row(ui, body, cli, palette, actions),
     }
 }
 
@@ -904,12 +1195,14 @@ fn draw_support_lines(
     extra: egui::Rect,
     error: Option<&str>,
     note: Option<&str>,
+    note2: Option<&str>,
     hint: Option<&str>,
     palette: &SettingsPalette,
 ) {
     let messages = [
         error.map(|text| (text, palette.error_text)),
         note.map(|text| (text, palette.text_secondary)),
+        note2.map(|text| (text, palette.text_secondary)),
         hint.map(|text| (text, palette.text_secondary)),
     ]
     .into_iter()
@@ -1816,6 +2109,23 @@ mod tests {
             update: crate::update::UpdatePhase::Idle,
             update_error: None,
             volumes: VolumesData::default(),
+            cli_install: CliInstallData::default(),
+        }
+    }
+
+    /// Ready 态观测样例:LoginInteractive + 随包 CLI 就绪,命中与生效下标
+    /// 由用例指定。
+    fn cli_ready_obs(hits: Vec<EntryState>, effective: Option<usize>) -> Observation {
+        Observation {
+            path_source: PathSource::LoginInteractive,
+            hits,
+            effective,
+            availability: Availability::Ready,
+            bundled_cli: Some(
+                "/Applications/macEverything.app/Contents/MacOS/macEverything".into(),
+            ),
+            path_unknown: false,
+            path_var: Some("/opt/homebrew/bin".into()),
         }
     }
 
@@ -2075,6 +2385,8 @@ mod tests {
             "语言",
             "唤起快捷键",
             "完整窗口快捷键",
+            "命令行工具",
+            i18n::s().cli_checking,
             "排除目录",
             "恢复默认",
             "小",
@@ -2125,15 +2437,12 @@ mod tests {
             about_y > index_y,
             "关于组须排在索引组之后(索引 y={index_y}, 关于 y={about_y})"
         );
-        let max_before_about = texts
-            .iter()
-            .filter(|text| text.pos.y < about_y)
-            .map(|text| text.pos.y + text.galley.size().y)
-            .fold(0.0_f32, f32::max);
+        // 分组顺序固定:命令行工具行在通用组(快捷键行之后),不越组。
+        let cli_y = find_text(&texts, "命令行工具").pos.y;
+        let window_y = find_text(&texts, "完整窗口快捷键").pos.y;
         assert!(
-            max_before_about <= SETTINGS_H - CONTENT_PAD.0,
-            "关于组之前的内容须在 620×600 首屏内(最低文本底 {max_before_about} > {})",
-            SETTINGS_H - CONTENT_PAD.0
+            cli_y > window_y,
+            "命令行工具行须在快捷键行之后(cli {cli_y}, window {window_y})"
         );
     }
 
@@ -2173,7 +2482,7 @@ mod tests {
                 "Language",
                 "Quick Search Shortcut",
                 "Full Window Shortcut",
-                "Excluded Folders",
+                "Command-Line Tool",
                 // 字号段
                 "Small",
                 "Standard",
@@ -2187,6 +2496,23 @@ mod tests {
                 assert!(
                     labels.contains(&expected),
                     "缺少英文文案 {expected:?};实际 {labels:?}"
+                );
+            }
+
+            // 命令行工具行(未安装态):状态、FDA 提示与安装按钮齐全。
+            let mut cli_ready = layout_test_data();
+            cli_ready.cli_install.observation = Some(cli_ready_obs(vec![], None));
+            let cli_out = run_body(&cli_ready);
+            let cli_texts = all_texts(&cli_out);
+            let cli_labels: Vec<&str> = cli_texts.iter().map(|text| text.galley.text()).collect();
+            for expected in [
+                i18n::s().cli_state_absent,
+                i18n::s().cli_install_button,
+                i18n::s().cli_fda_hint,
+            ] {
+                assert!(
+                    cli_labels.contains(&expected),
+                    "缺少英文 CLI 文案 {expected:?};实际 {cli_labels:?}"
                 );
             }
 
@@ -2504,6 +2830,221 @@ mod tests {
             "自启错误行必须增高通用卡片:基线 {baseline_language},错误 {error_language}"
         );
         find_text(&texts, i18n::s().autostart_set_failed);
+    }
+
+    // ===== 命令行工具行(设计 §5.1/§5.2 动作矩阵)=====
+
+    /// 未安装:状态「未安装」+ FDA 提示,安装按钮点击 → CliInstallInstall。
+    #[test]
+    fn cli_row_absent_shows_install_and_emits_action() {
+        let mut data = layout_test_data();
+        data.cli_install.observation = Some(cli_ready_obs(vec![], None));
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        find_text(&all_texts(&out), i18n::s().cli_state_absent);
+        find_text(&all_texts(&out), i18n::s().cli_fda_hint);
+        let pos = text_center(find_text(&all_texts(&out), i18n::s().cli_install_button));
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CliInstallInstall],
+            "未安装点击安装 → CliInstallInstall"
+        );
+    }
+
+    /// 已安装:状态 + 路径 + 卸载按钮;点击 → 携路径的 CliInstallUninstall。
+    #[test]
+    fn cli_row_ours_shows_path_and_uninstall() {
+        const OURS: &str = "/opt/homebrew/bin/macEverything";
+        let mut data = layout_test_data();
+        data.cli_install.observation = Some(cli_ready_obs(
+            vec![EntryState::Ours {
+                path: OURS.into(),
+                target: "/Applications/macEverything.app/Contents/MacOS/macEverything".into(),
+            }],
+            Some(0),
+        ));
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        find_text(&all_texts(&out), i18n::s().cli_state_ours);
+        find_text(&all_texts(&out), OURS);
+        let pos = text_center(find_text(&all_texts(&out), i18n::s().cli_uninstall_button));
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CliInstallUninstall(OURS.into())],
+            "卸载动作载荷须为链接路径"
+        );
+    }
+
+    /// 断链且卷未挂载:旧目标与「目标卷未挂载」可见,修复按钮禁点。
+    #[test]
+    fn cli_row_broken_unmounted_disables_repair() {
+        let mut data = layout_test_data();
+        data.cli_install.observation = Some(cli_ready_obs(
+            vec![EntryState::BrokenApp {
+                path: "/opt/homebrew/bin/macEverything".into(),
+                target: "/Volumes/USB/Old.app/Contents/MacOS/macEverything".into(),
+                volume_mounted: false,
+            }],
+            None,
+        ));
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let texts = all_texts(&out);
+        find_text(&texts, i18n::s().cli_state_broken);
+        find_text(&texts, "/Volumes/USB/Old.app/Contents/MacOS/macEverything");
+        find_text(&texts, i18n::s().cli_state_broken_volume);
+        let pos = text_center(find_text(&texts, i18n::s().cli_repair_button));
+        let output = click_at(&ctx, &data, pos);
+        assert!(
+            output.actions.is_empty(),
+            "卷未挂载时修复禁点:{:?}",
+            output.actions
+        );
+    }
+
+    /// 遮蔽:主状态显示遮蔽项(Foreign),追加「被遮蔽」提示,卸载按钮
+    /// 指向第一个 Ours(不是遮蔽项)。
+    #[test]
+    fn cli_row_shadowed_targets_first_ours() {
+        const OURS: &str = "/home/u/.local/bin/macEverything";
+        let mut data = layout_test_data();
+        data.cli_install.observation = Some(cli_ready_obs(
+            vec![
+                EntryState::Foreign {
+                    path: "/opt/homebrew/bin/macEverything".into(),
+                    executable: true,
+                },
+                EntryState::Ours {
+                    path: OURS.into(),
+                    target: "/Applications/macEverything.app/Contents/MacOS/macEverything".into(),
+                },
+            ],
+            None,
+        ));
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        let texts = all_texts(&out);
+        find_text(&texts, i18n::s().cli_state_foreign);
+        find_text(&texts, i18n::s().cli_state_shadowed);
+        let pos = text_center(find_text(&texts, i18n::s().cli_uninstall_button));
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CliInstallUninstall(OURS.into())],
+            "遮蔽时卸载按钮须指向第一个 Ours"
+        );
+    }
+
+    /// 其他来源(OtherApp):显示路径与「不覆盖」,不给任何按钮。
+    #[test]
+    fn cli_row_other_app_shows_path_without_buttons() {
+        let mut data = layout_test_data();
+        data.cli_install.observation = Some(cli_ready_obs(
+            vec![EntryState::OtherApp {
+                path: "/opt/homebrew/bin/macEverything".into(),
+                target: "/B/Real.app/Contents/MacOS/macEverything".into(),
+                executable: true,
+            }],
+            Some(0),
+        ));
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        find_text(&texts, i18n::s().cli_state_other_app);
+        find_text(&texts, "/opt/homebrew/bin/macEverything");
+        for label in [
+            i18n::s().cli_install_button,
+            i18n::s().cli_uninstall_button,
+            i18n::s().cli_repair_button,
+            i18n::s().cli_retry_button,
+        ] {
+            assert!(
+                texts.iter().all(|text| text.galley.text() != label),
+                "OtherApp 不得出现按钮 {label:?}"
+            );
+        }
+    }
+
+    /// PATH 不可信(来源非登录交互 shell):「无法读取 PATH」+ 重试按钮。
+    #[test]
+    fn cli_row_unknown_path_shows_retry() {
+        let mut data = layout_test_data();
+        let mut obs = cli_ready_obs(vec![], None);
+        obs.path_source = PathSource::ProcessEnv;
+        data.cli_install.observation = Some(obs);
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let (out, _) = run_frame(&ctx, &data, Vec::new());
+        find_text(&all_texts(&out), i18n::s().cli_unknown_path);
+        let pos = text_center(find_text(&all_texts(&out), i18n::s().cli_retry_button));
+        let output = click_at(&ctx, &data, pos);
+        assert_eq!(
+            output.actions,
+            vec![SettingsAction::CliInstallRefresh],
+            "重试按钮 → CliInstallRefresh"
+        );
+    }
+
+    /// 运行环境不可用(DevBuild):只给原因,不给按钮(安装/重试都不得出现)。
+    #[test]
+    fn cli_row_devbuild_shows_reason_without_buttons() {
+        let mut data = layout_test_data();
+        let mut obs = cli_ready_obs(vec![], None);
+        obs.availability = Availability::DevBuild;
+        data.cli_install.observation = Some(obs);
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        find_text(&texts, i18n::s().cli_unavailable_dev);
+        assert!(
+            texts
+                .iter()
+                .all(|text| text.galley.text() != i18n::s().cli_install_button),
+            "DevBuild 不得出现安装按钮"
+        );
+    }
+
+    /// busy 或尚未探测:状态「检查中…」,不给按钮。
+    #[test]
+    fn cli_row_busy_and_idle_show_checking_without_buttons() {
+        for label in ["busy", "idle"] {
+            let mut data = layout_test_data();
+            match label {
+                "busy" => data.cli_install.busy = true,
+                _ => data.cli_install.observation = None,
+            }
+            let out = run_body(&data);
+            let texts = all_texts(&out);
+            find_text(&texts, i18n::s().cli_checking);
+            assert!(
+                texts
+                    .iter()
+                    .all(|text| text.galley.text() != i18n::s().cli_install_button),
+                "{label} 态不得出现安装按钮"
+            );
+        }
+    }
+
+    /// 内联错误行:增高通用卡片(「索引」标题下移),错误文案实际绘制。
+    #[test]
+    fn cli_error_row_adds_card_height() {
+        let baseline = run_body(&layout_test_data());
+        let baseline_index = text_center(find_text(&all_texts(&baseline), i18n::s().group_index)).y;
+
+        let mut data = layout_test_data();
+        data.cli_install.error = Some("手动命令: sudo ln -s …".into());
+        let with_error = run_body(&data);
+        let texts = all_texts(&with_error);
+        let error_index = text_center(find_text(&texts, i18n::s().group_index)).y;
+        assert!(
+            error_index > baseline_index + 10.0,
+            "CLI 错误行必须增高通用卡片:基线 {baseline_index},错误 {error_index}"
+        );
+        find_text(&texts, "手动命令: sudo ln -s …");
     }
 
     /// 待审批：开关仍为关态，行内显示「已注册,待系统设置「登录项」允许」。

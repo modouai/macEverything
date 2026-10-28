@@ -11,6 +11,7 @@
 
 use crate::cli_install::path_env::PathSource;
 use crate::cli_install::InstallerFs;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -56,7 +57,7 @@ pub enum Availability {
 }
 
 /// 一次完整观测:PATH 来源 + 全部条目命中 + 生效条目 + 运行环境。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
     pub path_source: PathSource,
     /// PATH 顺序中的全部命中(含被遮蔽项)。
@@ -69,6 +70,9 @@ pub struct Observation {
     pub bundled_cli: Option<PathBuf>,
     /// PATH 扫描出现过非 ENOENT 错误(UI 视为 Unknown,禁用动作)。
     pub path_unknown: bool,
+    /// 探测到的 PATH 原值(`Failed` 时为 None);安装目标选择在 UI 侧
+    /// 复用本值(与本次分类同一份 PATH,避免重复跑登录 shell)。
+    pub path_var: Option<OsString>,
 }
 
 /// 「该段无条目」只认 ENOENT/ENOTDIR;其余错误(权限/循环/IO)一律按
@@ -215,7 +219,8 @@ pub fn classify_entry(
 
 /// 去尾斜杠(设计 §5.0-B 预处理):`/bin/` 与 `/bin` 是同一段,归一后再做
 /// 绝对路径判定与去重;只剥分隔符,其余保持原样(根 `/` 不动)。
-fn strip_trailing_seps(p: &Path) -> PathBuf {
+/// 安装目标选择(actions)复用同一预处理,保证两条路径的段语义一致。
+pub(crate) fn strip_trailing_seps(p: &Path) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     let mut b = p.as_os_str().as_bytes();
     while b.len() > 1 && b[b.len() - 1] == b'/' {
@@ -355,6 +360,7 @@ pub fn observe() -> Observation {
         availability,
         bundled_cli,
         path_unknown,
+        path_var,
     }
 }
 

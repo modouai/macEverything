@@ -2,9 +2,14 @@
 //! 落定」的原子序列,绝不覆盖或删除非本 App 拥有的条目。
 //!
 //! 动作入参是**点击时重新判定**得到的 EntryState;复核不过一律还原现场。
+//!
+//! 另含安装目标选择(§5.2「安装目标」):按 PATH 顺序挑第一个在白名单内、
+//! 存在且可写的目录;目录身份按 `dev`+`ino` 判定,字符串相等仅作快速路径。
 
-use crate::cli_install::classify::{classify_entry, EntryState};
+use crate::cli_install::classify::{classify_entry, strip_trailing_seps, EntryState};
 use crate::cli_install::InstallerFs;
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +23,18 @@ pub enum ActionError {
     Io(io::Error),
     /// 父目录不可写:保留现场,给手动命令。
     NonWritable(PathBuf),
+}
+
+impl std::fmt::Display for ActionError {
+    /// 分类的基础文案(设计 §5.3 的错误分类;UI 当前以 `{e:?}` 展示原始
+    /// 细节,本实现承载载荷并供后续 i18n 接管)。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAllowed => f.write_str("条目不属于该动作允许的类型"),
+            Self::Io(err) => write!(f, "文件系统错误: {err}"),
+            Self::NonWritable(dir) => write!(f, "目录不可写: {}", dir.display()),
+        }
+    }
 }
 
 /// 动作临时名:同目录下的隐藏文件 `.{原名}.{tag}.{pid}`。
@@ -150,6 +167,97 @@ pub fn manual_install_command(dir: &Path, cli: &Path, sudo: bool) -> String {
         "if [ -e {dst} ] || [ -L {dst} ]; then echo 'refusing: {dst} exists'; \
          else {prefix}ln -s {cli} {dst}; fi"
     )
+}
+
+/// 允许写入的目录白名单(顺序即文档承诺顺序;实际选择按 PATH 顺序,见
+/// 设计 §5.2「安装目标」)。以 `/` 开头的为绝对目录;其余条目相对 HOME,
+/// 由 [`choose_install_dir`] 用注入的 home 展开。
+pub const ALLOWED_DIRS: [&str; 4] = [
+    "/opt/homebrew/bin",
+    ".local/bin",
+    ".cargo/bin",
+    "/usr/local/bin",
+];
+
+/// 展开白名单条目:绝对条目原样;相对条目拼 HOME,home 缺失时跳过该条目。
+fn expand_allowed(dir: &str, home: Option<&OsStr>) -> Option<PathBuf> {
+    if dir.starts_with('/') {
+        Some(PathBuf::from(dir))
+    } else {
+        home.map(|h| Path::new(h).join(dir))
+    }
+}
+
+/// PATH 顺序中第一个「在白名单内、存在且可写」的目录(设计 §5.2 安装目标)。
+///
+/// 每段与 [`scan_path`](crate::cli_install::classify::scan_path) 同预处理
+/// (去尾斜杠、跳相对段、去重);目录身份按 `stat` 的 `dev`+`ino` 判定
+/// (符号链接别名目录因此被识别),字符串相等仅作快速路径。无满足项返回 None。
+pub fn choose_install_dir(
+    fs: &dyn InstallerFs,
+    path_var: &OsStr,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    allowed_in_path(fs, path_var, home, true)
+}
+
+/// 同 [`choose_install_dir`] 但不看可写性:选择失败后给手动命令时用
+/// (设计:命令目录取「PATH 中第一个允许目录」,可写与否只决定 sudo)。
+pub fn first_allowed_dir(
+    fs: &dyn InstallerFs,
+    path_var: &OsStr,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    allowed_in_path(fs, path_var, home, false)
+}
+
+/// [`choose_install_dir`] / [`first_allowed_dir`] 共用实现。
+fn allowed_in_path(
+    fs: &dyn InstallerFs,
+    path_var: &OsStr,
+    home: Option<&OsStr>,
+    require_writable: bool,
+) -> Option<PathBuf> {
+    let allowed: Vec<PathBuf> = ALLOWED_DIRS
+        .iter()
+        .filter_map(|dir| expand_allowed(dir, home))
+        .collect();
+    let mut seen = HashSet::new();
+    for seg in std::env::split_paths(path_var) {
+        let seg = strip_trailing_seps(&seg);
+        if !seg.is_absolute() || !seen.insert(seg.clone()) {
+            continue;
+        }
+        // 目录必须存在且是目录(跟随 stat;符号链接别名在此被解析)。
+        let Ok(meta) = fs.stat(&seg) else {
+            continue;
+        };
+        if meta.is_file {
+            continue;
+        }
+        if require_writable && !fs.access_w(&seg) {
+            continue;
+        }
+        // 快速路径:字面与白名单一致。
+        if allowed.iter().any(|dir| dir == &seg) {
+            return Some(seg);
+        }
+        // 身份判定:与任一白名单目录同 dev+ino(别名/前缀别名形态)。
+        if allowed.iter().any(|dir| {
+            fs.stat(dir)
+                .map(|m| (m.dev, m.ino) == (meta.dev, meta.ino))
+                .unwrap_or(false)
+        }) {
+            return Some(seg);
+        }
+    }
+    None
+}
+
+/// 手动安装提示:目标目录不可写时给 sudo 版本的带守卫命令(设计 §5.2
+/// 「必要时加 sudo」,可写与否由调用方按 `access_w` 决定)。
+pub fn manual_install_hint(fs: &dyn InstallerFs, dir: &Path, cli: &Path) -> String {
+    manual_install_command(dir, cli, !fs.access_w(dir))
 }
 
 #[cfg(test)]
@@ -376,5 +484,167 @@ mod tests {
             "单引号应转义为 '\\''': {cmd}"
         );
         assert!(!cmd.contains("-sf"));
+    }
+
+    // ===== 安装目标选择(设计 §5.2)=====
+
+    const HOME: &str = "/home/u";
+
+    /// 四个白名单目录全部存在(可写默认开),身份互不相同——目录判定按
+    /// dev+ino,夹具若共用同一身份会把「任意目录」都误判成白名单。
+    fn path_fs() -> FakeFs {
+        let mut fs = FakeFs::new();
+        fs.dir_at("/opt/homebrew/bin", 5, 5);
+        fs.dir_at("/home/u/.local/bin", 6, 6);
+        fs.dir_at("/home/u/.cargo/bin", 7, 7);
+        fs.dir_at("/usr/local/bin", 8, 8);
+        fs
+    }
+
+    fn home() -> Option<&'static OsStr> {
+        Some(OsStr::new(HOME))
+    }
+
+    /// 突变敏感:PATH 顺序优先于白名单数组顺序——白名单数组把
+    /// /opt/homebrew/bin 排在 ~/.local/bin 前,若实现按数组顺序挑会选中
+    /// Homebrew 目录而变红;按 PATH 顺序则应选 ~/.local/bin。
+    #[test]
+    fn path_order_beats_whitelist_order() {
+        let fs = path_fs();
+        let chosen = choose_install_dir(
+            &fs,
+            OsStr::new("/home/u/.local/bin:/opt/homebrew/bin"),
+            home(),
+        );
+        assert_eq!(
+            chosen.as_deref(),
+            Some(Path::new("/home/u/.local/bin")),
+            "PATH 顺序优先:两个允许目录都在 PATH 时选 PATH 靠前的 ~/.local/bin"
+        );
+    }
+
+    /// 不在 PATH 的可写白名单目录不选;PATH 段不在白名单也不选。
+    #[test]
+    fn off_path_dirs_not_chosen() {
+        let fs = path_fs();
+        assert_eq!(
+            choose_install_dir(&fs, OsStr::new("/tmp/other"), home()),
+            None,
+            "非白名单目录不选"
+        );
+        // 白名单目录都存在且可写,但 PATH 里没有它们。
+        assert_eq!(
+            choose_install_dir(&fs, OsStr::new("/nonexistent"), home()),
+            None,
+            "不在 PATH 的白名单目录不入选"
+        );
+    }
+
+    /// 不存在/不可写的白名单目录跳过,继续取 PATH 里下一个满足项。
+    #[test]
+    fn missing_or_nonwritable_dirs_skipped() {
+        let fs = path_fs();
+        let chosen = choose_install_dir(&fs, OsStr::new("/missing/bin:/opt/homebrew/bin"), home());
+        assert_eq!(
+            chosen.as_deref(),
+            Some(Path::new("/opt/homebrew/bin")),
+            "首个 PATH 段不存在时跳过取下一个"
+        );
+
+        let mut fs = path_fs();
+        fs.set_access_w(false);
+        assert_eq!(
+            choose_install_dir(
+                &fs,
+                OsStr::new("/opt/homebrew/bin:/home/u/.cargo/bin"),
+                home()
+            ),
+            None,
+            "不可写的白名单目录一律跳过"
+        );
+    }
+
+    /// 符号链接别名目录按 dev+ino 识别:PATH 段是指向白名单目录的链接时
+    /// 入选(返回 PATH 里的原样路径)。丢掉 dev+ino 比较,本测试变红。
+    #[test]
+    fn symlink_alias_dir_matched_by_dev_ino() {
+        let mut fs = path_fs();
+        fs.link("/alias/bin", "/home/u/.local/bin");
+        let chosen = choose_install_dir(&fs, OsStr::new("/alias/bin"), home());
+        assert_eq!(
+            chosen.as_deref(),
+            Some(Path::new("/alias/bin")),
+            "别名目录按身份识别,返回 PATH 原样段"
+        );
+    }
+
+    /// home 缺失时 `~` 形白名单条目不展开,展开后的同字面目录也不匹配。
+    #[test]
+    fn home_none_skips_home_entries() {
+        let fs = path_fs();
+        assert_eq!(
+            choose_install_dir(&fs, OsStr::new("/home/u/.local/bin"), None),
+            None,
+            "home 缺失时 HOME 相对条目整体跳过"
+        );
+        // 绝对条目不受影响。
+        let chosen = choose_install_dir(&fs, OsStr::new("/opt/homebrew/bin"), None);
+        assert_eq!(chosen.as_deref(), Some(Path::new("/opt/homebrew/bin")));
+    }
+
+    /// 预处理与 scan_path 对齐:相对段跳过、去尾斜杠、重复段只判一次。
+    #[test]
+    fn relative_trailing_and_duplicate_segments() {
+        let fs = path_fs();
+        let chosen = choose_install_dir(
+            &fs,
+            OsStr::new("bin:/opt/homebrew/bin/:/opt/homebrew/bin"),
+            home(),
+        );
+        assert_eq!(
+            chosen.as_deref(),
+            Some(Path::new("/opt/homebrew/bin")),
+            "相对段跳过,带尾斜杠的段归一后入选"
+        );
+    }
+
+    /// 白名单位置被普通文件占位:不是目录,不得入选(安装会撞 EEXIST,
+    /// 但预判失败直接跳过更清楚)。
+    #[test]
+    fn file_at_whitelist_path_not_chosen() {
+        let mut fs = path_fs();
+        fs.file_mode("/usr/local/bin", 3, 3, 0o755);
+        assert_eq!(
+            choose_install_dir(&fs, OsStr::new("/usr/local/bin"), home()),
+            None,
+            "目录位置被普通文件占位时跳过"
+        );
+    }
+
+    /// 手动命令回落不看可写性:不可写照样给出目录(命令带 sudo)。
+    #[test]
+    fn first_allowed_dir_ignores_writability() {
+        let mut fs = path_fs();
+        fs.set_access_w(false);
+        let chosen = first_allowed_dir(&fs, OsStr::new("/opt/homebrew/bin"), home());
+        assert_eq!(chosen.as_deref(), Some(Path::new("/opt/homebrew/bin")));
+        assert_eq!(
+            first_allowed_dir(&fs, OsStr::new("/only/other"), home()),
+            None
+        );
+    }
+
+    /// 手动提示:目录不可写给 sudo 版本,可写不带 sudo。
+    #[test]
+    fn manual_hint_switches_sudo_by_access_w() {
+        let bundle = Path::new(BUNDLE);
+        let mut fs = path_fs();
+        fs.set_access_w(false);
+        assert!(
+            manual_install_hint(&fs, Path::new("/opt/homebrew/bin"), bundle).contains("sudo ln -s"),
+            "不可写目录的提示须带 sudo"
+        );
+        let hint = manual_install_hint(&path_fs(), Path::new("/opt/homebrew/bin"), bundle);
+        assert!(!hint.contains("sudo"), "可写目录不带 sudo: {hint}");
     }
 }
