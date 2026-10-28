@@ -4,7 +4,7 @@
   <img src="docs/screenshots/hero-zh.png" alt="macEverything — macOS 文件名即时搜索" width="720">
 </p>
 
-[![Version](https://img.shields.io/badge/version-2.4.3-blue)](https://maceverything.modouai.dev/)
+[![Version](https://img.shields.io/badge/version-2.5.0-blue)](https://maceverything.modouai.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B%20·%20Apple%20Silicon-lightgrey)](#环境要求)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust)](https://www.rust-lang.org/)
@@ -23,7 +23,6 @@ macEverything 自建索引、不走 Spotlight:Spotlight 静默搜不到的目录
 - **完整**:与 `find` 零差异
 - **悬浮条(⌥Space)**:跨全屏应用上方可唤起,输入即搜,键盘全操作
 - **完整结果窗口(⌥⇧F)**:可排序、多选、原生右键菜单、Quick Look
-- **CLI + GUI**:同一引擎,两个独立客户端
 - **双语界面**:简体中文 / English,默认跟随系统
 
 ## 为什么不走 Spotlight?
@@ -109,6 +108,8 @@ macEverything stop
 ```
 
 引擎离线时 `query` 自动降级:直读落盘索引,结果标注「离线索引 · 生成于 …」。
+
+`query` 与 `status` 支持 `--json` 机器可读输出(带 schema_version),可供脚本与 AI/agent 工具直接调用;参数与 JSON 契约见[使用指南](docs/usage.md)。装了 App 的用户也可在设置 → 通用 →「命令行工具」一键把命令行安装到 PATH。
 
 ## 搜索语法
 

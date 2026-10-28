@@ -4,7 +4,7 @@
   <img src="docs/screenshots/hero-en.png" alt="macEverything — instant filename search for macOS" width="720">
 </p>
 
-[![Version](https://img.shields.io/badge/version-2.4.3-blue)](https://maceverything.modouai.dev/)
+[![Version](https://img.shields.io/badge/version-2.5.0-blue)](https://maceverything.modouai.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B%20·%20Apple%20Silicon-lightgrey)](#requirements)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust)](https://www.rust-lang.org/)
@@ -23,7 +23,6 @@ Coverage: your home directory, `/Applications` and local external volumes (netwo
 - **Complete**: matches `find` exactly
 - **Floating bar (⌥Space)**: appears over full-screen apps, type-to-search, keyboard-driven
 - **Results window (⌥⇧F)**: sortable table, multi-select, native context menus, Quick Look
-- **CLI + GUI**: one engine, two independent clients
 - **Bilingual UI**: English / 简体中文, follows the system by default
 
 ## Why not Spotlight?
@@ -111,6 +110,8 @@ macEverything stop
 ```
 
 When the engine is offline, `query` falls back to reading the on-disk index directly and labels the results `offline index · generated at …`.
+
+`query` and `status` accept `--json` for schema-versioned machine-readable output, so scripts and AI/agent tools can call the CLI directly; the flags and the JSON contract are in the [usage guide](docs/usage.md). The bundled app can also install the CLI onto your `PATH` from Settings → General → Command-Line Tool.
 
 ## Search syntax
 

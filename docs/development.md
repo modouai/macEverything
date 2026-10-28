@@ -27,10 +27,11 @@ crates/
 │   └── tests/             parity(对拍)/ fsevents_live(实机,#[ignore])
 └── cli/
     └── src/
-        ├── main.rs        五子命令分派 + start 后台化 + SIGPIPE 复位
-        ├── protocol.rs    消息契约(长度前缀/版本字段/path 校验)
-        ├── daemon.rs      引擎宿主(冷启动编排/增量循环/服务/单实例/落盘锁)
-        └── client.rs      连接/离线降级/输出格式化
+        ├── main.rs        子命令分派 + start 后台化 + SIGPIPE 复位 + 退出码(0/1/2)
+        ├── args.rs        参数解析(--data-dir 前置/`=` 形式、--json/--sort/--desc、绝对降序换算、数据目录优先级)
+        ├── json.rs        --json 输出构造(query/status/错误对象,schema_version=1)
+        ├── daemon.rs      引擎宿主(冷启动编排/增量循环/服务/单实例/落盘锁/目录 0700·文件 0600)
+        └── daemon/        volumes 子模块
 
 docs/
 ├── architecture.md        架构总览(实现态)
@@ -100,6 +101,14 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 自动隔离(`MCE_ROOTS` 指向合成树 + 临时 HOME),测后清理;合成树由 `scripts/spike-readdir` 生成。
 - 单轮测量受系统负载影响(实测偶见 40ms 噪声样本);判定以多轮中位为准。
 - 引擎级查询分布(不经过 daemon):`cargo run --release -p engine --example bench_query -- <index.bin> <总数>`。
+
+## CLI 集成(v2.5)
+
+协议与 JSON 契约的对外入口是 `docs/usage.md`「--json 输出契约」;实现要点:
+
+- **数据目录覆盖**:`--data-dir`(仅子命令前,空格/`=` 均可)> `MCE_DATA_DIR` > `$HOME` 默认(`cli/args.rs::resolve_data_dir`);env 为空/相对路径报错,**不回落默认目录**——静默换目录会让客户端连错 daemon。
+- **App 拉起引擎固定目录**:`engine_launcher` spawn 时显式 `.env("MCE_DATA_DIR", paths.data_dir)`;外部同名变量(终端启动/`launchctl setenv`)不继承,App 永远连默认目录。
+- **安装器**:`crates/app/src/cli_install/`(登录 shell PATH 探测 + 分类状态机 + 原子安装/修复/卸载);测试经 `test_fs.rs` 注入文件系统与 shell 结果,不触真实磁盘,新增分支同样走注入测试。
 
 ## 关键约定与陷阱(实现期踩坑记录)
 

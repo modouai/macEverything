@@ -28,6 +28,8 @@ cargo install --path crates/cli
 
 App 与命令行互不依赖:装 App 不要求命令行在 PATH,反之亦然。App 拉起引擎时优先用随包的命令行(包内 `Contents/MacOS/macEverything`),PATH 仅作兜底。
 
+已装 App 的用户也可在设置 → 通用 →「命令行工具」一键安装(符号链接进 PATH,见「图形界面 → 命令行工具」)。
+
 验证:`macEverything`(不带参数)打印用法。
 
 ## 图形界面
@@ -125,6 +127,17 @@ App 与命令行互不依赖:装 App 不要求命令行在 PATH,反之亦然。A
 - 点击后仅用默认浏览器打开官网下载页,不自动下载、不自动安装。
 - 每次检查仅向官网发起一次 HTTPS `GET /version.json`;不附加设备/用户标识,无遥测。User-Agent 携带应用版本号,服务端**仅按版本号聚合计数**(活跃安装分布,不记录 IP/设备);检查失败不弹窗、不影响搜索。
 
+### 命令行工具
+
+设置 → 通用 →「命令行工具」:把随包命令行以符号链接暴露到 PATH,免手工 `ln -sf`。
+
+- 安装目录按 PATH 顺序取第一个允许且可写的:`/opt/homebrew/bin` → `~/.local/bin` → `~/.cargo/bin` → `/usr/local/bin`。
+- 不覆盖其他来源:`cargo install`、Homebrew 或手工创建的同名条目一律显示来源并拒绝安装。
+- 链接失效区分目标:指向本 App 形态的失效链接提供「修复为当前 App」;其他来源的失效链接不提供动作,也不删除。
+- App 被移动导致链接失效时提供「修复」;目标卷未挂载时修复禁用,提示挂载后重试。
+- 无法读取登录 shell 的 PATH、或 App 运行在 DMG/只读卷时:只显示原因与「重试」,不执行动作;DMG 形态提示「先移到 Applications 并重启 App」。开发构建(`cargo run`)不提供安装。
+- 行下常驻提示:首次在终端运行可能需要完全磁盘访问权限(见「权限:完全磁盘访问」)。
+
 ### 引擎自动拉起与定位
 
 App 启动时检测引擎(socket 连通性),不在则按下列顺序定位可执行文件并自动拉起:
@@ -149,6 +162,20 @@ App 启动时检测引擎(socket 连通性),不在则按下列顺序定位可执
 ## 五个命令
 
 App 运行中时,以下命令同样可用(共用同一引擎与数据目录)。
+
+```text
+macEverything [--data-dir <PATH>] start
+macEverything [--data-dir <PATH>] stop
+macEverything [--data-dir <PATH>] query [--json] [--sort <name|size|mtime|path>] [--desc] [--] <关键词>
+macEverything [--data-dir <PATH>] status [--json]
+macEverything [--data-dir <PATH>] exclude add|remove|list|reset [路径]
+```
+
+参数规则:
+
+- `--data-dir` 只能出现在子命令之前,空格与 `=` 两种写法均可(`--data-dir /tmp/mce` 等价 `--data-dir=/tmp/mce`);子命令之后出现按意外参数处理。
+- `--json` 只对 `query`/`status` 有效;`--sort`/`--desc` 只对 `query` 有效,其他组合按用法错误处理。
+- 退出码:**0** 成功;**1** 运行错误(连不上引擎、索引不可读、`MCE_DATA_DIR` 非法等);**2** 用法错误(未知/缺失/重复选项、空关键词、相对 `--data-dir` 等),错误写 stderr,即使带 `--json` 也不输出 JSON。
 
 ### `macEverything start` — 启动引擎(后台)
 
@@ -185,6 +212,18 @@ $ macEverything query "季度报告"
 - 上限单轮 1000 条,超出提示;`| head` 等管道用法正常。
 - **daemon 未运行时自动离线**:直读落盘索引并标注「离线索引 · 生成于 …」。
 
+排序与机器可读输出:
+
+```bash
+macEverything query --sort mtime --desc "报告"     # 按修改时间,最新在前
+macEverything query --json "*.pdf" | jq '.entries[].path'
+```
+
+- `--sort <name|size|mtime|path>` 指定排序键;`--desc` 必须与 `--sort` 同时出现,单独使用按用法错误处理。
+- **`--desc` 是绝对降序**:不加它,`--sort mtime` 输出**最旧在前**——mtime 的自然方向是降序,四个键里只有它与直觉相反;`name`/`size`/`path` 不加 `--desc` 即升序。
+- 选项必须出现在关键词之前;关键词以 `-` 开头时用 `--` 分隔:`query --json -- "-foo"`。关键词开始后再出现选项按意外参数处理。
+- `--json` 时 stdout 只输出一个 JSON 对象(见「--json 输出契约」),提示与日志走 stderr;人类可读输出保持不变。
+
 ### `macEverything status` — 索引状态
 
 ```bash
@@ -197,7 +236,7 @@ $ macEverything status
   /Users/you/Documents  (Operation not permitted (os error 1))
 ```
 
-状态四态:构建中 / 就绪 / 补齐中(重放) / 重扫中(兜底)。权限缺口逐目录列出。
+状态四态:构建中 / 就绪 / 补齐中(重放) / 重扫中(兜底)。权限缺口逐目录列出。`status --json` 输出同一信息的机器可读形态,见下节。
 
 ### `macEverything exclude add|remove|list [路径]` / `macEverything exclude reset` — 排除目录
 
@@ -219,6 +258,65 @@ daemon 未运行时此命令报错(需引擎在线)。
 `.git`、`~/.Trash` 及卷元数据目录 `.fseventsd`/`.Trashes`/`.Spotlight-V100`/`.DocumentRevisions-V100`），
 保存配置后一次重扫生效。设置页对应「恢复默认」使用原生确认弹窗
 （默认按钮为「取消」）。旧 daemon 不认识该请求，须先 `macEverything stop && macEverything start` 换用新 CLI。
+
+## `--json` 输出契约
+
+`query --json` / `status --json` 向 stdout 输出**一个**带 `schema_version` 的 JSON 对象,供脚本与 AI/agent 工具解析;字段只增不删,行为变更须升版本。
+
+`query --json`:
+
+```json
+{
+  "schema_version": 1,
+  "total": 3,
+  "elapsed_ms": 2.1,
+  "stat_ms": 0.4,
+  "sort_echo": "mtime",
+  "desc_echo": true,
+  "offline_built_at": null,
+  "entries": [
+    {
+      "name": "季度报告.md",
+      "path": "/Users/you/Documents/季度报告.md",
+      "size": 24576,
+      "mtime": 1760000000,
+      "is_dir": false
+    }
+  ]
+}
+```
+
+- `entries` 每条含 `name`/`path`/`size`/`mtime`/`is_dir`;`size`(字节)与 `mtime`(Unix 秒)读不到为 `null`;最多 1000 条,数量 ≤ `total`。
+- `sort_echo` = 实际生效排序键(`relevance`/`name`/`size`/`mtime`/`path`);空串 = 对端旧版未回显,实际按 relevance。
+- `desc_echo` = `true` 降序 / `false` 升序 / `null` 方向未验证(relevance 排序或旧 daemon 未回显)。
+- `offline_built_at` = 在线为 `null`;离线直读落盘索引时为索引生成时刻(Unix 秒)。
+
+`status --json`:
+
+```json
+{
+  "schema_version": 1,
+  "state": "ready",
+  "entry_count": 1233836,
+  "gaps": [{ "path": "/Users/you/.Trash", "reason": "Operation not permitted (os error 1)" }],
+  "io_error_count": 0,
+  "built_at": 1760000000,
+  "index_file": "/Users/you/Library/Application Support/macEverything/index.bin",
+  "offline": false
+}
+```
+
+- `state` 六个取值:在线四态 `building` / `ready` / `reconciling` / `degraded`;daemon 不在时 `offline`(直读落盘索引,`offline = true`,此时 `gaps` 恒为空数组——缺口只在 daemon 内存里);`index.bin` 不存在时 `no_index`(`entry_count = 0`、`built_at = 0`,`index_file` 仍给出预期路径)。字段集在任何状态下一致。
+- `index.bin` 存在但读取/校验失败(损坏、截断、无权限):不报 `no_index`,输出错误对象 `code = "index_unreadable"`,退出码 1。
+
+`--json` 下运行失败同样向 stdout 输出一个 JSON 对象,退出码非 0:
+
+```json
+{ "schema_version": 1, "error": { "code": "warming", "message": "索引尚未就绪" } }
+```
+
+- `code`:daemon 返回的错误保留原码(如 `warming`、`version`);连接/离线路径失败为 `null`;索引不可读为 `index_unreadable`。
+- 用法错误(退出码 2)不输出 JSON:错误写 stderr,stdout 为空。
 
 ## 搜索语法
 
@@ -262,6 +360,39 @@ macOS 的 TCC 保护会让部分目录(如 `~/Documents`、`~/Desktop`、邮件�
 | `autostart-off` | 存在 = 你主动关过开机自启(下次启动不再默认注册);托盘重新勾选即清除 |
 | `daemon.log` | 引擎日志 |
 
+### 数据目录覆盖(`--data-dir` / `MCE_DATA_DIR`)
+
+默认目录可用参数或环境变量覆盖,优先级 `--data-dir` > `MCE_DATA_DIR` > 默认:
+
+```bash
+macEverything --data-dir /tmp/mce start           # 空格形式
+macEverything --data-dir=/tmp/mce status --json   # `=` 形式等价
+export MCE_DATA_DIR="$HOME/Library/Application Support/macEverything"
+```
+
+- `--data-dir` 必须是绝对路径,且只出现在子命令前;缺失值、空值、相对路径 = 用法错误(退出码 2)。
+- `MCE_DATA_DIR` 为空、仅空白或相对路径 = 运行错误(退出码 1),**不静默回落默认目录**。
+- 目录权限 0700;`index.bin`/`config.toml`/`daemon.log` 0600。索引含全盘文件路径,不要把自定义目录放在共享或全局可写位置。
+- `query`/`status` 不创建目录,只有 `start` 创建;`daemon.sock`/索引/日志全部跟随该目录。
+- 不同目录 = 不同实例,可同时运行;**自定义目录的实例与 App 互不可见**(App 永远连默认目录)。
+- `stop` 只停目标实例。共用默认目录时**不要 `stop`**——那会停掉 App 正在用的引擎;要独立生命周期就开独立实例。
+
+外部集成(外部工具 等)两种接法:
+
+```bash
+# 共享默认索引(省一次全盘扫描;不要对它 stop)
+macEverything start
+macEverything query --json --sort mtime --desc "发票 2026" | jq '.entries[].path'
+
+# 独立实例(自管生命周期;会再建一份索引,磁盘/内存成本自理)
+export MCE_DATA_DIR="$HOME/Library/Application Support/macEverything"
+macEverything start
+macEverything query --json "合同" | jq '.total'
+macEverything stop
+```
+
+接入方应锁定 `schema_version`(当前 1)与协议版本,升级时回归。
+
 ## 排障
 
 | 现象 | 处理 |
@@ -281,6 +412,7 @@ macOS 的 TCC 保护会让部分目录(如 `~/Documents`、`~/Desktop`、邮件�
 
 | 变量 | 用途 |
 |---|---|
+| `MCE_DATA_DIR` | 覆盖数据目录(绝对路径);空/相对路径报错,不回落默认。优先级低于 `--data-dir`,见「数据目录覆盖」 |
 | `MCE_ROOTS` | 覆盖扫描根(冒号分隔绝对路径);基准/隔离测试用,生产不要设 |
 | `MCE_FOREGROUND` | `start` 前台运行(调试用) |
 | `HOME` | 数据目录与默认扫描根随之变化(隔离测试用) |

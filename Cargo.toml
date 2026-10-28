@@ -4,7 +4,7 @@ members = ["crates/engine", "crates/protocol", "crates/client", "crates/cli", "c
 exclude = ["scripts/spike-readdir", "scripts/poc/poc1_window", "scripts/poc/poc1b_nspanel", "scripts/poc/poc2_hotkey", "scripts/poc/poc3_nsmenu", "scripts/poc/poc4_idle", "scripts/poc/poc6_height_resize", "scripts/poc/poc7_vibrancy", "scripts/poc/poc8_quicklook"]
 
 [workspace.package]
-version = "2.4.3"
+version = "2.5.0"
 edition = "2021"
 license = "MIT"
 

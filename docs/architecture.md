@@ -30,8 +30,8 @@ macEverything 的引擎架构:自建全盘文件名索引,不走 Spotlight。本
 | `engine` | 全部业务逻辑,可独立测试 | entry / arena / index / query / scanner / persist / fsevents / watcher / reconcile / config |
 | `protocol` | 协议契约(唯一真相:v1 从 cli 迁出,ADR-7) | 消息类型 / 编解码 / 校验 / 版本 |
 | `client` | 客户端承载层(唯一行为真相:v1 从 cli 迁出,ADR-7) | DaemonPaths / 连接 / stat_rows / 状态常量 / 离线降级 |
-| `cli` | 引擎宿主与命令行 | daemon(宿主)/ 子命令(五命令)/ main |
-| `app` | 图形界面(GUI,v2.0) | main(启动编排)/ session(查询会话)/ ui(双视口)/ platform(平台补丁)/ hotkey / tray / autostart / single_instance / engine_launcher |
+| `cli` | 引擎宿主与命令行 | daemon(宿主)/ args(参数解析·排序换算·数据目录优先级)/ json(--json 输出)/ main |
+| `app` | 图形界面(GUI,v2.0) | main(启动编排)/ session(查询会话)/ ui(双视口)/ platform(平台补丁)/ hotkey / tray / autostart / single_instance / engine_launcher / cli_install(命令行工具安装) |
 
 ## 六大设计决策(实现态摘要)
 
@@ -133,6 +133,15 @@ App 需要与 CLI 同款协议与客户端行为(连接 / 按需 stat / 离线�
 - **切 Space 失焦豁免**:失焦沿 → 宽限期 800ms 待决 → Space 变更通知按「锚失焦时刻」判(实测通知多晚于失焦 265~550ms,曾漏判);点击导致的失焦经鼠标键状态当帧判出、立即隐藏。
 - **主题跟随自建探测**:改类断掉 winit 的主题 KVO(`NSKVONotifying_WinitWindow` 被移除),改为渲染帧查询系统外观(`NSApp.effectiveAppearance`),仅在悬浮条可见期按节流检查。
 - **排帧纪律**:只在悬浮条可见期排帧(含主题检查);全隐藏期不排帧,事件循环回 `Wait`——隐藏态 CPU 0% 的机制。
+
+## v2.5 增补:CLI 集成(实现态摘要)
+
+设计推导见 `specs/cli-integration-v2.5/design.md`。
+
+- **数据目录覆盖**:解析优先级 `--data-dir` > `MCE_DATA_DIR` > `$HOME` 默认(`cli/args.rs`);env 为空/相对路径报错,不静默回落默认目录。目录 0700、`index.bin`/`config.toml`/`daemon.log` 0600;`start` 父进程预检目录可写后,给 spawn 的子进程显式回设 `MCE_DATA_DIR`。`daemon.sock`/索引/日志全部跟随目录——不同目录 = 不同实例。
+- **App 拉起引擎固定目录**:`engine_launcher` spawn 时显式 `.env("MCE_DATA_DIR", paths.data_dir)`——外部同名变量(终端启动/`launchctl setenv`)不继承,App 永远连默认目录。
+- **CLI JSON 契约**:`query/status --json` 输出 `schema_version = 1` 的单对象(`cli/json.rs`);字段、错误码与退出码(0/1/2)以 `docs/usage.md`「--json 输出契约」为入口。协议仅新增可选 `desc_echo` 回显,旧 daemon 缺省 `null`。
+- **安装器**:`app` 的 `cli_install` 模块——登录 shell PATH 探测(`-lic` → `-lc` → 进程,超时终止进程组) + 分类状态机 + 原子安装/修复/卸载(只动自己装的符号链接,不覆盖其他来源);测试经 `test_fs` 注入文件系统,不触真实磁盘。
 
 ## 生命周期
 
