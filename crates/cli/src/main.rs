@@ -108,6 +108,15 @@ fn spawn_background(paths: &client::DaemonPaths) -> anyhow::Result<()> {
 }
 
 fn start(paths: &client::DaemonPaths) -> Result<(), CliError> {
+    // 父进程预检(设计 §4.2 步骤 1):目录不可用(路径被普通文件占用/无权限)在
+    // spawn 前如实报出路径与 errno——子进程 stdio 接 /dev/null,不预检就只剩
+    // spawn_background 400ms try_wait 的泛化文案。serve 分支的 ensure_data_dir
+    // 与此重复,但目录已就位时是幂等空操作。
+    daemon::ensure_data_dir(&paths.data_dir).map_err(|e| CliError::Runtime {
+        code: None,
+        message: format!("数据目录不可用({}): {e}", paths.data_dir.display()),
+        json: false,
+    })?;
     if std::env::var_os("MCE_FOREGROUND").is_some() {
         return daemon::serve(paths.clone()).map_err(runtime);
     }

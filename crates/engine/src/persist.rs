@@ -461,6 +461,27 @@ mod tests {
             0o600
         );
     }
+
+    /// 收敛钉:落盘产物被外部改宽(0644)后,再次 save 经 tmp+rename 换 inode,
+    /// 新 inode 由 tmp 的 create mode 决定 → 收敛回 0600。
+    /// 突变「tmp 用 File::create 默认 0644」此测必红(rename 不改宽文件的位)。
+    #[test]
+    fn resave_converges_widened_index_back_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut i = Index::new();
+        i.insert("a.txt", crate::entry::NO_PARENT, false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.bin");
+        let meta = IndexMeta::default();
+        write_atomic(&i, &meta, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&i, &meta, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "再次落盘应把改宽的旧文件收敛回 0600"
+        );
+    }
 }
 
 #[cfg(test)]

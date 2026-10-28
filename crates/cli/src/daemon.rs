@@ -1803,4 +1803,43 @@ mod tests {
             0o600
         );
     }
+
+    /// 收敛钉:已存在目录 0755、已存在日志 0644,经 ensure_data_dir + open_log_file
+    /// 归位 0700/0600,且日志旧内容保留(append 打开,不截断)。
+    /// 突变「删 ensure_data_dir 的 set_permissions」「删 open_log_file 的 open 前
+    /// 补 chmod」——DirBuilder/open 的 mode 只作用于新建,此测必红。
+    #[test]
+    fn existing_dir_and_log_converge_to_0700_0600_with_content_kept() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = data.join("daemon.log");
+        std::fs::write(&log, b"old-line\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        ensure_data_dir(&data).unwrap();
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "已存在 0755 目录应收敛 0700"
+        );
+
+        open_log_file(&log)
+            .expect("日志文件应可打开")
+            .write_all(b"new-line\n")
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "已存在 0644 日志应收敛 0600"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "old-line\nnew-line\n",
+            "append 打开不得截断旧内容"
+        );
+    }
 }

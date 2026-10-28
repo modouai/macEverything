@@ -135,3 +135,30 @@ fn relative_env_data_dir_human_error_goes_to_stderr() {
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());
 }
+
+/// 父进程预检(设计 §4.2 步骤 1):数据目录被普通文件占用 → `start` 在 spawn
+/// 前失败,退出码 1,stderr 含路径与 errno;不进入 spawn 后台路径,无子 daemon。
+/// 突变「删 start 的 ensure_data_dir 预检」:错误退化为 spawn 后的
+/// 「引擎未启动(退出码 …)」泛化文案(不含路径),两个断言必红。
+#[test]
+fn start_with_data_dir_occupied_by_file_fails_before_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = dir.path().join("occupied");
+    std::fs::write(&occupied, b"x").unwrap();
+    let out = Command::new(bin())
+        .env("HOME", dir.path())
+        .env("MCE_DATA_DIR", &occupied)
+        .arg("start")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("数据目录不可用"), "{stderr}");
+    assert!(
+        stderr.contains(occupied.to_string_lossy().as_ref()),
+        "stderr 应含数据目录路径:\n{stderr}"
+    );
+    // 预检挡在 spawn 前:数据目录(实为文件)旁不得出现 daemon.sock,
+    // 也无从产生后台引擎进程
+    assert!(!dir.path().join("daemon.sock").exists());
+}

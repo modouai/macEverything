@@ -192,9 +192,11 @@ macEverything status [--json]
 
 ### 4.3 隔离与安全
 
-- 目录由 `start` 创建：`DirBuilder` 0700；已存在目录尝试 chmod 0700，失败记 warn。
+- 目录由 `start` 创建：`DirBuilder` 0700；已存在目录也强制 0700（失败即启动失败）。
 - `index.bin` / `config.toml` / `daemon.log` 创建为 0600；已存在文件也尝试 chmod 0600；
-  socket 仍为 0600。
+  socket 仍为 0600。`index.bin`/`config.toml` 对已存在的 0644 旧文件在**下次落盘时**
+  经 tmp+rename 收敛为 0600（`daemon.log` 每次启动收敛）；0700 目录本身已挡住
+  其他用户读取。
 - 自定义目录不要放在共享/世界可写位置；索引含全盘文件路径，属敏感数据。
 - App 仍固定使用默认目录；**自定义目录的实例对 App 不可见**，这是预期行为。
   实现上由 `engine_launcher` 显式固定环境，见 §4.5。
