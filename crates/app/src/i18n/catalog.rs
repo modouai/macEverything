@@ -69,6 +69,7 @@ catalog! {
     cli_unavailable_moved: "先移到 Applications 并重启 App" / "Move to Applications and relaunch the app",
     cli_unavailable_bundled: "App 内置命令行缺失或损坏" / "The bundled command-line tool is missing or damaged",
     cli_unknown_path: "无法读取登录 shell 的 PATH" / "Couldn't read the login shell PATH",
+    cli_worker_start_failed: "命令行工具检查线程异常退出" / "The command-line tool worker exited unexpectedly",
     cli_hint_add_path: "PATH 中没有可用目录；先把 {dir} 加入 PATH（勿由 App 修改 shell 配置），然后重试安装" / "No usable directory in PATH; add {dir} to PATH (the app won't edit your shell config), then retry installation",
     cli_fda_hint: "首次在终端运行可能需要完全磁盘访问权限" / "The first terminal run may need Full Disk Access",
     // 关于 / 更新

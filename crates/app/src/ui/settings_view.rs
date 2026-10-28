@@ -205,7 +205,8 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             ui.add_space(GROUP_GAP);
             draw_about_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(GROUP_GAP);
-            // 外接磁盘放末位:关于组与既有首屏预算钉住不变(测试 settings_layout_has_all_rows)
+            // 外接磁盘组固定排在末位(分组顺序由本函数与
+            // settings_layout_has_all_rows 钉住);内容超高整页滚动,不约束首屏。
             draw_volumes_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(CONTENT_PAD.0);
         });
@@ -2390,8 +2391,9 @@ mod tests {
             .unwrap_or_else(|| panic!("缺少文本 {needle:?}"))
     }
 
-    /// 布局:四组标题、行标签、字号三段、语言、添加按钮与目录行齐全;
-    /// 内容自标题栏下起排；关于组追加后标准字号下整页滚动，前三组仍在首屏内。
+    /// 布局:五组标题、行标签、字号三段、语言、命令行工具行、添加按钮与
+    /// 目录行齐全;内容自标题栏下起排,分组顺序固定,超出 620×600 的部分
+    /// 由整页滚动承载(无首屏预算约束)。
     #[test]
     fn settings_layout_has_all_rows() {
         let data = layout_test_data();
@@ -2452,8 +2454,8 @@ mod tests {
             min_top >= TITLEBAR_H,
             "内容不得侵入固定标题栏(最早文本 y={min_top})"
         );
-        // 关于组为第四组，标准字号下整页需要滚动；其之前的内容仍须完整落在
-        // 620×600 首屏内（含底部留白）。
+        // 分组顺序固定:关于组在索引组之后;页面超出 620×600 时由滚动区承载,
+        // 断言只锁定相对顺序,不约束首屏。
         let about_y = find_text(&texts, i18n::s().group_about).pos.y;
         let index_y = find_text(&texts, i18n::s().group_index).pos.y;
         assert!(

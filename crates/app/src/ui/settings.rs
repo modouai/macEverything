@@ -323,6 +323,13 @@ impl CliInstallUi {
         self.generation
     }
 
+    /// 工作线程启动失败或无结果退出:解除 busy 并落本地化内联错误,
+    /// 旧观测保留(界面不卡在「检查中…」;原始细节只进日志)。
+    pub(crate) fn worker_died(&mut self) {
+        self.busy = false;
+        self.error = Some(i18n::s().cli_worker_start_failed.to_owned());
+    }
+
     /// 落地一次回投:旧代数丢弃;动作错误只置错误并解除 busy(阶段保持);
     /// 观测成功覆盖 last;探测失败保留 last(无 last 回 Idle)。
     pub(crate) fn apply(&mut self, r: CliInstallResult) {
@@ -639,12 +646,12 @@ impl SettingsState {
         open && self.cli_refresh_pending && !self.cli_install.busy
     }
 
-    /// 安装器工作线程无法启动:清 busy/通道并落内联错误(观测保留)。
+    /// 安装器工作线程无法启动:清 busy/通道并落本地化内联错误(观测保留;
+    /// 原始细节只进日志,与 exclude/volumes 同纪律)。
     pub(crate) fn cli_install_spawn_failed(&mut self, detail: String) {
         log::warn!("命令行工具工作线程启动失败:{detail}");
-        self.cli_install.busy = false;
         self.cli_rx = None;
-        self.cli_install.error = Some(detail);
+        self.cli_install.worker_died();
     }
 
     /// 非阻塞收取安装器后台结果(设置 pass 锁内;空 = 保持 busy 等下一帧)。
@@ -658,7 +665,7 @@ impl SettingsState {
             Err(TryRecvError::Empty) => self.cli_rx = Some(rx),
             Err(TryRecvError::Disconnected) => {
                 log::warn!("命令行工具工作线程异常退出(无结果)");
-                self.cli_install.busy = false;
+                self.cli_install.worker_died();
             }
         }
     }
@@ -1399,7 +1406,8 @@ fn apply_volume_toggle(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, name: &
 ///
 /// 共享锁只落代数/busy/回投通道,随即释放;分类、动作与登录 shell 探测都在
 /// 工作线程(observe 可耗时至数秒)。完成时请求设置视口重绘,由
-/// `tick_cli_install` 下帧收取。返回 true = 操作已开始;false = 已有操作在途。
+/// `tick_cli_install` 下帧收取。返回 true = 操作已开始;
+/// false = 工作线程启动失败(错误已落地,调用方无须清挂起位)。
 fn spawn_cli_install(
     ctx: &egui::Context,
     shared: &Arc<Mutex<Shared>>,
@@ -1446,7 +1454,9 @@ fn spawn_cli_install(
 }
 
 /// 工作线程体:执行动作 + 全量复核观测(不持共享锁;observe 会 spawn 登录
-/// shell)。动作失败仍回投新观测——界面以复核结果为准,错误单独展示。
+/// shell)。复核观测随结果回投,但**失败路径不消费它**:`apply` 对
+/// `action_error` 提前返回,动作前观测保留、错误单独展示;成功路径以
+/// 动作后的复核观测为准(覆盖 last)。
 fn run_cli_install(action: &CliInstallAction) -> (Result<Observation, String>, Option<String>) {
     let fs = RealFs::new();
     match action {
@@ -2464,6 +2474,73 @@ mod tests {
         );
         assert!(!state.cli_install.busy, "动作错误解除 busy");
         assert!(state.cli_install.error.is_some(), "错误保留到界面展示");
+    }
+
+    /// 工作线程启动失败:终态落本地化内联错误、清 busy,观测保留
+    /// (镜像 exclude_spawn_failure_is_terminal_without_response;原始细节
+    /// 只进日志,不进界面)。
+    #[test]
+    fn cli_install_spawn_failure_is_terminal_with_localized_error() {
+        let mut state = test_state();
+        state.cli_install.begin_resolve();
+        let (tx, rx) = mpsc::channel();
+        state.cli_rx = Some(rx);
+
+        state.cli_install_spawn_failed("无法启动命令行工具工作线程:资源不足".into());
+        assert!(!state.cli_install.busy);
+        assert!(state.cli_rx.is_none(), "失败终态须清通道");
+        assert_eq!(
+            state.cli_install.error.as_deref(),
+            Some(i18n::s().cli_worker_start_failed),
+            "界面只展示本地化句子"
+        );
+        assert!(
+            !state
+                .cli_install
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("资源不足")),
+            "原始错误细节不得进界面"
+        );
+        assert!(state.cli_install.last.is_none(), "未拿到观测");
+
+        // 启动失败后通道已清:发送端只能断开,不残留半开通道。
+        drop(tx);
+    }
+
+    /// 工作线程无结果退出(通道断开):不得让 busy 永久卡住;落本地化错误,
+    /// 旧观测保留(镜像 exclude_worker_disconnect_ends_busy_with_error)。
+    #[test]
+    fn cli_install_worker_disconnect_ends_busy_with_error() {
+        let mut state = test_state();
+        let g = state.cli_install.begin_resolve();
+        deliver_cli(
+            &mut state,
+            CliInstallResult {
+                generation: g,
+                result: Ok(cli_obs()),
+                action_error: None,
+            },
+        );
+        assert!(state.cli_install.last.is_some());
+
+        // 第二次探测在途时线程无结果退出。
+        let (_tx, rx) = mpsc::channel::<CliInstallResult>();
+        state.cli_install.begin_resolve();
+        state.cli_rx = Some(rx);
+        drop(_tx);
+        state.tick_cli_install();
+        assert!(!state.cli_install.busy, "断链须解除 busy");
+        assert_eq!(
+            state.cli_install.error.as_deref(),
+            Some(i18n::s().cli_worker_start_failed),
+            "断链与启动失败共用同一本地化文案"
+        );
+        assert!(
+            state.cli_install.last.is_some(),
+            "断链不得清掉旧观测(界面保持上次状态)"
+        );
+        assert!(state.cli_rx.is_none(), "one-op 通道用完即弃");
     }
 
     /// 快照复制观测/busy/错误(视图绘制的只读数据源)。
