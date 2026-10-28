@@ -134,7 +134,7 @@ App 与命令行互不依赖:装 App 不要求命令行在 PATH,反之亦然。A
 - 安装目录按 PATH 顺序取第一个允许且可写的:`/opt/homebrew/bin` → `~/.local/bin` → `~/.cargo/bin` → `/usr/local/bin`。
 - 不覆盖其他来源:`cargo install`、Homebrew 或手工创建的同名条目一律显示来源并拒绝安装。
 - 链接失效区分目标:指向本 App 形态的失效链接提供「修复为当前 App」;其他来源的失效链接不提供动作,也不删除。
-- App 被移动导致链接失效时提供「修复」;目标卷未挂载时修复禁用,提示挂载后重试。
+- App 被移动导致链接失效时提供「修复」;目标卷未挂载时修复禁用,提示「目标卷未挂载」。
 - 无法读取登录 shell 的 PATH、或 App 运行在 DMG/只读卷时:只显示原因与「重试」,不执行动作;DMG 形态提示「先移到 Applications 并重启 App」。开发构建(`cargo run`)不提供安装。
 - 行下常驻提示:首次在终端运行可能需要完全磁盘访问权限(见「权限:完全磁盘访问」)。
 
@@ -175,7 +175,7 @@ macEverything [--data-dir <PATH>] exclude add|remove|list|reset [路径]
 
 - `--data-dir` 只能出现在子命令之前,空格与 `=` 两种写法均可(`--data-dir /tmp/mce` 等价 `--data-dir=/tmp/mce`);子命令之后出现按意外参数处理。
 - `--json` 只对 `query`/`status` 有效;`--sort`/`--desc` 只对 `query` 有效,其他组合按用法错误处理。
-- 退出码:**0** 成功;**1** 运行错误(连不上引擎、索引不可读、`MCE_DATA_DIR` 非法等);**2** 用法错误(未知/缺失/重复选项、空关键词、相对 `--data-dir` 等),错误写 stderr,即使带 `--json` 也不输出 JSON。
+- 退出码:**0** 成功;**1** 运行错误(连不上引擎、索引不可读、`MCE_DATA_DIR` 非法等);**2** 用法错误(未知/缺失选项、重复的 `--data-dir`/`--sort`、空关键词、相对 `--data-dir` 等),错误写 stderr,即使带 `--json` 也不输出 JSON。
 
 ### `macEverything start` — 启动引擎(后台)
 
@@ -315,7 +315,7 @@ daemon 未运行时此命令报错(需引擎在线)。
 { "schema_version": 1, "error": { "code": "warming", "message": "索引尚未就绪" } }
 ```
 
-- `code`:daemon 返回的错误保留原码(如 `warming`、`version`);连接/离线路径失败为 `null`;索引不可读为 `index_unreadable`。
+- `code`:daemon 返回的错误保留原码(如 `warming`、`version`);连接/离线路径失败为 `null`;`status` 离线索引不可读为 `index_unreadable`(query 离线路径失败为 `null`)。
 - 用法错误(退出码 2)不输出 JSON:错误写 stderr,stdout 为空。
 
 ## 搜索语法
