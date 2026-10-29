@@ -261,6 +261,20 @@ pub fn custom_icon_rgba(path: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// 取路径处 APP bundle 自身图标(`NSWorkspace iconForFile:`)并转成 [`ICON_PX`]
+/// 见方 **预乘** RGBA(取图/解码/缩放在工作线程)。调用方负责只传 APP bundle。
+pub fn app_icon_rgba(path: &str) -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::app_icon_rgba(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// 记录根窗句柄(创建期一次)。
 /// 安装 Space 变更后的悬浮条重绘钩子(`App::new` 调用一次)。
 ///

@@ -46,8 +46,8 @@ use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSEventModifierFlags,
-    NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem, NSModalResponseAbort,
+    NSBackingStoreType, NSBezierPath, NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSEvent,
+    NSEventModifierFlags, NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem, NSModalResponseAbort,
     NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPanel, NSPasteboard,
     NSPasteboardWriting, NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
@@ -55,9 +55,9 @@ use objc2_app_kit::{
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest, NSNotification,
-    NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey, NSURLRequestCachePolicy,
-    NSURLResponse, NSURLSession, NSURL,
+    NSArray, NSData, NSDictionary, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest,
+    NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey,
+    NSURLRequestCachePolicy, NSURLResponse, NSURLSession, NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -587,7 +587,17 @@ pub fn show_root_window() -> Result<()> {
         .with(|cell| cell.borrow().root.clone())
         .ok_or_else(|| anyhow!("根窗句柄未记录(attach_root 未执行)"))?;
     let app = NSApplication::sharedApplication(mtm);
-    app.activate();
+    // Dock 图标(Accessory→Regular policy 切换)先于激活/置前:policy 切换会让系统
+    // 重算本 app 的窗口归属,放在置前之后实测概率把窗口压回普通层(2026-10-29
+    // 用户报「完整窗口概率性被其他应用遮挡」)。
+    set_dock_icon(true);
+    // 硬激活:macOS 14+ 起无参 `activate()` 只在系统判定「用户交互允许」时生效,
+    // 悬浮条是 non-activating panel(点击不授予激活许可),非激活 app 下调用概率性
+    // 静默失败——窗口 orderFront 后拿不到 key,随后被前台应用压下(同上用户报告)。
+    // `activateIgnoringOtherApps` 虽标弃用(官方建议 NSApp.activate),但它正是
+    // 「无视前台归属抢激活」的语义,启动器类应用唯一可靠路径(实机 2026-10-29)。
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
     // 最小化态下单发 orderFront/makeKey 不会从 Dock 恢复:先 deminiaturize
     //（与设置窗同法;2026-10-18 review 补）。
     if root.isMiniaturized() {
@@ -604,7 +614,6 @@ pub fn show_root_window() -> Result<()> {
     root.orderFrontRegardless();
     root.makeKeyAndOrderFront(None);
     root.makeMainWindow();
-    set_dock_icon(true);
     let f = root.frame();
     log::info!(
         "完整窗口(根窗)唤起:isVisible={} isKey={} frame={:.0}x{:.0}@({:.0},{:.0})",
@@ -1701,6 +1710,16 @@ pub fn custom_icon_rgba(path: &str) -> Option<Vec<u8>> {
     image_rgba(&icon)
 }
 
+/// 取 APP bundle 自身图标(`NSWorkspace iconForFile:` 返回该 APP 的图标,自然含
+/// 用户给 APP 设过的自定义图标)。调用方负责只传 APP bundle 路径。
+///
+/// 返回 64×64 **预乘** RGBA;由图标工作线程调用,只做 `NSWorkspace` 查询与返回
+/// 图像的 TIFF 数据化,不创建/操作视图或窗口(跨线程依据见 `ui/icons.rs` 模块注释)。
+pub fn app_icon_rgba(path: &str) -> Option<Vec<u8>> {
+    let icon = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(path));
+    image_rgba(&icon)
+}
+
 /// `NSImage` → 64×64 **预乘** RGBA:TIFF 表示 → image 解码 → Lanczos 缩放。
 ///
 /// 系统图标源通常 ≥512px,缩到 64px 即满足 Retina 2x 的 32pt 行图标。
@@ -1722,9 +1741,39 @@ fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
         let ptr: *const std::ffi::c_void = msg_send![&*tiff, bytes];
         std::slice::from_raw_parts(ptr.cast::<u8>(), len)
     };
-    let decoded = image::load_from_memory(bytes).ok()?;
+    let decoded = decode_icon_tiff(&tiff, bytes)?;
     let resized = decoded.resize_exact(ICON_PX, ICON_PX, image::imageops::FilterType::Lanczos3);
     Some(resized.to_rgba8().into_raw())
+}
+
+/// TIFF 数据 → 8bit 解码图像。
+///
+/// 直解优先(类型图标的 TIFF 为 8bit,快路径);失败时经 `NSBitmapImageRep` 转
+/// PNG 中转重解——macOS 26 图标管线给 APP 图标(`iconForFile:`)输出 **16bit
+/// float 采样的多页 TIFF**(实测 1024×1024 bps=16 float,~74MB),`image` crate
+/// 不支持该采样格式,AppKit 的 PNG 导出会降到 8bit(实机 2026-10-29 探针验证)。
+/// 代价:PNG 中转约数百毫秒/次;worker 串行 + 路径缓存(每个 APP 只取一次),
+/// 首批 APP 结果渐次出现,可接受。
+/// 纯数据转换(NSBitmapImageRep 无视图/窗口操作),线程依据同 `ui/icons.rs`。
+fn decode_icon_tiff(tiff: &NSData, bytes: &[u8]) -> Option<image::DynamicImage> {
+    if let Ok(decoded) = image::load_from_memory(bytes) {
+        return Some(decoded);
+    }
+    let rep = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), tiff)?;
+    // SAFETY:rep 为有效对象,representationUsingType:properties: 是纯数据转换,
+    // 不创建/操作视图或窗口;PNG 属性字典为空。
+    let png = unsafe {
+        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+    }?;
+    // SAFETY:同上调用方 `bytes`——PNG NSData 只读缓冲区,同步解码期间存活。
+    let png_bytes = unsafe {
+        let ptr: *const std::ffi::c_void = msg_send![&*png, bytes];
+        std::slice::from_raw_parts(ptr.cast::<u8>(), png.length())
+    };
+    // PNG 保留 16bit(Rgba16),先降 8bit 再交给调用方缩放(缩放按 u8 走,更快)。
+    image::load_from_memory(png_bytes)
+        .ok()
+        .map(|decoded| image::DynamicImage::ImageRgba8(decoded.to_rgba8()))
 }
 
 /// 拉取 HTTPS 资源：同步返回响应体；非 200/非 HTTPS/超大/超时 = Err。

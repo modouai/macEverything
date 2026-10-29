@@ -488,6 +488,25 @@ impl ResultsState {
             self.return_focus_on_release = Some(egui::Key::Escape);
         }
 
+        // ↵:表格持焦且有导航行 = 默认应用打开;⌘↵ = 访达显示(悬浮条 ⌘↵ 同惯例)。
+        // 搜索框聚焦不接管(Enter 归输入框);IME 组合让位与 Esc/空格同口径。
+        if self.table_focused && !self.ime_composing && !self.ime_busy {
+            let press = ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter) {
+                    Some(true)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            if let Some(cmd) = press {
+                if let Some((row, reveal)) = enter_action(self.anchor, &self.selection, cmd) {
+                    self.open_row(row, reveal);
+                }
+            }
+        }
+
         // ↓:搜索框聚焦时进入表格并选中首行(同时让搜索框失焦);
         // 表格聚焦后 ↑/↓ 按行移动(显示顺序;允许长按重复)。
         let down_from_input = self.input_focused
@@ -842,7 +861,7 @@ impl ResultsState {
             self.table_focused = true;
         }
         if let Some(i) = open_row {
-            self.open_row(i);
+            self.open_row(i, false);
         }
         if let Some((i, pos)) = context_click {
             self.open_context_menu(i, pos, frame);
@@ -1134,12 +1153,13 @@ impl ResultsState {
             .collect()
     }
 
-    /// 双击:默认应用打开(palette::open_path 复用;失败以本地化文案落状态栏)。
-    fn open_row(&mut self, i: usize) {
+    /// 双击/↵:默认应用打开(reveal=false)或访达显示(⌘↵;palette::open_path 复用;
+    /// 失败以本地化文案落状态栏)。
+    fn open_row(&mut self, i: usize, reveal: bool) {
         let Some(entry) = self.results.get(i) else {
             return;
         };
-        if let Err(err) = palette::open_path(&entry.path, false) {
+        if let Err(err) = palette::open_path(&entry.path, reveal) {
             self.status_note = Some(StatusNote::Raw(err.text()));
             self.status_note_is_error = true;
         }
@@ -1839,6 +1859,18 @@ fn stepped_row(current: Option<usize>, len: usize, delta: isize) -> Option<usize
         }
         None => Some(if delta >= 0 { 0 } else { len - 1 }),
     }
+}
+
+/// ↵ 的行与方式裁决:anchor 优先(↑↓ 导航行),无 anchor 取 selection 首
+/// (BTreeSet 最小,与 ↑↓ 的 current 取法同源);两者皆无 → None(无动作)。
+/// `cmd` = ⌘↵,true → 访达显示(悬浮条 ⌘↵ 同惯例)。表格持焦/IME 让位由调用方守卫。
+fn enter_action(
+    anchor: Option<usize>,
+    selection: &BTreeSet<usize>,
+    cmd: bool,
+) -> Option<(usize, bool)> {
+    let row = anchor.or_else(|| selection.iter().next().copied())?;
+    Some((row, cmd))
 }
 
 /// 首行再按 ↑:焦点回到搜索框(无选中时 ↑ 仍选末行)。
@@ -4970,6 +5002,145 @@ mod tests {
         assert_eq!(st.selection, BTreeSet::from([0]), "↓ 应选中首行");
         assert!(st.table_focused, "↓ 后表格应持焦");
         assert!(!st.input_focused, "↓ 后搜索框应交还焦点");
+    }
+
+    /// ↵:表格持焦且有导航行 = 默认应用打开该行。动作触发以「打开失败落状态栏」
+    /// 钉住:fixture 路径不存在,`open_path` 不起进程直接返回 FileMissing。
+    /// 突变「删 Enter 接线」时必红(status_note 保持 None)。
+    #[test]
+    fn enter_opens_navigated_row_headless() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..5)
+            .map(|i| HitEntry {
+                name: format!("file-{i}.txt"),
+                path: format!("/tmp/mce-test/file-{i}.txt"),
+                size: Some(1),
+                mtime: Some(1_700_000_000),
+                is_dir: false,
+            })
+            .collect();
+        st.total = 5;
+        let mut icons = IconCache::without_worker();
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw(vec![]), |ui| st.draw_impl(ui, None, &mut icons));
+        out.textures_delta.clear();
+        assert!(st.input_focused, "前置:首帧搜索框持焦");
+
+        // ↓ 选中首行。
+        let mut out = ctx.run_ui(
+            raw(vec![key_event(
+                egui::Key::ArrowDown,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )]),
+            |ui| st.draw_impl(ui, None, &mut icons),
+        );
+        out.textures_delta.clear();
+        assert_eq!(st.selection, BTreeSet::from([0]), "前置:↓ 已选中首行");
+
+        // ↵ 触发打开(fixture 路径不存在 → 失败落状态栏)。
+        let mut out = ctx.run_ui(
+            raw(vec![key_event(
+                egui::Key::Enter,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )]),
+            |ui| st.draw_impl(ui, None, &mut icons),
+        );
+        out.textures_delta.clear();
+        assert!(st.status_note.is_some(), "↵ 应触发打开动作(失败落状态栏)");
+    }
+
+    /// ⌘↵ = 访达显示(悬浮条 ⌘↵ 同惯例)。集成层只钉「⌘ 形态的 Enter 也触发
+    /// 动作」;reveal=false/true 的区分由 `enter_action` 纯函数测试钉住。
+    #[test]
+    fn cmd_enter_opens_navigated_row_headless() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..5)
+            .map(|i| HitEntry {
+                name: format!("file-{i}.txt"),
+                path: format!("/tmp/mce-test/file-{i}.txt"),
+                size: Some(1),
+                mtime: Some(1_700_000_000),
+                is_dir: false,
+            })
+            .collect();
+        st.total = 5;
+        let mut icons = IconCache::without_worker();
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw(vec![]), |ui| st.draw_impl(ui, None, &mut icons));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(
+            raw(vec![key_event(
+                egui::Key::ArrowDown,
+                true,
+                false,
+                egui::Modifiers::NONE,
+            )]),
+            |ui| st.draw_impl(ui, None, &mut icons),
+        );
+        out.textures_delta.clear();
+        assert_eq!(st.selection, BTreeSet::from([0]), "前置:↓ 已选中首行");
+
+        let mut out = ctx.run_ui(
+            raw(vec![key_event(
+                egui::Key::Enter,
+                true,
+                false,
+                egui::Modifiers::COMMAND,
+            )]),
+            |ui| st.draw_impl(ui, None, &mut icons),
+        );
+        out.textures_delta.clear();
+        assert!(st.status_note.is_some(), "⌘↵ 应触发打开动作(失败落状态栏)");
+    }
+
+    /// ↵ 行与方式裁决:anchor 优先(↑↓ 导航行),无 anchor 取 selection 首
+    /// (BTreeSet 最小,与 ↑↓ 的 current 取法同源);空选中无动作;cmd → 访达显示。
+    #[test]
+    fn enter_action_picks_anchor_then_first_and_reveals_on_cmd() {
+        assert_eq!(
+            enter_action(Some(2), &BTreeSet::from([2]), false),
+            Some((2, false))
+        );
+        assert_eq!(
+            enter_action(Some(2), &BTreeSet::from([2]), true),
+            Some((2, true)),
+            "⌘↵ → 访达显示"
+        );
+        assert_eq!(
+            enter_action(None, &BTreeSet::from([1, 3]), false),
+            Some((1, false)),
+            "无 anchor 取 selection 首"
+        );
+        assert_eq!(
+            enter_action(Some(4), &BTreeSet::new(), false),
+            Some((4, false)),
+            "anchor 优先,不因 selection 空而短路"
+        );
+        assert_eq!(
+            enter_action(None, &BTreeSet::new(), false),
+            None,
+            "无选中无动作"
+        );
     }
 
     /// 回归:首行 ↑ 回焦必须等按键松开;若按下帧立即回焦,按住产生的 repeat

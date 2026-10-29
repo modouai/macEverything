@@ -5,6 +5,11 @@
 //! - **类型图标**:UI 线程先解析 UTI(`platform::uti_for`,廉价的 UTType 查询),
 //!   纹理、失败记录与在途请求都以 **UTI** 为键——`.jpg/.jpeg/.jpe` 等映射到同一
 //!   UTI 的不同扩展名共享一份纹理与在途请求,不会重复解码 36MB TIFF。
+//! - **APP bundle**(`.app` 目录):图标每个 APP 不同,按**路径**取
+//!   (`NSWorkspace iconForFile:`,自然含用户自定义);缓存与在途去重同「自定义
+//!   图标」通道(路径为键,失败落 `None` 回落 KEY_APP 类型图标 = 通用 APP 图标,
+//!   不是文件夹图标——类型图标通道对 APP bundle 用固定 UTI
+//!   `com.apple.application-bundle`)。
 //! - **自定义图标**:用户给单个文件设过自定义图标时只能按路径取。路径检查结果
 //!   (`Some` 纹理 / `None` = 无自定义或读取失败)跨帧保留;在途路径去重,不重复
 //!   请求;`reset` 与 2048 条上限会清掉 `None`/最早条目。
@@ -52,19 +57,28 @@ const MAX_PATH_ICONS: usize = 2048;
 const KEY_FOLDER: &str = "type:folder";
 /// 无扩展名文件的类型分组键。
 const KEY_NO_EXTENSION: &str = "type:noext";
+/// APP bundle 的类型分组键(目录 + `.app` 后缀;兜底显示通用 APP 图标)。
+const KEY_APP: &str = "type:app";
+/// APP bundle 的系统 UTI(macOS 固定标识符,等同 `UTType.applicationBundle`),
+/// 兜底类型图标的取图键。
+const APP_UTI: &str = "com.apple.application-bundle";
 
 /// 工作线程请求(UI 线程发送,单 worker 串行消费)。
+#[derive(Debug)]
 enum IconRequest {
     /// 按 UTI 取类型图标。
     Type(String),
     /// 按路径检查自定义图标。
     Path(String),
+    /// 按路径取 APP bundle 自身图标(每个 APP 图标不同,无法按类型去重)。
+    App(String),
 }
 
 /// 工作线程响应(UI 线程分帧上传纹理并落缓存)。
 enum IconResponse {
     Type { uti: String, rgba: Option<Vec<u8>> },
     Path { path: String, rgba: Option<Vec<u8>> },
+    App { path: String, rgba: Option<Vec<u8>> },
 }
 
 /// 结果行图标缓存(跨帧保留;单位置一个)。
@@ -192,10 +206,23 @@ impl IconCache {
         }
     }
 
-    /// 取一行的图标纹理:自定义图标优先;未命中/无自定义/失败回落类型图标。
+    /// 取一行的图标纹理:APP bundle 按路径取自身图标;其余条目自定义图标优先;
+    /// 未命中/无自定义/失败回落类型图标。
     ///
-    /// 自定义图标未检查过时只发请求,本帧先用类型图标或兜底字形。
+    /// APP bundle(`.app` 目录)的图标每个 APP 不同,`NSWorkspace iconForFile:`
+    /// 才能给到(自然含用户自定义);未命中/失败时本帧先用类型图标(KEY_APP →
+    /// 通用 APP 图标,不是文件夹图标)。
     pub fn icon(&mut self, ctx: &egui::Context, entry: &HitEntry) -> Option<egui::TextureId> {
+        if is_app_bundle(&entry.name, entry.is_dir) {
+            match self.path_icons.get(&entry.path) {
+                Some(Some(tex)) => return Some(tex.id()),
+                Some(None) => {} // 取图失败 → 通用 APP 类型图标兜底
+                None => {
+                    self.request_app(ctx, &entry.path);
+                }
+            }
+            return self.type_icon(ctx, &entry.name, entry.is_dir);
+        }
         match self.path_icons.get(&entry.path) {
             Some(Some(tex)) => return Some(tex.id()),
             Some(None) => {} // 已查无自定义图标 → 类型图标
@@ -204,6 +231,22 @@ impl IconCache {
             }
         }
         self.type_icon(ctx, &entry.name, entry.is_dir)
+    }
+
+    /// APP bundle 图标请求入队(按路径,与自定义图标检查共用去重/缓存空间);
+    /// 返回是否新入队。
+    fn request_app(&mut self, ctx: &egui::Context, path: &str) -> bool {
+        if self.path_icons.contains_key(path) || !self.pending_paths.insert(path.to_owned()) {
+            return false;
+        }
+        if !self.send(IconRequest::App(path.to_owned())) {
+            // 通道不可用(worker 已退出):按「无图」落缓存,回落类型图标。
+            self.pending_paths.remove(path);
+            self.store_path_icon(path.to_owned(), None);
+        } else {
+            ctx.request_repaint_after(RESPONSE_POLL);
+        }
+        true
     }
 
     /// 路径请求入队(去重);返回是否新入队。
@@ -232,8 +275,13 @@ impl IconCache {
         let uti = match self.key_to_uti.get(&key) {
             Some(uti) => uti.clone(),
             None => {
-                // 廉价解析(UTType 查询)留在 UI 线程;取图/解码在 worker。
-                let uti = platform::uti_for(extension(name), is_dir);
+                // APP bundle 兜底用固定系统 UTI(通用 APP 图标);其余廉价解析
+                // (UTType 查询)留在 UI 线程;取图/解码在 worker。
+                let uti = if key == KEY_APP {
+                    APP_UTI.to_owned()
+                } else {
+                    platform::uti_for(extension(name), is_dir)
+                };
                 self.key_to_uti.insert(key, uti.clone());
                 uti
             }
@@ -327,6 +375,12 @@ impl IconCache {
             IconResponse::Path { path, rgba } => {
                 self.pending_paths.remove(&path);
                 let name = format!("icon-path:{path}");
+                let tex = rgba.and_then(|rgba| load_texture(ctx, &name, rgba));
+                self.store_path_icon(path, tex);
+            }
+            IconResponse::App { path, rgba } => {
+                self.pending_paths.remove(&path);
+                let name = format!("icon-app:{path}");
                 let tex = rgba.and_then(|rgba| load_texture(ctx, &name, rgba));
                 self.store_path_icon(path, tex);
             }
@@ -462,6 +516,10 @@ fn worker_loop(
                 let rgba = objc2::rc::autoreleasepool(|_| platform::custom_icon_rgba(&path));
                 IconResponse::Path { path, rgba }
             }
+            IconRequest::App(path) => {
+                let rgba = objc2::rc::autoreleasepool(|_| platform::app_icon_rgba(&path));
+                IconResponse::App { path, rgba }
+            }
         };
         if resp_tx.send(resp).is_err() {
             break;
@@ -503,15 +561,28 @@ fn extension(name: &str) -> Option<&str> {
 
 /// 类型分组键(UTI 解析前的廉价去重键;缓存纹理本身按 UTI 存)。
 ///
-/// 目录与无扩展名各有专用键;扩展名小写归并(`PDF` 与 `pdf` 同类型)。
+/// APP bundle 与目录、无扩展名各有专用键;扩展名小写归并(`PDF` 与 `pdf` 同类型)。
 fn type_key(name: &str, is_dir: bool) -> String {
     if is_dir {
-        return KEY_FOLDER.to_owned();
+        return if is_app_bundle(name, is_dir) {
+            KEY_APP.to_owned()
+        } else {
+            KEY_FOLDER.to_owned()
+        };
     }
     match extension(name) {
         Some(ext) => format!("ext:{}", ext.to_ascii_lowercase()),
         None => KEY_NO_EXTENSION.to_owned(),
     }
+}
+
+/// APP bundle 判定:目录且 display 名以 `.app` 结尾(ASCII 大小写不敏感)。
+/// 与 `engine::query::is_app_entry` 同口径(engine 侧钉排序,本侧钉图标)。
+fn is_app_bundle(name: &str, is_dir: bool) -> bool {
+    const SUFFIX: &[u8] = b".app";
+    is_dir
+        && name.len() >= SUFFIX.len()
+        && name.as_bytes()[name.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 #[cfg(test)]
@@ -554,6 +625,86 @@ mod tests {
             type_key("Photos.2026", true),
             type_key("Photos.2026", false)
         );
+    }
+
+    /// APP 判定 = 目录 + `.app` 后缀(ASCII 大小写不敏感);非目录与普通目录不算。
+    #[test]
+    fn app_bundle_detection() {
+        assert!(is_app_bundle("Safari.app", true));
+        assert!(is_app_bundle("Tool.APP", true));
+        assert!(!is_app_bundle("fake.app", false), "非目录不判 APP");
+        assert!(!is_app_bundle("plain", true), "无后缀目录不判 APP");
+        assert!(
+            !is_app_bundle("notes.app.txt", true),
+            "非 .app 结尾不判 APP"
+        );
+    }
+
+    /// APP bundle 的类型分组键走专用 KEY_APP:兜底显示通用 APP 图标而非文件夹图标。
+    #[test]
+    fn type_key_app_bundles_use_dedicated_key() {
+        assert_eq!(type_key("Safari.app", true), KEY_APP);
+        assert_eq!(type_key("Tool.APP", true), KEY_APP);
+        assert_ne!(type_key("plain", true), KEY_APP);
+    }
+
+    /// APP bundle 走按路径取图(NSWorkspace iconForFile:,每个 APP 图标不同),
+    /// 不走类型图标通道。
+    #[test]
+    fn app_bundle_requests_icon_by_path() {
+        let ctx = egui::Context::default();
+        let (mut cache, req_rx, _resp_tx) = IconCache::with_test_channels();
+        let mut entry = hit("Safari.app");
+        entry.is_dir = true;
+        let _ = cache.icon(&ctx, &entry);
+        assert!(
+            matches!(req_rx.try_recv(), Ok(IconRequest::App(p)) if p == entry.path),
+            "APP bundle 应发按路径取图请求"
+        );
+    }
+
+    /// APP 图标按路径取图失败:落「无图」缓存(不重复请求),回落专用类型图标
+    /// (KEY_APP → 通用 APP 图标),而非文件夹图标。
+    #[test]
+    fn app_bundle_failure_falls_back_to_app_type_icon() {
+        let ctx = egui::Context::default();
+        let (mut cache, req_rx, resp_tx) = IconCache::with_test_channels();
+        let mut entry = hit("Broken.app");
+        entry.is_dir = true;
+        let _ = cache.icon(&ctx, &entry);
+        resp_tx
+            .send(IconResponse::App {
+                path: entry.path.clone(),
+                rgba: None,
+            })
+            .unwrap();
+        cache.begin_frame(&ctx);
+        assert!(
+            matches!(cache.path_icons.get(&entry.path), Some(None)),
+            "取图失败应落缓存"
+        );
+
+        // 失败后不再重复发路径请求;兜底解析出通用 APP 类型图标请求。
+        let _ = cache.icon(&ctx, &entry);
+        // 第一次 icon() 已发出的 App 请求先消费掉,再断言本轮只发兜底 Type 请求。
+        assert!(
+            matches!(req_rx.try_recv(), Ok(IconRequest::App(p)) if p == entry.path),
+            "首条应为第一次调用的 App 请求"
+        );
+        match req_rx.try_recv() {
+            Ok(IconRequest::Type(uti)) => {
+                assert_eq!(uti, APP_UTI, "兜底应为通用 APP 类型图标而非文件夹图标")
+            }
+            other => panic!("失败后应只发兜底 Type 请求,实际 {other:?}"),
+        }
+        loop {
+            match req_rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Ok(IconRequest::App(p)) => panic!("失败路径不得重复请求:{p}"),
+                Ok(_) => {}
+            }
+        }
     }
 
     #[test]

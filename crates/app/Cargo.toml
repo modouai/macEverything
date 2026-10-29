@@ -48,6 +48,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSVisualEffectView",
     "NSColor",
     "NSImage",
+    "NSBitmapImageRep",
     "NSBezierPath",
     # Task 5 结果行真实图标:iconForContentType(UTI) 的 cfg 门槛(0.3.2 源码
     # NSWorkspace.rs:132 要求 NSImage + objc2-uniform-type-identifiers 两个 feature)。

@@ -222,13 +222,25 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // top-limit 选择而非全量排序:select_nth O(n) 划出前 limit 段,再对 k ≤ limit 排序;
     // 全量 sort O(n log n) 计入 elapsed_ms,百万命中时单独击穿 P99 <10ms。
     // 比较子含 idx 决胜成全序,截断集与稳定排序一致(确定性不受不稳定划分影响)。
+    // APP 包置顶为最高维度(spec v1-core):候选行不携带额外字段,比较时按条目
+    // 判定(display 名 `.app` 后缀,4 字节比较,O(log n) 次比较开销可忽略)。
+    let cmp = |a: &(u8, usize, u32), b: &(u8, usize, u32)| {
+        let app = |row: &(u8, usize, u32)| {
+            is_app_entry(entries[row.2 as usize].is_dir(), view.display_name(row.2))
+        };
+        app(b)
+            .cmp(&app(a))
+            .then(b.0.cmp(&a.0))
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+    };
     if limit == 0 {
         rows.clear();
     } else if limit < rows.len() {
-        rows.select_nth_unstable_by(limit - 1, cmp_rows);
+        rows.select_nth_unstable_by(limit - 1, &cmp);
         rows.truncate(limit);
     }
-    rows.sort_by(cmp_rows);
+    rows.sort_by(&cmp);
     let hits = rows.into_iter().map(|(_, _, i)| i).collect();
     QueryOutcome {
         hits,
@@ -237,9 +249,13 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     }
 }
 
-/// 候选行全序比较:分数降序、名长升序、条目号升序决胜。
-fn cmp_rows(a: &(u8, usize, u32), b: &(u8, usize, u32)) -> std::cmp::Ordering {
-    b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+/// 候选行全序比较的最高维度:App 包(spec「匹配排序」= 目录且 display 名以
+/// `.app` 结尾,ASCII 大小写不敏感,`case:` 的原大小写候选同判)。
+fn is_app_entry(is_dir: bool, display: &[u8]) -> bool {
+    const SUFFIX: &[u8] = b".app";
+    is_dir
+        && display.len() >= SUFFIX.len()
+        && display[display.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 /// 列排序键(完整窗口列头):Relevance = v1 质量序(委托 execute),
@@ -731,6 +747,70 @@ mod match_tests {
         let out = execute(&i, &parse("*").unwrap(), 0);
         assert!(out.hits.is_empty());
         assert_eq!(out.total, 5);
+    }
+
+    fn names(i: &Index, hits: &[u32]) -> Vec<String> {
+        hits.iter()
+            .map(|&h| String::from_utf8_lossy(i.display_name_of(h)).into_owned())
+            .collect()
+    }
+
+    /// APP 置顶(spec v1-core「匹配排序」):低分 APP(子串命中)排在所有非 APP
+    /// (含高分前缀命中)之前;APP 组内与普通条目仍按打分/名长原序。
+    /// 突变「比较子去掉 APP 维度」时必红。
+    #[test]
+    fn app_bundles_rank_first_in_relevance_order() {
+        let mut i = Index::new();
+        let d = i.insert("Applications", NO_PARENT, true);
+        let _ = i.insert("zeta.app", d, true); // APP,子串命中(score 1)
+        let _ = i.insert("alpha.txt", d, false); // 前缀命中(score 3)
+        let out = execute(&i, &parse("a").unwrap(), 100);
+        // 非 APP 组内:alpha.txt 与 Applications 同前缀分,名长升序(9 < 12)。
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["zeta.app", "alpha.txt", "Applications"],
+            "低分 APP 应置顶"
+        );
+    }
+
+    /// APP 判定 = 目录 + display 名 `.app` 后缀(ASCII 大小写不敏感):
+    /// 大写后缀仍置顶;非目录与普通目录不置顶。
+    #[test]
+    fn app_ranking_is_case_insensitive_and_dir_only() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("Tool.APP", d, true); // 大写后缀:仍判 APP
+        let _ = i.insert("raider", d, true); // 目录但非 .app:不置顶
+        let _ = i.insert("fake.app", d, false); // 非目录:不置顶
+        let out = execute(&i, &parse("a").unwrap(), 100);
+        // 非 APP 组内按打分同名长升序(raider 6 字节 < fake.app 8 字节)。
+        assert_eq!(names(&i, &out.hits), vec!["Tool.APP", "raider", "fake.app"]);
+    }
+
+    /// `case:` 下候选名是 NFC 原大小写形态:APP 判定读 display 名,不依赖折叠形态。
+    #[test]
+    fn app_ranking_survives_case_sensitive_query() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("Apps.app", d, true); // case:a 前缀命中(score 3)
+        let _ = i.insert("app.txt", d, false); // case:a 前缀命中(score 3),名更短
+        let out = execute(&i, &parse("case:a").unwrap(), 100);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["Apps.app", "app.txt"],
+            "case: 下 APP 仍置顶"
+        );
+    }
+
+    /// top-limit 截断与排序同一比较子:limit=1 保留的应是 APP,不是高分普通条目。
+    #[test]
+    fn app_first_survives_top_limit_truncation() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let _ = i.insert("zeta.app", d, true);
+        let _ = i.insert("alpha.txt", d, false);
+        let out = execute(&i, &parse("a").unwrap(), 1);
+        assert_eq!(names(&i, &out.hits), vec!["zeta.app"]);
     }
 }
 
