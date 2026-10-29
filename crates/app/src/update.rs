@@ -235,12 +235,23 @@ pub fn download_page(lang: crate::i18n::Lang) -> &'static str {
 
 /// 用默认浏览器打开官网下载页；失败返回可读错误（调用方决定是否显示）。
 pub fn open_download_page() -> Result<(), String> {
-    let page = download_page(crate::i18n::lang());
-    log::info!("打开下载页: {page}");
-    match std::process::Command::new("open").arg(page).spawn() {
+    open_url(download_page(crate::i18n::lang()))
+}
+
+/// 官网首页（版本行「官网」链接指向这里）。
+pub const WEBSITE_URL: &str = "https://maceverything.modouai.dev/";
+
+/// 用默认浏览器打开官网首页；失败只记日志（链接点击属非关键路径）。
+pub fn open_website() -> Result<(), String> {
+    open_url(WEBSITE_URL)
+}
+
+fn open_url(url: &'static str) -> Result<(), String> {
+    log::info!("打开网页: {url}");
+    match std::process::Command::new("open").arg(url).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || match child.wait() {
-                Ok(st) if !st.success() => log::warn!("open 退出异常({st}):{page}"),
+                Ok(st) if !st.success() => log::warn!("open 退出异常({st}):{url}"),
                 Ok(_) => {}
                 Err(err) => log::warn!("等待 open 退出失败: {err}"),
             });

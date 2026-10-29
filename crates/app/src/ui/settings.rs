@@ -1245,6 +1245,12 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             ctx.request_repaint_of(viewport_id());
         }
         SettingsAction::OpenUpdatePage => apply_update_page(shared, ctx),
+        SettingsAction::OpenWebsite => {
+            // 链接点击属非关键路径:失败只记日志,不占内联错误位。
+            if let Err(err) = crate::update::open_website() {
+                log::warn!("打开官网失败: {err}");
+            }
+        }
     }
 }
 

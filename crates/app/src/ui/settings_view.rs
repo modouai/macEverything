@@ -156,6 +156,8 @@ pub(crate) enum SettingsAction {
     CheckUpdate,
     /// 打开官网下载页。
     OpenUpdatePage,
+    /// 打开官网首页(版本行「官网」链接)。
+    OpenWebsite,
 }
 
 /// 一帧绘制结果：动作队列（通常为空或单条）。
@@ -197,8 +199,6 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             let full_w = ui.available_width();
             let extra_h = support_extra_height(ui);
             ui.add_space(CONTENT_PAD.0);
-            draw_appearance_group(ui, full_w, data, &palette, extra_h, &mut actions);
-            ui.add_space(GROUP_GAP);
             draw_general_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(GROUP_GAP);
             draw_index_group(ui, full_w, data, &palette, extra_h, &mut actions);
@@ -323,37 +323,7 @@ impl CliRow {
     }
 }
 
-/// 外观组：分组标题 + 单行卡片（字号分段 + 可选的保存错误）。
-fn draw_appearance_group(
-    ui: &mut egui::Ui,
-    full_w: f32,
-    data: &SettingsData,
-    palette: &SettingsPalette,
-    extra_h: f32,
-    actions: &mut Vec<SettingsAction>,
-) {
-    let font_error = data.font_error.as_ref().map(SettingsError::text);
-    let error = font_error.as_deref();
-    let rows = [GroupRow {
-        kind: RowKind::FontSize,
-        spec: RowSpec::new(ROW_H).with_extra(extra_for(error.is_some(), extra_h)),
-        error,
-        note: None,
-        note2: None,
-        hint: None,
-    }];
-    draw_card(
-        ui,
-        full_w,
-        i18n::s().group_appearance,
-        &rows,
-        data,
-        palette,
-        actions,
-    );
-}
-
-/// 通用组：五行卡片（自启 / 语言 / 两个快捷键 / 命令行工具）。
+/// 通用组：六行卡片（字号 / 自启 / 语言 / 两个快捷键 / 命令行工具）。
 fn draw_general_group(
     ui: &mut egui::Ui,
     full_w: f32,
@@ -362,6 +332,7 @@ fn draw_general_group(
     extra_h: f32,
     actions: &mut Vec<SettingsAction>,
 ) {
+    let font_error = data.font_error.as_ref().map(SettingsError::text);
     let autostart_error = data.autostart_error.as_ref().map(AutostartError::text);
     let language_error = data.language_error.as_ref().map(LanguageError::text);
     let autostart_note = if autostart_error.is_none() && data.autostart_approval {
@@ -392,6 +363,14 @@ fn draw_general_group(
     let cli_hint = cli.hint;
 
     let rows = [
+        GroupRow {
+            kind: RowKind::FontSize,
+            spec: RowSpec::new(ROW_H).with_extra(extra_for(font_error.is_some(), extra_h)),
+            error: font_error.as_deref(),
+            note: None,
+            note2: None,
+            hint: None,
+        },
         GroupRow {
             kind: RowKind::Autostart,
             spec: RowSpec::new(ROW_H).with_extra(extra_for(has_message, extra_h)),
@@ -867,8 +846,17 @@ fn draw_version_row(
     let label = i18n::s().row_version;
     let label_w = text_width(ui, label, LABEL_FONT);
     let natural_status_w = text_width(ui, &status, SUPPORT_FONT);
-    let fixed_w =
-        version_w + UPDATE_CLUSTER_GAP + 1.0 + UPDATE_CLUSTER_GAP + LABEL_CONTROL_GAP + button_w;
+    // 官网链接(次链接样式)插在状态说明与操作按钮之间。
+    let site_label = i18n::s().row_website_link;
+    let site_w = text_width(ui, site_label, SUPPORT_FONT);
+    let fixed_w = version_w
+        + UPDATE_CLUSTER_GAP
+        + 1.0
+        + UPDATE_CLUSTER_GAP
+        + LABEL_CONTROL_GAP
+        + site_w
+        + UPDATE_CLUSTER_GAP
+        + button_w;
     // 极端字号倍率 / 英文长文案下优先保住「版本」标签与按钮，状态说明截断。
     let max_cluster_w = (body.width() - 2.0 * ROW_PAD_X - label_w - LABEL_CONTROL_GAP).max(0.0);
     let status_w = natural_status_w.min((max_cluster_w - fixed_w).max(0.0));
@@ -888,7 +876,14 @@ fn draw_version_row(
         ),
         egui::vec2(button_w, ADD_BUTTON_H),
     );
-    let status_right = button.left() - LABEL_CONTROL_GAP;
+    let site_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            button.left() - UPDATE_CLUSTER_GAP - site_w,
+            control.center().y - ADD_BUTTON_H / 2.0,
+        ),
+        egui::vec2(site_w, ADD_BUTTON_H),
+    );
+    let status_right = site_rect.left() - LABEL_CONTROL_GAP;
     let status_rect = egui::Rect::from_min_max(
         egui::pos2(status_right - status_w, control.top()),
         egui::pos2(status_right, control.bottom()),
@@ -932,6 +927,37 @@ fn draw_version_row(
             UpdatePhase::Available { .. } => SettingsAction::OpenUpdatePage,
             _ => SettingsAction::CheckUpdate,
         });
+    }
+
+    // 官网链接:链接样式(次要色 + 下划线),点击用默认浏览器打开首页。
+    let site_response = ui.interact(
+        site_rect,
+        ui.scope_id().with("settings-website-link"),
+        egui::Sense::click(),
+    );
+    let site_color = if site_response.hovered() {
+        palette.text_primary
+    } else {
+        palette.text_secondary
+    };
+    draw_text(
+        ui,
+        site_rect,
+        site_label,
+        SUPPORT_FONT,
+        site_color,
+        egui::Align2::CENTER_CENTER,
+    );
+    let underline_y = site_rect.bottom() - 3.0;
+    ui.painter().line_segment(
+        [
+            egui::pos2(site_rect.left() + 1.0, underline_y),
+            egui::pos2(site_rect.right() - 1.0, underline_y),
+        ],
+        egui::Stroke::new(1.0, site_color),
+    );
+    if site_response.clicked() {
+        actions.push(SettingsAction::OpenWebsite);
     }
 }
 
@@ -2402,7 +2428,6 @@ mod tests {
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
 
         for expected in [
-            "外观",
             "通用",
             "索引",
             "字号",
@@ -2498,7 +2523,6 @@ mod tests {
 
             for expected in [
                 // 分组标题
-                "Appearance",
                 "General",
                 "Index",
                 // 行标签
@@ -2821,20 +2845,21 @@ mod tests {
         );
     }
 
-    /// 行内错误行参与卡片高度:字号保存失败会下移后续分组，错误文案可见。
+    /// 行内错误行参与卡片高度:字号保存失败会下移通用组内后续行，错误文案可见。
     #[test]
     fn font_error_row_adds_card_height() {
         let baseline = run_body(&layout_test_data());
-        let baseline_general = text_center(find_text(&all_texts(&baseline), "通用")).y;
+        // 字号行在通用卡片首位,错误行把它后面的「开机自启」行往下推。
+        let baseline_autostart = text_center(find_text(&all_texts(&baseline), "开机自启")).y;
 
         let mut data = layout_test_data();
         data.font_error = Some(SettingsError::SaveFailed);
         let with_error = run_body(&data);
         let texts = all_texts(&with_error);
-        let error_general = text_center(find_text(&texts, "通用")).y;
+        let error_autostart = text_center(find_text(&texts, "开机自启")).y;
         assert!(
-            error_general > baseline_general + 10.0,
-            "字号错误行必须增高外观卡片:基线 {baseline_general},错误 {error_general}"
+            error_autostart > baseline_autostart + 10.0,
+            "字号错误行必须增高通用卡片:基线 {baseline_autostart},错误 {error_autostart}"
         );
         find_text(&texts, i18n::s().settings_save_failed);
     }
@@ -3327,6 +3352,27 @@ mod tests {
                     output.actions
                 ),
             }
+        }
+    }
+
+    /// 版本行「官网」链接：绘制且点击 → OpenWebsite（中英两语言）。
+    #[test]
+    fn website_link_click_emits_open_website() {
+        for lang in [i18n::Lang::ZhHans, i18n::Lang::En] {
+            i18n::with_lang(lang, || {
+                let ctx = egui::Context::default();
+                ctx.set_visuals(egui::Visuals::dark());
+                let data = layout_test_data();
+                let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
+                // 链接文本在可点矩形内居中，文本中心即点击点。
+                let pos = text_center(find_text(&all_texts(&out), i18n::s().row_website_link));
+                let output = click_at_sized(&ctx, &data, pos, TALL_TEST_H);
+                assert_eq!(
+                    output.actions,
+                    vec![SettingsAction::OpenWebsite],
+                    "{lang:?} 官网链接点击须请求打开官网"
+                );
+            });
         }
     }
 
@@ -3895,7 +3941,7 @@ mod tests {
             let out = run_body(&layout_test_data());
             let texts = all_texts(&out);
             let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
-            for expected in ["外观", "通用", "索引", "字号", "跟随系统"] {
+            for expected in ["通用", "索引", "字号", "跟随系统"] {
                 assert!(labels.contains(&expected), "大字号缺少 {expected:?}");
             }
         });

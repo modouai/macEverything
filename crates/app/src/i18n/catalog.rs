@@ -34,7 +34,6 @@ macro_rules! catalog {
 catalog! {
     settings_title: "设置" / "Settings",
     // 分组 / 行
-    group_appearance: "外观" / "Appearance",
     group_general: "通用" / "General",
     group_index: "索引" / "Index",
     row_font_size: "字号" / "Text Size",
@@ -75,6 +74,7 @@ catalog! {
     // 关于 / 更新
     group_about: "关于" / "About",
     row_version: "版本" / "Version",
+    row_website_link: "官网" / "Website",
     row_auto_check: "启动时自动检查更新" / "Check for Updates at Launch",
     update_open_failed: "无法打开下载页" / "Couldn't open the download page",
     update_status_idle: "尚未检查" / "Not checked yet",
