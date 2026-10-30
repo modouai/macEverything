@@ -31,3 +31,7 @@
 - A4 日志 < 1MB/天：基线 daemon.log 日增数 MB 且 96% 为失败刷屏
 - A5 GUI ≤ 150MB/100MB：基线 208MB（仅悬浮条+托盘态）——**注**：悬浮条 + 托盘两视口常驻态已 208MB，超过阶段一目标，S4a 压减空间以本行为准
 - A6b 峰值 ≤ 400MB：基线 1782MB
+
+## S0.3 归因结论（2026-10-30 完成，详见 tech.md §6.3）
+
+MallocStackLogging=1 重启 GUI 复现操作（打开结果窗口 + 短查询 + 滚动）——peak 4.3GB 复现，`Malloc Large (empty)` 3GB/362 块。分配栈定案：**CJK 字体回退慢路径**（`egui_system_font_provider` → fontique：`Query::matches` 191MB×3 + `load_blob` 苹方 ttc 整块载入 76MB×2），galley 缓存 miss 反复触发所致；tessellation 与字形图集假设被排除。IOSurface 归属完成（常驻 85.8MB：结果窗口三缓冲 31MB + 悬浮条 11MB + 第三视口 12MB，视口关闭不释放）。修复项按 §6.2 重排：CJK 字体内置注入为主修复。

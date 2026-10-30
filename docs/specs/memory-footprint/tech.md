@@ -236,17 +236,21 @@ struct Overlay {
 
 ### 6.2 阶段一（确定性手段，目标 ≤ 150MB）
 
-1. **死页归还**：viewport 空闲（无输入、无滚动）60s 后 `malloc_zone_pressure_relief`（`platform/mac.rs` unsafe 区）；预期 -73MB。
-2. **图标缓存治理**：现状已是 worker 回传 64×64 预乘 RGBA + 路径缓存上限 2048 条 FIFO 淘汰（`ui/icons.rs:54` `MAX_PATH_ICONS`），上界 64×64×4×2048 ≈ 32MB（与实测 CG Image 18MB 同量级）。治理：上限 2048 → 小上限（128）LRU + 确认缓存淘汰路径上 egui 纹理 handle 与 CG Image 的显式释放；预期 -15MB 以上。
-3. **字形图集上限**：`max_texture_side` 8192→4096（单块重烘 256MB→64MB 上限），封峰值不降稳态；中文场景重烘频次换内存上限，可接受。
-4. **堆粗查**：`heap` 定位 49.7MB 中的明显异常块（8MB/7.7MB 两大块归属），易修则修。
+1. **消灭 CJK 字体回退慢路径（峰值主修复，S0.3 归因定案）**：注入覆盖 CJK 的字体源使中文 galley 布局直接命中，`egui_system_font_provider`/fontique 的 fallback（`Family::resolve_slow` → `Query::matches` 191MB×3 + `load_blob` 苹方 ttc 整块载入 76MB×2，实测复现 peak 4.3GB）只在极生僻字形时偶发。实现取向：egui `FontInsert` 注入 CJK 覆盖字体（字形全集，~10MB 一次性内存）置于 Proportional/Monospace 高优先级；拉丁仍 SF Pro/SF Mono。`system_fonts` feature 的保留与否随实现评估（去掉则 fontique 不参与，需确认默认字体面覆盖）。
+2. **死页归还**：viewport 空闲（无输入、无滚动）60s 后 `malloc_zone_pressure_relief`（`platform/mac.rs` unsafe 区）；对 `Malloc Large (empty)` 死页（峰值时实测 3GB/362 块滞留）。
+3. **图标缓存治理**：现状已是 worker 回传 64×64 预乘 RGBA + 路径缓存上限 2048 条 FIFO 淘汰（`ui/icons.rs:54` `MAX_PATH_ICONS`），上界 64×64×4×2048 ≈ 32MB（与实测 CG Image 18MB 同量级）。治理：上限 2048 → 小上限（128）LRU + 确认缓存淘汰路径上 egui 纹理 handle 与 CG Image 的显式释放；预期 -15MB 以上。
+4. **字形图集上限**：`max_texture_side` 8192→4096（单块重烘 256MB→64MB 上限），封顶保险（归因证实峰值主因不是图集，此项降级为防扩散）。
+5. **堆粗查**：`heap` 定位活跃堆中的明显异常块，易修则修。
 
-### 6.3 阶段二（归因驱动，目标 ≤ 100MB；S0 结论回填本节）
+### 6.3 阶段二（归因驱动，目标 ≤ 100MB；S0.3 归因结论已回填）
 
-1. **IOSurface 逐个归属**：`vmmap -pages` 按 IOSurface 地址/大小分组，回答「66 个 surface 各属于哪个视口/图层、各多大」。处置路径：隐藏视口（结果窗口关闭、悬浮条隐藏）显式释放其 surface（egui viewport 生命周期钩子）；毛玻璃层（Popover + CAFilter，见 floatbar-visual 规格）单独计量；调查 CAOpenGLLayer drawable 池是否可配置收敛。
-2. **1.7GB 峰值归因**：`MallocStackLogging=1` 复现（完整结果窗口冷启动 / 万行滚动 / 悬浮条首弹），`malloc_history` 定位。嫌疑序：① egui 单帧 tessellation 巨量（可见行数 × 图元膨胀）② 字形图集多轮扩容（1024→2048→4096→8192 每级整块重分配）③ 图标批量解码。修复项按结论追加，验收 A6b（峰值 ≤ 400MB）。
-3. **CoreText/字体缓存**：SF Pro/SF Mono 已按 family 注入；检查 CoreText 回退（苹方）栅格化缓存的驻留规模，必要时限制缓存字号集合。
-4. **每帧分配审计**：egui `RawInput`/克隆热点（style、字体定义整份克隆是常见项）；结果窗口行数据避免每帧重建。
+**归因结论（2026-10-30，MallocStackLogging 复现实测）**：
+
+- **峰值真凶**：结果窗口打开 + 中文文件名列表 → 每个 galley 布局遇 CJK 字形走 `egui_system_font_provider` → fontique 系统回退慢路径——`Query::matches` 单次分配 191MB×3、`SourceCache::load_blob` 把苹方 ttc 整块载入 76MB×2；galley 缓存 miss 反复触发，mmap 大块堆积，malloc 归还滞后 → `Malloc Large (empty)` 3GB/362 块滞留 → 复现 peak 4.3GB。**嫌疑序中的 tessellation 巨量与字形图集多轮扩容均被排除**（Malloc Large 活跃仅 12.8MB，纹理在 IOSurface/IOAccelerator 侧且未涨）。
+- **IOSurface 归属（常驻态 85.8MB/28 个，结果窗口关闭也不释放）**：2160×1254 BGRA 10.4MB×3 = 结果窗口 drawable 三缓冲（IOGPUSurfaceMTL + AppKit 镜像）；1400×492 2.7MB×4 = 悬浮条；1240×1200 5.8MB×2 = 第三视口。滚动时 `NSIOSurfacePool nextUnusedSurface` 增配 18.8MB 块。处置：视口关闭显式释放 surface（egui viewport 生命周期钩子；drawable 池行为随实现调查）——预期常驻 -55MB。
+- **CG Image**：8–18MB（图标，随查询内容浮动），§6.2.3 治理已覆盖。
+
+**剩余探索项**：视口 surface 释放（上述）；CoreText 栅格化缓存驻留限制；每帧分配审计（style 克隆热点）。修复项落地后按数据决定是否继续冲 ≤ 100MB 或回评审定线。
 
 ### 6.4 阶段二出口条件
 
