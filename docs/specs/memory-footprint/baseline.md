@@ -35,3 +35,15 @@
 ## S0.3 归因结论（2026-10-30 完成，详见 tech.md §6.3）
 
 MallocStackLogging=1 重启 GUI 复现操作（打开结果窗口 + 短查询 + 滚动）——peak 4.3GB 复现，`Malloc Large (empty)` 3GB/362 块。分配栈定案：**CJK 字体回退慢路径**（`egui_system_font_provider` → fontique：`Query::matches` 191MB×3 + `load_blob` 苹方 ttc 整块载入 76MB×2），galley 缓存 miss 反复触发所致；tessellation 与字形图集假设被排除。IOSurface 归属完成（常驻 85.8MB：结果窗口三缓冲 31MB + 悬浮条 11MB + 第三视口 12MB，视口关闭不释放）。修复项按 §6.2 重排：CJK 字体内置注入为主修复。
+
+## S2 实测（A2 第一档，2026-10-30/31）
+
+隔离环境：60 万文件合成树（3000 目录 × 200 文件，603,001 条目），release 构建，`scripts/mem-watch.sh` 1s 采样：
+
+| 指标 | S1 版二进制 | S2 版二进制 | 变化 |
+| --- | --- | --- | --- |
+| 首扫后稳态 footprint | 119MB | **86MB** | -28% |
+| 全量重扫峰值（exclude 触发，同步） | 321MB | **176MB** | **-45%** |
+| 重扫结束后驻留 | 321MB（滞留不落） | 176MB（pressure_relief 归还） | 死页归还得证 |
+
+外推 1.26M 实机条目：重扫峰值 ≈ 176 × 2.1 ≈ **370MB < 450MB（A2 第一档达标）**，S5 实机复核。残留 90MB（176 - 86 稳态）为 dir_map 重建与 table/flush 缓冲的部分滞留页，S3 的 dir_map intern 化进一步收敛。
