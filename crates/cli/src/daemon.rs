@@ -14,7 +14,7 @@ use engine::watcher::{self, DirBatcher};
 
 mod volumes;
 use protocol::{self, Gap, HitEntry, Request, Response};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -132,6 +132,28 @@ pub struct EngineState {
     /// 交错会写出「配置含自定义条目、内存却已重置」的错位状态,并并发全量重扫。
     /// 只包变更序列,`ExcludeList` 读不加锁(避免被长重扫阻塞)。
     exclude_op_lock: Mutex<()>,
+    /// 重扫互斥仲裁:自动源 `try_lock`(失败即弃——dropped/流断开类本就该忽略),
+    /// exclude 源 `lock()`(阻塞等待)。锁覆盖扫描段 + 替换段全程:若只护扫描段,
+    /// exclude 同步重扫完成后迟到的自动替换段会用更旧产物覆盖 holder 并落盘,
+    /// 回退 exclude 成果。
+    rescan_lock: Mutex<()>,
+    /// 重扫进行中(自动与 exclude 路径都置):期间再收 dropped 直接忽略(替换段
+    /// 的 rescan_floor 与重放会追平);diff 照常执行并记入 `rescan_dirty`。
+    rescanning: AtomicBool,
+    /// 重扫窗口内 diff 过的目录(canonical 形态)。重扫产出的新索引不含窗口内
+    /// 变更——替换段完成后逐目录重放 diff 追平(diff 以磁盘为准,幂等)。
+    rescan_dirty: Mutex<HashSet<PathBuf>>,
+    /// 上次全量重扫完成时刻(防「重扫→新 dropped→重扫」振荡的第二道闸;原先
+    /// 是 consume_events 局部变量,重扫移入后台线程后上移至 state)。
+    last_rescan: Mutex<Option<Instant>>,
+    /// diff 持久失败负缓存(canonical 目录路径)。EPERM/连续失败目录短路后续
+    /// diff:EPERM 目录保留索引条目(与首扫「入索引 + 记 gaps + 空子树」语义
+    /// 一致)但不再重试——摘除会让父 diff 重插,制造插-摘振荡。键用**路径**而非
+    /// 条目号:compact 全量重排条目号,旧号会错杀无辜条目。进程内存活,重启
+    /// 清零(用户补授权限后重启即自动重新索引)。
+    perm_denied: Mutex<HashSet<PathBuf>>,
+    /// 未知 errno 的连续失败计数(累计 3 次按持久失败入负缓存)。
+    diff_fail_counts: Mutex<HashMap<PathBuf, u8>>,
 }
 
 impl EngineState {
@@ -159,6 +181,12 @@ impl EngineState {
                 volumes_excluded: vec![],
             }),
             exclude_op_lock: Mutex::new(()),
+            rescan_lock: Mutex::new(()),
+            rescanning: AtomicBool::new(false),
+            rescan_dirty: Mutex::new(HashSet::new()),
+            last_rescan: Mutex::new(None),
+            perm_denied: Mutex::new(HashSet::new()),
+            diff_fail_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -419,7 +447,7 @@ fn apply_and_track(
         }
         Err(e) => {
             state.io_errors.fetch_add(1, Ordering::Relaxed);
-            log::warn!("目录 diff 失败 {}: {e}", abs_dir.display());
+            handle_diff_error(state, idx, map, abs_dir, &e);
             0
         }
     }
@@ -431,6 +459,17 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
     let base = abs_dir
         .canonicalize()
         .unwrap_or_else(|_| abs_dir.to_path_buf());
+    // 持久失败负缓存:短路(含补链路径)。EPERM 目录保留索引条目但不再重试。
+    // 重启清零——用户补授权限后重启即自动重新索引。
+    if state.perm_denied.lock().unwrap().contains(&base) {
+        return 0;
+    }
+    // 重扫窗口记账:替换段完成后重放追平(diff_one 全程持 holder 写锁,与替换
+    // 段挂 holder 互斥,「先 push 后 drain → 基于旧索引 → 被重放」或「后 push →
+    // 基于新索引 → 不重放」,无第三种交错)。
+    if state.rescanning.load(Ordering::SeqCst) {
+        state.rescan_dirty.lock().unwrap().insert(base.clone());
+    }
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
     let mut h = state.holder.write().unwrap();
     let IndexHolder::Mutable(idx) = &mut *h else {
@@ -595,7 +634,6 @@ fn consume_events(
     let mut batcher = DirBatcher::new(BATCH_WINDOW, watcher::system_now());
     let mut replay_events: u64 = 0;
     let mut stream_errored = false;
-    let mut last_rescan: Option<Instant> = None;
 
     loop {
         if state.stopping.load(Ordering::Relaxed) {
@@ -630,7 +668,7 @@ fn consume_events(
                             REPLAY_DOWNTIME_THRESHOLD_SECS,
                         ) {
                             log::warn!("重放零事件且停机超阈值,转全量重扫");
-                            degrade_and_rescan(&state, &paths);
+                            spawn_rescan(&state, &paths); // 后台重扫,消费循环继续 diff 旧索引
                             continue;
                         }
                         // 判定二:抽样对拍——日志滚动会「部分回放」(从保留窗口起点
@@ -638,7 +676,7 @@ fn consume_events(
                         // 仅对「来自落盘索引的停机重放」有意义;首扫后索引是全新全量的,
                         // 抽样只白付开销(且首扫窗口变更本就由本轮重放覆盖)。
                         if replayed_from_disk && sampling_finds_gap(&state, &paths) {
-                            continue; // 已转 degraded,重扫完成后自行置 READY
+                            continue; // 已转 degraded(后台重扫),完成后自行置 READY
                         }
                         state.set_state(state::READY);
                         flush(&state, &paths);
@@ -646,9 +684,15 @@ fn consume_events(
                     continue;
                 }
                 if fsevents::is_dropped(ev.flags) {
+                    // 重扫进行中直接忽略:替换段以 rescan_floor 跳过陈旧标记,窗口内
+                    // 变更由 rescan_dirty 重放追平,这个 dropped 本身不携带信息。
+                    if state.rescanning.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     // 冷却双保险:rescan_floor 兜住重扫期间积压的旧标记,但重扫**之后**
                     // 新产生的 dropped(重扫自身引起的缓冲溢出)仍需限频,防退化振荡。
-                    if let Some(t) = last_rescan {
+                    // 重扫已异步化(后台线程),消费不再停摆,本分支应趋于绝迹。
+                    if let Some(t) = *state.last_rescan.lock().unwrap() {
                         if t.elapsed() < RESCAN_COOLDOWN {
                             log::warn!(
                                 "重扫冷却期内再收丢弃标记({:.0}s 前刚重扫过),已忽略",
@@ -658,8 +702,7 @@ fn consume_events(
                         }
                     }
                     log::warn!("收到丢弃类标记,转全量重扫兜底");
-                    degrade_and_rescan(&state, &paths);
-                    last_rescan = Some(Instant::now());
+                    spawn_rescan(&state, &paths); // 后台重扫,消费循环继续 diff 旧索引
                     continue;
                 }
                 replay_events += 1;
@@ -700,7 +743,7 @@ fn consume_events(
         )
     {
         log::warn!("重放不可信(流断开或零事件长停机),转全量重扫");
-        degrade_and_rescan(&state, &paths);
+        spawn_rescan(&state, &paths);
     }
     if stopping {
         flush(&state, &paths);
@@ -713,7 +756,7 @@ fn consume_events(
 /// 抽样 N 个已索引目录做 diff:差异目录占比超阈值判重放不可信 → 全量重扫;
 /// 少量差异(正常竞态)由抽样 diff 自身直接补上。
 /// 返回 true 表示已转降级重扫。
-fn sampling_finds_gap(state: &EngineState, paths: &DaemonPaths) -> bool {
+fn sampling_finds_gap(state: &Arc<EngineState>, paths: &DaemonPaths) -> bool {
     const SAMPLE_DIRS: usize = 100;
     const MISMATCH_PCT_LIMIT: usize = 5;
     let bases: Vec<PathBuf> = {
@@ -740,7 +783,7 @@ fn sampling_finds_gap(state: &EngineState, paths: &DaemonPaths) -> bool {
             "抽样对拍 {mismatched}/{} 个目录与磁盘不符,判重放不可信,转全量重扫",
             bases.len()
         );
-        degrade_and_rescan(state, paths);
+        spawn_rescan(state, paths); // 后台重扫,消费循环继续 diff 旧索引
         return true;
     }
     false
@@ -748,8 +791,27 @@ fn sampling_finds_gap(state: &EngineState, paths: &DaemonPaths) -> bool {
 
 /// 降级:全量重扫重建索引,替换 holder 并重落盘,回就绪。
 /// 覆盖水位在扫描**之前**取(id > floor 的变更仍会被正常 diff,重扫未必包含)。
-fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
+///
+/// 锁与并发(tech.md §1):`rescan_lock` 覆盖扫描段 + 替换段全程。自动源
+/// `wait_for_lock=false`(try_lock 失败 = 重扫已在进行,放弃本次触发——dropped/
+/// 流断开类本就该忽略);exclude 源 `wait_for_lock=true`(同步 `lock()`,响应
+/// 语义「返回时排除项已生效」不变,最坏等一轮完整重扫)。`rescanning` 置位
+/// 期间消费循环照常 diff(与替换段的 holder 写锁互斥)并记 `rescan_dirty`,
+/// 替换段末尾重放追平窗口内变更。
+fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: bool) {
+    let _guard = if wait_for_lock {
+        Some(state.rescan_lock.lock().unwrap())
+    } else {
+        match state.rescan_lock.try_lock() {
+            Ok(g) => Some(g),
+            Err(_) => {
+                log::info!("重扫已在进行,忽略本次自动触发");
+                return;
+            }
+        }
+    };
     state.set_state(state::DEGRADED);
+    state.rescanning.store(true, Ordering::SeqCst);
     let floor = fsevents::current_event_id();
     let roots = state.roots.lock().unwrap().clone();
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
@@ -772,8 +834,90 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths) {
     state.applied_event_id.fetch_max(floor, Ordering::Relaxed);
     state.rescan_floor.fetch_max(floor, Ordering::Relaxed);
     rebuild_dir_map(state);
+    // 重扫窗口追平:先清 rescanning 再 drain——此后消费线程 diff 的对象已是新
+    // 索引,无需再记集合;窗口内已记目录基于旧索引 diff 过,重放追平。push 与
+    // drain 都持各自的 Mutex,且 diff_one 全程持 holder 写锁、替换段挂 holder
+    // 也持写锁——「push 在 drain 前 → 基于旧索引 → 被 drain 带走重放」或
+    // 「push 在 drain 后 → 基于新索引 → 不重放」,互斥保证无丢失。
+    state.rescanning.store(false, Ordering::SeqCst);
+    let replayed: Vec<PathBuf> = state.rescan_dirty.lock().unwrap().drain().collect();
+    for dir in &replayed {
+        diff_one(state, dir);
+    }
     flush(state, paths);
     state.set_state(state::READY);
+    *state.last_rescan.lock().unwrap() = Some(Instant::now());
+}
+
+/// 自动源的重扫入口:后台线程执行(不阻塞消费循环);锁被占用即放弃。
+fn spawn_rescan(state: &Arc<EngineState>, paths: &DaemonPaths) {
+    let st = state.clone();
+    let p = paths.clone();
+    std::thread::spawn(move || degrade_and_rescan(&st, &p, false));
+}
+
+/// 记录持久失败目录:入负缓存(去重)+ gaps 记账(去重,上限 256 条)。
+/// 返回是否新入负缓存(调用方据此决定是否留日志,避免重复刷屏)。
+fn record_persistent_failure(state: &EngineState, abs_dir: &Path, reason: &str) -> bool {
+    let is_new = state
+        .perm_denied
+        .lock()
+        .unwrap()
+        .insert(abs_dir.to_path_buf());
+    if is_new {
+        let mut gaps = state.gaps.lock().unwrap();
+        let path_str = abs_dir.to_string_lossy().into_owned();
+        if gaps.len() < 256 && !gaps.iter().any(|g| g.path == path_str) {
+            gaps.push(Gap {
+                path: path_str,
+                reason: reason.into(),
+            });
+        }
+    }
+    is_new
+}
+
+/// diff 失败分派(tech.md §2):ENOENT → 磁盘已删,摘子树跟进;EPERM/EACCES →
+/// 保留条目(与首扫「入索引 + 记 gaps + 空子树」语义一致,摘除会被父 diff 重插
+/// 制造插-摘振荡)+ 负缓存短路;其他 errno 连续 3 次按持久失败处理。
+fn handle_diff_error(
+    state: &EngineState,
+    idx: &mut Index,
+    map: &mut HashMap<PathBuf, u32>,
+    abs_dir: &Path,
+    e: &std::io::Error,
+) {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            let removed = engine::scanner::remove_prefix(idx, map, abs_dir);
+            state.dirty.fetch_add(removed as u64, Ordering::Relaxed);
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            if record_persistent_failure(
+                state,
+                abs_dir,
+                "权限拒绝(如无完全磁盘访问权限),已停止重试;重启后自动重新索引",
+            ) {
+                log::warn!("目录 diff 权限拒绝 {},入负缓存", abs_dir.display());
+            }
+        }
+        _ => {
+            let mut counts = state.diff_fail_counts.lock().unwrap();
+            let n = counts.entry(abs_dir.to_path_buf()).or_insert(0);
+            *n += 1;
+            if *n >= 3 {
+                counts.remove(abs_dir);
+                drop(counts);
+                if record_persistent_failure(
+                    state,
+                    abs_dir,
+                    "连续 diff 失败,已停止重试;重启后自动重新索引",
+                ) {
+                    log::warn!("目录 diff 连续失败 {},入负缓存: {e}", abs_dir.display());
+                }
+            }
+        }
+    }
 }
 
 /// 冷启动编排(独立线程):有索引 → Shared 秒开 → 物化 → 重放;无/损坏 → 首扫。
@@ -874,7 +1018,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
         Ok(v) => v,
         Err(e) => {
             log::error!("建流失败({e}),转全量重扫兜底模式");
-            degrade_and_rescan(&state, &paths);
+            spawn_rescan(&state, &paths);
             return Ok(());
         }
     };
@@ -1118,7 +1262,7 @@ fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
         };
     }
     *state.cfg.lock().unwrap() = defaults.clone();
-    degrade_and_rescan(state, paths);
+    degrade_and_rescan(state, paths, true); // 同步:响应语义「返回时排除项已生效」
     Response::Exclude {
         ok: true,
         excluded: defaults.excluded,
@@ -1181,7 +1325,7 @@ fn apply_exclude_change(
         log::error!("配置保存失败: {e}");
         return Err(format!("配置保存失败({e}),变更未持久化,重启后将丢失"));
     }
-    degrade_and_rescan(state, paths);
+    degrade_and_rescan(state, paths, true); // 同步:响应语义「返回时排除项已生效」
     Ok(())
 }
 
@@ -1421,7 +1565,7 @@ mod tests {
         };
         std::fs::create_dir_all(&paths.data_dir).unwrap();
         let before = fsevents::current_event_id();
-        degrade_and_rescan(&state, &paths);
+        degrade_and_rescan(&state, &paths, true);
         let floor = state.rescan_floor.load(Ordering::Relaxed);
         assert!(floor >= before, "覆盖水位取重扫开始时刻");
         assert!(state.applied_event_id.load(Ordering::Relaxed) >= floor);
@@ -1841,5 +1985,214 @@ mod tests {
             "old-line\nnew-line\n",
             "append 打开不得截断旧内容"
         );
+    }
+
+    // ---------- S1 失败治理与重扫窗口(tech.md §1/§2) ----------
+
+    /// 构造:Mutable 索引含 root 与 subdirs(父先于子),dir_map 键为 canonical 形态。
+    fn seeded_state(root: &std::path::Path, subdirs: &[&str]) -> Arc<EngineState> {
+        let state = Arc::new(EngineState::new());
+        let root = root.canonicalize().unwrap(); // 与 diff_one 基址同形态(/var→/private/var)
+        let mut idx = Index::new();
+        let mut map = HashMap::new();
+        let root_idx = idx.insert(&root.to_string_lossy(), NO_PARENT, true);
+        map.insert(root.to_path_buf(), root_idx);
+        for sub in subdirs {
+            let p = root.join(sub);
+            let parent = p.parent().unwrap().to_path_buf();
+            let pidx = map[&parent];
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let k = idx.insert(&name, pidx, true);
+            map.insert(p, k);
+        }
+        *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+        *state.dir_map.lock().unwrap() = map;
+        state
+    }
+
+    /// EPERM 目录语义钉(tech.md §2):保留条目(摘除会被父 diff 重插 → 插-摘振荡)
+    /// + 入负缓存 + gaps 记账;负缓存短路后不再重试(io_errors 不再涨、日志不再刷)。
+    ///
+    /// 突变验证:「EPERM 分支改为摘除」→ is_live 断言红;「无负缓存」→ 短路断言红。
+    #[test]
+    fn eperm_dir_keeps_entry_and_short_circuits() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        let state = seeded_state(&root, &["locked"]);
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert_eq!(diff_one(&state, &locked), 0, "diff 失败返回 0 变更");
+        {
+            let h = state.holder.read().unwrap();
+            let IndexHolder::Mutable(idx) = &*h else {
+                panic!("holder 应为 Mutable")
+            };
+            let map = state.dir_map.lock().unwrap();
+            assert!(
+                idx.entries[map[&locked] as usize].is_live(),
+                "EPERM 目录保留条目(与首扫「入索引+空子树+gaps」语义一致)"
+            );
+        }
+        assert!(state.perm_denied.lock().unwrap().contains(&locked));
+        assert_eq!(state.gaps.lock().unwrap().len(), 1, "gaps 记账一次");
+
+        let mid = state.io_errors.load(Ordering::Relaxed);
+        assert_eq!(diff_one(&state, &locked), 0);
+        assert_eq!(
+            state.io_errors.load(Ordering::Relaxed),
+            mid,
+            "负缓存短路:不再重试、不再计数"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// ENOENT 目录语义钉:磁盘已删 → 摘子树 + 清映射(父 diff 不会重插,无振荡)。
+    /// 突变「NotFound 分支改为保留」→ live 计数断言红。
+    #[test]
+    fn enoent_dir_diff_removes_subtree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("gone").join("child")).unwrap();
+        let state = seeded_state(&root, &["gone", "gone/child"]);
+        let gone = root.join("gone");
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        assert_eq!(diff_one(&state, &gone), 0);
+        {
+            let h = state.holder.read().unwrap();
+            let IndexHolder::Mutable(idx) = &*h else {
+                panic!("holder 应为 Mutable")
+            };
+            let live = idx.entries.iter().filter(|e| e.is_live()).count();
+            assert_eq!(live, 1, "仅剩根条目:gone 子树级联摘除");
+        }
+        assert!(
+            !state.dir_map.lock().unwrap().contains_key(&gone),
+            "dir_map 键同步清除"
+        );
+    }
+
+    /// 未知 errno 钉:连续 3 次失败才入负缓存(阈值防偶发错误被永久短路)。
+    /// 突变阈值(3 → 1)→ 前两次断言红。
+    #[test]
+    fn unknown_errno_three_strikes_enters_negative_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let state = seeded_state(tmp.path(), &["d"]);
+        let e = std::io::Error::from_raw_os_error(5); // EIO,非 NotFound/EPERM
+        {
+            let mut h = state.holder.write().unwrap();
+            let IndexHolder::Mutable(idx) = &mut *h else {
+                panic!("holder 应为 Mutable")
+            };
+            let mut map = state.dir_map.lock().unwrap();
+            handle_diff_error(&state, idx, &mut map, &dir, &e);
+            handle_diff_error(&state, idx, &mut map, &dir, &e);
+            assert!(
+                !state.perm_denied.lock().unwrap().contains(&dir),
+                "前两次不入负缓存"
+            );
+            handle_diff_error(&state, idx, &mut map, &dir, &e);
+        }
+        assert!(
+            state.perm_denied.lock().unwrap().contains(&dir),
+            "第三次入负缓存"
+        );
+        assert_eq!(state.gaps.lock().unwrap().len(), 1);
+    }
+
+    /// 负缓存键稳定性钉:键为 canonical 路径——条目号在 compact 全量重排后失效,
+    /// 错杀无辜条目会静默丢更新。突变「键改条目号」或「compact 清空负缓存」
+    /// → 对应断言红。
+    #[test]
+    fn negative_cache_survives_compact_and_spares_other_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::create_dir(root.join("live")).unwrap();
+        let state = seeded_state(&root, &["locked", "live"]);
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        diff_one(&state, &locked);
+        assert!(state.perm_denied.lock().unwrap().contains(&locked));
+
+        {
+            let mut h = state.holder.write().unwrap();
+            let IndexHolder::Mutable(idx) = &mut *h else {
+                panic!("holder 应为 Mutable")
+            };
+            idx.compact();
+        }
+        let mid = state.io_errors.load(Ordering::Relaxed);
+        diff_one(&state, &locked);
+        assert_eq!(
+            state.io_errors.load(Ordering::Relaxed),
+            mid,
+            "compact 后负缓存仍短路(权限未恢复,若失效则此 diff 失败计数上涨)"
+        );
+
+        std::fs::write(root.join("live").join("new.txt"), "x").unwrap();
+        assert!(
+            diff_one(&state, &root.join("live")) > 0,
+            "其他目录内容漂移正常更新,不被负缓存错杀"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// 重扫窗口追平语义钉:窗口内 diff 照常应用并记集合;替换段挂上「扫描时点
+    /// 快照」(不含窗口变更)后,drain 重放把窗口变更补进新索引。
+    /// 突变「不记 rescan_dirty」或「替换段不 drain」→ 末段 entry_count 断言红。
+    #[test]
+    fn rescan_replay_restores_window_changes_dropped_by_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        let state = seeded_state(&root, &["d"]);
+        let d = root.join("d");
+
+        state.rescanning.store(true, Ordering::SeqCst);
+        std::fs::write(d.join("x.txt"), "").unwrap();
+        assert!(diff_one(&state, &d) > 0, "窗口内变更照常 diff(旧索引)");
+        assert!(
+            state.rescan_dirty.lock().unwrap().contains(&d),
+            "窗口内 diff 记集合"
+        );
+
+        // 模拟重扫产物替换:全新索引 = 扫描开始时点快照(不含窗口内 x.txt)
+        let mut idx = Index::new();
+        let mut map = HashMap::new();
+        let r = idx.insert(&root.to_string_lossy(), NO_PARENT, true);
+        map.insert(root.to_path_buf(), r);
+        let d_idx = idx.insert("d", r, true);
+        map.insert(d, d_idx);
+        *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+        *state.dir_map.lock().unwrap() = map;
+        {
+            let h = state.holder.read().unwrap();
+            let IndexHolder::Mutable(idx) = &*h else {
+                panic!("holder 应为 Mutable")
+            };
+            assert_eq!(idx.entry_count(), 2, "替换后快照不含窗口变更");
+        }
+
+        // 替换段追平:清标志(rescanning)→ drain → 逐目录重放
+        state.rescanning.store(false, Ordering::SeqCst);
+        let replayed: Vec<PathBuf> = state.rescan_dirty.lock().unwrap().drain().collect();
+        assert_eq!(replayed.len(), 1);
+        for dir in &replayed {
+            diff_one(&state, dir);
+        }
+        {
+            let h = state.holder.read().unwrap();
+            let IndexHolder::Mutable(idx) = &*h else {
+                panic!("holder 应为 Mutable")
+            };
+            assert_eq!(idx.entry_count(), 3, "重放把窗口变更(x.txt)补进新索引");
+        }
     }
 }
