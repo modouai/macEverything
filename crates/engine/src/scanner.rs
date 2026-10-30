@@ -138,19 +138,51 @@ fn scan_serial(roots: &[PathBuf], excludes: &[PathBuf]) -> (Index, ScanGaps) {
     (index, gaps)
 }
 
-/// 聚合记录:目录条目携带自身原始路径(`raw`,dir_map 键——目录名非 UTF-8 时
-/// lossy 名重建的键会与弹队原始路径漂移,macOS 不可达但 Linux ext4 可触发)。
-/// pub:daemon 首扫流式聚合复用(分片可见)。
+/// 聚合记录:目录表引用 + 名称(峰值瘦身,ADR-6 增补)。
+///
+/// 旧设计逐条拷贝完整父路径(`parent: PathBuf` + Dir 的 `raw: PathBuf`),百万
+/// 级扫描的 `Vec<Rec>` 是全量重扫峰值内存的主项;改为 `dir_seq` 引用目录表后,
+/// 路径串仅在表内存一份,记录体 32B/条。pub:daemon 首扫流式聚合复用(分片可见)。
 pub enum Rec {
-    Dir {
-        parent: PathBuf,
-        name: String,
-        raw: PathBuf,
-    },
-    File {
-        parent: PathBuf,
-        name: String,
-    },
+    /// 目录条目。`dir_seq` 指向**自身**在目录表中的位置(入队时刻登记,与产出
+    /// 记录同 shard 同原子时刻),聚合时 raw = table[dir_seq] 直接取用——完整
+    /// 原始字节,目录名非 UTF-8 时键不漂移(旧 raw 存在的理由,逐字保留)。
+    Dir { dir_seq: u32, name: String },
+    /// 文件条目。`dir_seq` 指向**父目录**。
+    File { dir_seq: u32, name: String },
+}
+
+/// 目录路径表:并行遍历侧按 shard 本地登记(每目录恰一次,入队时刻),聚合侧
+/// 合并为连续存储。`dir_seq` 全局编码 = `shard << SEQ_SHARD_BITS | local`,
+/// 单 shard 目录数上限 `1 << SEQ_SHARD_BITS`(越界 panic——2^20 目录/shard,
+/// 远超现实规模)。
+pub struct DirTable {
+    paths: Vec<PathBuf>,
+    offsets: Vec<usize>, // 每 shard 在 paths 中的起点
+}
+
+/// dir_seq 编码的 shard 位宽(见 DirTable)。
+const SEQ_SHARD_BITS: u32 = 12;
+
+impl DirTable {
+    fn encode(shard: usize, local: usize) -> u32 {
+        assert!(
+            local < (1usize << (32 - SEQ_SHARD_BITS)),
+            "单 shard 目录数超出 dir_seq 编码位宽"
+        );
+        ((shard as u32) << (32 - SEQ_SHARD_BITS)) | local as u32
+    }
+
+    fn shard_of(seq: u32) -> usize {
+        (seq >> (32 - SEQ_SHARD_BITS)) as usize
+    }
+
+    #[must_use]
+    pub fn get(&self, seq: u32) -> &Path {
+        let shard = Self::shard_of(seq);
+        let local = (seq & ((1 << (32 - SEQ_SHARD_BITS)) - 1)) as usize;
+        &self.paths[self.offsets[shard] + local]
+    }
 }
 
 /// 并行遍历(ADR-6):共享目录队列(work-sharing:纯 FIFO 消费,空队即退),
@@ -158,36 +190,62 @@ pub enum Rec {
 /// (无逐条全局锁),scope 结束一次性上收;记录按路径深度稳定排序后才返回,
 /// 保证聚合侧「父记录先于子记录」。注意:条目号/arena 布局随线程交织,不做
 /// 字节级稳定——此为 ADR-6「分片按队列顺序聚合」的已登记偏差(见 plan 偏差 #3)。
+///
+/// 目录表登记规则(峰值瘦身):队列元素携带目录的 dir_seq;目录**入队时刻**
+/// 由产出其记录的 shard 登记路径(每目录恰一次),该 Dir 记录同 shard 引用同一
+/// seq——记录与登记天然同 shard,无需跨线程同步;子记录引用父 seq(可能跨
+/// shard),聚合侧经 DirTable 编码定位。返回 (records, table, gaps)。
 pub fn collect_records(
     roots: &[PathBuf],
     excludes: &[PathBuf],
     threads: usize,
-) -> (Vec<Rec>, ScanGaps) {
+) -> (Vec<Rec>, DirTable, ScanGaps) {
     use std::sync::Mutex;
 
-    let queue: Mutex<VecDeque<PathBuf>> = Mutex::new(roots.iter().cloned().collect());
-    let gaps: Mutex<ScanGaps> = Mutex::new(ScanGaps::default());
     let nthreads = threads.min(
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8),
     );
+    let mut shard_dirs: Vec<Vec<PathBuf>> = (0..nthreads).map(|_| Vec::new()).collect();
     let mut shards: Vec<Vec<Rec>> = (0..nthreads).map(|_| Vec::new()).collect();
 
+    // 根目录预先登记在 shard 0(shard 尚未 spawn,主线程独占无锁)。
+    let mut queue: VecDeque<(PathBuf, u32)> = VecDeque::new();
+    for root in roots {
+        let seq = DirTable::encode(0, shard_dirs[0].len());
+        shard_dirs[0].push(root.clone());
+        queue.push_back((root.clone(), seq));
+    }
+    let queue: Mutex<VecDeque<(PathBuf, u32)>> = Mutex::new(queue);
+    let gaps: Mutex<ScanGaps> = Mutex::new(ScanGaps::default());
+    // 闭包为 move(需捕获各自 shard 的可变借用);queue/gaps 以共享引用捕获
+    //(&Mutex 为 Copy,每线程一份引用副本,不 move 本体);目录表按迭代器切分
+    // 不相交借用(索引式 &mut shard_dirs[sid] 无法通过借用检查——spawn 借用
+    // 存活至 scope 结束)。
+    let queue = &queue;
+    let gaps_ref = &gaps;
+    let mut dirs_iter = shard_dirs.iter_mut();
+
     std::thread::scope(|s| {
-        for shard in shards.iter_mut() {
-            s.spawn(|| loop {
-                let Some(dir) = queue.lock().unwrap().pop_front() else {
+        for (sid, shard) in shards.iter_mut().enumerate() {
+            let dirs = dirs_iter.next().unwrap();
+            s.spawn(move || loop {
+                let Some((dir, seq)) = queue.lock().unwrap().pop_front() else {
                     break;
                 };
                 let rd = match std::fs::read_dir(&dir) {
                     Ok(rd) => rd,
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        gaps.lock().unwrap().permission.push((dir, e.to_string()));
+                        gaps_ref
+                            .lock()
+                            .unwrap()
+                            .permission
+                            .push((dir, e.to_string()));
                         continue;
                     }
                     Err(_) => {
-                        gaps.lock().unwrap().io_errors += 1;
+                        gaps_ref.lock().unwrap().io_errors += 1;
                         continue;
                     }
                 };
@@ -195,28 +253,28 @@ pub fn collect_records(
                     let entry = match entry {
                         Ok(e) => e,
                         Err(_) => {
-                            gaps.lock().unwrap().io_errors += 1;
+                            gaps_ref.lock().unwrap().io_errors += 1;
                             continue;
                         }
                     };
                     match classify_entry(entry, excludes) {
                         Ok(Step::Dir { path, name }) => {
+                            // 子目录:登记自身路径取得 seq(与 Dir 记录同 shard),
+                            // 入队供后续处理其子树。
+                            let child_seq = DirTable::encode(sid, dirs.len());
+                            dirs.push(path.clone());
                             shard.push(Rec::Dir {
-                                parent: dir.clone(),
+                                dir_seq: child_seq,
                                 name,
-                                raw: path.clone(),
                             });
-                            queue.lock().unwrap().push_back(path);
+                            queue.lock().unwrap().push_back((path, child_seq));
                         }
                         Ok(Step::File { name }) => {
-                            shard.push(Rec::File {
-                                parent: dir.clone(),
-                                name,
-                            });
+                            shard.push(Rec::File { dir_seq: seq, name });
                         }
                         Ok(Step::Skip) => {}
                         Err(()) => {
-                            gaps.lock().unwrap().io_errors += 1;
+                            gaps_ref.lock().unwrap().io_errors += 1;
                         }
                     }
                 }
@@ -224,20 +282,29 @@ pub fn collect_records(
         }
     });
 
+    // 合并各 shard 目录表为连续存储(编码不变,offsets 定位)。
+    let mut paths = Vec::new();
+    let mut offsets = Vec::with_capacity(nthreads);
+    for d in &shard_dirs {
+        offsets.push(paths.len());
+        paths.extend(d.iter().cloned());
+    }
+    let table = DirTable { paths, offsets };
+
     let mut recs: Vec<Rec> = shards.into_iter().flatten().collect();
     // 分片交织破坏 shard 内「父先于子」的因果序:子目录记录可能落在序号更小的
     // shard,flatten 后先于父被消费,dir_map 查父即 miss panic(全量套件实测
     // flake)。按**条目自身在树中的深度**稳定排序恢复拓扑序:目录的自身深度 =
-    // 其 raw 路径段数;文件的自身深度 = 父路径段数 + 1——同深度的目录记录必先于
+    // 其表内路径段数;文件的自身深度 = 父路径段数 + 1——同深度的目录记录必先于
     // 其直接子文件(单轮聚合含跨类型父子,「文件用父深度」会让两者同深度,
     // 反序时子先于父即 miss)。深度相同者互不为祖先,顺序无关。
     // sort_by_cached_key:key 为整路径 components 遍历,cached 版每记录只算一次
     // (sort_by_key 会按比较次数重复解析路径,百万记录下聚合段多付千万次遍历)
     recs.sort_by_cached_key(|r| match r {
-        Rec::Dir { raw, .. } => raw.components().count(),
-        Rec::File { parent, .. } => parent.components().count() + 1,
+        Rec::Dir { dir_seq, .. } => table.get(*dir_seq).components().count(),
+        Rec::File { dir_seq, .. } => table.get(*dir_seq).components().count() + 1,
     });
-    (recs, gaps.into_inner().unwrap())
+    (recs, table, Mutex::into_inner(gaps).unwrap())
 }
 
 /// 聚合前登记根条目(键为原始路径形态,与 `apply_records` 的 dir_map 同规则)。
@@ -253,16 +320,26 @@ pub fn seed_roots(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, roots:
 /// 把记录切片聚合进 index。前置:dir_map 已含根(`seed_roots`);切片内父记录
 /// 先于子记录(`collect_records` 的深度排序保证,跨批亦然——深度单调不减)。
 /// 可分批调用,批间索引处于一致可查询状态(首扫分片可见的实现载体)。
-pub fn apply_records(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, recs: &[Rec]) {
+///
+/// Dir 聚合:raw = table[dir_seq](自身原始路径)直接作 dir_map 键——目录名
+/// 非 UTF-8 时键保真(不做父路径 + lossy 名拼接,那会键漂移);父条目号查
+/// `raw.parent()`(PathBuf 零拷贝切片,拓扑序保证父已在 map)。
+pub fn apply_records(
+    index: &mut Index,
+    dir_map: &mut HashMap<PathBuf, u32>,
+    recs: &[Rec],
+    table: &DirTable,
+) {
     for rec in recs {
         match rec {
-            Rec::Dir { parent, name, raw } => {
-                let pidx = dir_map[parent];
+            Rec::Dir { dir_seq, name } => {
+                let raw = table.get(*dir_seq);
+                let pidx = dir_map[raw.parent().expect("目录记录的表内路径必有父段")];
                 let idx = index.insert(name, pidx, true);
-                dir_map.insert(raw.clone(), idx);
+                dir_map.insert(raw.to_path_buf(), idx);
             }
-            Rec::File { parent, name } => {
-                let pidx = dir_map[parent];
+            Rec::File { dir_seq, name } => {
+                let pidx = dir_map[table.get(*dir_seq)];
                 index.insert(name, pidx, false);
             }
         }
@@ -292,11 +369,11 @@ pub fn remove_prefix(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, pre
 
 /// 并行扫描入口(一次性):遍历 → 深度排序 → 聚合。
 fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
-    let (recs, gaps) = collect_records(roots, excludes, threads);
+    let (recs, table, gaps) = collect_records(roots, excludes, threads);
     let mut index = Index::new();
     let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
     seed_roots(&mut index, &mut dir_map, roots);
-    apply_records(&mut index, &mut dir_map, &recs);
+    apply_records(&mut index, &mut dir_map, &recs, &table);
     (index, gaps)
 }
 
@@ -566,13 +643,13 @@ mod tests {
 
         let (one_shot, _) = scan_roots(&roots, &excl, 4);
 
-        let (recs, _) = collect_records(&roots, &excl, 4);
+        let (recs, table, _) = collect_records(&roots, &excl, 4);
         let mut staged = Index::new();
         let mut dir_map = HashMap::new();
         seed_roots(&mut staged, &mut dir_map, &roots);
         // 逐条聚合(最严切分):任何「子记录先于父记录」的排序缺陷都会在此暴露
         for chunk in recs.chunks(1) {
-            apply_records(&mut staged, &mut dir_map, chunk);
+            apply_records(&mut staged, &mut dir_map, chunk, &table);
         }
 
         assert_eq!(staged.entry_count(), one_shot.entry_count());
@@ -610,5 +687,39 @@ mod tests {
             .map(|i| idx2.full_path(i).to_string_lossy().into_owned())
             .collect();
         assert!(!paths2.iter().any(|p| p.contains("/src")));
+    }
+
+    /// 非 UTF-8 目录名 dir_map 键保真钉(tech.md §3):聚合的键 = 目录表原始
+    /// 字节,不因 lossy 名称漂移。macOS APFS 拒绝非法 UTF-8 字节名(EILSEQ,
+    /// 场景仅 Linux ext4 可达),故用合成 DirTable + Rec 直测聚合侧——正是
+    /// 本改动触及的范围。突变「Dir 聚合改父路径 + lossy 名拼接」→ 字节比对必红。
+    #[test]
+    fn non_utf8_dir_name_key_stays_raw() {
+        use std::os::unix::ffi::OsStringExt;
+        let t = tempfile::tempdir().unwrap();
+        let bad = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xFF]);
+        let table = DirTable {
+            paths: vec![t.path().to_path_buf(), t.path().join(&bad)],
+            offsets: vec![0],
+        };
+        let recs = vec![Rec::Dir {
+            dir_seq: DirTable::encode(0, 1),
+            name: bad.to_string_lossy().into_owned(),
+        }];
+
+        let mut index = Index::new();
+        let mut dir_map = HashMap::new();
+        seed_roots(&mut index, &mut dir_map, &[t.path().to_path_buf()]);
+        apply_records(&mut index, &mut dir_map, &recs, &table);
+
+        let key = dir_map
+            .keys()
+            .find(|k| k.file_name() == Some(&bad))
+            .expect("dir_map 应含原始字节形态的非 UTF-8 键(lossy 拼接会产出 U+FFFD 漂移键)");
+        assert_eq!(
+            key.as_os_str().as_encoded_bytes().last(),
+            Some(&0xFF),
+            "键保留原始字节,未被 lossy 替换"
+        );
     }
 }

@@ -219,7 +219,8 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let (recs, gaps) = engine::scanner::collect_records(&[vol.to_path_buf()], &excludes, threads);
+    let (recs, table, gaps) =
+        engine::scanner::collect_records(&[vol.to_path_buf()], &excludes, threads);
     let mut applied = 0usize;
     for chunk in recs.chunks(SCAN_CHUNK) {
         // 批间检查:扫描中途拔盘 → 中止,清除由下一轮对账兜底;
@@ -236,7 +237,7 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
         let mut h = state.holder.write().unwrap();
         if let IndexHolder::Mutable(idx) = &mut *h {
             let mut map = state.dir_map.lock().unwrap();
-            engine::scanner::apply_records(idx, &mut map, chunk);
+            engine::scanner::apply_records(idx, &mut map, chunk, &table);
             applied += chunk.len();
             state.dirty.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         }

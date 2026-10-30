@@ -3,6 +3,7 @@ pub mod config;
 pub mod entry;
 pub mod fsevents;
 pub mod index;
+pub mod malloc_pressure;
 pub mod persist;
 pub mod query;
 pub mod reconcile;

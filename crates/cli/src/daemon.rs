@@ -614,6 +614,7 @@ fn maybe_compact(state: &EngineState) {
     };
     log::info!("索引整理:条目 {before} → {after},回收墓碑与 arena 孤儿字节");
     rebuild_dir_map(state);
+    engine::malloc_pressure::release_heap_pressure();
 }
 
 /// 事件消费循环(重放与增量共用):批量 diff + 落盘节流 + 降级判定。
@@ -845,6 +846,9 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
         diff_one(state, dir);
     }
     flush(state, paths);
+    // 重扫产物(recs 临时结构 + 旧索引)释放后,滞留的 Malloc Large 脏页
+    // (实测 254MB)在此一次性归还内核。
+    engine::malloc_pressure::release_heap_pressure();
     state.set_state(state::READY);
     *state.last_rescan.lock().unwrap() = Some(Instant::now());
 }
@@ -979,7 +983,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             let mut staging_map: HashMap<PathBuf, u32> = HashMap::new();
             engine::scanner::seed_roots(&mut index, &mut staging_map, &roots);
             *state.holder.write().unwrap() = IndexHolder::Mutable(index);
-            let (recs, gaps) = engine::scanner::collect_records(&roots, &excludes, threads);
+            let (recs, table, gaps) = engine::scanner::collect_records(&roots, &excludes, threads);
             state.built_at.store(now_secs(), Ordering::Relaxed);
             let mut gap_list = invalid_roots_gaps(&roots);
             gap_list.extend(gaps.permission.iter().map(|(p, r)| Gap {
@@ -991,7 +995,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             for chunk in recs.chunks(SCAN_CHUNK) {
                 let mut h = state.holder.write().unwrap();
                 if let IndexHolder::Mutable(idx) = &mut *h {
-                    engine::scanner::apply_records(idx, &mut staging_map, chunk);
+                    engine::scanner::apply_records(idx, &mut staging_map, chunk, &table);
                 }
             }
             state.applied_event_id.store(water, Ordering::Relaxed);
