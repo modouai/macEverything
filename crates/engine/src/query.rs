@@ -154,8 +154,24 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // 分段 → 定长块:(块起始条目号, 块切片)。16k 条/块:百万级单段切成 ~77 块,
     // 负载均衡足够;块内串行逐条(条目号 = 块起始号 + 块内下标)。
     const BLOCK: usize = 16 * 1024;
+    let segments = view.entry_segments();
+    // 分段稠密性自检(debug):trait 契约要求段序拼满 0..N-1(见
+    // IndexView::entry_segments);违反即 dir_hits/父指针的全局下标访问失去
+    // 意义(稀疏编号越界或错位),测试期先红。最大段末 == 总条目数 ⇔ 无缝覆盖。
+    debug_assert_eq!(
+        segments
+            .iter()
+            .map(|(s, seg)| s + seg.len() as u32)
+            .max()
+            .unwrap_or(0),
+        segments
+            .iter()
+            .map(|(_, seg)| seg.len() as u32)
+            .sum::<u32>(),
+        "entry_segments 必须稠密覆盖条目号空间 0..N-1"
+    );
     let mut blocks: Vec<(u32, &[Entry])> = Vec::new();
-    for &(start, seg) in &view.entry_segments() {
+    for &(start, seg) in &segments {
         for (i, chunk) in seg.chunks(BLOCK).enumerate() {
             blocks.push((start + (i * BLOCK) as u32, chunk));
         }

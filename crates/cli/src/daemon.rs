@@ -371,7 +371,8 @@ fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Opt
 /// 冷启动直挂 Base(mmap 只读)常驻、查询零物化;首个需要可变性的操作
 /// (增量 diff / 卷写入)经此一次性转换。materialize 条目号 1:1 保持,
 /// 先建的 dir_map 无需重建。全程持 holder 写锁:读者在锁上等待,唤醒后见到的
-/// 已是 Mutable,无 Empty 观察窗。
+/// 已是 Mutable,无 Empty 观察窗。成本(实测,release):1.02M 条目 ~9ms,
+/// 首次含 mmap 缺页 ~95ms;一次性,已 Mutable 时零开销直接返回。
 fn ensure_mutable(state: &EngineState) {
     let mut h = state.holder.write().unwrap();
     if matches!(&*h, IndexHolder::Shared(_)) {
@@ -487,9 +488,10 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
     if state.perm_denied.lock().unwrap().contains(&base) {
         return 0;
     }
-    // 重扫窗口记账:替换段完成后重放追平(diff_one 全程持 holder 写锁,与替换
-    // 段挂 holder 互斥,「先 push 后 drain → 基于旧索引 → 被重放」或「后 push →
-    // 基于新索引 → 不重放」,无第三种交错)。
+    // 重扫窗口记账:替换段完成后重放追平。push 不持 holder 锁(在取锁之前);
+    // 安全性由「push 恒先于同次 diff 的 apply,且 apply 持 holder 写锁、替换段
+    // 挂 holder 也持写锁」的互斥保证:「先 push 后 drain → 基于旧索引 → 被重放」
+    // 或「后 push → 基于新索引 → 不重放」,无第三种交错。
     if state.rescanning.load(Ordering::SeqCst) {
         state.rescan_dirty.lock().unwrap().insert(base.clone());
     }
@@ -593,9 +595,10 @@ fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
         }
         // Shared(直挂 Base,本会话零增量):盘上索引即当前状态,不重写;
         // 活条目数直接按**已借用的 guard** 统计——不得经 live_count/with_view
-        // 再取同一把 holder 锁:同线程「持读 + 写者排队 + 再读」在 macOS
-        // pthread_rwlock 上返回 EDEADLK,unwrap 即 panic 且锁中毒(Stop 响应
-        // 丢失、socket 残留、被阻塞的写者随之 panic)。Empty(首扫中):0。
+        // 再取同一把 holder 锁:同线程「持读 + 写者排队 + 再读」在本平台实测
+        // 不是返回 EDEADLK 而是**永久阻塞**(写者优先,见
+        // holder_reentry_with_queued_writer_is_fatally_blocking 钉),后果为
+        // stop 线程挂死、socket 残留、后续读者全部卡死。Empty(首扫中):0。
         IndexHolder::Shared(v) => (true, live_count_of(v.as_ref())),
         IndexHolder::Empty => (true, 0),
     }
@@ -889,9 +892,10 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     rebuild_dir_map(state);
     // 重扫窗口追平:先清 rescanning 再 drain——此后消费线程 diff 的对象已是新
     // 索引,无需再记集合;窗口内已记目录基于旧索引 diff 过,重放追平。push 与
-    // drain 都持各自的 Mutex,且 diff_one 全程持 holder 写锁、替换段挂 holder
-    // 也持写锁——「push 在 drain 前 → 基于旧索引 → 被 drain 带走重放」或
-    // 「push 在 drain 后 → 基于新索引 → 不重放」,互斥保证无丢失。
+    // drain 各持自己的 Mutex;push 不持 holder 锁,但恒先于同次 diff 的 apply
+    // (apply 持 holder 写锁,与替换段挂 holder 互斥)——「push 在 drain 前 →
+    // 基于旧索引 → 被 drain 带走重放」或「push 在 drain 后 → 基于新索引 →
+    // 不重放」,无丢失。
     state.rescanning.store(false, Ordering::SeqCst);
     let replayed: Vec<PathBuf> = state.rescan_dirty.lock().unwrap().drain().collect();
     for dir in &replayed {
@@ -1588,13 +1592,13 @@ mod tests {
         });
     }
 
-    /// persist_final 在 Shared 态(stop 时的常态)的输出契约:不重写盘上索引
+    /// persist_final 在 Shared 态(stop 时的常态)的输出契约钉:不重写盘上索引
     /// (data_dir 不存在时仍 ok=true,写动作会因父目录缺失而失败),活条目数按
-    /// 视图如实统计(墓碑不计)。计数走**已借用 guard** 的 live_count_of——
-    /// 再入 live_count/with_view 会同线程二次取 holder 读锁,写者排队时 macOS
-    /// pthread_rwlock 判 EDEADLK → panic + 锁中毒(stop 响应丢失)。突变
-    /// 「Shared 分支改回经 with_view 再入取数」在写者排队场景即触发该缺陷,
-    /// 本测以 data_dir 缺席 + 计数契约双钉收口。
+    /// 视图如实统计(墓碑不计)。注:本测**杀不死**「Shared 分支改回经
+    /// with_view 再入取数」的突变——再入窗口在函数内部,外部无法向该窗口注入
+    /// 写者(预先入队的写者同样卡死修复版的首取锁);再入的致命性由
+    /// `holder_reentry_with_queued_writer_is_fatally_blocking` 平台钉收口,
+    /// 再入的排除靠「已借用 guard 计数」的结构与评审。
     #[test]
     fn persist_final_shared_state_reports_live_count_without_rewrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -1628,7 +1632,9 @@ mod tests {
     }
 
     /// stop 与在途写者并发:persist_final 等写者完成后如实统计(正常阻塞语义),
-    /// 不 panic、不死锁。EDEADLK 再入缺陷已由「已借用 guard 计数」从结构上消除。
+    /// 不挂死。注:此为并发冒烟钉——sleep(5ms) 后写者通常已释放,本测**杀不死**
+    /// 再入突变;再入致命性由 `holder_reentry_with_queued_writer_is_fatally_
+    /// blocking` 平台钉收口(机制),再入的排除靠「已借用 guard 计数」的结构。
     #[test]
     fn persist_final_completes_under_pending_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1661,6 +1667,45 @@ mod tests {
         writer.join().unwrap();
         assert!(ok);
         assert_eq!(n, 2, "根 + a.txt");
+    }
+
+    /// 平台机制钉(本机 macOS 实测):同线程「持读锁 → 写者入队 → 再取读锁」
+    /// **不是 EDEADLK 返回,而是永久阻塞**——后到的读按写者优先排队等写者,
+    /// 写者又等本线程放锁,结构性互等,无调度可解。比 panic 更重:触发线程
+    /// 挂死,后续所有读者排队卡死。persist_final 的计数因此必须走已借用 guard
+    /// (live_count_of),不得再入 holder 锁。
+    /// 形态:独立线程复现 A 持读 → B 请求写(sleep 50ms 确保入队)→ A 二次读,
+    /// 主测 300ms 未返回即断言(阻塞是结构性的,判定无时间竞争;若平台未来
+    /// 放行同线程递归读,本测变红提示重评 persist_final 再入风险)。
+    /// 注:探测线程组会以挂死状态存活至测试进程退出,无副作用。
+    #[test]
+    fn holder_reentry_with_queued_writer_is_fatally_blocking() {
+        let lock = Arc::new(std::sync::RwLock::new(()));
+        let probe = {
+            let lock = Arc::clone(&lock);
+            std::thread::spawn(move || {
+                let g1 = lock.read().unwrap(); // A 持读
+                let w = {
+                    let lock = Arc::clone(&lock);
+                    std::thread::spawn(move || {
+                        let _w = lock.write().unwrap(); // B 请求写 → 入队阻塞
+                    })
+                };
+                std::thread::sleep(std::time::Duration::from_millis(50)); // 确保 B 入队
+                let _g2 = lock.read().unwrap(); // A 二次读 → 阻塞(平台若放行则返回)
+                drop(g1);
+                w.join().unwrap();
+            })
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe.join());
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(
+            matches!(done, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "同线程持读+写者入队+再取读应为致命阻塞;若探测已返回,平台行为已变,须重评 persist_final 的再入风险"
+        );
     }
 
     /// 水位的核心不变量钉:applied 只在 diff 完成后推进,「已收未应用」不得计入。

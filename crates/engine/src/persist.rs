@@ -134,11 +134,22 @@ where
             tombstones += 1;
         }
     }
-    debug_assert_eq!(
-        layout.path_offsets.len(),
-        n as usize,
-        "path_offsets 与条目号全量对齐是落盘布局不变量"
-    );
+    // 布局对齐硬校验(release 生效,非 debug_assert):失配即拒绝写出——
+    // 布局段与条目流不对齐时产物 load 必失败(Truncated),用户侧表现为
+    // 无感知的全量重扫,必须在写盘前拦截。
+    // 布局对齐硬校验(release 生效,非 debug_assert):失配即拒绝写出——
+    // 布局段与条目流不对齐时产物 load 必失败(Truncated),用户侧表现为
+    // 无感知的全量重扫,必须在写盘前拦截。
+    if layout.path_offsets.len() != n as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "path_offsets({}) 与条目流长度({}) 不对齐,拒绝写出 load 必失败的布局",
+                layout.path_offsets.len(),
+                n
+            ),
+        ));
+    }
     // header 计数回填
     buf[n_entries_pos..n_entries_pos + 4].copy_from_slice(&n.to_le_bytes());
     buf[tombstones_pos..tombstones_pos + 4].copy_from_slice(&tombstones.to_le_bytes());
@@ -547,6 +558,35 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(left.len(), 1); // 无 .tmp 残留
+    }
+
+    /// 布局对齐硬校验钉(release 生效):path_offsets 与条目流长度失配 →
+    /// Err(InvalidData),且零产物落盘(检查在 tmp 写入前)。突变「校验退回
+    /// debug_assert」时:debug profile 本测因 panic 必红;`cargo test --release`
+    /// 下失配文件被静默写出、断言同样必红——两种 profile 都杀得死。
+    #[test]
+    fn write_rejects_misaligned_layout_without_side_effects() {
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        i.insert("a.txt", d, false);
+        // 故意短的 path_offsets(1 对,条目流 2 条):模拟失配合成视图
+        let layout = EntryLayout {
+            display_arena: &i.display_arena.data,
+            match_arena: &i.match_arena.data,
+            path_pool: &i.path_pool.data,
+            path_offsets: &[(0, 4)],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.bin");
+        let err = write_atomic(&layout, i.entries.iter(), &IndexMeta::default(), &path)
+            .expect_err("失配布局必须被拒绝");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!path.exists(), "目标文件不得产出");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "无 .tmp 残留(检查先于临时文件写入)"
+        );
     }
 
     // 临时文件名钉:目标名本身以 .tmp 结尾时,临时文件不得与目标同名
