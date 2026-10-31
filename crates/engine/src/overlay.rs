@@ -68,6 +68,7 @@ impl Overlay {
     pub fn is_empty(&self) -> bool {
         self.overlaid.is_empty()
             && self.anchors.is_empty()
+            && self.anchor_base.is_empty()
             && self.dir_ids.is_empty()
             && self.index.entries.is_empty()
     }
@@ -264,19 +265,21 @@ impl Overlay {
         for (name, k) in old {
             self.unlink_anchor(k);
             self.index.remove(k);
-            self.dir_ids.remove(&abs_dir.join(&name));
+            self.remove_dir_key(&abs_dir.join(&name));
             // 深层 anchor 兜底:该子树内此前自身被 diff 过的目录,其 anchor 不在
             // 本 anchor 直接子项的 unlink 射程内(级联只墓碑 overlay 条目,
             // anchors/overlaid/dir_ids 键残留会让 base 深层子树泄漏命中)——
             // 按被删子项路径前缀扫账本(低频删除路径的写侧路径比对)。
             self.purge_prefix(base, &abs_dir.join(&name));
         }
-        // base 子目录从 listing 消失的删除方向:本 anchor 的 overlay 旧子项集
-        // (old)对此看不见——子树此前自身被 diff 过时其 anchor 是独立桥(顶层
-        // 占位),父首 diff 时 old 为空更是整棵不可见。按 base 子项路径前缀扫,
-        // 作废该子树的全部 overlay 账本(文件路径无子树,sweep 天然空转)。
-        for name in base_children.keys() {
-            if !listing.contains_key(name) {
+        // base 子目录从 listing 消失**或降级为文件**的删除方向:本 anchor 的
+        // overlay 旧子项集(old)对「消失」看不见——子树此前自身被 diff 过时其
+        // anchor 是独立桥(顶层占位),父首 diff 时 old 为空更是整棵不可见;
+        // 对「降级」(rm -rf d1 && touch d1)则名字仍在 listing,旧条件会放过,
+        // 残留深层桥让 base 陈旧子树复活(评审 C1 变体 A)。仅扫 base 目录子项
+        // (文件子项无子树,天然无账本);文件路径 purge 天然空转。
+        for (name, &b) in &base_children {
+            if base.entry(b).is_dir() && listing.get(name) != Some(&true) {
                 self.purge_prefix(base, &abs_dir.join(name));
             }
         }
@@ -312,6 +315,15 @@ impl Overlay {
         if let Some(b) = self.anchor_base.remove(&o) {
             self.anchors.remove(&b);
         }
+    }
+
+    /// 按 base 目录号摘除双向桥(purge 前缀扫的收口入口;返回被摘的 overlay
+    /// 条目号供级联墓碑)。与 [`Overlay::unlink_anchor`] 同一套账本纪律,
+    /// 只是定位方向相反。
+    fn unlink_anchor_by_base(&mut self, b: u32) -> Option<u32> {
+        let a = self.anchors.remove(&b)?;
+        self.anchor_base.remove(&a);
+        Some(a)
     }
 
     /// 确保 Base 目录的 anchor 条目存在,返回其 overlay 条目号。
@@ -385,9 +397,8 @@ impl Overlay {
             })
             .collect();
         for b in victims {
-            if let Some(a) = self.anchors.remove(&b) {
+            if let Some(a) = self.unlink_anchor_by_base(b) {
                 self.index.remove(a); // 级联:anchor 下的 overlay 子树一并墓碑
-                self.anchor_base.remove(&a);
             }
             self.overlaid.remove(&b);
         }
@@ -412,6 +423,9 @@ pub struct CompositeView<'a> {
     /// Base 空间条目槽位数(含墓碑):两空间的分界 = Overlay 段起始号。
     base_count: u32,
     overlay: &'a Overlay,
+    /// Overlay 是否携带增量(flush/重扫后的常态为空):空时 entry_valid 顶部
+    /// 短路,Base 命中零屏蔽判定开销。
+    overlay_active: bool,
 }
 
 impl<'a> CompositeView<'a> {
@@ -426,6 +440,7 @@ impl<'a> CompositeView<'a> {
             base,
             base_count,
             overlay,
+            overlay_active: !overlay.is_empty(),
         }
     }
 
@@ -507,6 +522,9 @@ impl IndexView for CompositeView<'_> {
     ///   侧同名额本就是权威命中,不抑制会双份(子树已转 Base 裁定,anchor 自身
     ///   的名字也属 Base 裁定范围)。
     fn entry_valid(&self, idx: u32) -> bool {
+        if !self.overlay_active {
+            return true; // 无增量(flush/重扫后常态):全量有效,零判定开销
+        }
         if idx < self.base_count {
             let mut cur = idx;
             loop {
@@ -515,8 +533,18 @@ impl IndexView for CompositeView<'_> {
                     return true; // 终止条件 1:到根,全链无 overlay → 有效
                 }
                 if self.overlay.overlaid.contains(&p) {
-                    // 终止条件 2:最近祖先被 diff,直接子项层以 listing 为准
-                    return self.overlay.anchors.contains_key(&cur);
+                    // 终止条件 2:最近祖先被 diff,直接子项层以 listing 为准。
+                    // 加固(C1 纵深防御):键存在但锚定条目已墓碑的残键一律按
+                    // 无效处理——退化为保守屏蔽,而非泄漏陈旧子树(变体 B:
+                    // 深层 anchors 键在级联墓碑后若未及摘除,contains_key 会
+                    // 让 base 陈旧目录复活)。
+                    return self.overlay.anchors.get(&cur).is_some_and(|&o| {
+                        self.overlay
+                            .index
+                            .entries
+                            .get(o as usize)
+                            .is_some_and(|e| e.is_live())
+                    });
                 }
                 cur = p; // p 未被 diff:p 的存活性由其父链裁定,递归上溯
             }
@@ -997,7 +1025,10 @@ mod tests {
             .unwrap();
         let view = ov.composite_view(&base);
         assert_eq!(total(&view, "deep"), 0, "已删目录子树必须随父 listing 作废");
-        assert!(ov.is_empty() || !ov.anchors.is_empty() || true); // 账本形态由其余断言覆盖
+        assert!(
+            !ov.anchors.contains_key(&id_of(&base, &root.join("sub"))),
+            "被删目录子项的 anchors 键必须随父层 diff 摘除"
+        );
     }
 
     /// file→dir 类型翻转:base 陈旧**文件**条目不得被桥连(缺陷 1 回归钉)。
@@ -1263,6 +1294,105 @@ mod tests {
         // 假阳性方向:path:w2 不得命中 w1 下文件(错空间号会读到无关槽位)
         assert_eq!(total(&view, "path:w2"), 1, "path:w2 只命中 b.txt");
         assert_eq!(total(&view, "whole:new.txt"), 1, "name 查询对照(恒正常)");
+    }
+
+    /// dir→file 类型翻转泄漏(评审 C1)变体 A:父从未 diff,d1/d2 先各自 diff,
+    /// 整树删除后原地降级为同名文件,父层首 diff——删除方向 sweep 必须覆盖
+    /// 「listing 有名但降级为文件」(父层 old 为空,翻转分支根本不进)。
+    /// 突变「sweep 条件去掉降级判定」→ 陈旧 base 子树复活:d1 与新文件双份
+    /// (whole:d1=2)、深层 d2 泄漏(whole:d2=1),本测断言红。
+    #[test]
+    fn dir_to_file_flip_first_parent_diff_sweeps_demoted_subtree() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("d1/d2")).unwrap();
+        std::fs::write(root.join("d1/d2/leaf.txt"), "").unwrap();
+        std::fs::write(root.join("keep.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+        let d1 = root.join("d1");
+
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(id_of(&base, &d1)), &d1, &[])
+            .unwrap();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &d1.join("d2"))),
+            &d1.join("d2"),
+            &[],
+        )
+        .unwrap();
+
+        // rm -rf d1 && touch d1:目录降级为同名文件
+        std::fs::remove_dir_all(&d1).unwrap();
+        std::fs::write(&d1, "").unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        let view = ov.composite_view(&base);
+        assert_eq!(total(&view, "whole:leaf"), 0, "已删深层文件不得泄漏");
+        assert_eq!(total(&view, "whole:d2"), 0, "已删深层目录不得泄漏");
+        assert_eq!(
+            total(&view, "whole:d1"),
+            1,
+            "同名文件恰一份(不得与 base 陈旧目录条目双份)"
+        );
+        assert_eq!(total(&view, "keep"), 1, "删除范围外不受误伤");
+        let merged = materialize_composite(&base, &ov);
+        let paths: std::collections::BTreeSet<String> = (0..merged.entries.len() as u32)
+            .filter(|&i| merged.entries[i as usize].is_live())
+            .map(|i| merged.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, hit_paths(&view), "物化与合成视图零差异(无幽灵根)");
+    }
+
+    /// dir→file 类型翻转泄漏(评审 C1)变体 B:父先 diff(翻转分支生效,unlink
+    /// 清直接桥并级联墓碑深层 overlay 条目),但深层 anchors 键残留会让
+    /// contains_key 把 base 陈旧 d2 判有效。sweep 条件修复后本测由 purge 扫
+    /// 兜住;entry_valid 的 is_live 加固为纵深防御(残键漏网退化为保守屏蔽)。
+    #[test]
+    fn dir_to_file_flip_rediff_sweeps_deep_anchor_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("d1/d2")).unwrap();
+        std::fs::write(root.join("d1/d2/leaf.txt"), "").unwrap();
+        std::fs::write(root.join("keep.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+        let d1 = root.join("d1");
+
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(id_of(&base, &d1)), &d1, &[])
+            .unwrap();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &d1.join("d2"))),
+            &d1.join("d2"),
+            &[],
+        )
+        .unwrap();
+
+        // rm -rf d1 && touch d1;父层再 diff(翻转分支:unlink o1 + 级联)
+        std::fs::remove_dir_all(&d1).unwrap();
+        std::fs::write(&d1, "").unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        let view = ov.composite_view(&base);
+        assert_eq!(total(&view, "whole:leaf"), 0);
+        assert_eq!(
+            total(&view, "whole:d2"),
+            0,
+            "深层 anchors 残键不得让 base 陈旧 d2 复活"
+        );
+        assert_eq!(total(&view, "whole:d1"), 1, "同名文件恰一份");
+        assert_eq!(total(&view, "keep"), 1, "删除范围外不受误伤");
+        let merged = materialize_composite(&base, &ov);
+        let paths: std::collections::BTreeSet<String> = (0..merged.entries.len() as u32)
+            .filter(|&i| merged.entries[i as usize].is_live())
+            .map(|i| merged.full_path(i).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, hit_paths(&view), "物化与合成视图零差异(无幽灵根)");
     }
 
     /// purge_prefix:摘除子树波及的 Overlay 账本同步作废

@@ -190,8 +190,7 @@ fn overlay_fixture() -> (tempfile::TempDir, engine::index::Index) {
     fs::write(r.join("node_modules/x.js"), "").unwrap();
     fs::write(r.join("docs/b.md"), "").unwrap();
     fs::write(r.join("README.md"), "").unwrap();
-    let (index, gaps) =
-        engine::scanner::scan_roots(&[r.to_path_buf()], &[PathBuf::from("node_modules")], 1);
+    let (index, gaps) = engine::scanner::scan_roots(&[r.to_path_buf()], &fixture_excludes(), 1);
     assert_eq!(gaps.permission.len(), 0);
     (t, index)
 }
@@ -212,7 +211,7 @@ fn parity_overlay_diff_then_query_zero_diff() {
         &index,
         DiffTarget::Base(find_id(&index, root)),
         root,
-        &[PathBuf::from("node_modules")],
+        &fixture_excludes(),
     )
     .unwrap();
     let src = root.join("src");
@@ -220,7 +219,7 @@ fn parity_overlay_diff_then_query_zero_diff() {
         &index,
         DiffTarget::Base(find_id(&index, &src)),
         &src,
-        &[PathBuf::from("node_modules")],
+        &fixture_excludes(),
     )
     .unwrap();
 
@@ -258,7 +257,7 @@ fn parity_overlay_nested_two_levels_zero_diff() {
             &index,
             DiffTarget::Base(find_id(&index, &dir)),
             &dir,
-            &[PathBuf::from("node_modules")],
+            &fixture_excludes(),
         )
         .unwrap();
     }
@@ -300,7 +299,7 @@ fn parity_overlay_subdir_diff_then_parent() {
         &index,
         DiffTarget::Base(find_id(&index, &lib)),
         &lib,
-        &[PathBuf::from("node_modules")],
+        &fixture_excludes(),
     )
     .unwrap();
     {
@@ -324,7 +323,7 @@ fn parity_overlay_subdir_diff_then_parent() {
         &index,
         DiffTarget::Base(find_id(&index, &src)),
         &src,
-        &[PathBuf::from("node_modules")],
+        &fixture_excludes(),
     )
     .unwrap();
     let view = ov.composite_view(&index);
@@ -365,7 +364,7 @@ fn parity_overlay_eperm_mixed_tree() {
         &index,
         DiffTarget::Base(find_id(&index, &src)),
         &src,
-        &[PathBuf::from("node_modules")],
+        &fixture_excludes(),
     )
     .unwrap();
     // locked 目录可读性恢复前的子树空:diff locked 会失败(EPERM 形态),

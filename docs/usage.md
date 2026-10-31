@@ -230,7 +230,7 @@ macEverything query --json "*.pdf" | jq '.entries[].path'
 ```bash
 $ macEverything status
 状态: 就绪
-条目数: 1233836
+条目数: 约 1233836 条
 索引生成: 2026-10-16 00:12:00 UTC
 索引文件: /Users/you/Library/Application Support/macEverything/index.bin
 权限缺口(1 个目录,未收录):
