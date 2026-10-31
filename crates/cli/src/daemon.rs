@@ -592,20 +592,28 @@ fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
             }
         }
         // Shared(直挂 Base,本会话零增量):盘上索引即当前状态,不重写;
-        // 条目数从视图如实统计。Empty(首扫中):无索引,0。
-        _ => (true, live_count(state).unwrap_or(0)),
+        // 活条目数直接按**已借用的 guard** 统计——不得经 live_count/with_view
+        // 再取同一把 holder 锁:同线程「持读 + 写者排队 + 再读」在 macOS
+        // pthread_rwlock 上返回 EDEADLK,unwrap 即 panic 且锁中毒(Stop 响应
+        // 丢失、socket 残留、被阻塞的写者随之 panic)。Empty(首扫中):0。
+        IndexHolder::Shared(v) => (true, live_count_of(v.as_ref())),
+        IndexHolder::Empty => (true, 0),
     }
 }
 
-/// 活条目数(分段枚举统计)。Shared 态无内存计数器(mmap 侧墓碑数在 load 时
-/// 即弃),与 Mutable 的 entry_count 走同一枚举面,供 status/最终落盘汇报。
+/// 活条目数(分段枚举统计;入参为**已借用**的视图)。Shared 态无内存计数器
+/// (mmap 侧墓碑数在 load 时即弃),与 Mutable 的 entry_count 走同一枚举面。
+/// 调用方若已持 holder 锁,必须用本函数而非 [`live_count`]——后者自取锁。
+fn live_count_of(view: &dyn IndexView) -> u32 {
+    view.entry_segments()
+        .iter()
+        .map(|(_, s)| s.iter().filter(|e| e.is_live()).count() as u32)
+        .sum()
+}
+
+/// 活条目数(自取 holder 读锁的无持锁调用方入口:status 汇报)。
 fn live_count(state: &EngineState) -> Option<u32> {
-    with_view(state, |v| {
-        v.entry_segments()
-            .iter()
-            .map(|(_, s)| s.iter().filter(|e| e.is_live()).count() as u32)
-            .sum()
-    })
+    with_view(state, live_count_of)
 }
 
 fn should_flush(state: &EngineState) -> bool {
@@ -1578,6 +1586,81 @@ mod tests {
             assert_eq!(v.display_name(b), b"b.txt".as_slice());
             assert!(v.entry(a).is_live() && v.entry(b).is_live());
         });
+    }
+
+    /// persist_final 在 Shared 态(stop 时的常态)的输出契约:不重写盘上索引
+    /// (data_dir 不存在时仍 ok=true,写动作会因父目录缺失而失败),活条目数按
+    /// 视图如实统计(墓碑不计)。计数走**已借用 guard** 的 live_count_of——
+    /// 再入 live_count/with_view 会同线程二次取 holder 读锁,写者排队时 macOS
+    /// pthread_rwlock 判 EDEADLK → panic + 锁中毒(stop 响应丢失)。突变
+    /// 「Shared 分支改回经 with_view 再入取数」在写者排队场景即触发该缺陷,
+    /// 本测以 data_dir 缺席 + 计数契约双钉收口。
+    #[test]
+    fn persist_final_shared_state_reports_live_count_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"").unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("a.txt", root, false);
+        let b = idx.insert("b.txt", root, false);
+        idx.remove(b); // 一条墓碑:活条目统计必须剔除
+        let idx_file = data.path().join("index.bin");
+        let layout = persist::EntryLayout::of(&idx);
+        persist::write_atomic(
+            &layout,
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write().unwrap() =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        // data_dir 指向不存在目录:Shared 分支不得尝试写(写即失败 ok=false)
+        let paths = DaemonPaths {
+            data_dir: data.path().join("absent"),
+        };
+        let (ok, n) = persist_final(&state, &paths);
+        assert!(ok, "Shared 态不重写,盘上索引即当前状态");
+        assert_eq!(n, 2, "根 + a.txt;墓碑 b 不计");
+    }
+
+    /// stop 与在途写者并发:persist_final 等写者完成后如实统计(正常阻塞语义),
+    /// 不 panic、不死锁。EDEADLK 再入缺陷已由「已借用 guard 计数」从结构上消除。
+    #[test]
+    fn persist_final_completes_under_pending_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("a.txt", root, false);
+        let idx_file = data.path().join("index.bin");
+        let layout = persist::EntryLayout::of(&idx);
+        persist::write_atomic(
+            &layout,
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write().unwrap() =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        let st = state.clone();
+        let writer = std::thread::spawn(move || {
+            let _g = st.holder.write().unwrap(); // 短暂持写后释放
+        });
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let paths = DaemonPaths {
+            data_dir: data.path().join("absent"),
+        };
+        let (ok, n) = persist_final(&state, &paths);
+        writer.join().unwrap();
+        assert!(ok);
+        assert_eq!(n, 2, "根 + a.txt");
     }
 
     /// 水位的核心不变量钉:applied 只在 diff 完成后推进,「已收未应用」不得计入。
