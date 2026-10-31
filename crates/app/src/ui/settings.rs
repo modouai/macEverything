@@ -989,6 +989,8 @@ impl SettingsData {
 /// 设置视口 pass（deferred 回调）。
 pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
+    // 空闲判定采样(设置视口输入;三视口共用同一口径,见 ui/idle.rs)。
+    crate::ui::idle::note_viewport_activity(&ctx);
     let now = Instant::now();
 
     // 关闭=隐藏：红点（close_requested）与 ⌘W 同一路径。子视口须自行消费关闭请求

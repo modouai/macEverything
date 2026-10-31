@@ -122,6 +122,9 @@ raw-window-handle = "0.6"
 # 注意 crate 文档:macOS 上 manager 必须在主线程创建,且需主线程事件循环在跑
 # (eframe 的 NSApplication::run 即此循环;事件泵细节见 src/hotkey.rs 模块注释)。
 global-hotkey = { version = "0.6", features = ["serde"] }
+# 系统 UI 字体(SF Pro/SF Mono)只读 mmap 载入(堆粗查易修项:替代 fs::read 的
+# ~8MB 堆拷贝;版本随 engine 已入锁文件)。
+memmap2.workspace = true
 # Task 21:热键动作「主队列直调」(`DispatchQueue::main().exec_async`,不等被节流的帧)。
 # 版本与 PoC-4(scripts/poc/poc4_idle)实锁一致;macOS SDK 的 dispatch_get_main_queue
 # 已内联为全局量,直接声明符号会链接失败,故走该 crate(其实现即 `&_dispatch_main_q`)。
@@ -144,3 +147,6 @@ tray-icon = { version = "0.26.1", default-features = false }
 [dev-dependencies]
 # 设置持久化单测用独立临时目录(与 engine/client/cli 同版本)。
 tempfile = "3"
+# CJK 字体注入的 footprint 对比采样(#[ignore] 测试):复现 eframe 同款
+# fontique 系统回退慢路径(tech.md §6.2.1 归因);生产路径不直接依赖它。
+egui_system_font_provider = "0.37"

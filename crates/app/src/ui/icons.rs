@@ -12,9 +12,9 @@
 //!   `com.apple.application-bundle`)。
 //! - **自定义图标**:用户给单个文件设过自定义图标时只能按路径取。路径检查结果
 //!   (`Some` 纹理 / `None` = 无自定义或读取失败)跨帧保留;在途路径去重,不重复
-//!   请求;`reset` 与 2048 条上限会清掉 `None`/最早条目。
-//!   已知取舍:`Some` 纹理**不复查**源图标之后的移除/修改——一直保留到 2048 条
-//!   上限淘汰或重启。可接受为性能取舍(每次查询不重复读资源属性)。
+//!   请求;`reset` 与容量上限会清掉 `None`/最久未用条目。
+//!   已知取舍:`Some` 纹理**不复查**源图标之后的移除/修改——一直保留到容量
+//!   淘汰或重启。可接受为性能取舍(每次查询不重复读资源属性)。
 //!
 //! ## 线程模型(为什么 AppKit 可在工作线程调用)
 //!
@@ -50,8 +50,9 @@ const UPLOAD_BUDGET: usize = 8;
 const RESPONSE_POLL: Duration = Duration::from_millis(16);
 /// 在途请求超时(持续无任何响应):防止 worker 卡死时永久 60fps 轮询。
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
-/// 路径图标缓存上限(含自定义图标);超出按插入序淘汰最早。
-const MAX_PATH_ICONS: usize = 2048;
+/// 路径图标缓存上限(含自定义图标;内存规格 tech.md §6.2.3:2048→128 LRU,
+/// 上界 64×64×4×128 ≈ 2MB,对照原 2048 条 ≈ 32MB)。超出按**最久未用**淘汰。
+const MAX_PATH_ICONS: usize = 128;
 
 /// 目录的类型分组键(与扩展名分组键空间隔离,避免文件扩展名撞键)。
 const KEY_FOLDER: &str = "type:folder";
@@ -89,9 +90,10 @@ pub struct IconCache {
     type_icons: HashMap<String, egui::TextureHandle>,
     /// 取图失败的类型(UTI):不再重试,直接落兜底。
     failed_types: HashSet<String>,
-    /// 路径 → 自定义图标;`None` = 无自定义或读取失败(均永久缓存到 reset/上限)。
+    /// 路径 → 自定义图标;`None` = 无自定义或读取失败(均保留到 reset/上限)。
     path_icons: HashMap<String, Option<egui::TextureHandle>>,
-    /// 路径插入顺序(上限淘汰用;与 `path_icons` 同步维护)。
+    /// 路径 LRU 序(头 = 最久未用,尾 = 最近使用;命中/覆盖即移尾;
+    /// 上限淘汰从头取。与 `path_icons` 同步维护)。
     path_order: VecDeque<String>,
     /// 在途类型请求(UTI);同一 UTI 不重复发请求。
     pending_types: HashSet<String>,
@@ -214,23 +216,37 @@ impl IconCache {
     /// 通用 APP 图标,不是文件夹图标)。
     pub fn icon(&mut self, ctx: &egui::Context, entry: &HitEntry) -> Option<egui::TextureId> {
         if is_app_bundle(&entry.name, entry.is_dir) {
-            match self.path_icons.get(&entry.path) {
-                Some(Some(tex)) => return Some(tex.id()),
-                Some(None) => {} // 取图失败 → 通用 APP 类型图标兜底
-                None => {
-                    self.request_app(ctx, &entry.path);
+            if self.path_icons.contains_key(&entry.path) {
+                self.touch(&entry.path);
+                if let Some(Some(tex)) = self.path_icons.get(&entry.path) {
+                    return Some(tex.id());
                 }
+                // 取图失败 → 通用 APP 类型图标兜底
+            } else {
+                self.request_app(ctx, &entry.path);
             }
             return self.type_icon(ctx, &entry.name, entry.is_dir);
         }
-        match self.path_icons.get(&entry.path) {
-            Some(Some(tex)) => return Some(tex.id()),
-            Some(None) => {} // 已查无自定义图标 → 类型图标
-            None => {
-                self.request_path(ctx, &entry.path);
+        if self.path_icons.contains_key(&entry.path) {
+            self.touch(&entry.path);
+            if let Some(Some(tex)) = self.path_icons.get(&entry.path) {
+                return Some(tex.id());
             }
+            // 已查无自定义图标 → 类型图标
+        } else {
+            self.request_path(ctx, &entry.path);
         }
         self.type_icon(ctx, &entry.name, entry.is_dir)
+    }
+
+    /// LRU 记账:命中的路径移到队尾(最近使用)。
+    ///
+    /// O(容量)线性定位——容量 128,每行图标每帧一次,量级无虞。
+    fn touch(&mut self, path: &str) {
+        if let Some(pos) = self.path_order.iter().position(|p| p == path) {
+            let path = self.path_order.remove(pos).expect("position 有效");
+            self.path_order.push_back(path);
+        }
     }
 
     /// APP bundle 图标请求入队(按路径,与自定义图标检查共用去重/缓存空间);
@@ -387,16 +403,18 @@ impl IconCache {
         }
     }
 
-    /// 记录路径图标结果(含「无自定义/失败」),维护插入序并执行上限淘汰。
+    /// 记录路径图标结果(含「无自定义/失败」),维护 LRU 序并执行上限淘汰。
     fn store_path_icon(&mut self, path: String, icon: Option<egui::TextureHandle>) {
-        if !self.path_icons.contains_key(&path) {
-            self.path_order.push_back(path.clone());
+        if self.path_icons.insert(path.clone(), icon).is_some() {
+            // 覆盖已有条目(理论不可达:在途去重挡住重复请求)按最近使用收尾。
+            self.touch(&path);
+        } else {
+            self.path_order.push_back(path);
         }
-        self.path_icons.insert(path, icon);
         self.trim_path_icons();
     }
 
-    /// 路径缓存超上限时按插入序淘汰最早条目。
+    /// 路径缓存超上限时按 LRU 淘汰最久未用条目。
     fn trim_path_icons(&mut self) {
         while self.path_icons.len() > MAX_PATH_ICONS {
             let victim = self.path_order.pop_front().or_else(|| {
@@ -411,7 +429,7 @@ impl IconCache {
     }
 
     /// 每次唤起/复位时调用:清掉「无自定义/读取失败」的路径条目(它们只对上次
-    /// 结果集有意义),自定义图标纹理保留;仍超上限则按插入序淘汰最早。
+    /// 结果集有意义),自定义图标纹理保留;仍超上限则按 LRU 淘汰最久未用。
     pub fn on_reset(&mut self) {
         self.path_icons.retain(|_, icon| icon.is_some());
         let existing: HashSet<String> = self.path_icons.keys().cloned().collect();
@@ -1034,7 +1052,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS, "路径缓存上限 2048");
+        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS, "路径缓存上限 128");
         assert!(!cache.path_icons.contains_key("/tmp/mce-icon-test/cap-0"));
         assert!(!cache.path_icons.contains_key("/tmp/mce-icon-test/cap-1"));
 
@@ -1057,6 +1075,109 @@ mod tests {
         );
         assert_eq!(cache.path_icons[custom].as_ref().unwrap().id(), custom_id);
         assert_eq!(cache.path_order.len(), 1);
+    }
+
+    /// 突变钉:容量常量必须是 128(内存规格 tech.md §6.2.3;若有人调回大容量,
+    /// 此测先红,提示去规格处重新定线)。
+    #[test]
+    fn path_icon_capacity_is_pinned_to_spec() {
+        assert_eq!(MAX_PATH_ICONS, 128);
+    }
+
+    /// LRU 语义:命中把条目移到队尾;淘汰从头取最久未用——最旧但刚被命中的
+    /// 条目必须存活,淘汰的是「没人再看」的第二旧条目。突变(命中不 touch,
+    /// 退回 FIFO)时 lru-0 被淘汰、lru-1 存活,本测双断言皆红。
+    #[test]
+    fn path_icon_cache_evicts_least_recently_used() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
+        let path = |i: usize| format!("/tmp/mce-icon-test/lru-{i}");
+        for i in 0..MAX_PATH_ICONS {
+            cache.apply_response(
+                &ctx,
+                IconResponse::Path {
+                    path: path(i),
+                    rgba: None,
+                },
+            );
+        }
+        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS);
+
+        // 命中最旧的 lru-0(icon() 走缓存命中分支并 touch)。
+        let mut entry = hit("lru-0");
+        entry.path = path(0);
+        let _ = cache.icon(&ctx, &entry);
+        // LRU 序:头应是 lru-1(lru-0 已被移到队尾)。
+        assert_eq!(
+            cache.path_order.front().map(String::as_str),
+            Some(path(1).as_str()),
+            "命中后最久未用应是 lru-1"
+        );
+
+        // 再进 2 条:挤掉 lru-1、lru-2,lru-0(最旧但刚用过)必须存活。
+        for i in (MAX_PATH_ICONS)..(MAX_PATH_ICONS + 2) {
+            cache.apply_response(
+                &ctx,
+                IconResponse::Path {
+                    path: path(i),
+                    rgba: None,
+                },
+            );
+        }
+        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS, "硬上限不变");
+        assert!(cache.path_icons.contains_key(&path(0)), "刚命中的条目存活");
+        assert!(
+            !cache.path_icons.contains_key(&path(1)),
+            "最久未用的 lru-1 被淘汰"
+        );
+        assert!(
+            !cache.path_icons.contains_key(&path(2)),
+            "次旧的 lru-2 被淘汰"
+        );
+        assert!(
+            cache.path_icons.contains_key(&path(3)),
+            "更晚插入且未命中的 lru-3 存活"
+        );
+    }
+
+    /// 命中「无自定义/读取失败」条目同样刷新 LRU(它们也是缓存条目,
+    /// 不刷新会在长会话里被误淘汰,导致同路径反复发 AppKit 检查)。
+    #[test]
+    fn touching_failed_path_entries_refreshes_recency() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
+        let path = |i: usize| format!("/tmp/mce-icon-test/fail-{i}");
+        for i in 0..MAX_PATH_ICONS {
+            cache.apply_response(
+                &ctx,
+                IconResponse::Path {
+                    path: path(i),
+                    rgba: None,
+                },
+            );
+        }
+        let mut entry = hit("fail-0");
+        entry.path = path(0);
+        let _ = cache.icon(&ctx, &entry);
+
+        // 再进 1 条:挤掉新的最久未用 lru-1;刚被命中(虽是「无自定义」)的
+        // lru-0 必须存活——否则下帧同路径又要发一次 AppKit 检查。
+        cache.apply_response(
+            &ctx,
+            IconResponse::Path {
+                path: path(MAX_PATH_ICONS),
+                rgba: None,
+            },
+        );
+        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS);
+        assert!(
+            cache.path_icons.contains_key(&path(0)),
+            "命中的失败条目按 LRU 存活"
+        );
+        assert!(
+            !cache.path_icons.contains_key(&path(1)),
+            "淘汰的是未命中的 lru-1"
+        );
     }
 
     #[cfg(target_os = "macos")]

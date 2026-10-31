@@ -52,22 +52,26 @@
 //! 全隐藏期不排帧(隐藏态 CPU 0% 红线);唤起时 `ThemeFollow::check_now_with`
 //! 立即应用锁外探测到的外观。
 //!
-//! 中文字体(2026-10-16 调查结论,不显式加载字体文件):
-//! ① 苹方已无稳定路径——macOS 26 起移入 AssetsV2 哈希目录,本机实测
-//!    `/System/Library/Fonts/PingFang.ttc` 不存在;
-//! ② 稳定路径备选均为 .ttc 集合且 face 0 不是简体面(PingFang.ttc face0=HK、
-//!    STHeiti Light.ttc face0=TC,fontTools 实查)——静默 pin index 0 会把简体
-//!    用户引向错字形面;按名取面须自解析 name 表,成本/风险不划算;
-//! ③ 系统回退已给出期望字体:CoreText(zh_CN 语境)对汉字回退即
-//!    PingFangSC-Regular(`CTFontCreateForString` 探针实测);egui `system_fonts`
-//!    的 fontique 走同一系统回退源。
-//! 回退链(现状,实测生效):egui 默认字体(拉丁/图标)→ FontProvider 按缺失字形
-//! 逐簇查系统字体(zh 语境 → 苹方;韩文 → AppleSDGothicNeo;emoji → Apple Color Emoji)。
-//! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
+//! 中文字体(2026-11-01 定案,推翻 2026-10-16「不显式加载」的旧结论):
+//! 旧方案让中文走 `system_fonts` 的系统回退。内存归因(tech.md §6.3)证实该
+//! 回退是 4.3GB 峰值的真凶:fontique 慢路径单次 `Query::matches` 分配 191MB×3、
+//! 苹方 ttc 整块载入 76MB×2,galley 缓存 miss 反复触发后 mmap 大块滞留。
+//! 现方案:**内置 Noto Sans SC Regular**(OFL 1.1,`assets/fonts/`)经
+//! `FontInsert` 注入 Proportional 与 Monospace,中文字形直接命中,回退路径
+//! 对常用汉字不再触发(韩文/生僻字形/彩色 emoji 仍走系统回退兜底)。
+//! 当年的两条理由已失效:① egui 0.37 已换 skrifa 解析(支持单文件 CFF/OTF,
+//! 不再限于 ab_glyph),且我们不再依赖系统字体路径(macOS 26 把苹方挪进
+//! AssetsV2 哈希目录、路径不稳定,恰是要绕开的);② 字节进二进制只读段、
+//! `FontData::from_static` 零拷贝,内存成本是图集字形(≤64MB 上限,见
+//! `MAX_ATLAS_TEXTURE_SIDE`)而非 191MB 级回退分配。
+//! 运行期实际命中的回退字体仍在 `ui()` 留痕一次(`discovered_fonts`)。
+//! 正常形态:命中列表只应出现**小体量**的符号/其他文种字体(实测 STIX Two
+//! Math 一枚);再见到苹方等 CJK 大字体即说明汉字落回了慢路径,按回归处理。
 
 pub mod font;
 pub mod hotkey_keys;
 pub mod icons;
+pub mod idle;
 pub mod mascot;
 pub mod menu_actions;
 pub mod palette;
@@ -98,14 +102,29 @@ use crate::update;
 use crate::update::UpdatePhase;
 use crate::window_state::{self, SizeUpdate, WindowSize, WindowSizeTracker};
 
-/// 系统 CJK 字体候选路径(探测用;结论见模块注释「中文字体」)。
+/// 系统 CJK 字体候选路径(探测留痕:回退真的触发时,来源会落在这些系统字体;
+/// 结论见模块注释「中文字体」)。
 const CJK_FONT_CANDIDATES: [&str; 2] = [
     "/System/Library/Fonts/PingFang.ttc", // 苹方(macOS ≤ 15 路径)
     "/System/Library/Fonts/STHeiti Light.ttc", // 黑体(旧备选)
 ];
 
-/// macOS 原生 UI 字体：拉丁优先 SF Pro / SF Mono；CJK 缺失字形仍由
-/// `system_fonts` 的 CoreText 回退（苹方/AppleSDGothicNeo 等）。
+/// 内置 CJK 字体(Noto Sans SC Regular,SIL OFL 1.1;`assets/fonts/`,许可证
+/// `assets/fonts/OFL.txt` 随字体分发)。字形覆盖:BMP CJK 统一表意文字
+/// 20,976 字(≈全集)+ 假名 + 全角标点,文件名层面的汉字全覆盖;韩文等
+/// 未覆盖字形仍由 `system_fonts` 回退兜底。
+///
+/// 字节经 `include_bytes!` 进二进制只读段,`FontData::from_static` 零拷贝借用
+/// ——载入不产生堆分配,常驻为 clean file-backed 页(不计 phys_footprint)。
+const CJK_FONT_BYTES: &[u8] = include_bytes!("../../../../assets/fonts/NotoSansSC-Regular.otf");
+/// 内置 CJK 字体的注册名(`FontDefinitions::families` 表中的键;测试钉住)。
+const CJK_FONT_NAME: &str = "Noto Sans SC";
+/// 诊断开关:置位后不注入内置 CJK 字体,中文回到系统回退慢路径——仅供
+/// footprint A/B 对比与排障(归因复现);生产不设置。
+const CJK_FONT_DISABLE_ENV: &str = "MCE_NO_CJK_FONT";
+
+/// macOS 原生 UI 字体：拉丁优先 SF Pro / SF Mono；CJK 由内置 Noto Sans SC
+/// 覆盖，其外字形（韩文/生僻字/彩色 emoji）仍由 `system_fonts` 回退。
 const SYSTEM_UI_FONT_SPECS: [(&str, &str, egui::FontFamily); 2] = [
     (
         "SF Pro",
@@ -118,6 +137,34 @@ const SYSTEM_UI_FONT_SPECS: [(&str, &str, egui::FontFamily); 2] = [
         egui::FontFamily::Monospace,
     ),
 ];
+
+/// 字形图集纹理边长上限(内存规格 tech.md §6.2.4,防扩散封顶)。
+///
+/// epaint 图集宽度 = `max_texture_side`(eframe 每帧从 GL_MAX_TEXTURE_SIZE
+/// 塞进 RawInput,本机 8192),高度按倍增涨到与宽度同值,单块满图 8192² RGBA
+/// ≈ 256MB;收到 4096 后上界 64MB。egui 对该值无公开配置面——style 里
+/// `visuals.text_options.max_texture_side` 每帧被输入值覆盖(`update_fonts_mut`),
+/// 唯一收口点是 [`egui::Plugin::input_hook`](输入处理前改 RawInput)。
+const MAX_ATLAS_TEXTURE_SIDE: usize = 4096;
+
+/// 纯函数:把渲染端提供的纹理边长向下收口;`None`(后端未报)不放大,交回
+/// egui 自己的缺省(2048)。
+fn clamp_texture_side(side: Option<usize>) -> Option<usize> {
+    side.map(|s| s.min(MAX_ATLAS_TEXTURE_SIDE))
+}
+
+/// 图集边长收口插件(`install_atlas_cap` 注册;每 pass 输入处理前生效)。
+struct AtlasSideCap;
+
+impl egui::Plugin for AtlasSideCap {
+    fn debug_name(&self) -> &'static str {
+        "atlas-side-cap"
+    }
+
+    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        input.max_texture_side = clamp_texture_side(input.max_texture_side);
+    }
+}
 
 /// 首帧接线轮询上限(悬浮条视口窗创建于注册 pass 之后,补丁须下一帧才找得到;
 /// 上限防「窗口永不出现」时无限排帧烧 CPU)。
@@ -137,29 +184,94 @@ fn probe_fonts() {
     }
 }
 
-/// 安装 macOS 原生 UI 字体（拉丁主字体）。
+/// 安装 UI 字体:内置 CJK 覆盖字体(Proportional + Monospace)+ macOS 原生
+/// 拉丁字体(SF Pro / SF Mono)。
 ///
-/// 只把 SF Pro / SF Mono 放到对应 family 的**首位**，保留 egui 默认字体与
-/// system_fonts 回退链；中文等 CJK 字形仍由 CoreText 回退到苹方。
-fn install_system_ui_fonts(ctx: &egui::Context) {
+/// 优先级都用 `FontPriority::Highest`,但 egui 的 Highest = 插到 family 表
+/// **下标 0**——后插入者排前。故先装 CJK 再装拉丁,得到「拉丁 → SF Pro、
+/// 中文 → Noto Sans SC」:Noto Sans SC 自带拉丁字形,若它排前,英文也会被
+/// 换成 Noto 字形,观感回退。egui 逐字符按 family 序取首个含该字形的字体,
+/// 中文命中内置后即不再落到 system_fonts 回退(内存规格 tech.md §6.2.1 主修复)。
+fn install_ui_fonts(ctx: &egui::Context, install_cjk: bool) {
+    if install_cjk {
+        ctx.add_font(egui::FontInsert::new(
+            CJK_FONT_NAME,
+            egui::FontData::from_static(CJK_FONT_BYTES),
+            vec![
+                egui::InsertFontFamily {
+                    family: egui::FontFamily::Proportional,
+                    priority: egui::FontPriority::Highest,
+                },
+                egui::InsertFontFamily {
+                    family: egui::FontFamily::Monospace,
+                    priority: egui::FontPriority::Highest,
+                },
+            ],
+        ));
+        log::info!(
+            "内置 CJK 字体已注册:{CJK_FONT_NAME}({} KB)",
+            CJK_FONT_BYTES.len() / 1024
+        );
+    }
     for (name, path, family) in SYSTEM_UI_FONT_SPECS {
-        match std::fs::read(path) {
-            Ok(bytes) => {
+        match mapped_font_data(path) {
+            Ok(data) => {
+                let bytes = data.0.as_ref().len();
                 ctx.add_font(egui::FontInsert::new(
                     name,
-                    egui::FontData::from_owned(bytes),
+                    egui::FontData::from_blob(std::sync::Arc::new(data), 0),
                     vec![egui::InsertFontFamily {
                         family,
                         priority: egui::FontPriority::Highest,
                     }],
                 ));
-                log::info!("系统 UI 字体已加载:{name}({path})");
+                log::info!("系统 UI 字体已加载:{name}({path},{bytes} 字节,mmap 只读)");
             }
             Err(err) => {
                 log::warn!("系统 UI 字体加载失败({path}),保留 egui 默认字体: {err}");
             }
         }
     }
+}
+
+/// 只读 mmap 的字体文件(`FontData::from_blob` 的 Blob 载体)。
+///
+/// 堆粗查易修项(tech.md §6.2.5):原实现 `std::fs::read` + `from_owned` 把
+/// SFNS.ttf/SFNSMono.ttf 各 ~4MB 拷进堆并终身持有(实测 Malloc 大块 7.7MB);
+/// mmap 后为 clean file-backed 页,不计 phys_footprint,也没有堆拷贝。
+struct MappedFont(memmap2::Mmap);
+
+impl AsRef<[u8]> for MappedFont {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+/// 只读映射系统字体文件。
+///
+/// SAFETY:常规文件的只读映射,无写共享面;映射由 `MappedFont` 持有保活,
+/// 生命周期与 `FontData` 一致。文件被系统替换时 mmap 语义仍是读到一致内容
+/// (私有的已映射快照),不存在悬垂。
+fn mapped_font_data(path: &str) -> std::io::Result<MappedFont> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY:见函数注释。
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(MappedFont(mmap))
+}
+
+/// 生产入口:诊断开关 [`CJK_FONT_DISABLE_ENV`] 置位时跳过 CJK 注入
+/// (footprint A/B 对比、归因复现用)。
+fn install_system_ui_fonts(ctx: &egui::Context) {
+    let install_cjk = std::env::var_os(CJK_FONT_DISABLE_ENV).is_none();
+    if !install_cjk {
+        log::info!("{CJK_FONT_DISABLE_ENV} 置位:不注入内置 CJK 字体,中文走系统回退");
+    }
+    install_ui_fonts(ctx, install_cjk);
+}
+
+/// 注册图集边长收口插件(见 [`MAX_ATLAS_TEXTURE_SIDE`])。
+fn install_atlas_cap(ctx: &egui::Context) {
+    ctx.add_plugin(AtlasSideCap);
 }
 
 /// 悬浮条视口 id(注册与命令定向同一处,勿散落)。
@@ -494,8 +606,13 @@ impl App {
         tray: Option<tray::TrayRuntime>,
     ) -> Self {
         probe_fonts();
-        // 拉丁主字体用 macOS 原生 SF Pro / SF Mono；CJK 仍走系统回退。
+        // 图集边长收口(防扩散;须在可能触发排版的首帧前注册)。
+        install_atlas_cap(&cc.egui_ctx);
+        // 拉丁主字体用 macOS 原生 SF Pro / SF Mono,中文用内置 Noto Sans SC
+        // (消灭 system_fonts 回退慢路径;诊断开关见 CJK_FONT_DISABLE_ENV)。
         install_system_ui_fonts(&cc.egui_ctx);
+        // 空闲死页归还看门狗(输入静默 60s 后归还 Malloc Large 滞留脏页)。
+        idle::spawn_watchdog();
         // 全局字号倍率先于基准安装（设置 · 字号：只缩放文字，几何尺寸不变）。
         font::set_scale(settings_file.font_size.scale());
         // 字号基准(全局长大两号);悬浮条另有更细的字号档(ui/palette.rs 常量)。
@@ -1086,6 +1203,9 @@ fn hotkey_frame_events(
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 空闲判定采样(根视口输入;悬浮条/设置在各自绘制入口采样)。
+        idle::note_viewport_activity(ctx);
+
         // 首帧纠偏(产品形态:三窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
         // eframe 0.37 在首帧 post_rendering 里**无条件** `set_visible(true)`
         //(`native/epi_integration.rs:443-450`,白闪修复;`create_glutin_windowed_context`
@@ -1323,6 +1443,8 @@ impl eframe::App for App {
 /// 悬浮条视口的绘制回调(deferred:自己的 pass 内运行,含 tick/主题/动作落地)。
 fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
+    // 空闲判定采样(悬浮条视口输入;常驻交互频繁,空闲口径见 idle 模块注释)。
+    idle::note_viewport_activity(&ctx);
     let now = Instant::now();
     let mut s = match shared.lock() {
         Ok(g) => g,
@@ -1478,7 +1600,7 @@ mod tests {
     }
 
     /// macOS 原生拉丁字体：SF Pro / SF Mono 必须排在 family 首位，且能实际排版
-    /// （中文仍由 system_fonts 回退，不要求出现在定义表里）。
+    /// （中文由内置 Noto Sans SC 覆盖，见 cjk 字体专项测试）。
     #[cfg(target_os = "macos")]
     #[test]
     fn system_ui_fonts_are_primary_and_rasterize() {
@@ -1498,7 +1620,7 @@ mod tests {
         };
         let mut out = ctx.run_ui(input(), |_ui| {});
         out.textures_delta.clear();
-        install_system_ui_fonts(&ctx);
+        install_ui_fonts(&ctx, true);
         let mut out = ctx.run_ui(input(), |_ui| {});
         out.textures_delta.clear();
 
@@ -1520,6 +1642,281 @@ mod tests {
             );
         }
         assert!(galley.size().x > 0.0, "SF Pro 排版失败（空 galley）");
+    }
+
+    /// 生成一批覆盖常用汉字的「文件名」行(去重,gallery 缓存必 miss,
+    /// 模拟结果窗口滚动逐行布局的真实形态)。
+    fn cjk_result_rows(n: usize) -> Vec<String> {
+        const CHARSET: [char; 47] = [
+            '项', '目', '文', '件', '夹', '报', '告', '终', '稿', '会', '议', '纪', '要', '设',
+            '计', '图', '纸', '数', '据', '备', '份', '照', '片', '视', '频', '音', '乐', '系',
+            '统', '日', '志', '配', '置', '用', '户', '下', '载', '客', '户', '端', '服', '务',
+            '器', '端', '口', '密', '码',
+        ];
+        (0..n)
+            .map(|i| {
+                let a = CHARSET[i % CHARSET.len()];
+                let b = CHARSET[(i * 7 + 3) % CHARSET.len()];
+                let c = CHARSET[(i * 13 + 11) % CHARSET.len()];
+                format!("{a}{b}{c}_报告_Q{i}.docx")
+            })
+            .collect()
+    }
+
+    /// 测试替身:统计系统回退被询问的次数(恒返回 None → 缺字形画豆腐块,
+    /// 但「有没有问」正是我们要测的信号,且不依赖本机装了什么字体)。
+    #[derive(Default)]
+    struct CountingProvider(std::sync::atomic::AtomicUsize);
+
+    impl egui::epaint::text::FontProvider for CountingProvider {
+        fn font_for(
+            &self,
+            _request: &egui::epaint::text::FallbackRequest<'_>,
+        ) -> Option<egui::FontInsert> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+
+    fn probe_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn run_layout_pass(ctx: &egui::Context, rows: &[String]) {
+        let mut out = ctx.run_ui(probe_input(), |ui| {
+            for row in rows {
+                ui.label(row.as_str());
+            }
+        });
+        out.textures_delta.clear();
+    }
+
+    /// 主修复钉(tech.md §6.2.1):内置 CJK 字体排在 SF Pro 之后、family 表可见,
+    /// 常用汉字全部由已装字体解析(has_glyph 经 family 链查)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn builtin_cjk_font_is_installed_and_covers_han() {
+        assert!(
+            CJK_FONT_BYTES.len() > 1_000_000,
+            "内置字体字节数异常({}),疑似资源缺失",
+            CJK_FONT_BYTES.len()
+        );
+        let ctx = egui::Context::default();
+        install_ui_fonts(&ctx, true);
+        let mut out = ctx.run_ui(probe_input(), |_ui| {});
+        out.textures_delta.clear();
+
+        let families = ctx.fonts(|f| f.definitions().families.clone());
+        // Highest 插 0,后插者排前:各 family 前两位应为「拉丁 + 内置 CJK」。
+        for (family, latin) in [
+            (egui::FontFamily::Proportional, "SF Pro"),
+            (egui::FontFamily::Monospace, "SF Mono"),
+        ] {
+            let list = families.get(&family).expect("family 表缺失");
+            assert_eq!(
+                &list[0..2],
+                &[latin, CJK_FONT_NAME],
+                "{family:?} 前两位应为「{latin} + 内置 CJK」,实际 {list:?}"
+            );
+        }
+        // 文件名层面会出现的字形全部命中已装字体(含全角标点与中文括号)。
+        let sample = "项目文件报告终稿.docx……《会议》纪要！（数据）备份～v2";
+        ctx.fonts_mut(|f| {
+            assert!(
+                f.has_glyphs(&egui::FontId::proportional(15.0), sample),
+                "常用汉字应全部由已装字体覆盖:{sample}"
+            );
+            assert!(
+                f.has_glyphs(&egui::FontId::monospace(13.0), "中文路径/日志_备份"),
+                "Monospace family 同样要有 CJK 覆盖"
+            );
+        });
+    }
+
+    /// 主修复反证:注入内置 CJK 后,布局一批中文行**不得**询问系统回退
+    /// (fontique 慢路径的入口即 `FontProvider::font_for`;归因实测该路径单次
+    /// 分配 191MB)。`discovered_fonts` 为空是 egui 侧的同义证据:回退命中过
+    /// 的字体都会登记在那里。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cjk_layout_never_consults_font_provider() {
+        let ctx = egui::Context::default();
+        let provider = std::sync::Arc::new(CountingProvider::default());
+        ctx.add_font_provider(std::sync::Arc::clone(&provider) as _);
+        install_ui_fonts(&ctx, true);
+        // 字体经 add_font 排队,首个 pass 应用;之后分批布局不同中文行
+        // (逐行去重,galley 缓存 miss,等价结果窗口滚动)。
+        run_layout_pass(&ctx, &[]);
+        let rows = cjk_result_rows(300);
+        for chunk in rows.chunks(64) {
+            run_layout_pass(&ctx, chunk);
+        }
+
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "中文布局不得触发系统回退询问"
+        );
+        assert!(
+            ctx.fonts(|f| f.discovered_fonts().is_empty()),
+            "回退命中过的字体不得出现在 discovered_fonts"
+        );
+    }
+
+    /// 突变验证:同一布局,不注入内置 CJK(等价 `MCE_NO_CJK_FONT` 生效的旧行为)
+    /// 时,回退**必须**被询问——证明上一条测试的断言真的拦在慢路径上,而非恒绿。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn without_builtin_cjk_the_provider_is_consulted() {
+        let ctx = egui::Context::default();
+        let provider = std::sync::Arc::new(CountingProvider::default());
+        ctx.add_font_provider(std::sync::Arc::clone(&provider) as _);
+        install_ui_fonts(&ctx, false);
+        run_layout_pass(&ctx, &[]);
+        run_layout_pass(&ctx, &cjk_result_rows(64));
+
+        assert!(
+            provider.0.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "无内置 CJK 时,汉字布局应触发回退询问(旧行为,须保持可见)"
+        );
+    }
+
+    /// 系统 UI 字体走只读 mmap(堆粗查易修项 §6.2.5):映射字节与文件一致、
+    /// 带有效字体魔数;突变(退回 fs::read 拷贝)不经过本函数,由堆采样对账。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_fonts_load_via_readonly_mmap() {
+        for (name, path, _) in SYSTEM_UI_FONT_SPECS {
+            let mapped = mapped_font_data(path).unwrap_or_else(|e| panic!("{name} mmap 失败: {e}"));
+            let bytes = mapped.0.as_ref();
+            let file_len = std::fs::metadata(path).expect("元数据").len();
+            assert_eq!(bytes.len() as u64, file_len, "{name} 映射长度应等于文件");
+            // TrueType sfnt 版本:SFNS.ttf 是 0x00010000(OTTO/CFF 是 "OTTO")。
+            let sfnt = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert!(
+                sfnt == 0x0001_0000 || &bytes[0..4] == b"OTTO",
+                "{name} 首 4 字节应为 sfnt 版本,实际 {sfnt:#010x}"
+            );
+        }
+    }
+
+    /// 图集边长收口(tech.md §6.2.4):插件在输入处理前把 8192 收到 4096;
+    /// egui 由此值定 epaint 图集宽度。
+    #[test]
+    fn atlas_side_cap_clamps_raw_input() {
+        assert_eq!(clamp_texture_side(None), None, "后端未报缺省值,不放大");
+        assert_eq!(clamp_texture_side(Some(2048)), Some(2048), "小值不动");
+        assert_eq!(clamp_texture_side(Some(8192)), Some(4096));
+        assert_eq!(clamp_texture_side(Some(16384)), Some(4096));
+
+        let ctx = egui::Context::default();
+        install_atlas_cap(&ctx);
+        let mut input = probe_input();
+        input.max_texture_side = Some(8192);
+        let mut out = ctx.run_ui(input, |_ui| {});
+        out.textures_delta.clear();
+        assert_eq!(
+            ctx.input(|i| i.max_texture_side),
+            MAX_ATLAS_TEXTURE_SIDE,
+            "插件收口必须先于输入处理生效(本 pass 的图集宽度由此值决定)"
+        );
+    }
+
+    /// footprint 对比采样(`#[ignore]`,手动**一次只跑一条**;两条各自独立进程,
+    /// 互不污染 malloc 状态):
+    /// `cargo test -p macEverything-app -- --ignored --nocapture ignored_cjk_footprint_with_builtin`
+    /// (同法跑 `_without_builtin`)。复现归因操作(结果窗口 + 中文文件名列表
+    /// 滚动):注入侧峰值应停留在百 MB 内;对照侧可见 fontique 慢路径的大块分配。
+    #[cfg(target_os = "macos")]
+    #[ignore = "footprint 采样:手动单跑,输出供规格验收(A6)引用"]
+    #[test]
+    fn ignored_cjk_footprint_with_builtin() {
+        footprint_harness(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[ignore = "footprint 采样:手动单跑,输出供规格验收(A6)引用"]
+    #[test]
+    fn ignored_cjk_footprint_without_builtin() {
+        footprint_harness(false);
+    }
+
+    /// 当前进程 phys_footprint(MB;口径与 scripts/mem-watch.sh 相同)。
+    /// `/usr/bin/footprint -f bytes` 的 `phys_footprint:` 行。
+    #[cfg(target_os = "macos")]
+    fn phys_footprint_mb() -> u64 {
+        let out = std::process::Command::new("/usr/bin/footprint")
+            .args(["-f", "bytes", &std::process::id().to_string()])
+            .output()
+            .expect("运行 /usr/bin/footprint 失败");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("phys_footprint:") {
+                let bytes: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                return bytes / (1024 * 1024);
+            }
+        }
+        0
+    }
+
+    /// 进程生命周期峰值 footprint(MB;同 `footprint` 工具的
+    /// `phys_footprint_peak:` 行,免起 vmmap 附加)。
+    #[cfg(target_os = "macos")]
+    fn lifetime_peak_mb() -> u64 {
+        let out = std::process::Command::new("/usr/bin/footprint")
+            .args(["-f", "bytes", &std::process::id().to_string()])
+            .output()
+            .expect("运行 /usr/bin/footprint 失败");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("phys_footprint_peak:") {
+                let bytes: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                return bytes / (1024 * 1024);
+            }
+        }
+        0
+    }
+
+    #[cfg(target_os = "macos")]
+    #[expect(clippy::print_stderr)]
+    fn footprint_harness(install_cjk: bool) {
+        let started = std::time::Instant::now();
+        let ctx = egui::Context::default();
+        // eframe 同款系统回退(fontique 真慢路径),不是测试替身。
+        ctx.add_font_provider(std::sync::Arc::new(
+            egui_system_font_provider::SystemFontProvider::new(),
+        ));
+        install_ui_fonts(&ctx, install_cjk);
+        run_layout_pass(&ctx, &[]);
+        let rows = cjk_result_rows(2000);
+        for chunk in rows.chunks(64) {
+            run_layout_pass(&ctx, chunk);
+        }
+        let discovered = ctx.fonts(|f| {
+            f.discovered_fonts()
+                .iter()
+                .map(|i| i.name.clone())
+                .collect::<Vec<_>>()
+        });
+        eprintln!(
+            "HARNESS install_cjk={install_cjk} rows={} elapsed={:?} discovered_fonts={discovered:?} phys_footprint={} MB lifetime_peak={} MB",
+            rows.len(),
+            started.elapsed(),
+            phys_footprint_mb(),
+            lifetime_peak_mb(),
+        );
     }
 
     /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。
