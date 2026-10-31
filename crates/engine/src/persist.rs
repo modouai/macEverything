@@ -137,9 +137,6 @@ where
     // 布局对齐硬校验(release 生效,非 debug_assert):失配即拒绝写出——
     // 布局段与条目流不对齐时产物 load 必失败(Truncated),用户侧表现为
     // 无感知的全量重扫,必须在写盘前拦截。
-    // 布局对齐硬校验(release 生效,非 debug_assert):失配即拒绝写出——
-    // 布局段与条目流不对齐时产物 load 必失败(Truncated),用户侧表现为
-    // 无感知的全量重扫,必须在写盘前拦截。
     if layout.path_offsets.len() != n as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

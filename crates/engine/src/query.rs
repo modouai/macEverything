@@ -155,20 +155,17 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // 负载均衡足够;块内串行逐条(条目号 = 块起始号 + 块内下标)。
     const BLOCK: usize = 16 * 1024;
     let segments = view.entry_segments();
-    // 分段稠密性自检(debug):trait 契约要求段序拼满 0..N-1(见
-    // IndexView::entry_segments);违反即 dir_hits/父指针的全局下标访问失去
-    // 意义(稀疏编号越界或错位),测试期先红。最大段末 == 总条目数 ⇔ 无缝覆盖。
-    debug_assert_eq!(
-        segments
-            .iter()
-            .map(|(s, seg)| s + seg.len() as u32)
-            .max()
-            .unwrap_or(0),
-        segments
-            .iter()
-            .map(|(_, seg)| seg.len() as u32)
-            .sum::<u32>(),
-        "entry_segments 必须稠密覆盖条目号空间 0..N-1"
+    // 分段稠密性自检(debug):trait 契约要求段按序无缝拼满 0..N-1(见
+    // IndexView::entry_segments)——首段起于 0,且每段「起始号 + 段长」等于下
+    // 一段起始号;违反即 dir_hits/父指针的全局下标访问失去意义(稀疏编号越界
+    // 或错位),测试期先红。
+    debug_assert!(
+        segments.is_empty()
+            || (segments[0].0 == 0
+                && segments
+                    .windows(2)
+                    .all(|w| w[0].0 + w[0].1.len() as u32 == w[1].0)),
+        "entry_segments 必须按序稠密覆盖条目号空间 0..N-1"
     );
     let mut blocks: Vec<(u32, &[Entry])> = Vec::new();
     for &(start, seg) in &segments {

@@ -1674,10 +1674,11 @@ mod tests {
     /// 写者又等本线程放锁,结构性互等,无调度可解。比 panic 更重:触发线程
     /// 挂死,后续所有读者排队卡死。persist_final 的计数因此必须走已借用 guard
     /// (live_count_of),不得再入 holder 锁。
-    /// 形态:独立线程复现 A 持读 → B 请求写(sleep 50ms 确保入队)→ A 二次读,
-    /// 主测 300ms 未返回即断言(阻塞是结构性的,判定无时间竞争;若平台未来
-    /// 放行同线程递归读,本测变红提示重评 persist_final 再入风险)。
-    /// 注:探测线程组会以挂死状态存活至测试进程退出,无副作用。
+    /// 形态:独立线程复现 A 持读 → B 请求写(sleep 200ms 确保入队)→ A 二次读,
+    /// 主测 300ms 未返回即断言(阻塞是结构性的,判定无时间竞争;若平台放行
+    /// 同线程递归读,探测须先放全部读锁再 join 写者,否则 join 自身永挂、
+    /// 钉失去区分力——本测会变红提示重评 persist_final 再入风险)。
+    /// 注:阻塞平台上探测线程组以挂死状态存活至测试进程退出,无副作用。
     #[test]
     fn holder_reentry_with_queued_writer_is_fatally_blocking() {
         let lock = Arc::new(std::sync::RwLock::new(()));
@@ -1691,9 +1692,10 @@ mod tests {
                         let _w = lock.write().unwrap(); // B 请求写 → 入队阻塞
                     })
                 };
-                std::thread::sleep(std::time::Duration::from_millis(50)); // 确保 B 入队
-                let _g2 = lock.read().unwrap(); // A 二次读 → 阻塞(平台若放行则返回)
+                std::thread::sleep(std::time::Duration::from_millis(200)); // 确保 B 入队
+                let g2 = lock.read().unwrap(); // A 二次读 → 阻塞(平台若放行则返回)
                 drop(g1);
+                drop(g2); // 先放全部读锁再等写者,否则 join 永挂
                 w.join().unwrap();
             })
         };
