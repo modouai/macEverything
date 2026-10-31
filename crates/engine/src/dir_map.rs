@@ -67,6 +67,8 @@ impl DirIndexMap {
     /// 插入/更新:同键覆盖值(池槽与键字节不动);新键入池。
     pub fn insert(&mut self, key: &Path, idx: u32) {
         let bytes = key.as_os_str().as_encoded_bytes();
+        // 空键会与死槽哨兵(空路径)混淆,keys() 会漏掉它——键必为非空绝对路径。
+        debug_assert!(!bytes.is_empty(), "dir_map 键不得为空路径");
         let h = fnv1a64(bytes);
         // 先查既键(共享借用),后动桶与池,避免可变借用交叠。
         if let Some(s) = self.slot_of(h, bytes) {
@@ -141,8 +143,11 @@ impl DirIndexMap {
     /// 从桶中摘槽;桶空则整桶删除。
     fn bucket_evict(&mut self, h: u64, s: u32) {
         let empty = match self.buckets.get_mut(&h) {
-            // One 桶的单槽必是 s(slot_of 在本桶命中)。
-            Some(Bucket::One(_)) => true,
+            // One 桶的单槽必是 s(slot_of 在本桶命中),违约即桶内定位已坏,响亮暴露。
+            Some(Bucket::One(x)) => {
+                debug_assert_eq!(*x, s, "One 桶单槽应为待摘槽");
+                true
+            }
             Some(Bucket::Many(slots)) => {
                 let pos = slots.iter().position(|&x| x == s).expect("待摘槽必在桶内");
                 slots.swap_remove(pos); // 桶内顺序无语义

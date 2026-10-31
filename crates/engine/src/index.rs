@@ -145,6 +145,36 @@ impl Index {
         self.full_path_dyn(idx).into()
     }
 
+    /// 条目完整路径的**原始字节**形态(display 名直接组字节,不经 lossy)。
+    /// 扫描摘除(scanner::remove_prefix)的 victim 匹配用它与调用方前缀(磁盘
+    /// 原始字节)比对——`full_path` 走 `from_utf8_lossy`,非 UTF-8 名称会被替换成
+    /// U+FFFD 而与真实字节错位(dir_map 键保真的前提是全链路原始字节;APFS 拒绝
+    /// 非 UTF-8 名,此差异实际只在 Linux 侧可达)。pub(crate):父链拼接第三形态
+    /// 与 `dir_path_bytes`(match 形态)/`full_path`(lossy display 形态)同处
+    /// 一文件,防「拼接唯此一份」约定漂移。
+    pub(crate) fn full_path_raw_bytes(&self, idx: u32) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        let mut parts: Vec<&[u8]> = Vec::new();
+        let mut cur = idx;
+        loop {
+            let e = &self.entries[cur as usize];
+            parts.push(self.display_name_of(cur));
+            if e.parent == NO_PARENT {
+                break;
+            }
+            cur = e.parent;
+        }
+        parts.reverse();
+        let mut bytes: Vec<u8> = Vec::new();
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                bytes.push(b'/');
+            }
+            bytes.extend_from_slice(p);
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+
     /// 直接子项(活条目)。O(n) 线性扫是已知设计(百万规模单目录 diff ~2-4ms,预算内)。
     pub fn children_of(&self, dir_idx: u32) -> Vec<u32> {
         self.entries

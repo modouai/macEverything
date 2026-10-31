@@ -350,8 +350,9 @@ pub fn apply_records(index: &mut Index, dir_map: &mut DirIndexMap, recs: &[Rec],
 /// 清除以 `prefix` 为路径前缀的整棵子树(卷卸载/ENOENT 摘除,低频)。
 ///
 /// 键 intern 化后 dir_map 无 `starts_with` 遍历能力,受害者在**索引侧**收集
-/// (memory-footprint §4.4):活目录条目按完整路径(原始字节,见 `full_path_raw`)
-/// 前缀匹配,**浅者先**调 `Index::remove`——其子树级联墓碑(「活条目的父必活」
+/// (memory-footprint §4.4):活目录条目按完整路径(原始字节,见
+/// `Index::full_path_raw_bytes`)前缀匹配,**浅者先**调 `Index::remove`——其子树
+/// 级联墓碑(「活条目的父必活」
 /// 不变量)保证后代无遗漏,深键重复删除对墓碑短路,天然幂等。dir_map 清键按值
 /// 谓词清扫:受害者条目此刻全部墓碑,连同历史滞留的「条目已死、键仍在」陈旧键
 /// 一并清除(`DirIndexMap::retain`)。返回清除的活条目数(含目录)。无匹配返回 0
@@ -363,6 +364,8 @@ pub fn apply_records(index: &mut Index, dir_map: &mut DirIndexMap, recs: &[Rec],
 /// 拿 canonical 前缀直接匹配完整路径会整树漏摘。对每个根条目 canonicalize 一次
 /// (根本体在两调用场景都存在:ENOENT 只删子树,卷卸载时卷仍挂载;失败退恒等桥
 /// ——无符号链接根时两形态本就相同),canonical 前缀经桥换算出字面形态一并匹配。
+/// 桥只覆盖**根分量**即充分:中段符号链接目录被 scanner 一律 Skip(classify_entry
+/// 的 symlink 分支)——不入索引、更不会成为 dir_map 键,不存在需要桥接的中间层。
 pub fn remove_prefix(index: &mut Index, dir_map: &mut DirIndexMap, prefix: &Path) -> u32 {
     let before = index.entry_count();
     // 根桥:字面根 → canonical 根。
@@ -372,7 +375,7 @@ pub fn remove_prefix(index: &mut Index, dir_map: &mut DirIndexMap, prefix: &Path
             e.parent == NO_PARENT && e.is_live() && e.is_dir()
         })
         .map(|i| {
-            let literal = full_path_raw(index, i);
+            let literal = index.full_path_raw_bytes(i);
             let canon = literal.canonicalize().unwrap_or_else(|_| literal.clone());
             (literal, canon)
         })
@@ -399,7 +402,7 @@ pub fn remove_prefix(index: &mut Index, dir_map: &mut DirIndexMap, prefix: &Path
             let e = &index.entries[i as usize];
             e.is_live() && e.is_dir()
         })
-        .map(|i| (i, full_path_raw(index, i)))
+        .map(|i| (i, index.full_path_raw_bytes(i)))
         .filter(|(_, p)| prefixes.iter().any(|pre| p.starts_with(pre)))
         .collect();
     // 浅者先:级联墓碑让深键重复删除短路(与旧实现同语义)。
@@ -412,35 +415,11 @@ pub fn remove_prefix(index: &mut Index, dir_map: &mut DirIndexMap, prefix: &Path
     // 安全性由消费点兜住,清扫多清不会错杀:daemon `apply_and_track` 对 get 命中
     // 的键先验 `is_live`,死键只做 map.remove 短路(永不按死条目 diff);compact/
     // 重扫后 `rebuild_dir_map` 整表重建,陈旧键无长期存续形态。
-    dir_map.retain(|v| index.entries[v as usize].is_live());
+    // get(非下标)取值:degrade_and_rescan 替换 holder 与 rebuild_dir_map 之间
+    // 不持锁,本函数可能以「新索引 + 旧 map」进入——旧 map 残留的条目号对新索引
+    // 越界,越界号本就不可能活,清键语义恰好正确,不得 panic。
+    dir_map.retain(|v| index.entries.get(v as usize).is_some_and(|e| e.is_live()));
     before.saturating_sub(index.entry_count())
-}
-
-/// 条目完整路径的原始字节形态(display 名直接组字节,不经 lossy)。victim 匹配
-/// 用它与调用方前缀(磁盘原始字节)比对——`Index::full_path` 走 `from_utf8_lossy`,
-/// 非 UTF-8 名称会被替换成 U+FFFD 而与真实字节错位(dir_map 键保真的前提是全链
-/// 路原始字节;APFS 拒绝非 UTF-8 名,此差异实际只在 Linux 侧可达)。
-fn full_path_raw(index: &Index, idx: u32) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    let mut parts: Vec<&[u8]> = Vec::new();
-    let mut cur = idx;
-    loop {
-        let e = &index.entries[cur as usize];
-        parts.push(index.display_name_of(cur));
-        if e.parent == NO_PARENT {
-            break;
-        }
-        cur = e.parent;
-    }
-    parts.reverse();
-    let mut bytes: Vec<u8> = Vec::new();
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            bytes.push(b'/');
-        }
-        bytes.extend_from_slice(p);
-    }
-    PathBuf::from(std::ffi::OsString::from_vec(bytes))
 }
 
 /// 并行扫描入口(一次性):遍历 → 深度排序 → 聚合。
