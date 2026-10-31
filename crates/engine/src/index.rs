@@ -210,6 +210,26 @@ impl Index {
         }
     }
 
+    /// 重挂父指针(Overlay 桥复用,tech.md §4.2 写侧:子目录先于父被 diff 时,
+    /// 其 anchor 是顶层桥接占位;父层首 diff 复用该桥并挂到真实父 anchor 下,
+    /// 而非新建覆盖——覆盖会让旧桥链成孤儿,见 overlay.rs)。
+    /// **不做路径池级联**:overlay 目录的池段是「合成完整路径」(overlay.rs
+    /// `rewrite_dir_path` 两段拼接 = 链上最高桥的 base 目录路径 + 中间段),把
+    /// 链中段的桥挂到更长链后,最高桥的 base 段与补入的中间段恒等互换
+    /// (两侧同为 match 形态父链拼接),既有池段值不变;查询侧路径按链现算,
+    /// 自动正确。调用方保证:new_parent 为活条目且不在 idx 子树内(当前调用
+    /// 形态:占位桥 parent 从 NO_PARENT 变为真实父 anchor,结构性无环)。
+    pub fn reparent(&mut self, idx: u32, new_parent: u32) {
+        debug_assert_ne!(idx, new_parent, "reparent 不得自挂");
+        debug_assert!(
+            self.entries
+                .get(new_parent as usize)
+                .is_some_and(|e| e.is_live()),
+            "reparent 目标父必须为活条目"
+        );
+        self.entries[idx as usize].parent = new_parent;
+    }
+
     /// 一趟 O(n) 构建 parent -> 活子项邻接表。子树遍历(rebuild/remove)查表取子项,
     /// 总代价 O(n + S),替代逐层全量扫(后者在顶层目录改名时是 O(n×S),击穿写锁红线)。
     fn children_table(&self) -> Vec<Vec<u32>> {

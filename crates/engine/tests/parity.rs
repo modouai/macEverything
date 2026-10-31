@@ -489,3 +489,95 @@ fn parity_overlay_type_flip_and_subtree_removal_zero_diff() {
         "物化与合成视图零差异"
     );
 }
+
+/// 子先父后 + re-diff(评审第四形态「桥覆盖孤儿」对拍):子目录先 diff(桥为
+/// 顶层占位)→ 父层首 diff 必须复用并 re-parent,不得新建覆盖;多轮 re-diff
+/// 恒一份,整树删除后零泄漏。突变「复用/reparent 去掉」时:命中数塌缩/重复
+/// (link 覆盖清扫旧桥 → 数据丢失)与 hit_paths 折叠断言必红。
+#[test]
+fn parity_overlay_child_first_then_parent_zero_diff() {
+    let (t, index) = overlay_fixture();
+    let root = t.path();
+    fs::write(root.join("src/lib/new_deep.txt"), "").unwrap();
+
+    let mut ov = Overlay::new();
+    let src = root.join("src");
+    let lib = root.join("src/lib");
+    // 子先:lib 直接 diff(父 src、祖 root 均从未 diff,桥为顶层占位)
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &lib)),
+        &lib,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    // 祖首:复用 lib 桥并挂到 root 桥下
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, root)),
+        root,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    // 父首:lib 桥从 root 桥下 re-parent 到 src 桥下(链中段挂接)
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    // re-diff 轮次:恒一份、路径不折叠
+    for _ in 0..2 {
+        ov.apply_diff(
+            &index,
+            DiffTarget::Base(find_id(&index, &lib)),
+            &lib,
+            &fixture_excludes(),
+        )
+        .unwrap();
+        ov.apply_diff(
+            &index,
+            DiffTarget::Base(find_id(&index, root)),
+            root,
+            &fixture_excludes(),
+        )
+        .unwrap();
+    }
+    let view = ov.composite_view(&index);
+    let probe =
+        |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+    assert_eq!(probe("whole:deep.txt"), 1, "re-diff 后旧文件恰一份");
+    assert_eq!(probe("whole:new_deep.txt"), 1, "re-diff 后增量恰一份");
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "对拍零差异(重复行会在此处经 total 折叠断言暴露)"
+    );
+
+    // 整树删除 + 父层 diff:零泄漏、物化无幽灵根
+    fs::remove_dir_all(&lib).unwrap();
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    let view = ov.composite_view(&index);
+    let probe =
+        |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+    assert_eq!(probe("whole:deep.txt"), 0, "已删路径不得泄漏");
+    assert_eq!(probe("whole:new_deep.txt"), 0, "已删增量不得泄漏");
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "删除后对拍零差异"
+    );
+    let merged = engine::overlay::materialize_composite(&index, &ov);
+    let merged_paths: BTreeSet<String> = (0..merged.entries.len() as u32)
+        .filter(|&i| merged.entries[i as usize].is_live())
+        .map(|i| merged.full_path(i).to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(merged_paths, overlay_hits(&index, &ov), "物化无幽灵根");
+}

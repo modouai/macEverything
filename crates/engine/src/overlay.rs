@@ -191,21 +191,54 @@ impl Overlay {
                 removed += 1;
             }
             let existing = old.remove(name);
-            let entry = match existing {
+            let existing = match existing {
                 // 存活且类型一致:overlay 条目原位保留(目录子项的桥在下方续接)
-                Some(k) if self.index.entries[k as usize].is_dir() == *is_dir => k,
-                // 新增,或类型翻转(旧条目墓碑 + 新条目入位,与 Index::diff_dir 同语义);
+                Some(k) if self.index.entries[k as usize].is_dir() == *is_dir => Some(k),
+                // 类型翻转:旧条目墓碑 + 桥同步摘除,按下方分支重建;
                 // 计数已按 prior 集完成,此处只落写侧
                 other => {
                     if let Some(k) = other {
                         self.unlink_anchor(k);
                         self.index.remove(k);
                     }
-                    let k = self.index.insert(name, anchor, *is_dir);
-                    if *is_dir {
-                        self.rewrite_dir_path(base, k);
+                    None
+                }
+            };
+            let entry = match existing {
+                Some(k) => k,
+                None if !*is_dir => self.index.insert(name, anchor, false),
+                None => {
+                    // 目录新增前的**桥复用**:同名 base 子目录已有活桥(子目录
+                    // 先于父被 diff 时,其 anchor 是顶层桥接占位、不在本 anchor
+                    // 的子项集里)——复用并 re-parent 到当前 anchor,而非新建。
+                    // 新建 + link 覆盖会让旧桥链变孤儿:其下真实 overlay 子树
+                    // 仍活仍命中(同路径重复结果行),re-diff 每轮复制一份
+                    // (无界增长),删除方向 sweep 按 anchors 键摘不到旧桥
+                    // (anchor_base 残留),物化时幽灵根腐化落盘。
+                    let reused = base_children
+                        .get(name)
+                        .copied()
+                        .filter(|&b| base.entry(b).is_live() && base.entry(b).is_dir())
+                        .and_then(|b| self.anchors.get(&b).copied())
+                        .filter(|&o| {
+                            self.index
+                                .entries
+                                .get(o as usize)
+                                .is_some_and(|e| e.is_live())
+                        });
+                    match reused {
+                        Some(o) => {
+                            // 池段免重写:合成路径 = 链上最高桥的 base 段 + 中间段,
+                            // 挂接点变化恒等互换(Index::reparent 注)
+                            self.index.reparent(o, anchor);
+                            o
+                        }
+                        None => {
+                            let k = self.index.insert(name, anchor, true);
+                            self.rewrite_dir_path(base, k);
+                            k
+                        }
                     }
-                    k
                 }
             };
             if *is_dir {
@@ -258,8 +291,17 @@ impl Overlay {
         Ok(DiffStats { added, removed })
     }
 
-    /// 登记 base↔overlay anchor 对(同键覆盖:类型翻转重建条目后桥指向新号)。
+    /// 登记 base↔overlay anchor 对。同 base 目录已有**异条目**旧桥(历史覆盖
+    /// 遗留的孤儿)时清扫:旧桥级联墓碑(其 overlay 子树是上一次 listing 的
+    /// 陈旧真相,可见性由新桥条目 / base 子树兜底,不丢可见数据),anchor_base
+    /// 键同步清除——残留会让旧桥链逃过删除方向 sweep 并在物化时成为幽灵根。
     fn link_anchor(&mut self, b: u32, o: u32) {
+        if let Some(&prev) = self.anchors.get(&b) {
+            if prev != o {
+                self.anchor_base.remove(&prev);
+                self.index.remove(prev); // 级联墓碑旧桥链
+            }
+        }
         self.anchors.insert(b, o);
         self.anchor_base.insert(o, b);
     }
@@ -1071,6 +1113,67 @@ mod tests {
             .map(|i| merged.full_path(i).to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths, hit_paths(&view), "物化与合成视图零差异");
+    }
+
+    /// 桥覆盖孤儿(评审第四形态)回归钉:子目录先于父被 diff(桥是顶层占位),
+    /// 父层首 diff 必须复用并 re-parent 该桥,而非新建覆盖。
+    /// 突变「复用/reparent 去掉(改回新建覆盖)」:
+    /// - re-diff 轮后 whole:f.txt 命中 2(同路径重复结果行,用户可见)→ 红;
+    /// - 孤儿态 + 整树删除后已删路径仍命中(泄漏 1≠0)+ 物化幽灵根 → 红。
+    #[test]
+    fn child_first_bridge_is_reused_not_duplicated_on_parent_diff() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        std::fs::write(root.join("c/f.txt"), "").unwrap();
+        std::fs::write(root.join("keep.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+        let c = root.join("c");
+
+        let mut ov = Overlay::new();
+        // 子先:c 是 base 目录(dir_map 寻址),事件直中 c 时父可从未 diff
+        // (P0 承认的事件丢失现实)——此时 c 的桥是顶层占位
+        ov.apply_diff(&base, DiffTarget::Base(id_of(&base, &c)), &c, &[])
+            .unwrap();
+        // 父首:必须复用占位桥并挂正,不得新建覆盖
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        {
+            let view = ov.composite_view(&base);
+            assert_eq!(total(&view, "whole:f.txt"), 1, "父首 diff 后同路径恰一份");
+        }
+        // re-diff 轮次(评审序列 y→root→c→y→c):无界增长复制钉
+        for _ in 0..2 {
+            ov.apply_diff(&base, DiffTarget::Base(id_of(&base, &c)), &c, &[])
+                .unwrap();
+            ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+                .unwrap();
+        }
+        {
+            let view = ov.composite_view(&base);
+            assert_eq!(total(&view, "whole:f.txt"), 1, "re-diff 不得复制条目");
+            let mut reference = std::collections::BTreeSet::new();
+            ref_walk(root, &mut reference);
+            reference.insert(root.to_string_lossy().into_owned());
+            assert_eq!(hit_paths(&view), reference, "对拍零差异");
+        }
+
+        // 整树删除后再 diff 父:已删路径清零、物化无幽灵根
+        std::fs::remove_dir_all(&c).unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        {
+            let view = ov.composite_view(&base);
+            assert_eq!(total(&view, "whole:f.txt"), 0, "已删路径不得泄漏命中");
+            assert_eq!(total(&view, "keep"), 1, "删除范围外不受误伤");
+            let merged = materialize_composite(&base, &ov);
+            let paths: std::collections::BTreeSet<String> = (0..merged.entries.len() as u32)
+                .filter(|&i| merged.entries[i as usize].is_live())
+                .map(|i| merged.full_path(i).to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(paths, hit_paths(&view), "物化与合成视图零差异(无幽灵根)");
+        }
     }
 
     /// purge_prefix:摘除子树波及的 Overlay 账本同步作废
