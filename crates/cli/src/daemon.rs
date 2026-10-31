@@ -751,7 +751,12 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
             // 节流起点按「尝试过 flush」推进:失败重试不密集化
             *state.last_flush.lock().unwrap() = Instant::now();
         }
-        Err(e) => log::error!("合并产物重载失败(保留增量态,下轮重试): {e}"),
+        Err(e) => {
+            log::error!("合并产物重载失败(保留增量态,下轮重试): {e}");
+            // 节流起点照推进:dirty 已超批量阈值时,失败重试不得退化为
+            // 消费循环逐轮密集全量重写
+            *state.last_flush.lock().unwrap() = Instant::now();
+        }
     }
 }
 
@@ -1184,24 +1189,37 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
 /// remap mmap Base(Shared),不留百万级堆索引常驻——**首扫与重扫替换段共用**
 /// (P0 迁移的同一逻辑,tech.md §1.6 预告的切换点)。
 ///
-/// 可见性(product 场景 2「建索引期间搜索」):产物先以 Mutable 挂回 holder
-/// (查询持续可见,不出现 Empty 观察窗),写盘 + 重载完成后写锁内原位 swap
-/// Shared——与 flush_merged 同形态。写盘/重载失败保持 Mutable(保守可用,下轮
-/// flush 重试落盘),扫描成果不作废。
+/// 可见性(product 场景 2「建索引期间搜索」):产物以 Mutable 挂载(重扫路径,
+/// 写锁内原子、无观察窗)或**复用在位 Mutable**(首扫路径,holder 全程非
+/// Empty),写盘 + 重载完成后写锁内原位 swap Shared——与 flush_merged 同形态。
+/// 写盘/重载失败保持 Mutable(保守可用,下轮 flush 重试落盘),扫描成果不作废。
 ///
 /// 锁序(tech.md §7 落盘串行):rescan_lock → flush_lock → holder,写+load 段
 /// 整体在 flush_lock 内(与 flush_merged/persist_final 的 rename 互斥,防交错
 /// rename 后把陈旧快照 mmap 成 Base);无反向获取点,无环。写盘期间持 holder
-/// 读锁(内容与形态冻结,查询不受阻);放读 → 取写的窗口由下方**形态复核**
-/// 兜住:diff 会把 Mutable 转 Overlaid(变体变更)→ 放弃 swap,产物已落盘,
-/// 增量交 flush 合并收敛。窗口内 ENOENT 摘除是唯一同变体内容变更(µs 级),
-/// 摘除对象磁盘已不存在,父目录下次 diff 幂等重墓碑,最终一致。
+/// 读锁(内容与形态冻结,查询不受阻,compact 同样拿不到写锁);放读 → 取写的
+/// 窗口由**形态复核**兜住:diff 会把 Mutable 转 Overlaid(变体变更)→ 放弃
+/// swap,产物已落盘,增量交 flush 合并收敛。
+///
+/// 同变体内容变更只剩两处 µs 级窗口(放读锁 → 取写锁之间):
+/// - `handle_diff_error` 的 ENOENT 摘除——摘除对象磁盘已不存在,父目录下次
+///   diff 幂等重墓碑,最终一致;
+/// - `maybe_compact` 的 Mutable 臂原地 compact——对扫描产物不可达:新产物零
+///   墓碑/零孤儿字节,`needs_compaction` 恒假;且其写锁与本函数读锁互斥,
+///   读锁段内无法运行。
 ///
 /// swap 落地 Shared 即清 dirty:盘面 = 内存真相(flush 的「Shared 态 dirty==0」
 /// 前提;重扫路径后续 drain 重放会重新累积)。meta 取调用方当时的水位——崩溃
 /// 窗口内盘上水位偏旧,重启重放幂等追平。
 fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
     *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+    mount_mutable_in_place(state, paths);
+}
+
+/// 在位落盘(holder 已持 Mutable 产物;首扫直接复用流水线挂载,无 Empty 观察
+/// 窗):flush_lock 内写盘 → 重载 → 形态复核 swap Shared。
+/// 锁序与窗口语义见 [`mount_scan_product`]。
+fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
     let _flush_guard = state.flush_lock.lock().unwrap();
     let written = {
         let h = state.holder.read().unwrap();
@@ -1246,20 +1264,20 @@ fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
 fn collapse_empty_overlay(state: &EngineState) {
     let mut h = state.holder.write().unwrap();
     let taken = std::mem::replace(&mut *h, IndexHolder::Empty);
-    let collapsed = matches!(
-        &taken,
-        IndexHolder::Overlaid(st) if st.overlay.is_empty() && matches!(st.base, BaseRef::Mmap(_))
-    );
-    *h = match taken {
+    let (landed, collapsed) = match taken {
         IndexHolder::Overlaid(st) if st.overlay.is_empty() => match st.base {
-            BaseRef::Mmap(v) => IndexHolder::Shared(v),
-            base => IndexHolder::Overlaid(Box::new(OverlaidState {
-                base,
-                overlay: st.overlay,
-            })),
+            BaseRef::Mmap(v) => (IndexHolder::Shared(v), true),
+            base => (
+                IndexHolder::Overlaid(Box::new(OverlaidState {
+                    base,
+                    overlay: st.overlay,
+                })),
+                false,
+            ),
         },
-        other => other,
+        other => (other, false),
     };
+    *h = landed;
     drop(h);
     if collapsed {
         state.dirty.store(0, Ordering::Relaxed);
@@ -1417,22 +1435,10 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             }
             state.applied_event_id.store(water, Ordering::Relaxed);
             state.seen_event_id.store(water, Ordering::Relaxed);
-            // T4:首扫产物同样收敛为 mmap Base(与重扫替换段共用 mount_scan_product,
-            // tech.md §4.3)——不留堆索引常驻;此刻水位已含 water,落盘 meta 一致。
-            // mount_scan_product 自己完成「挂回 Mutable → 落盘 → swap Shared」,
-            // 批间可见性与旧实现一致(product 场景 2)。
-            let idx = {
-                let mut h = state.holder.write().unwrap();
-                match std::mem::replace(&mut *h, IndexHolder::Empty) {
-                    IndexHolder::Mutable(idx) => idx,
-                    IndexHolder::Empty => unreachable!("同线程不会放回 Empty"),
-                    other => {
-                        *h = other; // 形态异常(理论不可达):原样归还,guard 内不重入取锁
-                        panic!("首扫流式聚合后 holder 应为 Mutable")
-                    }
-                }
-            };
-            mount_scan_product(&state, &paths, idx);
+            // T4:首扫产物同样收敛为 mmap Base(与重扫替换段共用 mount 的在位
+            // 路径,tech.md §4.3)——不留堆索引常驻;此刻水位已含 water,落盘 meta
+            // 一致。holder 自 apply 循环起恒为 Mutable,在位落盘无 Empty 观察窗。
+            mount_mutable_in_place(&state, &paths);
             rebuild_dir_map(&state);
             flush(&state, &paths); // Shared 态:盘上即刚写产物,无操作
             state.set_state(state::READY);

@@ -425,6 +425,9 @@ fn assemble_streamed(
             "流式条目流与路径偏移表失配,拒绝写出",
         ));
     }
+    // get_ref().try_clone():复制出的 fd 与 BufWriter 持有的**共享同一文件偏移**
+    // ——冲刷后游标在段末,copy_spill 内 seek(Start(0)) 归位才能从段首读;
+    // 段与段互不重叠,顺序消费无需在两次 copy 之间恢复游标。
     let mut d = sink.display.get_ref().try_clone()?;
     copy_spill(&mut d, &mut out)?;
     let mut m = sink.match_w.get_ref().try_clone()?;
@@ -946,6 +949,10 @@ mod tests {
         i.insert("a.txt", d, false);
         let sub = i.insert("sub", d, true);
         i.insert("x", sub, false);
+        // 大小写混排名:display("A.txt") ≠ match(折叠后 "a.txt")——display/match
+        // 两段字节不同,「拼接段序错乱」类突变才有区分力(全小写夹具下两段逐位
+        // 相同,对调拷贝顺序测试仍绿,评审实测)
+        i.insert("A.txt", d, false);
         let gone = i.insert("gone.txt", d, false);
         i.remove(gone); // 墓碑文件:生产者按原样产出(等价性不含语义过滤)
         let dir = tempfile::tempdir().unwrap();
@@ -988,14 +995,19 @@ mod tests {
         // 溢写文件不残留;产物可加载可查
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
         let view = load_mmap(&p2).unwrap();
-        let out = crate::query::execute(view.as_ref(), &crate::query::parse("a.txt").unwrap(), 10);
+        // whole:x 精确整词:子串 "a.txt" 会同时命中 a.txt 与 A.txt(折叠同名)
+        let out =
+            crate::query::execute(view.as_ref(), &crate::query::parse("whole:x").unwrap(), 10);
         assert_eq!(out.total, 1);
         let path_out = crate::query::execute(
             view.as_ref(),
             &crate::query::parse("path:docs").unwrap(),
             10,
         );
-        assert_eq!(path_out.total, 3, "路径池拼接正确(docs + a.txt + sub)");
+        assert_eq!(
+            path_out.total, 4,
+            "路径池拼接正确(docs + a.txt + sub + A.txt)"
+        );
     }
 
     /// 流式写的原子性钉:生产者中途失败 → 目标不得产出、溢写文件全清理。

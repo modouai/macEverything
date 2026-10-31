@@ -773,7 +773,7 @@ pub fn write_merged_atomic(
             format!("Overlay 账本腐化，拒绝合并写出：{why}"),
         )
     };
-    let mut live_out = 0u32;
+    // write_stream_atomic 返回值即流统计的活条目数,无需旁路捕获
     crate::persist::write_stream_atomic(meta, path, |sink| {
         // —— Base 段（与 materialize_composite 同序同判）——
         for &(start, seg) in &base.entry_segments() {
@@ -840,10 +840,8 @@ pub fn write_merged_atomic(
             )?;
             merged_of.insert(o, new);
         }
-        live_out = sink.live_count();
         Ok(())
-    })?;
-    Ok(live_out)
+    })
 }
 
 #[cfg(test)]
@@ -1682,7 +1680,11 @@ mod tests {
         let base = scan(root);
         let root_id = id_of(&base, root);
 
-        // 第一轮：root 加文件 + 删 keep；d 删 old + 加 new.txt；e 加 new2
+        // 第一轮：root 加文件 + 删 keep；d 删 old + 加 new.txt；e 加 new2。
+        // Notes.txt 为大小写混排名(display "Notes.txt" ≠ match 折叠形态)——
+        // 字节等价钉对「拼接段序错乱」类突变才有区分力(评审必修:全小写夹具下
+        // display/match 逐位相同,对调拷贝顺序测试仍绿)。
+        std::fs::write(root.join("Notes.txt"), "").unwrap();
         std::fs::write(root.join("n0.txt"), "").unwrap();
         std::fs::remove_file(root.join("keep.txt")).unwrap();
         std::fs::remove_file(root.join("d/old.txt")).unwrap();
