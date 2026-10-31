@@ -405,10 +405,23 @@ impl Default for Index {
 }
 
 /// 内存视图与 mmap 只读视图的统一读取面(ADR-3:查询代码无分支扩散)。
-/// 查询端只依赖本 trait:Task 12 的 mmap `SharedView` 实现同一组方法后自动获得查询能力。
-/// 必须实现的是五个存储访问原语;其余名称/路径读取有默认实现(按偏移切 arena)。
+/// 查询端只依赖本 trait:S3 的双源合成视图(Base + Overlay 各自连续,tech.md §4.3)
+/// 实现同一组方法后自动获得查询能力。必须实现的是「分段枚举 + 随机访问」与四个
+/// 存储访问原语;其余名称/路径读取有默认实现(按偏移切 arena)。
+///
+/// 接口契约(tech.md §4.3 接口改造):**条目遍历是分段枚举,不存在「单一连续
+/// 切片」假设**——单源 Index 恒一段;双源各产一段。随机访问仅限低频点
+/// (结果行组装/排序键),全量扫描必须走分段枚举(每条目一次虚调用是热路径红线)。
 pub trait IndexView: Sync {
-    fn entries(&self) -> &[Entry];
+    /// 连续条目段枚举(扫描原语):(段起始条目号, 连续 Entry 切片)序列。
+    /// 段内条目号 = 段起始号 + 段内下标;调用方不得假设段数为 1 或段间连续。
+    /// 返回 Vec 而非迭代器是 dyn 兼容约束(泛型/RPITIT 方法非对象安全);
+    /// 每查询入口一次的小分配,不在逐条目路径上。
+    fn entry_segments(&self) -> Vec<(u32, &[Entry])>;
+
+    /// 随机访问:条目号 → 条目。越界行为与内存切片一致(panic,同一信任级别)。
+    fn entry(&self, idx: u32) -> &Entry;
+
     fn display_arena(&self) -> &[u8];
     fn match_arena(&self) -> &[u8];
     fn path_pool(&self) -> &[u8];
@@ -417,14 +430,14 @@ pub trait IndexView: Sync {
 
     /// 匹配形态名(match arena 折叠段;case: 查询在查询端另取 display 归一)。
     fn match_name(&self, idx: u32) -> &[u8] {
-        let e = &self.entries()[idx as usize];
+        let e = self.entry(idx);
         let s = e.match_start as usize;
         &self.match_arena()[s..s + e.match_len as usize]
     }
 
     /// 展示形态名(display arena 原始字节,未归一)。
     fn display_name(&self, idx: u32) -> &[u8] {
-        let e = &self.entries()[idx as usize];
+        let e = self.entry(idx);
         let s = e.display_start as usize;
         &self.display_arena()[s..s + e.display_len as usize]
     }
@@ -440,7 +453,7 @@ pub trait IndexView: Sync {
         let mut parts: Vec<&[u8]> = Vec::new();
         let mut cur = idx;
         loop {
-            let e = &self.entries()[cur as usize];
+            let e = self.entry(cur);
             parts.push(self.display_name(cur));
             if e.parent == NO_PARENT {
                 break;
@@ -454,8 +467,11 @@ pub trait IndexView: Sync {
 }
 
 impl IndexView for Index {
-    fn entries(&self) -> &[Entry] {
-        &self.entries
+    fn entry_segments(&self) -> Vec<(u32, &[Entry])> {
+        vec![(0, self.entries.as_slice())]
+    }
+    fn entry(&self, idx: u32) -> &Entry {
+        &self.entries[idx as usize]
     }
     fn display_arena(&self) -> &[u8] {
         &self.display_arena.data
@@ -714,15 +730,20 @@ mod tests {
         assert!(i.entries[kids[0] as usize].is_dir(), "翻转后为目录");
     }
 
-    // —— Task 8:IndexView 统一读取面(ADR-3) ——
+    // —— Task 8:IndexView 统一读取面(ADR-3);T2 改分段枚举(tech.md §4.3) ——
 
     #[test]
-    fn view_exposes_slices() {
+    fn view_exposes_segments() {
         let mut i = ix();
         let d = i.insert("docs", NO_PARENT, true);
         i.insert("a.txt", d, false);
         let v: &dyn IndexView = &i;
-        assert_eq!(v.entries().len(), 2);
+        // 单源 Index 恒一段,段起始号 0,段长 = 条目总数
+        let segs = v.entry_segments();
+        assert_eq!(segs.len(), 1, "单源 Index 恰一个连续段");
+        assert_eq!(segs[0].0, 0);
+        assert_eq!(segs[0].1.len(), 2);
+        assert!(v.entry(1).is_live());
         assert_eq!(v.match_name(1), b"a.txt");
         assert_eq!(v.display_name(1), b"a.txt");
         assert_eq!(v.dir_path(0), b"docs");

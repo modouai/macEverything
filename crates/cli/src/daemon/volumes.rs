@@ -19,7 +19,9 @@ use std::time::Duration;
 use engine::config::Config;
 use engine::fsevents::{self};
 
-use super::{consume_events, flush, DaemonPaths, EngineState, IndexHolder, SCAN_CHUNK};
+use super::{
+    consume_events, ensure_mutable, flush, DaemonPaths, EngineState, IndexHolder, SCAN_CHUNK,
+};
 
 /// 卷轮询间隔。
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -158,6 +160,8 @@ fn reconcile(state: &Arc<EngineState>, paths: &DaemonPaths) -> anyhow::Result<()
 /// 顺序执行:同一时刻至多一个卷在扫,不与主索引争写锁带宽。
 fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     log::info!("卷挂载,开始索引: {}", vol.display());
+    // 冷启动直挂 Shared 后的卷写入在此按需物化(条目号 1:1,dir_map 免重建)
+    ensure_mutable(state);
     state.roots.lock().unwrap().push(vol.to_path_buf());
     {
         let mut h = state.holder.write().unwrap();
@@ -204,6 +208,8 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     // 本轮扫描的世代快照:任一卸载(含本轮自己的中止路径)推进世代即失效,
     // 批间校验不过直接放弃,不与新一轮扫描交错应用。
     let my_epoch = state.volume_scan_epoch.load(Ordering::Relaxed);
+    // 直挂 Shared 态同样在此按需物化(运行期补扫路径不经 mount_volume 时)
+    ensure_mutable(state);
     {
         let mut h = state.holder.write().unwrap();
         let IndexHolder::Mutable(idx) = &mut *h else {
@@ -261,6 +267,8 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     if let Some(mut stream) = state.volume_streams.lock().unwrap().remove(vol) {
         stream.stop(); // Drop 内 stop;卷消费线程因 rx 断开退出,volume_owned 不触发降级
     }
+    // 直挂 Shared 态在此按需物化,前缀清除照常生效(否则只能靠重试路径)
+    ensure_mutable(state);
     let removed = {
         let mut h = state.holder.write().unwrap();
         let IndexHolder::Mutable(idx) = &mut *h else {
@@ -287,6 +295,10 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
         .filter_map(volume_root_of)
         .filter(|v| !desired.contains(v))
         .collect();
+    // 有待清卷才物化:无卷变更的冷启动保持 Shared 常驻(零堆索引),不清白付
+    if !stale.is_empty() {
+        ensure_mutable(state);
+    }
     for vol in stale {
         let removed = {
             let mut h = state.holder.write().unwrap();

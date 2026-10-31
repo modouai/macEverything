@@ -11,7 +11,13 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
     let view = persist::load_mmap(std::path::Path::new(path)).expect("加载索引失败");
-    println!("条目 {}", view.entries().len());
+    println!(
+        "条目 {}",
+        view.entry_segments()
+            .iter()
+            .map(|(_, s)| s.len())
+            .sum::<usize>()
+    );
 
     let mut times = Vec::with_capacity(200);
     let mut seed: u64 = 0xABCD;

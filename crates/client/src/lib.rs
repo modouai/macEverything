@@ -350,7 +350,11 @@ pub fn offline_status(paths: &DaemonPaths) -> Result<StatusOutcome, StatusError>
     }
     match persist::load_mmap(&index) {
         Ok(v) => {
-            let live = v.entries().iter().filter(|e| e.is_live()).count() as u32;
+            let live = v
+                .entry_segments()
+                .iter()
+                .map(|(_, s)| s.iter().filter(|e| e.is_live()).count() as u32)
+                .sum::<u32>();
             let gaps: Vec<Gap> = vec![];
             Ok(StatusOutcome::Reported(StatusReport {
                 state: state::OFFLINE.to_string(),

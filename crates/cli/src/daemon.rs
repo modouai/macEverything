@@ -1,4 +1,4 @@
-//! daemon:引擎宿主——冷启动编排(秒开 → 物化 → 重放/重扫)+ 增量循环 + 服务循环。
+//! daemon:引擎宿主——冷启动编排(秒开直挂 Base → 重放/重扫)+ 增量循环 + 服务循环。
 //! 单实例:绑定 EADDRINUSE 时 connect 探测——连得上 = 已在运行;连不上 = 崩溃
 //! 残留 stale socket,unlink 重绑。stop 经 socket 消息触发,响应在最终落盘后返回。
 use anyhow::{bail, Context, Result};
@@ -285,7 +285,7 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc:
                     *h,
                     String::from_utf8_lossy(v.display_name(*h)).into_owned(),
                     v.full_path_dyn(*h),
-                    v.entries()[*h as usize].is_dir(),
+                    v.entry(*h).is_dir(),
                 )
             })
             .collect();
@@ -367,8 +367,26 @@ fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Opt
 
 // —— 冷启动与增量 ——
 
+/// Shared → Mutable 按需物化(T3 Overlay 落地后此转换点退役,tech.md §4.3):
+/// 冷启动直挂 Base(mmap 只读)常驻、查询零物化;首个需要可变性的操作
+/// (增量 diff / 卷写入)经此一次性转换。materialize 条目号 1:1 保持,
+/// 先建的 dir_map 无需重建。全程持 holder 写锁:读者在锁上等待,唤醒后见到的
+/// 已是 Mutable,无 Empty 观察窗。
+fn ensure_mutable(state: &EngineState) {
+    let mut h = state.holder.write().unwrap();
+    if matches!(&*h, IndexHolder::Shared(_)) {
+        let shared = std::mem::replace(&mut *h, IndexHolder::Empty);
+        *h = match shared {
+            IndexHolder::Shared(v) => IndexHolder::Mutable(v.materialize()),
+            other => other,
+        };
+    }
+}
+
 /// 重建「绝对目录路径 → 条目号」映射(冷启动/重扫后一次性)。
 /// O(n) 邻接表 + BFS;键为绝对路径,与 FSEvents 事件路径可直接比对。
+/// 读侧经 IndexView:Shared(直挂 Base)与 Mutable 皆可建——冷启动不再物化,
+/// dir_map 直接从 mmap 视图建立;后续按需转可变时条目号 1:1,映射继续有效。
 fn rebuild_dir_map(state: &EngineState) {
     // 两个形态各司其职:根条目名是「字面配置根」(scanner 契约,用于匹配);
     // map 键用 canonical 形态——/tmp 等系统符号链接下 FSEvents 上报真实路径
@@ -376,25 +394,29 @@ fn rebuild_dir_map(state: &EngineState) {
     let literal_roots = state.roots.lock().unwrap().clone();
     let mut map = DirIndexMap::default();
     let h = state.holder.read().unwrap();
-    let IndexHolder::Mutable(idx) = &*h else {
-        return;
+    let view: &dyn IndexView = match &*h {
+        IndexHolder::Shared(v) => v.as_ref(),
+        IndexHolder::Mutable(i) => i,
+        IndexHolder::Empty => return,
     };
-    let n = idx.entries.len() as u32;
+    // 分段枚举建邻接表 + 收集根条目号(段内下标 + 段起始号 = 条目号)
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for i in 0..n {
-        let e = &idx.entries[i as usize];
-        if e.parent != NO_PARENT && e.is_live() {
-            children.entry(e.parent).or_default().push(i);
+    let mut root_ids: Vec<u32> = Vec::new();
+    for &(start, seg) in &view.entry_segments() {
+        for (j, e) in seg.iter().enumerate() {
+            let i = start + j as u32;
+            if e.parent != NO_PARENT && e.is_live() {
+                children.entry(e.parent).or_default().push(i);
+            }
+            if e.parent == NO_PARENT && e.is_live() && e.is_dir() {
+                root_ids.push(i);
+            }
         }
     }
     let mut queue: std::collections::VecDeque<(PathBuf, u32)> = std::collections::VecDeque::new();
-    for i in 0..n {
-        let e = &idx.entries[i as usize];
-        if e.parent != NO_PARENT || !e.is_live() || !e.is_dir() {
-            continue;
-        }
+    for i in root_ids {
         // 根条目名 = 完整绝对路径(scanner 契约),按字面根匹配
-        let name = String::from_utf8_lossy(idx.display_name_of(i)).into_owned();
+        let name = String::from_utf8_lossy(view.display_name(i)).into_owned();
         if let Some(r) = literal_roots.iter().find(|r| r.to_string_lossy() == name) {
             let key = r.canonicalize().unwrap_or_else(|_| r.clone());
             map.insert(&key, i);
@@ -404,9 +426,9 @@ fn rebuild_dir_map(state: &EngineState) {
     while let Some((abs, idx_p)) = queue.pop_front() {
         if let Some(kids) = children.get(&idx_p) {
             for &k in kids {
-                if idx.entries[k as usize].is_dir() {
+                if view.entry(k).is_dir() {
                     let mut p = abs.clone();
-                    p.push(String::from_utf8_lossy(idx.display_name_of(k)).into_owned());
+                    p.push(String::from_utf8_lossy(view.display_name(k)).into_owned());
                     map.insert(&p, k);
                     queue.push_back((p, k));
                 }
@@ -472,6 +494,9 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
         state.rescan_dirty.lock().unwrap().insert(base.clone());
     }
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
+    // 冷启动直挂 Shared 后的首个 diff 在此按需物化(条目号 1:1,dir_map 免重建);
+    // T3 Overlay 落地后此转换点退役(diff 直写 Overlay)。
+    ensure_mutable(state);
     let mut h = state.holder.write().unwrap();
     let IndexHolder::Mutable(idx) = &mut *h else {
         return 0;
@@ -532,12 +557,16 @@ fn build_meta(state: &EngineState) -> IndexMeta {
 }
 
 /// 快照落盘(原子替换,flush_lock 串行化);失败留痕不中断。
+/// Shared 态(dirty == 0,无本会话增量)无需重写:盘上索引即当前状态。
 fn flush(state: &EngineState, paths: &DaemonPaths) {
     let _guard = state.flush_lock.lock().unwrap();
     let h = state.holder.read().unwrap();
     if let IndexHolder::Mutable(idx) = &*h {
         let meta = build_meta(state);
-        if let Err(e) = persist::write_atomic(idx, &meta, &paths.index_file()) {
+        let layout = persist::EntryLayout::of(idx);
+        if let Err(e) =
+            persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file())
+        {
             log::error!("落盘失败: {e}");
         } else {
             state.dirty.store(0, Ordering::Relaxed);
@@ -553,7 +582,8 @@ fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
     match &*h {
         IndexHolder::Mutable(idx) => {
             let meta = build_meta(state);
-            match persist::write_atomic(idx, &meta, &paths.index_file()) {
+            let layout = persist::EntryLayout::of(idx);
+            match persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file()) {
                 Ok(()) => (true, idx.entry_count()),
                 Err(e) => {
                     log::error!("最终落盘失败: {e}");
@@ -561,8 +591,21 @@ fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
                 }
             }
         }
-        _ => (true, 0),
+        // Shared(直挂 Base,本会话零增量):盘上索引即当前状态,不重写;
+        // 条目数从视图如实统计。Empty(首扫中):无索引,0。
+        _ => (true, live_count(state).unwrap_or(0)),
     }
+}
+
+/// 活条目数(分段枚举统计)。Shared 态无内存计数器(mmap 侧墓碑数在 load 时
+/// 即弃),与 Mutable 的 entry_count 走同一枚举面,供 status/最终落盘汇报。
+fn live_count(state: &EngineState) -> Option<u32> {
+    with_view(state, |v| {
+        v.entry_segments()
+            .iter()
+            .map(|(_, s)| s.iter().filter(|e| e.is_live()).count() as u32)
+            .sum()
+    })
 }
 
 fn should_flush(state: &EngineState) -> bool {
@@ -925,7 +968,7 @@ fn handle_diff_error(
     }
 }
 
-/// 冷启动编排(独立线程):有索引 → Shared 秒开 → 物化 → 重放;无/损坏 → 首扫。
+/// 冷启动编排(独立线程):有索引 → 直挂 Shared 秒开(零物化)→ 重放;无/损坏 → 首扫。
 fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     let cfg = config::load(&paths.config_file());
     *state.cfg.lock().unwrap() = cfg.clone();
@@ -952,21 +995,15 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             state.built_at.store(built, Ordering::Relaxed);
             state.applied_event_id.store(last_id, Ordering::Relaxed);
             state.seen_event_id.store(last_id, Ordering::Relaxed);
-            // 两段式:Shared 立即可查
+            // 直挂 Shared(P3 后常驻即 Base,冷启动不再物化堆索引,tech.md §4.3):
+            // 查询立即由 mmap 视图服务。首个可变性需求(增量 diff / 卷写入)经
+            // ensure_mutable 按需物化——条目号 1:1,dir_map 与后续操作不受影响。
             *state.holder.write().unwrap() = IndexHolder::Shared(view);
             state.set_state(state::RECONCILING);
-            // 物化 → 可变索引
-            let idx = {
-                let h = state.holder.read().unwrap();
-                match &*h {
-                    IndexHolder::Shared(v) => v.materialize(),
-                    _ => unreachable!("刚挂 Shared"),
-                }
-            };
-            *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
             rebuild_dir_map(&state);
             // 启动清除:上次会话的卷前缀中,本次未挂载(或已停用)的移除——
             // 落盘索引不重扫,脏卷条目无自然消亡机制,必须在建流/就绪前清掉。
+            // (有待清卷时内部按需转可变;无卷变更则保持 Shared 常驻。)
             volumes::purge_unmounted(&state, &desired_set);
             (last_id, true)
         }
@@ -1130,12 +1167,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         } => run_query(state, &query, limit, sort.as_deref(), desc.unwrap_or(false)),
         Request::Status { .. } => {
             let name = *state.state_name.lock().unwrap();
-            let entry_count = with_view(state, |v| {
-                (0..v.entries().len() as u32)
-                    .filter(|i| v.entries()[*i as usize].is_live())
-                    .count() as u32
-            })
-            .unwrap_or(0);
+            let entry_count = live_count(state).unwrap_or(0);
             Response::Status {
                 state: name.into(),
                 entry_count,
@@ -1488,6 +1520,66 @@ mod tests {
         state
     }
 
+    /// T2 桥接钉(tech.md §4.3 冷启动改造):冷启动直挂 Shared 后查询走 mmap
+    /// 视图;首个增量 diff 经 ensure_mutable 按需物化——Shared → Mutable 条目号
+    /// 1:1,已建 dir_map 继续有效(条目号稳定性是 T3 屏蔽判定的前提)。
+    /// 突变「ensure_mutable 不物化」→ diff 静默丢弃(holder 仍 Shared、条目数
+    /// 不变)本测必红。
+    #[test]
+    fn shared_holder_serves_queries_and_materializes_on_first_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"").unwrap();
+        let state = Arc::new(EngineState::new());
+        // 建索引并落盘 → load_mmap → Shared 挂载(模拟冷启动直挂 Base)
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        let a = idx.insert("a.txt", root, false);
+        let b = idx.insert("b.txt", root, false);
+        let idx_file = data.path().join("index.bin");
+        let layout = persist::EntryLayout::of(&idx);
+        persist::write_atomic(
+            &layout,
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write().unwrap() =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        // Shared 态建 dir_map(rebuild 改读 IndexView,不再要求 Mutable;
+        // 突变「rebuild 仍只认 Mutable 提前返回」→ map 被清空,断言必红)
+        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        rebuild_dir_map(&state);
+        assert!(
+            state
+                .dir_map
+                .lock()
+                .unwrap()
+                .contains_key(&dir.path().canonicalize().unwrap()),
+            "Shared 态 rebuild_dir_map 应建立根映射"
+        );
+        // Shared 态查询直接可服务(冷启动秒开语义)
+        match run_query(&state, "a.txt", 10, None, false) {
+            Response::Query { total, .. } => assert_eq!(total, 1, "Shared 态应可查"),
+            other => panic!("意外响应: {other:?}"),
+        }
+        // 磁盘新增 c.txt:首个 diff 触发按需物化,增量照常生效
+        std::fs::write(dir.path().join("c.txt"), b"").unwrap();
+        assert_eq!(diff_one(&state, dir.path()), 1, "首个 diff 应生效");
+        {
+            let h = state.holder.read().unwrap();
+            assert!(matches!(&*h, IndexHolder::Mutable(_)), "diff 后应已转可变");
+        }
+        // 条目号 1:1 保持:a/b 仍在原号且为活条目(物化拷贝不重排)
+        with_view(&state, |v| {
+            assert_eq!(v.display_name(a), b"a.txt".as_slice());
+            assert_eq!(v.display_name(b), b"b.txt".as_slice());
+            assert!(v.entry(a).is_live() && v.entry(b).is_live());
+        });
+    }
+
     /// 水位的核心不变量钉:applied 只在 diff 完成后推进,「已收未应用」不得计入。
     /// 突变「事件到达即推进落盘水位」——即 stop 前 100ms 变更永久丢失的根因链——
     /// 时第一段断言必红。
@@ -1618,7 +1710,7 @@ mod tests {
                 panic!("应为可变索引")
             };
             let root = idx
-                .entries()
+                .entries
                 .iter()
                 .position(|e| e.parent == NO_PARENT && e.is_dir())
                 .expect("mounted_state 应含根目录条目") as u32;
@@ -1772,9 +1864,11 @@ mod tests {
         );
         let hidden_path = hidden_file.to_string_lossy().into_owned();
         let indexed = with_view(&state, |v| {
-            (0..v.entries().len() as u32)
-                .filter(|i| v.entries()[*i as usize].is_live())
-                .any(|i| v.full_path_dyn(i) == hidden_path)
+            v.entry_segments().iter().any(|&(start, seg)| {
+                seg.iter()
+                    .enumerate()
+                    .any(|(j, e)| e.is_live() && v.full_path_dyn(start + j as u32) == hidden_path)
+            })
         })
         .expect("重扫后应挂载可变索引");
         assert!(
