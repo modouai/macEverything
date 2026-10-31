@@ -134,6 +134,7 @@ fn parity_parallel_arm() {
 
 // —— T3 合成视图对拍(memory-footprint tech.md §4.6 风险表:查询双源合并零差异)——
 
+use engine::index::IndexView;
 use engine::overlay::{DiffTarget, Overlay};
 
 /// 按完整路径定位 base 条目号。
@@ -180,11 +181,12 @@ fn ref_set(root: &Path, excludes: &[PathBuf]) -> BTreeSet<String> {
 fn overlay_fixture() -> (tempfile::TempDir, engine::index::Index) {
     let t = tempfile::tempdir().unwrap();
     let r = t.path();
-    fs::create_dir_all(r.join("src/lib")).unwrap();
+    fs::create_dir_all(r.join("src/lib/deeper")).unwrap();
     fs::create_dir_all(r.join("node_modules")).unwrap();
     fs::create_dir_all(r.join("docs")).unwrap();
     fs::write(r.join("src/a.rs"), "").unwrap();
     fs::write(r.join("src/lib/deep.txt"), "").unwrap();
+    fs::write(r.join("src/lib/deeper/bottom.txt"), "").unwrap();
     fs::write(r.join("node_modules/x.js"), "").unwrap();
     fs::write(r.join("docs/b.md"), "").unwrap();
     fs::write(r.join("README.md"), "").unwrap();
@@ -382,4 +384,108 @@ fn parity_overlay_eperm_mixed_tree() {
         "对拍零差异(锁定目录子树两侧同为空或同为实读)"
     );
     let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+}
+
+/// 类型翻转 + 子树删除(评审缺陷 1/2 的对拍形态):file→dir 翻转不桥连 base
+/// 陈旧文件;整树删除后父层 diff 摘净深层 anchor(各自 diff 过的独立桥)。
+/// 对拍零差异 + 物化产物同集(突变「link 守卫去 is_dir」「删除方向去 purge 扫」
+/// 时对应断言必红)。
+#[test]
+fn parity_overlay_type_flip_and_subtree_removal_zero_diff() {
+    let (t, index) = overlay_fixture();
+    let root = t.path();
+    // 形态一:file→dir 翻转(src/a.rs)
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    fs::create_dir(root.join("src/a.rs")).unwrap();
+    fs::write(root.join("src/a.rs/i.txt"), "").unwrap();
+    // 形态二:整树删除已 diff 过的子树(src/lib);lib 内深层目录(deeper,
+    // 首扫收录)也各自 diff——独立桥的深层 anchor 摘除必须经 purge 扫,unlink 够不着
+    fs::write(root.join("src/lib/new_deep.txt"), "").unwrap();
+
+    let mut ov = Overlay::new();
+    let src = root.join("src");
+    let lib = root.join("src/lib");
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, root)),
+        root,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    // 深层各自 diff(翻转目录 a.rs 经 overlay 寻址 diff)
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &lib)),
+        &lib,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    let deeper = root.join("src/lib/deeper");
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &deeper)),
+        &deeper,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    let a_rs = ov
+        .overlay_dir_id(&src.join("a.rs"))
+        .expect("翻转目录应入 overlay 寻址面");
+    ov.apply_diff(
+        &index,
+        DiffTarget::OverlayDir(a_rs),
+        &src.join("a.rs"),
+        &fixture_excludes(),
+    )
+    .unwrap();
+
+    // 翻转钉:src/a.rs 唯一命中且为目录(base 陈旧文件不得复活)
+    {
+        let view = ov.composite_view(&index);
+        let out = engine::query::execute(&view, &engine::query::parse("whole:a.rs").unwrap(), 10);
+        assert_eq!(out.total, 1, "翻转后恰一份");
+        assert!(view.entry(out.hits[0]).is_dir(), "命中必须是目录");
+    }
+
+    // 形态二落地:整树删除 src/lib,再 diff src → 深层桥摘净
+    fs::remove_dir_all(&lib).unwrap();
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &fixture_excludes(),
+    )
+    .unwrap();
+    {
+        let view = ov.composite_view(&index);
+        let probe =
+            |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+        assert_eq!(probe("whole:deep.txt"), 0, "已删子树深层文件不得泄漏");
+        assert_eq!(probe("whole:bottom"), 0, "已删深层独立桥目录内容不得泄漏");
+        assert_eq!(probe("whole:new_deep.txt"), 0, "已删子树深层增量不得泄漏");
+    }
+
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "对拍零差异"
+    );
+    // 物化产物与合成视图同集(墓碑桥/幽灵根不落盘)
+    let merged = engine::overlay::materialize_composite(&index, &ov);
+    let merged_paths: BTreeSet<String> = (0..merged.entries.len() as u32)
+        .filter(|&i| merged.entries[i as usize].is_live())
+        .map(|i| merged.full_path(i).to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        merged_paths,
+        overlay_hits(&index, &ov),
+        "物化与合成视图零差异"
+    );
 }

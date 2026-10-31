@@ -536,7 +536,8 @@ fn resolve_target(
 
 /// 对单个绝对目录执行 diff(写侧入 Overlay,tech.md §4.2)并维护 dir_map。
 /// 锁序:holder(write) → dir_map。返回该目录本次的变更条数(added + removed),
-/// 供抽样对拍判定用(计数口径 = overlay 旧子项集 vs listing,首 diff 全记 added)。
+/// 供抽样对拍判定用(计数口径 = 真实漂移:overlay 旧子项集 vs listing;首 diff
+/// 的统计旧集回退 base 子项名集,与 diff_dir 时代一致,无漂移返回 0)。
 fn apply_and_track(
     state: &EngineState,
     base: &mut BaseRef,
