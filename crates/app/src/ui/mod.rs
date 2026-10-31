@@ -109,8 +109,10 @@ const CJK_FONT_CANDIDATES: [&str; 2] = [
     "/System/Library/Fonts/STHeiti Light.ttc", // 黑体(旧备选)
 ];
 
-/// 内置 CJK 字体(Noto Sans SC Regular,SIL OFL 1.1;`assets/fonts/`,许可证
-/// `assets/fonts/OFL.txt` 随字体分发)。字形覆盖:BMP CJK 统一表意文字
+/// 内置 CJK 字体(Noto Sans SC Regular,SIL OFL 1.1)。许可文本源在
+/// `assets/fonts/OFL.txt`,bundle.sh 打包时拷入
+/// `Contents/Resources/fonts/OFL.txt` 随 app 分发(OFL 要求随分发提供;
+/// 缺失在脚本自检段硬失败)。字形覆盖:BMP CJK 统一表意文字
 /// 20,976 字(≈全集)+ 假名 + 全角标点,文件名层面的汉字全覆盖;韩文等
 /// 未覆盖字形仍由 `system_fonts` 回退兜底。
 ///
@@ -170,7 +172,8 @@ impl egui::Plugin for AtlasSideCap {
 /// 上限防「窗口永不出现」时无限排帧烧 CPU)。
 const PATCH_ATTACH_ATTEMPTS: u32 = 300;
 
-/// 启动探测候选字体存在性并留痕(不加载——理由见模块注释「中文字体」)。
+/// 启动留痕系统 CJK 候选的存在性(纯诊断:回退真触发时来源会落在这些
+/// 系统字体;候选本身不参与加载——汉字字形已内置,见 [`CJK_FONT_BYTES`])。
 fn probe_fonts() {
     for path in CJK_FONT_CANDIDATES {
         log::info!(
@@ -1203,9 +1206,6 @@ fn hotkey_frame_events(
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 空闲判定采样(根视口输入;悬浮条/设置在各自绘制入口采样)。
-        idle::note_viewport_activity(ctx);
-
         // 首帧纠偏(产品形态:三窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
         // eframe 0.37 在首帧 post_rendering 里**无条件** `set_visible(true)`
         //(`native/epi_integration.rs:443-450`,白闪修复;`create_glutin_windowed_context`
@@ -1341,6 +1341,12 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // 空闲判定采样(根视口;悬浮条/设置在各自绘制入口采样)。采样点必须在
+        // 真渲染 pass:logic() 在根窗隐藏期也会被 eframe 唤起,而那时读到的是
+        // 上一显示帧的陈旧 events,反复记活跃会把 60s 静默计时无限后推,
+        // 「全隐藏归还」就永远不会触发。
+        idle::note_viewport_activity(&ctx);
 
         // ⌘W = 关闭完整窗口（与红点同语义：隐藏，不退出 App）。
         // 仅根视口持焦时处理，避免悬浮条持焦时误关背后的完整窗口。
@@ -1828,23 +1834,17 @@ mod tests {
         );
     }
 
-    /// footprint 对比采样(`#[ignore]`,手动**一次只跑一条**;两条各自独立进程,
-    /// 互不污染 malloc 状态):
-    /// `cargo test -p macEverything-app -- --ignored --nocapture ignored_cjk_footprint_with_builtin`
-    /// (同法跑 `_without_builtin`)。复现归因操作(结果窗口 + 中文文件名列表
-    /// 滚动):注入侧峰值应停留在百 MB 内;对照侧可见 fontique 慢路径的大块分配。
+    /// footprint 对比采样(`#[ignore]`,单进程单跑,一次只测一侧):
+    /// 注入侧 `cargo test -p macEverything-app -- --ignored --nocapture ignored_cjk_footprint`;
+    /// 对照侧前置 `MCE_NO_CJK_FONT=1`(与生产同一开关)。复现归因操作(结果
+    /// 窗口 + 中文文件名列表滚动):注入侧峰值应停留在百 MB 内;对照侧可见
+    /// fontique 慢路径的大块分配。
     #[cfg(target_os = "macos")]
-    #[ignore = "footprint 采样:手动单跑,输出供规格验收(A6)引用"]
+    #[ignore = "footprint 采样:手动单跑,输出供规格验收(A6)引用;MCE_NO_CJK_FONT=1 选对照侧"]
     #[test]
-    fn ignored_cjk_footprint_with_builtin() {
-        footprint_harness(true);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[ignore = "footprint 采样:手动单跑,输出供规格验收(A6)引用"]
-    #[test]
-    fn ignored_cjk_footprint_without_builtin() {
-        footprint_harness(false);
+    fn ignored_cjk_footprint() {
+        let install_cjk = std::env::var_os(CJK_FONT_DISABLE_ENV).is_none();
+        footprint_harness(install_cjk);
     }
 
     /// 当前进程 phys_footprint(MB;口径与 scripts/mem-watch.sh 相同)。

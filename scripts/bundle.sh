@@ -5,6 +5,8 @@
 #   MacOS/macEverything-app   App 本体(CFBundleExecutable;LSUIElement 菜单栏应用)
 #   MacOS/macEverything       引擎 CLI(随包;App 定位三档①「同目录」即命中它)
 #   Resources/AppIcon.icns    应用图标(吉祥物);Info.plist 的 CFBundleIconFile 指向它
+#   Resources/fonts/OFL.txt   内置 CJK 字体(Noto Sans SC)的 OFL 1.1 许可文本
+#                             (OFL 要求随分发提供;缺失在自检段硬失败)
 #   Info.plist                bundle 标识 = 自启条目身份键(PoC-5 坑②)
 #
 # 必须签名(PoC-5 硬门槛:未签名 arm64 进程直接 SIGKILL;签名无效时
@@ -51,6 +53,11 @@ cp "target/release/$EXE" "$APP/Contents/MacOS/$EXE"
 cp "target/release/$CLI" "$APP/Contents/MacOS/$CLI"
 chmod +x "$APP/Contents/MacOS/$EXE" "$APP/Contents/MacOS/$CLI"
 cp "assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# OFL 1.1 分发合规:许可文本必须随字体一起分发(内置 Noto Sans SC,
+# crates/app/src/ui/mod.rs CJK_FONT_BYTES)。release.sh 的组装同样只经本脚本,
+# ditto 打包时随 bundle 带走;缺失在文末自检段硬失败。
+mkdir -p "$APP/Contents/Resources/fonts"
+cp "assets/fonts/OFL.txt" "$APP/Contents/Resources/fonts/OFL.txt"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -88,6 +95,8 @@ fi
 # —— 自检(产物实证,失败即退出非零)——
 echo "-- plutil -lint Info.plist --"
 plutil -lint "$APP/Contents/Info.plist"
+echo "-- Resources/fonts/OFL.txt(OFL 分发合规) --"
+diff -q "assets/fonts/OFL.txt" "$APP/Contents/Resources/fonts/OFL.txt"
 echo "-- codesign --verify --strict(app) --"
 codesign --verify --strict --verbose=2 "$APP"
 echo "-- codesign --verify --strict(CLI) --"
