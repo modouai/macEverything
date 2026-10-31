@@ -407,6 +407,11 @@ pub fn remove_prefix(index: &mut Index, dir_map: &mut DirIndexMap, prefix: &Path
     for (i, _) in &victims {
         index.remove(*i);
     }
+    // dir_map 清键按值谓词:受害者条目此刻全部墓碑,连同**全表**历史滞留的
+    // 「条目已死、键仍在」陈旧键一并清除(超出旧实现的前缀 retain 范围,良性)。
+    // 安全性由消费点兜住,清扫多清不会错杀:daemon `apply_and_track` 对 get 命中
+    // 的键先验 `is_live`,死键只做 map.remove 短路(永不按死条目 diff);compact/
+    // 重扫后 `rebuild_dir_map` 整表重建,陈旧键无长期存续形态。
     dir_map.retain(|v| index.entries[v as usize].is_live());
     before.saturating_sub(index.entry_count())
 }
@@ -531,12 +536,18 @@ mod tests {
     /// dir_map 键是 canonical 形态(diff_one 基址)而索引完整路径是字面形态——
     /// 摘除必须按桥双向覆盖:字面形态匹配受害者,键经值谓词清扫。
     /// 突变「只拿调用方前缀直接匹配完整路径」→ 摘除计数断言红。
-    /// fixture 用真实 tempdir(macOS 下 /var → /private/var,字面 ≠ canonical)。
+    /// fixture 用真实 tempdir(macOS 下 /var → /private/var,字面 ≠ canonical);
+    /// 环境形态恰好相同(如 Linux /tmp 为实目录)时本钉退化为恒绿,先断言拦下。
     #[test]
     fn remove_prefix_bridges_literal_root_and_canonical_keys() {
         let t = tempfile::tempdir().unwrap();
         let literal = t.path().to_path_buf();
         let canon = literal.canonicalize().unwrap();
+        assert_ne!(
+            literal, canon,
+            "本测依赖「字面 ≠ canonical」的 tempdir 形态(macOS /var → /private/var);\
+             当前环境两者相同,桥未被测到——防恒绿假钉,显式失败"
+        );
         let mut index = Index::new();
         let mut dir_map = DirIndexMap::default();
         // 根条目名 = 字面形态(索引侧),dir_map 键 = canonical 形态(daemon 侧)
