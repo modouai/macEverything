@@ -41,6 +41,16 @@ pub struct Overlay {
     /// Overlay 自身的小型 Index(parent 在 overlay 条目号空间内;桥接 anchor 的
     /// parent = NO_PARENT 占位,真实父经 `anchor_base` 切回 base 空间)。
     index: Index,
+    /// 可见性账本世代:凡改变查询可见性的写侧操作（apply_diff/purge_prefix）递增。
+    /// daemon flush 的「读锁快照流式写 → 写锁瞬间替换」靠它识别「放读锁 → 取写锁」
+    /// 窗口内插入的 diff（见 daemon::flush_merged）——普通 u64，恒在 holder 锁内
+    /// 读写；刻意**不参与** `is_empty`（世代非账本内容，空判定不得受其干扰）。
+    epoch: u64,
+}
+
+/// 世代递增（唯一两个可见性写点的收口）。
+fn touch(o: &mut Overlay) {
+    o.epoch += 1;
 }
 
 /// diff 目标所在空间:Base 已收录目录,或纯 overlay 目录(冷启动后新建)。
@@ -60,7 +70,13 @@ impl Overlay {
             anchor_base: HashMap::new(),
             dir_ids: HashMap::new(),
             index: Index::new(),
+            epoch: 0,
         }
+    }
+
+    /// 可见性账本世代（flush 快照一致性校验用，见字段注释）。
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// 是否完全无增量(compact/整理只在无 Overlay 时安全:任何账本非空都可能
@@ -291,6 +307,7 @@ impl Overlay {
         if let Some(b) = b0 {
             self.overlaid.insert(b);
         }
+        touch(self);
         Ok(DiffStats { added, removed })
     }
 
@@ -404,6 +421,7 @@ impl Overlay {
         }
         let p = prefix.to_path_buf();
         self.dir_ids.retain(|k, _| !k.starts_with(&p));
+        touch(self);
     }
 }
 
@@ -625,8 +643,9 @@ impl EntrySink {
 /// 物化时整条略去,其子项改挂到 base 目录号下;纯 overlay 条目按序追加,overlay
 /// 父为 anchor → 切 base 号,为纯 overlay 目录 → 用已映射的合成号。路径池按活
 /// 目录经父链重建(与 materialize/compact 同法,复用 `dir_path_bytes` 唯一实现)。
-/// T3 flush 的过渡写形态(T4 改条目流直写);落盘条目号为全新空间,内存侧
-/// base/overlay/dir_map 不受影响(索引文件只被下次冷启动消费,全量重建映射)。
+/// **T4 起 flush/persist_final 改走 [`write_merged_atomic`] 条目流直写,本函数
+/// 运行期已无消费方**，保留为「可见集」语义与**字节级等价**的测试基线
+/// （overlay 测试以其产物为对照钉死流式写路径）。落盘条目号为全新空间。
 pub fn materialize_composite(base: &dyn IndexView, overlay: &Overlay) -> Index {
     let base_count: u32 = base
         .entry_segments()
@@ -716,6 +735,115 @@ pub fn materialize_composite(base: &dyn IndexView, overlay: &Overlay) -> Index {
         }
     }
     out
+}
+
+/// 条目流直写(T4 flush 形态,tech.md §4.3):「Base + Overlay 顺序遍历」产出
+/// **可见集**条目流交 [`crate::persist::write_stream_atomic`] 边产边写——不经
+/// 全量堆物化（对照 [`materialize_composite`] 的全量 Index + 整文件 buf）。
+///
+/// 与物化路径的同源性：
+/// - 遍历顺序、可见集判定、父号重映射、anchor 略去完全同 `materialize_composite`，
+///   产物**字节级等价**（测试以其为对照钉）；
+/// - 活目录的合成完整路径直取**源空间**路径段（Base mmap 池段 / Overlay 预写段），
+///   零拷贝流出——留存条目的父链全是留存条目，链上名称与源一致，故源段字节 ==
+///   物化重建段（`rewrite_dir_path` 预写段与合并链恒等，见其注释）。
+///
+/// 账本腐化（父未留存/非 anchor 条目无父）在物化路径是 debug 断言，此处在
+/// release 同样响亮拒绝写出（产出损坏索引会让用户无感知全量重扫）。
+/// 返回活条目数（persist_final 条目数回报复用）。
+pub fn write_merged_atomic(
+    base: &dyn IndexView,
+    overlay: &Overlay,
+    meta: &crate::persist::IndexMeta,
+    path: &Path,
+) -> std::io::Result<u32> {
+    let base_count: u32 = base
+        .entry_segments()
+        .iter()
+        .map(|&(_, seg)| seg.len() as u32)
+        .sum();
+    let view = CompositeView::new(base, overlay);
+    // base 条目号 → 合成条目号（墓碑/被屏蔽不占号；NO_PARENT = 未留存）
+    let mut base_map: Vec<u32> = vec![NO_PARENT; base_count as usize];
+    // 纯 overlay 条目号 → 合成条目号（anchor 略去不占号）
+    let mut merged_of: HashMap<u32, u32> = HashMap::new();
+    let corrupted = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Overlay 账本腐化，拒绝合并写出：{why}"),
+        )
+    };
+    let mut live_out = 0u32;
+    crate::persist::write_stream_atomic(meta, path, |sink| {
+        // —— Base 段（与 materialize_composite 同序同判）——
+        for &(start, seg) in &base.entry_segments() {
+            for (j, e) in seg.iter().enumerate() {
+                let idx = start + j as u32;
+                if !e.is_live() || !view.entry_valid(idx) {
+                    continue;
+                }
+                let parent = if e.parent == NO_PARENT {
+                    NO_PARENT
+                } else {
+                    let mapped = base_map[e.parent as usize];
+                    if mapped == NO_PARENT {
+                        return Err(corrupted("留存条目的父未留存"));
+                    }
+                    mapped
+                };
+                let dir_path = if e.is_dir() {
+                    Some(base.dir_path(idx))
+                } else {
+                    None
+                };
+                let new = sink.push(
+                    base.display_name(idx),
+                    base.match_name(idx),
+                    parent,
+                    e.flags,
+                    dir_path,
+                )?;
+                base_map[idx as usize] = new;
+            }
+        }
+        // —— Overlay 段（anchor 略去不占号；纯 overlay 条目按插入序追加）——
+        for (o, e) in overlay.index.entries.iter().enumerate() {
+            let o = o as u32;
+            if !e.is_live() || overlay.anchor_base.contains_key(&o) {
+                continue;
+            }
+            let parent = if e.parent == NO_PARENT {
+                return Err(corrupted("非 anchor 条目的 parent 必指向 overlay 内条目"));
+            } else if let Some(&b) = overlay.anchor_base.get(&e.parent) {
+                let mapped = base_map[b as usize];
+                if mapped == NO_PARENT {
+                    return Err(corrupted("anchor 的 base 目录未留存"));
+                }
+                mapped // 父为 anchor → 挂其 base 目录
+            } else {
+                match merged_of.get(&e.parent) {
+                    Some(&p) => p, // 父为纯 overlay 目录 → 用已映射合成号
+                    None => return Err(corrupted("overlay 父条目未留存")),
+                }
+            };
+            let dir_path = if e.is_dir() {
+                Some(<Index as IndexView>::dir_path(&overlay.index, o))
+            } else {
+                None
+            };
+            let new = sink.push(
+                overlay.index.display_name_of(o),
+                overlay.index.match_name_of(o),
+                parent,
+                e.flags,
+                dir_path,
+            )?;
+            merged_of.insert(o, new);
+        }
+        live_out = sink.live_count();
+        Ok(())
+    })?;
+    Ok(live_out)
 }
 
 #[cfg(test)]
@@ -1537,5 +1665,175 @@ mod tests {
             IndexView::full_path_dyn(&view, out.hits[0]),
             root.join("brand/new/f.txt").to_string_lossy()
         );
+    }
+
+    // —— T4 条目流直写 ——
+
+    /// 场景夹具：root diff（屏蔽 + 新增）→ 子目录 d diff → 纯 overlay 子树
+    /// → 再一轮 d 重 diff（re-diff 复用桥）。覆盖：被屏蔽 Base 条目、anchor 桥、
+    /// 纯 overlay 目录、re-diff、多层嵌套——字节等价与 roundtrip 的最小充分集。
+    fn merge_fixture() -> (tempfile::TempDir, std::path::PathBuf, Index, Overlay) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("d/e")).unwrap();
+        std::fs::write(root.join("d/old.txt"), "").unwrap();
+        std::fs::write(root.join("d/e/leaf.txt"), "").unwrap();
+        std::fs::write(root.join("keep.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+
+        // 第一轮：root 加文件 + 删 keep；d 删 old + 加 new.txt；e 加 new2
+        std::fs::write(root.join("n0.txt"), "").unwrap();
+        std::fs::remove_file(root.join("keep.txt")).unwrap();
+        std::fs::remove_file(root.join("d/old.txt")).unwrap();
+        std::fs::write(root.join("d/new.txt"), "").unwrap();
+        std::fs::write(root.join("d/e/new2.txt"), "").unwrap();
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &root.join("d"))),
+            &root.join("d"),
+            &[],
+        )
+        .unwrap();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &root.join("d/e"))),
+            &root.join("d/e"),
+            &[],
+        )
+        .unwrap();
+
+        // 第二轮：纯 overlay 目录树 + d 重 diff（桥复用路径）
+        std::fs::create_dir_all(root.join("brand/new")).unwrap();
+        std::fs::write(root.join("brand/new/f.txt"), "").unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        let brand = ov
+            .overlay_dir_id(&root.join("brand"))
+            .expect("brand 应入寻址面");
+        ov.apply_diff(
+            &base,
+            DiffTarget::OverlayDir(brand),
+            &root.join("brand"),
+            &[],
+        )
+        .unwrap();
+        let newd = ov
+            .overlay_dir_id(&root.join("brand/new"))
+            .expect("new 应入寻址面");
+        ov.apply_diff(
+            &base,
+            DiffTarget::OverlayDir(newd),
+            &root.join("brand/new"),
+            &[],
+        )
+        .unwrap();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &root.join("d"))),
+            &root.join("d"),
+            &[],
+        )
+        .unwrap();
+        let root_owned = root.to_path_buf();
+        (t, root_owned, base, ov)
+    }
+
+    /// **字节级等价**主钉（T4 flush 突变验证的对照组）：流式直写产物与
+    /// 「materialize_composite + write_atomic」产物逐字节相同。
+    /// 突变「条目流漏过屏蔽判定（产出被屏蔽条目）」「重复产出 anchor」「遍历
+    /// 序错乱」→ 字节失配必红；产物语义由 roundtrip 测试独立钉。
+    #[test]
+    fn merged_stream_write_bytes_match_materialized_write() {
+        let (_t, _root, base, ov) = merge_fixture();
+        let meta = crate::persist::IndexMeta {
+            built_at: 7,
+            last_event_id: 9,
+            scan_roots: vec![b"/t".to_vec()],
+            excluded: vec![],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("materialized.bin");
+        let p2 = dir.path().join("streamed.bin");
+        let merged = materialize_composite(&base, &ov);
+        crate::persist::write_atomic(
+            &crate::persist::EntryLayout::of(&merged),
+            merged.entries.iter(),
+            &meta,
+            &p1,
+        )
+        .unwrap();
+        let live = write_merged_atomic(&base, &ov, &meta, &p2).unwrap();
+        assert_eq!(live, merged.entry_count(), "活条目数两路一致");
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            std::fs::read(&p2).unwrap(),
+            "流式直写与物化写字节级等价"
+        );
+    }
+
+    /// 流式直写产物的语义 roundtrip：mmap 载入后查询 = 合成视图命中集
+    /// （旧路径灭、新路径显、纯 overlay 子树、path: 查询）。
+    #[test]
+    fn merged_stream_output_roundtrips_through_mmap() {
+        let (t, root, base, ov) = merge_fixture();
+        let _keep = t;
+        let view = ov.composite_view(&base);
+        let meta = crate::persist::IndexMeta::default();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("merged.bin");
+        write_merged_atomic(&base, &ov, &meta, &p).unwrap();
+        let shared = crate::persist::load_mmap(&p).unwrap();
+
+        let hit_paths_of = |v: &dyn IndexView| -> std::collections::BTreeSet<String> {
+            let out = query::execute(v, &query::parse("*").unwrap(), usize::MAX);
+            out.hits.iter().map(|&h| v.full_path_dyn(h)).collect()
+        };
+        // 合成视图 vs 落盘重载：命中路径集零差异（根条目 parent == NO_PARENT，
+        // full_path 即其名，两侧同口径）
+        assert_eq!(
+            hit_paths_of(&view),
+            hit_paths_of(shared.as_ref()),
+            "流式落盘重载与合成视图命中集零差异"
+        );
+        // 关键语义抽查
+        let out = query::execute(shared.as_ref(), &query::parse("whole:old.txt").unwrap(), 10);
+        assert_eq!(out.total, 0, "被屏蔽的 Base 陈旧条目不得复活");
+        let out = query::execute(shared.as_ref(), &query::parse("whole:new.txt").unwrap(), 10);
+        assert_eq!(out.total, 1, "overlay 新文件落盘可见");
+        let out = query::execute(
+            shared.as_ref(),
+            &query::parse(&format!("path:{}", root.join("d").to_string_lossy())).unwrap(),
+            10,
+        );
+        assert!(out.total >= 2, "path: 查询经重建路径池命中 d 的子项");
+        // 独立参考枚举（当前磁盘态 + 根）终验
+        let mut reference = std::collections::BTreeSet::new();
+        ref_walk(&root, &mut reference);
+        reference.insert(root.to_string_lossy().into_owned());
+        assert_eq!(hit_paths_of(shared.as_ref()), reference, "对拍零差异");
+    }
+
+    /// epoch 世代钉：apply_diff / purge_prefix 各推进一代，is_empty 不受世代干扰。
+    #[test]
+    fn epoch_advances_on_visibility_writes_and_ignores_is_empty() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+        let mut ov = Overlay::new();
+        assert_eq!(ov.epoch(), 0);
+        assert!(ov.is_empty());
+        std::fs::write(root.join("b.txt"), "").unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        assert_eq!(ov.epoch(), 1, "apply_diff 推进世代");
+        assert!(!ov.is_empty());
+        ov.purge_prefix(&base, &root.join("a.txt"));
+        assert_eq!(ov.epoch(), 2, "purge_prefix 推进世代");
     }
 }

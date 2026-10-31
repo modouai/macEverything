@@ -26,9 +26,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// 停机时长超过此阈值且重放零事件 → 判重放不可信,转全量重扫(ADR-5 保守判定器)。
 pub const REPLAY_DOWNTIME_THRESHOLD_SECS: u64 = 48 * 3600;
 /// 落盘节流:距上次落盘超过此间隔且有变更 → 触发快照。
-const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-/// 落盘节流:累计变更超过此条数 → 立即触发快照。
-const FLUSH_DIRTY_LIMIT: u64 = 10_000;
+/// T4 放宽(tech.md §4.3):mmap Base 落地后落盘不再承担内存压力缓解(A1 由
+/// 「常驻 = mmap Base + 小 Overlay」兜底),拉长间隔/提高批量以减少全量重写与
+/// remap 频率;停机 flush 时机不变。
+const FLUSH_INTERVAL: Duration = Duration::from_secs(120);
+/// 落盘节流:累计变更超过此条数 → 立即触发快照(放宽理由同上)。
+const FLUSH_DIRTY_LIMIT: u64 = 30_000;
 /// 事件合批静默窗(tech.md 增量管线)。
 const BATCH_WINDOW: Duration = Duration::from_millis(100);
 /// 首扫流式聚合批大小:每批持写锁聚合后即释放,批间查询可见已扫部分(product 场景 2)。
@@ -550,8 +553,16 @@ fn apply_and_track(
         return 0;
     };
     if let engine::overlay::DiffTarget::Base(d0) = target {
-        if !base.as_view().entry(d0).is_live() {
-            map.remove(abs_dir); // 目录已删(子树墓碑):清映射,不做 diff
+        // 「新索引 + 旧 map」竞态窗口(替换段 swap 与 rebuild_dir_map 之间,遗留
+        // #12):map 残留的条目号对新索引可能**越界**。get+is_live 判活
+        // (scanner.rs 同一模式):越界/已死键一律清映射短路,绝不按死号下标。
+        // 突变「回退 entry(d0) 直下标」由 stale_dir_map_key 测试钉死。
+        let live =
+            base.as_view().entry_segments().iter().any(|&(s, seg)| {
+                d0 >= s && seg.get((d0 - s) as usize).is_some_and(|e| e.is_live())
+            });
+        if !live {
+            map.remove(abs_dir); // 目录已删(子树墓碑)或键失配:清映射,不做 diff
             return 0;
         }
     }
@@ -672,26 +683,85 @@ fn build_meta(state: &EngineState) -> IndexMeta {
 
 /// 快照落盘(原子替换,flush_lock 串行化);失败留痕不中断。
 /// Shared 态(dirty == 0,无本会话增量)无需重写:盘上索引即当前状态。
-/// Overlaid 态(T3 过渡形态):合成视图一次性物化写出(产物 = 可见集,被屏蔽
-/// 的 Base 陈旧条目不落盘——否则重启后无 Overlay 屏蔽面,陈旧路径复活);
-/// T4 改「Base + Overlay 条目流直写 + remap 换 Base + 清 Overlay」。
+/// Overlaid 态(T4 正式形态):合并流式直写 + remap 换 Base + 清 Overlay,
+/// 见 [`flush_merged`]。
 fn flush(state: &EngineState, paths: &DaemonPaths) {
     let _guard = state.flush_lock.lock().unwrap();
+    // Overlaid 分流:合并写需要「放读锁 → 取写锁」的锁形态,单独走 flush_merged
+    if matches!(&*state.holder.read().unwrap(), IndexHolder::Overlaid(_)) {
+        flush_merged(state, paths);
+        return;
+    }
     let h = state.holder.read().unwrap();
     let mut dirty_now = false;
     match &*h {
         IndexHolder::Mutable(idx) => {
             dirty_now = write_holder_index(idx, state, paths).is_ok();
         }
-        IndexHolder::Overlaid(st) => {
-            let merged = engine::overlay::materialize_composite(st.base.as_view(), &st.overlay);
-            dirty_now = write_holder_index(&merged, state, paths).is_ok();
-        }
         IndexHolder::Shared(_) | IndexHolder::Empty => {}
+        IndexHolder::Overlaid(_) => {} // 上方已分流
     }
     if dirty_now {
         state.dirty.store(0, Ordering::Relaxed);
         *state.last_flush.lock().unwrap() = Instant::now();
+    }
+}
+
+/// Overlaid 态的合并 flush(T4,tech.md §4.3「落盘与 Base 替换」):
+/// ① holder **读锁**内取 Base+Overlay 快照,条目流直写盘(查询不受阻,沿用
+///   既有 flush 的同构锁形态);② 放读锁、加载新 mmap;③ holder **写锁**内
+///   替换 Shared + 清 Overlay(旧 mmap 随 OverlaidState drop,munmap 只读映射
+///   近零成本)。全程 flush_lock 串行域内。
+///
+/// **快照一致性**(为什么需要 epoch):②③ 之间「放读 → 取写」窗口内插入的
+/// diff 会把改动写进即将被丢弃的 Overlay(丢更新)。替换前在写锁内复核
+/// `Overlay::epoch`:世代前移则放弃本次替换(dirty 保留、last_flush 照刷以免
+/// 密集重试),下轮 flush 重新合并——绝不丢弃窗口内增量。
+fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
+    let written = {
+        let h = state.holder.read().unwrap();
+        let IndexHolder::Overlaid(st) = &*h else {
+            return;
+        };
+        let epoch = st.overlay.epoch();
+        let meta = build_meta(state);
+        let ok = engine::overlay::write_merged_atomic(
+            st.base.as_view(),
+            &st.overlay,
+            &meta,
+            &paths.index_file(),
+        )
+        .map_err(|e| log::error!("合并落盘失败: {e}"))
+        .is_ok();
+        if ok {
+            Some(epoch)
+        } else {
+            None
+        }
+    };
+    let Some(epoch) = written else { return };
+    match persist::load_mmap(&paths.index_file()) {
+        Ok(view) => {
+            let mut h = state.holder.write().unwrap();
+            // 写锁内复核世代:diff 也必须拿写锁,故此刻的世代即终局判定
+            let snapshot_fresh = match &*h {
+                IndexHolder::Overlaid(st) => st.overlay.epoch() == epoch,
+                _ => false, // 形态已变(如重扫替换):不替换
+            };
+            if snapshot_fresh {
+                *h = IndexHolder::Shared(view);
+                drop(h);
+                state.dirty.store(0, Ordering::Relaxed);
+                log::info!("合并 flush 完成,Base 已 remap 为 mmap,Overlay 清零");
+            } else {
+                drop(h);
+                drop(view);
+                log::info!("合并写期间有新增量(世代前移),本轮不替换,下轮重试");
+            }
+            // 节流起点按「尝试过 flush」推进:失败重试不密集化
+            *state.last_flush.lock().unwrap() = Instant::now();
+        }
+        Err(e) => log::error!("合并产物重载失败(保留增量态,下轮重试): {e}"),
     }
 }
 
@@ -729,17 +799,23 @@ fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
             }
         }
         IndexHolder::Overlaid(st) => {
-            // 合成物化(可见集)落盘;条目数为去屏蔽后的真实活条目数
-            let merged = engine::overlay::materialize_composite(st.base.as_view(), &st.overlay);
-            let n = merged.entry_count();
+            // T4:条目流直写(可见集),不再全量物化;条目数 = 流统计的活条目数。
+            // stop 路径不做 remap(进程即将退出,盘上索引即下次冷启动的 Base)。
             let meta = build_meta(state);
-            let layout = persist::EntryLayout::of(&merged);
-            match persist::write_atomic(&layout, merged.entries.iter(), &meta, &paths.index_file())
-            {
-                Ok(()) => (true, n),
+            match engine::overlay::write_merged_atomic(
+                st.base.as_view(),
+                &st.overlay,
+                &meta,
+                &paths.index_file(),
+            ) {
+                Ok(n) => (true, n),
                 Err(e) => {
                     log::error!("最终落盘失败: {e}");
-                    (false, n)
+                    // 近似计数(含桥 anchor;仅用于 stop 应答回报)
+                    (
+                        false,
+                        live_count_of(&st.overlay.composite_view(st.base.as_view())),
+                    )
                 }
             }
         }
@@ -1065,10 +1141,12 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     }));
     *state.gaps.lock().unwrap() = gap_list;
     state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
-    // 重扫替换 holder:旧 Overlay 随整体替换丢弃——重扫产物为全量,窗口内变更由
-    // 下方 drain 重放追平,任何 Overlay 增量都已被覆盖(T3 前的「替换时清 Overlay」
-    // 在此以结构性方式满足)。
-    *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+    // 重扫替换段(T4 迁移,tech.md §4.3「P0 替换段衔接」收口):产物**直写落盘 →
+    // remap mmap Base → 清 Overlay**,不挂堆上 Mutable(与首扫共用
+    // mount_scan_product)。旧 Overlay 随整体替换丢弃——重扫产物为全量,窗口内
+    // 变更由下方 drain 重放追平。
+    let mounted = mount_scan_product(state, paths, idx);
+    *state.holder.write().unwrap() = mounted;
     // 水位推进到覆盖点:重扫内容 = 截至 floor 的磁盘状态;floor 以下积压的陈旧
     // 事件(含触发本轮重扫的 dropped 标记)从此刻起被消费循环跳过。
     state.seen_event_id.fetch_max(floor, Ordering::Relaxed);
@@ -1086,12 +1164,61 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     for dir in &replayed {
         diff_one(state, dir);
     }
+    // 窗口重放后 Overlay 若仍为空(常态:窗口无变更),刚写盘的 mmap Base 即盘上
+    // 真相——直接转 Shared 免一次全量合并写;有窗口变更则走 flush 合并。
+    collapse_empty_overlay(state);
     flush(state, paths);
     // 重扫产物(recs 临时结构 + 旧索引)释放后,滞留的 Malloc Large 脏页
     // (实测 254MB)在此一次性归还内核。
     engine::malloc_pressure::release_heap_pressure();
     state.set_state(state::READY);
     *state.last_rescan.lock().unwrap() = Some(Instant::now());
+}
+
+/// 扫描产物挂载(T4,tech.md §4.3):全量扫描 Index → 条目流直写落盘 →
+/// remap mmap Base(Shared),不留百万级堆索引常驻——**首扫与重扫替换段共用**
+/// (P0 迁移的同一逻辑,tech.md §1.6 预告的切换点)。写盘/重载失败退回挂
+/// Mutable(保守可用,下轮 flush 重试落盘),扫描成果不作废。
+/// 注:meta 取调用方当时的水位——崩溃窗口内盘上水位偏旧,重启重放幂等追平
+/// (「落盘水位 ≤ 索引内容」语义不受影响)。
+fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) -> IndexHolder {
+    let meta = build_meta(state);
+    let layout = persist::EntryLayout::of(&idx);
+    match persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file()) {
+        Ok(()) => match persist::load_mmap(&paths.index_file()) {
+            Ok(view) => {
+                drop(idx); // 落盘即弃堆产物,mmap Base 接管
+                IndexHolder::Shared(view)
+            }
+            Err(e) => {
+                log::error!("扫描产物重载失败,退回内存索引: {e}");
+                IndexHolder::Mutable(idx)
+            }
+        },
+        Err(e) => {
+            log::error!("扫描产物落盘失败,退回内存索引: {e}");
+            IndexHolder::Mutable(idx)
+        }
+    }
+}
+
+/// Overlaid{mmap Base, 空 Overlay} → Shared:刚写盘的 Base 即盘上真相,直挂免
+/// 全量合并写(重扫替换段的窗口无变更常态路径)。写锁内的 Empty 瞬态无观察者
+/// (与 ensure_overlay_ready 同一手法);Heap Base 不转(盘上内容与之无对应保证)。
+/// 窗口有变更(Overlay 非空)则不动,交 flush 合并。
+fn collapse_empty_overlay(state: &EngineState) {
+    let mut h = state.holder.write().unwrap();
+    let taken = std::mem::replace(&mut *h, IndexHolder::Empty);
+    *h = match taken {
+        IndexHolder::Overlaid(st) if st.overlay.is_empty() => match st.base {
+            BaseRef::Mmap(v) => IndexHolder::Shared(v),
+            base => IndexHolder::Overlaid(Box::new(OverlaidState {
+                base,
+                overlay: st.overlay,
+            })),
+        },
+        other => other,
+    };
 }
 
 /// 自动源的重扫入口:后台线程执行(不阻塞消费循环);锁被占用即放弃。
@@ -1245,8 +1372,21 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             }
             state.applied_event_id.store(water, Ordering::Relaxed);
             state.seen_event_id.store(water, Ordering::Relaxed);
+            // T4:首扫产物同样收敛为 mmap Base(与重扫替换段共用 mount_scan_product,
+            // tech.md §4.3)——不留堆索引常驻;此刻水位已含 water,落盘 meta 一致。
+            let mounted = mount_scan_product(&state, &paths, {
+                let mut h = state.holder.write().unwrap();
+                match std::mem::replace(&mut *h, IndexHolder::Empty) {
+                    IndexHolder::Mutable(idx) => idx,
+                    other => {
+                        *state.holder.write().unwrap() = other;
+                        unreachable!("首扫流式聚合后必为 Mutable")
+                    }
+                }
+            });
+            *state.holder.write().unwrap() = mounted;
             rebuild_dir_map(&state);
-            flush(&state, &paths);
+            flush(&state, &paths); // Shared 态:盘上即刚写产物,无操作
             state.set_state(state::READY);
             // 从扫描前水位重放:补齐扫描窗口变更,追平后转纯实时
             (water, false)
@@ -2634,5 +2774,137 @@ mod tests {
             3,
             "重放把窗口变更(x.txt)补进合成视图"
         );
+    }
+
+    // ---------- T4:flush 合并写 + P0 替换段迁移 ----------
+
+    /// 节流常量钉(T4 放宽,memory-footprint tech.md §4.3):落盘不再承担内存
+    /// 压力缓解(mmap Base 兜底 A1),放宽到 120s/30k 减少全量重写与 remap 频率。
+    /// 突变「改回 30s/10k」或「注释与值脱节」此测必红。
+    #[test]
+    fn flush_throttle_constants_match_spec() {
+        assert_eq!(FLUSH_INTERVAL, Duration::from_secs(120), "间隔 30s→120s");
+        assert_eq!(FLUSH_DIRTY_LIMIT, 30_000, "条数 10k→30k");
+    }
+
+    /// P0 替换段迁移钉(T4):重扫替换段必须「直写落盘 → remap mmap Base → 清
+    /// Overlay」,完成后 holder 为 Shared(mmap 直挂),绝不回退堆 Mutable
+    /// (否则重新引入百万级堆驻留)。突变「替换段回退 *holder = Mutable(idx)」
+    /// 或「collapse 漏调 + 窗口无变更」本断言红。
+    #[test]
+    fn rescan_replacement_mounts_mmap_base_not_heap_mutable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        let state = Arc::new(EngineState::new());
+        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        degrade_and_rescan(&state, &paths, true);
+        {
+            let h = state.holder.read().unwrap();
+            assert!(
+                matches!(&*h, IndexHolder::Shared(_)),
+                "重扫后应直挂 mmap Base(Shared),不得挂堆 Mutable"
+            );
+        }
+        // 重扫产物已落盘且可查(经 Shared 视图)
+        assert!(paths.index_file().exists(), "重扫产物应已落盘");
+        assert!(
+            status_entry_count(&state) > 0,
+            "Shared 态查询计数正常(dir_map/rebuild 链路完好)"
+        );
+    }
+
+    /// 「新索引 + 旧 map」竞态窗口钉(遗留 #12):替换段 swap 与 rebuild_dir_map
+    /// 之间,map 残留的条目号对新索引可能越界——必须按死键清映射短路,绝不
+    /// 按死号下标(panic 即索引不可用)。突变「apply_and_track 回退 entry(d0)
+    /// 直下标判活」本测 panic 红。
+    #[test]
+    fn stale_dir_map_key_outside_new_index_is_dropped_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale");
+        std::fs::create_dir(&stale).unwrap();
+        let state = Arc::new(EngineState::new());
+        // 小索引(仅 1 条 root),map 却残留指向 999 号(越界)的陈旧键
+        let mut idx = Index::new();
+        idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        let idx_file = dir.path().join("index.bin");
+        persist::write_atomic(
+            &persist::EntryLayout::of(&idx),
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write().unwrap() =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        let stale_key = stale.canonicalize().unwrap();
+        state.dir_map.lock().unwrap().insert(&stale_key, 999);
+        // diff 走到越界键:清映射返回 0,不 panic
+        assert_eq!(diff_one(&state, &stale), 0, "越界键按死键处理");
+        assert!(
+            !state.dir_map.lock().unwrap().contains_key(&stale_key),
+            "陈旧键应被清出"
+        );
+    }
+
+    /// flush 合并写主链路钉(T4,tech.md §4.3「落盘与 Base 替换」):Overlaid 态
+    /// flush → 条目流直写落盘 → holder 替换 Shared + Overlay 清零 → 查询语义
+    /// 不变(增量不丢)。突变「flush 后不替换/不清 Overlay」此测红;「替换丢
+    /// 增量」由 whole:new.txt 断言红。
+    #[test]
+    fn merged_flush_remaps_base_and_clears_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("a.txt", root, false);
+        let idx_file = data.path().join("index.bin");
+        persist::write_atomic(
+            &persist::EntryLayout::of(&idx),
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write().unwrap() =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        rebuild_dir_map(&state);
+
+        // 磁盘漂移 + diff → Overlaid(增量在 Overlay,未落盘)
+        std::fs::write(dir.path().join("new.txt"), b"").unwrap();
+        assert_eq!(diff_one(&state, dir.path()), 1);
+        assert!(matches!(
+            &*state.holder.read().unwrap(),
+            IndexHolder::Overlaid(_)
+        ));
+
+        // flush:合并直写 + remap + 清 Overlay
+        let paths = DaemonPaths {
+            data_dir: data.path().to_path_buf(),
+        };
+        flush(&state, &paths);
+        assert!(
+            matches!(&*state.holder.read().unwrap(), IndexHolder::Shared(_)),
+            "flush 后应为 Shared(remap 完成、Overlay 清零)"
+        );
+        // 内存查询:增量保留(合并写不得丢更新)
+        match run_query(&state, "whole:new.txt", 10, None, false) {
+            Response::Query { total, .. } => assert_eq!(total, 1, "flush 后增量保留"),
+            other => panic!("意外响应: {other:?}"),
+        }
+        // 盘上证词:重新 mmap 载入(模拟下次冷启动)后增量已在索引里
+        let reloaded = persist::load_mmap(&idx_file).unwrap();
+        let out = engine::query::execute(
+            reloaded.as_ref(),
+            &engine::query::parse("whole:new.txt").unwrap(),
+            10,
+        );
+        assert_eq!(out.total, 1, "增量已合并落盘");
     }
 }
