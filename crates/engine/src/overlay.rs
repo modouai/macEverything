@@ -449,6 +449,22 @@ impl IndexView for CompositeView<'_> {
         }
     }
 
+    /// 父条目号(合成空间):Overlay 条目的父存的是 overlay 空间号,必须重映射
+    /// (base_count + 父)——query 侧 dir_hits 按合成号直下标,错空间号会命中
+    /// 无关槽位(评审缺陷:path 查询对 overlay 新增文件假阴性/对无关条目假阳性)。
+    fn parent_idx(&self, idx: u32) -> u32 {
+        if idx < self.base_count {
+            self.base.entry(idx).parent
+        } else {
+            let p = self.overlay_entry(idx).parent;
+            if p == NO_PARENT {
+                NO_PARENT
+            } else {
+                self.base_count + p
+            }
+        }
+    }
+
     fn match_name(&self, idx: u32) -> &[u8] {
         if idx < self.base_count {
             self.base.match_name(idx)
@@ -722,6 +738,10 @@ mod tests {
         }
     }
 
+    fn set(paths: &[&str]) -> std::collections::BTreeSet<String> {
+        paths.iter().map(|s| s.to_string()).collect()
+    }
+
     fn total(view: &CompositeView, q: &str) -> u32 {
         query::execute(view, &query::parse(q).unwrap(), usize::MAX).total
     }
@@ -825,8 +845,24 @@ mod tests {
             root.join("d1/d2/n2.txt").to_string_lossy()
         );
         // path: 词命中 overlay 目录预写路径段(rewrite_dir_path 的钉;
-        // 突变「不写 overlay 路径池」→ path:d1 漏掉 n1.txt,必红)
-        assert_eq!(total(&view, "path:d1"), 2, "n1.txt + n2.txt");
+        // 突变「不写 overlay 路径池」→ path:d1 漏掉 n1/n2,必红)。
+        // 命中集口径:路径含 d1 的目录(base d1/d2、overlay d1/d2)的全部子项
+        // ——d2(base 目录,父层 listing 幸存)、n1、n2;leaf 已删被屏蔽。
+        let out_d1 = query::execute(&view, &query::parse("path:d1").unwrap(), 10);
+        let d1_set: std::collections::BTreeSet<String> = out_d1
+            .hits
+            .iter()
+            .map(|&h| view.full_path_composite(h))
+            .collect();
+        assert_eq!(
+            d1_set,
+            set(&[
+                &root.join("d1/d2").to_string_lossy(),
+                &root.join("d1/n1.txt").to_string_lossy(),
+                &root.join("d1/d2/n2.txt").to_string_lossy(),
+            ]),
+            "path:d1 命中集(base 幸存目录 + 两层 overlay 新文件)"
+        );
     }
 
     /// 子目录 diff 后父未再 diff(终止条件 1/2 的组合):
@@ -1174,6 +1210,59 @@ mod tests {
                 .collect();
             assert_eq!(paths, hit_paths(&view), "物化与合成视图零差异(无幽灵根)");
         }
+    }
+
+    /// path: 查询的父号空间重映射(评审终评缺陷回归钉):Overlay 条目的 parent
+    /// 是 overlay 空间号,dir_hits 按合成号对齐——突变「parent_idx 去掉重映射」时
+    /// dir_hits 直下标命中无关槽位:overlay 新文件假阴性(path:w1=0)、无关目录
+    /// 假阳性(path:w2 误中 w1 下文件),两断言皆红。
+    #[test]
+    fn path_query_remaps_overlay_parent_ids() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("w1")).unwrap();
+        std::fs::create_dir_all(root.join("w2")).unwrap();
+        std::fs::write(root.join("w1/a.txt"), "").unwrap();
+        std::fs::write(root.join("w2/b.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+
+        // root diff → w1/w2 桥建立(base 副本转屏蔽);w1 下新增文件只进 overlay
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        std::fs::write(root.join("w1/new.txt"), "").unwrap();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &root.join("w1"))),
+            &root.join("w1"),
+            &[],
+        )
+        .unwrap();
+        let view = ov.composite_view(&base);
+        // 假阴性方向:overlay 子项的父必须重映射进合成空间,path:w1 命中 w1 的
+        // 全部子项(overlay 存活副本 a.txt + overlay 新文件 new.txt)
+        let w1_hits = |view: &CompositeView| {
+            let out = query::execute(view, &query::parse("path:w1").unwrap(), 10);
+            let set: std::collections::BTreeSet<String> = out
+                .hits
+                .iter()
+                .map(|&h| view.full_path_composite(h))
+                .collect();
+            assert_eq!(set.len(), out.total as usize, "命中路径不得折叠");
+            set
+        };
+        assert_eq!(
+            w1_hits(&view),
+            set(&[
+                &root.join("w1/a.txt").to_string_lossy(),
+                &root.join("w1/new.txt").to_string_lossy()
+            ]),
+            "path:w1 必须命中 overlay 新文件(父号重映射)"
+        );
+        // 假阳性方向:path:w2 不得命中 w1 下文件(错空间号会读到无关槽位)
+        assert_eq!(total(&view, "path:w2"), 1, "path:w2 只命中 b.txt");
+        assert_eq!(total(&view, "whole:new.txt"), 1, "name 查询对照(恒正常)");
     }
 
     /// purge_prefix:摘除子树波及的 Overlay 账本同步作废

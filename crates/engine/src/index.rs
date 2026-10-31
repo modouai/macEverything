@@ -449,6 +449,16 @@ pub trait IndexView: Sync {
     /// 随机访问:条目号 → 条目。越界行为与内存切片一致(panic,同一信任级别)。
     fn entry(&self, idx: u32) -> &Entry;
 
+    /// 条目的父条目号,**全局合成空间号**(T3 评审 2026-10-31):单源视图与
+    /// `entry(idx).parent` 一致;双源合成视图必须把 overlay 空间父号重映射进
+    /// 合成空间(base_count + 父)——查询侧 path 词的 dir_hits 预过滤按合成号
+    /// 直下标取「父是否命中目录」,直接读 `entry(idx).parent` 会在 Overlay 命中
+    /// 上拿到错空间号、命中无关槽位(path 查询随机丢失/误收,持续整个增量窗口)。
+    /// NO_PARENT 原样返回(调用方以 `!= NO_PARENT` 短路)。
+    fn parent_idx(&self, idx: u32) -> u32 {
+        self.entry(idx).parent
+    }
+
     /// 匹配形态名(match 折叠段;case: 查询在查询端另取 display 归一)。
     fn match_name(&self, idx: u32) -> &[u8];
 

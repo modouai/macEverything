@@ -218,7 +218,11 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                     // 已知限制:path 词不横跨目录段与文件名——目录池无文件名、
                     // 文件只取自身名;tech.md「父路径+名称短拼」留待需求出现再落
                     // (Task 21 回填 tech.md),现行为即已知限制。
-                    let under_hit_dir = e.parent != NO_PARENT && dir_hits[e.parent as usize];
+                    // parent_idx:T3 合成视图的父号重映射挂点——dir_hits 按全局
+                    // 合成号对齐,Overlay 条目的 parent 是 overlay 空间号,直接
+                    // 下标会命中无关槽位(path 查询随机丢失/误收)。
+                    let parent = view.parent_idx(idx);
+                    let under_hit_dir = parent != NO_PARENT && dir_hits[parent as usize];
                     let name_hits_path = !e.is_dir()
                         && path_terms_match(view.match_name(idx), &c_path, plan.whole_word);
                     if !under_hit_dir && !name_hits_path {

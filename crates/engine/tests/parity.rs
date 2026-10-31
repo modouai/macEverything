@@ -492,8 +492,9 @@ fn parity_overlay_type_flip_and_subtree_removal_zero_diff() {
 
 /// 子先父后 + re-diff(评审第四形态「桥覆盖孤儿」对拍):子目录先 diff(桥为
 /// 顶层占位)→ 父层首 diff 必须复用并 re-parent,不得新建覆盖;多轮 re-diff
-/// 恒一份,整树删除后零泄漏。突变「复用/reparent 去掉」时:命中数塌缩/重复
-/// (link 覆盖清扫旧桥 → 数据丢失)与 hit_paths 折叠断言必红。
+/// 恒一份,整树删除后零泄漏。注:该突变的决定性杀伤在
+/// `child_first_bridge_is_reused_not_duplicated_on_parent_diff` 单测
+/// (首断言即红);本测钉终态对拍与物化无幽灵根。
 #[test]
 fn parity_overlay_child_first_then_parent_zero_diff() {
     let (t, index) = overlay_fixture();
