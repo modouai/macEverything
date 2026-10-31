@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod config;
+pub mod dir_map;
 pub mod entry;
 pub mod fsevents;
 pub mod index;

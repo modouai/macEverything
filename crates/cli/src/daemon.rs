@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use client::{stat_of, stat_rows, state, DaemonPaths};
 use engine::config;
+use engine::dir_map::DirIndexMap;
 use engine::entry::NO_PARENT;
 use engine::fsevents::{self, FseStream};
 use engine::index::{Index, IndexView};
@@ -118,7 +119,7 @@ pub struct EngineState {
     /// 落盘串行锁:stop 落盘与消费线程退出落盘/节流落盘互斥(曾实测并发
     /// write_atomic 交错损坏索引;tmp 名唯一化之外的语义级双保险)。
     flush_lock: Mutex<()>,
-    dir_map: Mutex<HashMap<PathBuf, u32>>,
+    dir_map: Mutex<DirIndexMap>,
     roots: Mutex<Vec<PathBuf>>,
     cfg: Mutex<config::Config>,
     /// 卷扫描世代:每次卷卸载推进,使在途扫描批次失效(防「拔出即重插」时
@@ -173,7 +174,7 @@ impl EngineState {
             dirty: AtomicU64::new(0),
             last_flush: Mutex::new(Instant::now()),
             flush_lock: Mutex::new(()),
-            dir_map: Mutex::new(HashMap::new()),
+            dir_map: Mutex::new(DirIndexMap::default()),
             roots: Mutex::new(vec![]),
             cfg: Mutex::new(config::Config {
                 excluded: vec![],
@@ -373,7 +374,7 @@ fn rebuild_dir_map(state: &EngineState) {
     // map 键用 canonical 形态——/tmp 等系统符号链接下 FSEvents 上报真实路径
     // (/private/tmp/...),canonicalize 让事件侧与索引侧同形。
     let literal_roots = state.roots.lock().unwrap().clone();
-    let mut map: HashMap<PathBuf, u32> = HashMap::new();
+    let mut map = DirIndexMap::default();
     let h = state.holder.read().unwrap();
     let IndexHolder::Mutable(idx) = &*h else {
         return;
@@ -396,7 +397,7 @@ fn rebuild_dir_map(state: &EngineState) {
         let name = String::from_utf8_lossy(idx.display_name_of(i)).into_owned();
         if let Some(r) = literal_roots.iter().find(|r| r.to_string_lossy() == name) {
             let key = r.canonicalize().unwrap_or_else(|_| r.clone());
-            map.insert(key.clone(), i);
+            map.insert(&key, i);
             queue.push_back((key, i));
         }
     }
@@ -406,7 +407,7 @@ fn rebuild_dir_map(state: &EngineState) {
                 if idx.entries[k as usize].is_dir() {
                     let mut p = abs.clone();
                     p.push(String::from_utf8_lossy(idx.display_name_of(k)).into_owned());
-                    map.insert(p.clone(), k);
+                    map.insert(&p, k);
                     queue.push_back((p, k));
                 }
             }
@@ -420,11 +421,11 @@ fn rebuild_dir_map(state: &EngineState) {
 fn apply_and_track(
     state: &EngineState,
     idx: &mut Index,
-    map: &mut HashMap<PathBuf, u32>,
+    map: &mut DirIndexMap,
     abs_dir: &Path,
     excludes: &[std::path::PathBuf],
 ) -> u32 {
-    let Some(&dir_idx) = map.get(abs_dir) else {
+    let Some(dir_idx) = map.get(abs_dir) else {
         return 0;
     };
     if !idx.entries[dir_idx as usize].is_live() {
@@ -440,7 +441,7 @@ fn apply_and_track(
                 if idx.entries[k as usize].is_dir() {
                     let mut p = abs_dir.to_path_buf();
                     p.push(String::from_utf8_lossy(idx.display_name_of(k)).into_owned());
-                    map.insert(p, k);
+                    map.insert(&p, k);
                 }
             }
             stats.added + stats.removed
@@ -765,7 +766,7 @@ fn sampling_finds_gap(state: &Arc<EngineState>, paths: &DaemonPaths) -> bool {
         if map.is_empty() {
             return false;
         }
-        let keys: Vec<PathBuf> = map.keys().cloned().collect();
+        let keys: Vec<PathBuf> = map.keys().map(Path::to_path_buf).collect();
         if keys.len() <= SAMPLE_DIRS {
             keys
         } else {
@@ -887,7 +888,7 @@ fn record_persistent_failure(state: &EngineState, abs_dir: &Path, reason: &str) 
 fn handle_diff_error(
     state: &EngineState,
     idx: &mut Index,
-    map: &mut HashMap<PathBuf, u32>,
+    map: &mut DirIndexMap,
     abs_dir: &Path,
     e: &std::io::Error,
 ) {
@@ -980,7 +981,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             // 再按批聚合,批间释放写锁——首扫期间 query 返回已扫部分、status 可见进度。
             // (重扫路径不这样做:tech.md 要求「重扫期间旧索引可查」,新索引建成才替换。)
             let mut index = Index::new();
-            let mut staging_map: HashMap<PathBuf, u32> = HashMap::new();
+            let mut staging_map = DirIndexMap::default();
             engine::scanner::seed_roots(&mut index, &mut staging_map, &roots);
             *state.holder.write().unwrap() = IndexHolder::Mutable(index);
             let (recs, table, gaps) = engine::scanner::collect_records(&roots, &excludes, threads);
@@ -1480,7 +1481,8 @@ mod tests {
         let root = idx.insert(dir.to_string_lossy().as_ref(), NO_PARENT, true);
         {
             let mut map = state.dir_map.lock().unwrap();
-            map.insert(dir.canonicalize().unwrap(), root);
+            let key = dir.canonicalize().unwrap();
+            map.insert(&key, root);
         }
         *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
         state
@@ -1998,16 +2000,16 @@ mod tests {
         let state = Arc::new(EngineState::new());
         let root = root.canonicalize().unwrap(); // 与 diff_one 基址同形态(/var→/private/var)
         let mut idx = Index::new();
-        let mut map = HashMap::new();
+        let mut map = DirIndexMap::default();
         let root_idx = idx.insert(&root.to_string_lossy(), NO_PARENT, true);
-        map.insert(root.to_path_buf(), root_idx);
+        map.insert(&root, root_idx);
         for sub in subdirs {
             let p = root.join(sub);
             let parent = p.parent().unwrap().to_path_buf();
-            let pidx = map[&parent];
+            let pidx = map.get(&parent).expect("夹具父键已插入");
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let k = idx.insert(&name, pidx, true);
-            map.insert(p, k);
+            map.insert(&p, k);
         }
         *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
         *state.dir_map.lock().unwrap() = map;
@@ -2035,8 +2037,9 @@ mod tests {
                 panic!("holder 应为 Mutable")
             };
             let map = state.dir_map.lock().unwrap();
+            let locked_idx = map.get(&locked).expect("locked 键应在");
             assert!(
-                idx.entries[map[&locked] as usize].is_live(),
+                idx.entries[locked_idx as usize].is_live(),
                 "EPERM 目录保留条目(与首扫「入索引+空子树+gaps」语义一致)"
             );
         }
@@ -2169,11 +2172,11 @@ mod tests {
 
         // 模拟重扫产物替换:全新索引 = 扫描开始时点快照(不含窗口内 x.txt)
         let mut idx = Index::new();
-        let mut map = HashMap::new();
+        let mut map = DirIndexMap::default();
         let r = idx.insert(&root.to_string_lossy(), NO_PARENT, true);
-        map.insert(root.to_path_buf(), r);
+        map.insert(&root, r);
         let d_idx = idx.insert("d", r, true);
-        map.insert(d, d_idx);
+        map.insert(&d, d_idx);
         *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
         *state.dir_map.lock().unwrap() = map;
         {

@@ -284,7 +284,7 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
         .lock()
         .unwrap()
         .keys()
-        .filter_map(|p| volume_root_of(p))
+        .filter_map(volume_root_of)
         .filter(|v| !desired.contains(v))
         .collect();
     for vol in stale {

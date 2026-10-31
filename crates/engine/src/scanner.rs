@@ -13,9 +13,10 @@
 //!   `assert_disjoint_roots`)。
 //!
 //! 两条路径(串行/并行)的分类语义由 `classify_entry` 单点保证。
+use crate::dir_map::DirIndexMap;
 use crate::entry::NO_PARENT;
 use crate::index::Index;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// 扫描缺口:权限类逐条留痕(目录 + errno 文案),其余 IO 错误只计数。
@@ -308,12 +309,12 @@ pub fn collect_records(
 }
 
 /// 聚合前登记根条目(键为原始路径形态,与 `apply_records` 的 dir_map 同规则)。
-pub fn seed_roots(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, roots: &[PathBuf]) {
+pub fn seed_roots(index: &mut Index, dir_map: &mut DirIndexMap, roots: &[PathBuf]) {
     for root in roots {
         // 根条目名 = 完整绝对路径(与串行臂一致,full_path 可直接使用)
         let name = root.to_string_lossy().into_owned();
         let idx = index.insert(&name, NO_PARENT, true);
-        dir_map.insert(root.clone(), idx);
+        dir_map.insert(root, idx);
     }
 }
 
@@ -324,54 +325,124 @@ pub fn seed_roots(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, roots:
 /// Dir 聚合:raw = table[dir_seq](自身原始路径)直接作 dir_map 键——目录名
 /// 非 UTF-8 时键保真(不做父路径 + lossy 名拼接,那会键漂移);父条目号查
 /// `raw.parent()`(PathBuf 零拷贝切片,拓扑序保证父已在 map)。
-pub fn apply_records(
-    index: &mut Index,
-    dir_map: &mut HashMap<PathBuf, u32>,
-    recs: &[Rec],
-    table: &DirTable,
-) {
+pub fn apply_records(index: &mut Index, dir_map: &mut DirIndexMap, recs: &[Rec], table: &DirTable) {
     for rec in recs {
         match rec {
             Rec::Dir { dir_seq, name } => {
                 let raw = table.get(*dir_seq);
-                let pidx = dir_map[raw.parent().expect("目录记录的表内路径必有父段")];
+                let parent = raw.parent().expect("目录记录的表内路径必有父段");
+                let pidx = dir_map
+                    .get(parent)
+                    .expect("父目录必先于子记录在 map(深度排序拓扑序保证)");
                 let idx = index.insert(name, pidx, true);
-                dir_map.insert(raw.to_path_buf(), idx);
+                dir_map.insert(raw, idx);
             }
             Rec::File { dir_seq, name } => {
-                let pidx = dir_map[table.get(*dir_seq)];
+                let pidx = dir_map
+                    .get(table.get(*dir_seq))
+                    .expect("父目录必先于子记录在 map(深度排序拓扑序保证)");
                 index.insert(name, pidx, false);
             }
         }
     }
 }
 
-/// 清除以 `prefix` 为路径前缀的整棵子树(卷卸载/停用路径,external-volumes §4)。
+/// 清除以 `prefix` 为路径前缀的整棵子树(卷卸载/ENOENT 摘除,低频)。
 ///
-/// 取 dir_map 中前缀匹配(含前缀自身)的条目,**浅者先**调 `Index::remove`——
-/// 其子树级联墓碑(「活条目的父必活」不变量)保证后代无遗漏,深键重复删除
-/// 对墓碑短路,天然幂等;dir_map 同步清掉前缀下全部键。返回清除的活条目数
-/// (含目录)。无匹配键返回 0(从未索引/重复清除,幂等)。
-pub fn remove_prefix(index: &mut Index, dir_map: &mut HashMap<PathBuf, u32>, prefix: &Path) -> u32 {
+/// 键 intern 化后 dir_map 无 `starts_with` 遍历能力,受害者在**索引侧**收集
+/// (memory-footprint §4.4):活目录条目按完整路径(原始字节,见 `full_path_raw`)
+/// 前缀匹配,**浅者先**调 `Index::remove`——其子树级联墓碑(「活条目的父必活」
+/// 不变量)保证后代无遗漏,深键重复删除对墓碑短路,天然幂等。dir_map 清键按值
+/// 谓词清扫:受害者条目此刻全部墓碑,连同历史滞留的「条目已死、键仍在」陈旧键
+/// 一并清除(`DirIndexMap::retain`)。返回清除的活条目数(含目录)。无匹配返回 0
+/// (从未索引/重复清除,幂等)。O(全目录) 单次几十 ms——摘除仅卷卸载/子树删除
+/// 时触发,预算内。
+///
+/// **形态桥**:dir_map 键是 canonical 形态(diff_one 基址规则),索引完整路径是
+/// 「字面根 + display 段」形态。根为符号链接(/tmp → /private/tmp)时两形态不同,
+/// 拿 canonical 前缀直接匹配完整路径会整树漏摘。对每个根条目 canonicalize 一次
+/// (根本体在两调用场景都存在:ENOENT 只删子树,卷卸载时卷仍挂载;失败退恒等桥
+/// ——无符号链接根时两形态本就相同),canonical 前缀经桥换算出字面形态一并匹配。
+pub fn remove_prefix(index: &mut Index, dir_map: &mut DirIndexMap, prefix: &Path) -> u32 {
     let before = index.entry_count();
-    let mut victims: Vec<u32> = dir_map
-        .iter()
-        .filter(|(p, _)| p.starts_with(prefix))
-        .map(|(_, &idx)| idx)
+    // 根桥:字面根 → canonical 根。
+    let bridge: Vec<(PathBuf, PathBuf)> = (0..index.entries.len() as u32)
+        .filter(|&i| {
+            let e = &index.entries[i as usize];
+            e.parent == NO_PARENT && e.is_live() && e.is_dir()
+        })
+        .map(|i| {
+            let literal = full_path_raw(index, i);
+            let canon = literal.canonicalize().unwrap_or_else(|_| literal.clone());
+            (literal, canon)
+        })
         .collect();
-    victims.sort_unstable_by_key(|&idx| index.full_path(idx).components().count());
-    for idx in victims {
-        index.remove(idx);
+    // 前缀两形态都要匹配:调用方给 canonical(diff_one 基址)或字面(卷根),
+    // 索引完整路径是字面形态。
+    let mut prefixes: Vec<PathBuf> = vec![prefix.to_path_buf()];
+    for (literal, canon) in &bridge {
+        if let Ok(rest) = prefix.strip_prefix(canon) {
+            let lp = if rest.as_os_str().is_empty() {
+                literal.clone()
+            } else {
+                literal.join(rest)
+            };
+            prefixes.push(lp);
+        }
     }
-    dir_map.retain(|p, _| !p.starts_with(prefix));
+    prefixes.sort();
+    prefixes.dedup();
+
+    // 受害者:活目录 + 完整路径命中任一形态前缀。
+    let mut victims: Vec<(u32, PathBuf)> = (0..index.entries.len() as u32)
+        .filter(|&i| {
+            let e = &index.entries[i as usize];
+            e.is_live() && e.is_dir()
+        })
+        .map(|i| (i, full_path_raw(index, i)))
+        .filter(|(_, p)| prefixes.iter().any(|pre| p.starts_with(pre)))
+        .collect();
+    // 浅者先:级联墓碑让深键重复删除短路(与旧实现同语义)。
+    victims.sort_unstable_by_key(|(_, p)| p.components().count());
+    for (i, _) in &victims {
+        index.remove(*i);
+    }
+    dir_map.retain(|v| index.entries[v as usize].is_live());
     before.saturating_sub(index.entry_count())
+}
+
+/// 条目完整路径的原始字节形态(display 名直接组字节,不经 lossy)。victim 匹配
+/// 用它与调用方前缀(磁盘原始字节)比对——`Index::full_path` 走 `from_utf8_lossy`,
+/// 非 UTF-8 名称会被替换成 U+FFFD 而与真实字节错位(dir_map 键保真的前提是全链
+/// 路原始字节;APFS 拒绝非 UTF-8 名,此差异实际只在 Linux 侧可达)。
+fn full_path_raw(index: &Index, idx: u32) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut cur = idx;
+    loop {
+        let e = &index.entries[cur as usize];
+        parts.push(index.display_name_of(cur));
+        if e.parent == NO_PARENT {
+            break;
+        }
+        cur = e.parent;
+    }
+    parts.reverse();
+    let mut bytes: Vec<u8> = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(p);
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
 }
 
 /// 并行扫描入口(一次性):遍历 → 深度排序 → 聚合。
 fn scan_parallel(roots: &[PathBuf], excludes: &[PathBuf], threads: usize) -> (Index, ScanGaps) {
     let (recs, table, gaps) = collect_records(roots, excludes, threads);
     let mut index = Index::new();
-    let mut dir_map: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
+    let mut dir_map = DirIndexMap::default();
     seed_roots(&mut index, &mut dir_map, roots);
     apply_records(&mut index, &mut dir_map, &recs, &table);
     (index, gaps)
@@ -421,16 +492,16 @@ mod tests {
     #[test]
     fn remove_prefix_purges_volume_subtree_and_map() {
         let mut index = Index::new();
-        let mut dir_map: HashMap<PathBuf, u32> = HashMap::new();
+        let mut dir_map = DirIndexMap::default();
         let home = PathBuf::from("/Users/t");
         let usb = PathBuf::from("/Volumes/U");
         seed_roots(&mut index, &mut dir_map, &[home.clone(), usb.clone()]);
-        let home_idx = dir_map[&home];
-        let usb_idx = dir_map[&usb];
+        let home_idx = dir_map.get(&home).unwrap();
+        let usb_idx = dir_map.get(&usb).unwrap();
         let note = index.insert("note.txt", home_idx, false);
         // U 盘侧:docs 目录(入 map)+ 两个文件 + 顶层散文件
         let docs = index.insert("docs", usb_idx, true);
-        dir_map.insert(usb.join("docs"), docs);
+        dir_map.insert(&usb.join("docs"), docs);
         index.insert("a.pdf", docs, false);
         index.insert("b.txt", docs, false);
         index.insert("loose.dat", usb_idx, false);
@@ -454,6 +525,36 @@ mod tests {
         // 幂等:再清一遍无匹配、无副作用
         assert_eq!(remove_prefix(&mut index, &mut dir_map, &usb), 0);
         assert_eq!(index.entry_count(), 2);
+    }
+
+    /// 形态桥钉(memory-footprint §4.4):根为符号链接(/tmp → /private/tmp)时,
+    /// dir_map 键是 canonical 形态(diff_one 基址)而索引完整路径是字面形态——
+    /// 摘除必须按桥双向覆盖:字面形态匹配受害者,键经值谓词清扫。
+    /// 突变「只拿调用方前缀直接匹配完整路径」→ 摘除计数断言红。
+    /// fixture 用真实 tempdir(macOS 下 /var → /private/var,字面 ≠ canonical)。
+    #[test]
+    fn remove_prefix_bridges_literal_root_and_canonical_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let literal = t.path().to_path_buf();
+        let canon = literal.canonicalize().unwrap();
+        let mut index = Index::new();
+        let mut dir_map = DirIndexMap::default();
+        // 根条目名 = 字面形态(索引侧),dir_map 键 = canonical 形态(daemon 侧)
+        let root_idx = index.insert(literal.to_string_lossy().as_ref(), NO_PARENT, true);
+        dir_map.insert(&canon, root_idx);
+        let sub_idx = index.insert("gone", root_idx, true);
+        dir_map.insert(&canon.join("gone"), sub_idx);
+        index.insert("f.txt", sub_idx, false);
+        let keep_idx = index.insert("keep", root_idx, true);
+        dir_map.insert(&canon.join("keep"), keep_idx);
+
+        // 调用方(diff_one)给 canonical 前缀
+        let removed = remove_prefix(&mut index, &mut dir_map, &canon.join("gone"));
+        assert_eq!(removed, 2, "gone + f.txt 级联");
+        assert!(!dir_map.contains_key(&canon.join("gone")), "受害者键已清");
+        assert!(dir_map.contains_key(&canon), "根键不受影响");
+        assert!(dir_map.contains_key(&canon.join("keep")), "兄弟键不受误伤");
+        assert_eq!(index.entry_count(), 2, "根 + keep 幸存");
     }
 
     #[test]
@@ -645,7 +746,7 @@ mod tests {
 
         let (recs, table, _) = collect_records(&roots, &excl, 4);
         let mut staged = Index::new();
-        let mut dir_map = HashMap::new();
+        let mut dir_map = DirIndexMap::default();
         seed_roots(&mut staged, &mut dir_map, &roots);
         // 逐条聚合(最严切分):任何「子记录先于父记录」的排序缺陷都会在此暴露
         for chunk in recs.chunks(1) {
@@ -708,7 +809,7 @@ mod tests {
         }];
 
         let mut index = Index::new();
-        let mut dir_map = HashMap::new();
+        let mut dir_map = DirIndexMap::default();
         seed_roots(&mut index, &mut dir_map, &[t.path().to_path_buf()]);
         apply_records(&mut index, &mut dir_map, &recs, &table);
 
