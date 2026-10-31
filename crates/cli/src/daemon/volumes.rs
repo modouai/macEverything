@@ -20,8 +20,19 @@ use engine::config::Config;
 use engine::fsevents::{self};
 
 use super::{
-    consume_events, ensure_mutable, flush, DaemonPaths, EngineState, IndexHolder, SCAN_CHUNK,
+    consume_events, ensure_mutable, flush, mutable_base_slot, DaemonPaths, EngineState,
+    IndexHolder, SCAN_CHUNK,
 };
+
+/// 摘除子树后同步作废 Overlay 账本(anchors/overlaid/dir_ids 锚定被摘 base 条目号,
+/// 不清账则查询侧把陈旧子树误判为有效)。仅在 Overlaid 态需要;_holder 借用在
+/// 调用方持锁期间传入。
+fn purge_overlay_after_prefix_removal(holder: &mut IndexHolder, prefix: &Path) {
+    if let IndexHolder::Overlaid(st) = holder {
+        let view = st.base.as_view();
+        st.overlay.purge_prefix(view, prefix);
+    }
+}
 
 /// 卷轮询间隔。
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -165,7 +176,7 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     state.roots.lock().unwrap().push(vol.to_path_buf());
     {
         let mut h = state.holder.write().unwrap();
-        let IndexHolder::Mutable(idx) = &mut *h else {
+        let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷索引推迟(主索引非可变态,如冷启动/整理中),下轮重试");
             state.roots.lock().unwrap().retain(|r| r != vol);
             return;
@@ -212,12 +223,18 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     ensure_mutable(state);
     {
         let mut h = state.holder.write().unwrap();
-        let IndexHolder::Mutable(idx) = &mut *h else {
+        let mut map = state.dir_map.lock().unwrap();
+        let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷扫描推迟(主索引非可变态),下轮重试: {}", vol.display());
             return;
         };
-        let mut map = state.dir_map.lock().unwrap();
         engine::scanner::remove_prefix(idx, &mut map, vol);
+        // 前缀清除先行:Overlay 账本同步作废(残留 anchor 会让陈旧子树在合成视图复活)。
+        // 与 seed 分两段取槽:purge 需 holder 全借用,与 idx 槽借用不交叠。
+        purge_overlay_after_prefix_removal(&mut h, vol);
+        let Some(idx) = mutable_base_slot(&mut h) else {
+            unreachable!("purge 不改 holder 形态,槽位必仍在")
+        };
         engine::scanner::seed_roots(idx, &mut map, std::slice::from_ref(&vol.to_path_buf()));
     }
     let cfg = state.cfg.lock().unwrap().clone();
@@ -241,7 +258,7 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
             return;
         }
         let mut h = state.holder.write().unwrap();
-        if let IndexHolder::Mutable(idx) = &mut *h {
+        if let Some(idx) = mutable_base_slot(&mut h) {
             let mut map = state.dir_map.lock().unwrap();
             engine::scanner::apply_records(idx, &mut map, chunk, &table);
             applied += chunk.len();
@@ -271,12 +288,14 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     ensure_mutable(state);
     let removed = {
         let mut h = state.holder.write().unwrap();
-        let IndexHolder::Mutable(idx) = &mut *h else {
+        let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷清除推迟(主索引非可变态),下轮重试");
             return;
         };
         let mut map = state.dir_map.lock().unwrap();
-        engine::scanner::remove_prefix(idx, &mut map, vol)
+        let removed = engine::scanner::remove_prefix(idx, &mut map, vol);
+        purge_overlay_after_prefix_removal(&mut h, vol);
+        removed
     };
     state.roots.lock().unwrap().retain(|r| r != vol);
     flush(state, paths);
@@ -302,12 +321,14 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
     for vol in stale {
         let removed = {
             let mut h = state.holder.write().unwrap();
-            let IndexHolder::Mutable(idx) = &mut *h else {
+            let Some(idx) = mutable_base_slot(&mut h) else {
                 log::warn!("启动清除跳过(主索引非可变态): {}", vol.display());
                 continue;
             };
             let mut map = state.dir_map.lock().unwrap();
-            engine::scanner::remove_prefix(idx, &mut map, &vol)
+            let removed = engine::scanner::remove_prefix(idx, &mut map, &vol);
+            purge_overlay_after_prefix_removal(&mut h, &vol);
+            removed
         };
         if removed > 0 {
             log::info!("启动清除未挂载卷前缀: {} 条目 {removed} 条", vol.display());

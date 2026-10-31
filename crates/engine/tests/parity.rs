@@ -131,3 +131,255 @@ fn parity_parallel_arm() {
     assert_eq!(s, p, "串行/并行路径集合一致");
     assert_eq!(s, ref_with_root, "索引(含根)与参考(加根)一致");
 }
+
+// —— T3 合成视图对拍(memory-footprint tech.md §4.6 风险表:查询双源合并零差异)——
+
+use engine::overlay::{DiffTarget, Overlay};
+
+/// 按完整路径定位 base 条目号。
+fn find_id(index: &engine::index::Index, p: &Path) -> u32 {
+    (0..index.entries.len() as u32)
+        .find(|&i| index.full_path(i) == p)
+        .unwrap_or_else(|| panic!("base 应含 {}", p.display()))
+}
+
+/// 合成视图全量命中路径集(含根,与 ref_set 同口径)。
+/// overlay 对拍的排除集(与 fixture 扫描同参)。
+fn fixture_excludes() -> Vec<PathBuf> {
+    vec![PathBuf::from("node_modules")]
+}
+
+fn overlay_hits(base: &engine::index::Index, ov: &Overlay) -> BTreeSet<String> {
+    let view = ov.composite_view(base);
+    let out = engine::query::execute(&view, &engine::query::parse("*").unwrap(), usize::MAX);
+    let set: BTreeSet<String> = out
+        .hits
+        .iter()
+        .map(|&h| view.full_path_composite(h))
+        .collect();
+    assert_eq!(set.len(), out.total as usize, "命中路径不得互相折叠");
+    set
+}
+
+/// 参考集:独立递归枚举 + 根。
+fn ref_set(root: &Path, excludes: &[PathBuf]) -> BTreeSet<String> {
+    let mut r = BTreeSet::new();
+    ref_walk(root, excludes, &mut r);
+    r.insert(root.to_string_lossy().into_owned());
+    r
+}
+
+/// 受控树:
+/// ```text
+/// root/
+/// ├── src/{a.rs, lib/deep.txt}
+/// ├── docs/b.md
+/// ├── node_modules/x.js   ← 排除目标
+/// └── README.md
+/// ```
+fn overlay_fixture() -> (tempfile::TempDir, engine::index::Index) {
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    fs::create_dir_all(r.join("src/lib")).unwrap();
+    fs::create_dir_all(r.join("node_modules")).unwrap();
+    fs::create_dir_all(r.join("docs")).unwrap();
+    fs::write(r.join("src/a.rs"), "").unwrap();
+    fs::write(r.join("src/lib/deep.txt"), "").unwrap();
+    fs::write(r.join("node_modules/x.js"), "").unwrap();
+    fs::write(r.join("docs/b.md"), "").unwrap();
+    fs::write(r.join("README.md"), "").unwrap();
+    let (index, gaps) =
+        engine::scanner::scan_roots(&[r.to_path_buf()], &[PathBuf::from("node_modules")], 1);
+    assert_eq!(gaps.permission.len(), 0);
+    (t, index)
+}
+
+/// 目录 diff 后立即查询:旧路径为空/新路径可见,对拍零差异。
+#[test]
+fn parity_overlay_diff_then_query_zero_diff() {
+    let (t, index) = overlay_fixture();
+    let root = t.path();
+    // 磁盘漂移:删两个文件、添两个文件(一层根 + 一层 src)
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    fs::write(root.join("src/new.rs"), "").unwrap();
+    fs::remove_file(root.join("README.md")).unwrap();
+    fs::write(root.join("top.txt"), "").unwrap();
+
+    let mut ov = Overlay::new();
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, root)),
+        root,
+        &[PathBuf::from("node_modules")],
+    )
+    .unwrap();
+    let src = root.join("src");
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &[PathBuf::from("node_modules")],
+    )
+    .unwrap();
+
+    // 立即查询专项:旧路径为空、新路径可见(不用重启/重扫)
+    let view = ov.composite_view(&index);
+    let probe =
+        |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+    assert_eq!(probe("whole:a.rs"), 0, "已删文件必须被屏蔽");
+    assert_eq!(probe("whole:new.rs"), 1, "新文件必须可见");
+    assert_eq!(probe("whole:README.md"), 0, "已删文件必须被屏蔽");
+    assert_eq!(probe("whole:top.txt"), 1, "新文件必须可见");
+
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "对拍零差异"
+    );
+}
+
+/// overlay 嵌套两层:root → src → src/lib 逐层 diff,深层 overlay 条目
+/// 路径两段拼接正确,对拍零差异。
+#[test]
+fn parity_overlay_nested_two_levels_zero_diff() {
+    let (t, index) = overlay_fixture();
+    let root = t.path();
+    fs::write(root.join("src/lib/new_deep.txt"), "").unwrap();
+    fs::remove_file(root.join("src/lib/deep.txt")).unwrap();
+    fs::write(root.join("src/nested.txt"), "").unwrap();
+
+    let mut ov = Overlay::new();
+    let src = root.join("src");
+    let lib = root.join("src/lib");
+    for dir in [root.to_path_buf(), src.clone(), lib.clone()] {
+        ov.apply_diff(
+            &index,
+            DiffTarget::Base(find_id(&index, &dir)),
+            &dir,
+            &[PathBuf::from("node_modules")],
+        )
+        .unwrap();
+    }
+    let view = ov.composite_view(&index);
+    let probe =
+        |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+    assert_eq!(
+        probe("whole:new_deep.txt"),
+        1,
+        "两层 overlay 深层新文件可见"
+    );
+    assert_eq!(probe("whole:deep.txt"), 0, "深层已删文件被屏蔽");
+    // 深层 overlay 条目路径经两段拼接完整复原
+    let out = engine::query::execute(&view, &engine::query::parse("new_deep").unwrap(), 10);
+    assert_eq!(
+        view.full_path_composite(out.hits[0]),
+        lib.join("new_deep.txt").to_string_lossy()
+    );
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "对拍零差异"
+    );
+}
+
+/// 子目录 diff 后父未再 diff:子树 overlay 裁定、父层 Base 陈旧不可见;
+/// 父随后 diff 时子树仍有效(「有 anchor 不在 overlaid → 终止有效」钉,
+/// 突变破坏该终止条件时本测必红)。
+#[test]
+fn parity_overlay_subdir_diff_then_parent() {
+    let (t, index) = overlay_fixture();
+    let root = t.path();
+    fs::write(root.join("src/lib/added.txt"), "").unwrap();
+
+    let mut ov = Overlay::new();
+    let lib = root.join("src/lib");
+    // 子目录先 diff(父从未 diff:桥接占位)
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &lib)),
+        &lib,
+        &[PathBuf::from("node_modules")],
+    )
+    .unwrap();
+    {
+        let view = ov.composite_view(&index);
+        let probe =
+            |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+        assert_eq!(probe("whole:deep.txt"), 1, "子树 overlay 裁定:旧文件可见");
+        assert_eq!(probe("whole:added.txt"), 1, "子树 overlay 裁定:新文件可见");
+    }
+    // 父层新文件:父未 diff → 不可见
+    fs::write(root.join("src/fresh.txt"), "").unwrap();
+    {
+        let view = ov.composite_view(&index);
+        let probe =
+            |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+        assert_eq!(probe("whole:fresh.txt"), 0, "父未 diff,父层新文件不可见");
+    }
+    // 父随后 diff:lib 幸存且为目录 → 桥续接,子树仍有效
+    let src = root.join("src");
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &[PathBuf::from("node_modules")],
+    )
+    .unwrap();
+    let view = ov.composite_view(&index);
+    let probe =
+        |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+    assert_eq!(probe("whole:added.txt"), 1, "父 diff 后子树仍有效");
+    assert_eq!(probe("whole:fresh.txt"), 1, "父 diff 后父层新文件可见");
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "对拍零差异"
+    );
+}
+
+/// EPERM 负缓存目录混合树:不可读目录保留语义(条目在 Base、子树空、不进
+/// overlay 可见集),与参考枚举(读不到即剪)零差异;可读环境自动退化为
+/// 全索引树,对拍同样成立(两实现同语义,互证不失效)。
+#[test]
+fn parity_overlay_eperm_mixed_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    let (t, index) = overlay_fixture();
+    let root = t.path();
+    let locked = root.join("src/locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("secret.txt"), "").unwrap();
+    // 扫描在锁定目录创建之后?不——fixture 已扫。此处按「锁定目录在扫描后出现,
+    // 随后父目录 diff」编排:listing 收录 locked(父可读),其子树因 diff 失败
+    // (负缓存短路)保持空——daemon 语义的引擎级等价物。
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        // 越权环境(root):读 000 目录不报错,两侧同语义实读,对拍不失效;恢复权限保清理
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut ov = Overlay::new();
+    let src = root.join("src");
+    ov.apply_diff(
+        &index,
+        DiffTarget::Base(find_id(&index, &src)),
+        &src,
+        &[PathBuf::from("node_modules")],
+    )
+    .unwrap();
+    // locked 目录可读性恢复前的子树空:diff locked 会失败(EPERM 形态),
+    // 负缓存语义 = 不 diff、条目保留。此处只验证父层 diff 后的零差异。
+    let view = ov.composite_view(&index);
+    let probe =
+        |q: &str| engine::query::execute(&view, &engine::query::parse(q).unwrap(), 10).total;
+    assert_eq!(
+        probe("whole:locked"),
+        1,
+        "EPERM 目录条目保留(父 listing 收录)"
+    );
+    assert_eq!(
+        overlay_hits(&index, &ov),
+        ref_set(root, &fixture_excludes()),
+        "对拍零差异(锁定目录子树两侧同为空或同为实读)"
+    );
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+}

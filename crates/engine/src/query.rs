@@ -181,6 +181,9 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // dir_hits 与条目号全量对齐(块间并行产出后按块序拼接 = 条目号序)。
     // 块内 (start..) 前缀 id 序 zip 切片:块起始号按值进入迭代链,内层闭包只借
     // execute 栈帧上的 view/plan/编译产物,不持外层闭包局部量。
+    // dir_hits 不做有效性判定(entry_valid):被屏蔽目录只影响其自身与子项的
+    // 候选资格,子项在候选层逐条判定;此处仅为预过滤器,多放进来的失效目录
+    // 不会产出结果,避免 path 查询对全量目录做上溯链判定。
     let dir_hits: Vec<bool> = if plan.path_terms.is_empty() {
         Vec::new()
     } else {
@@ -198,11 +201,14 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
 
     // 候选行:(分数, 名长, 条目号)。case: 候选名 = NFC(display)(不折叠);
     // 否则 = match 名(arena 已折叠,零拷贝借用)。
+    // entry_valid 为 T3 合成视图的屏蔽判定挂点(tech.md §4.2):Base 命中经
+    // 条目号链上溯屏蔽陈旧子树,Overlay 命中抑制 base 背书 anchor 的双份;
+    // 单源视图默认恒真,零开销。
     let mut rows: Vec<(u8, usize, u32)> = blocks
         .par_iter()
         .flat_map_iter(|&(start, chunk)| {
             (start..).zip(chunk.iter()).filter_map(|(idx, e)| {
-                if !e.is_live() {
+                if !e.is_live() || !view.entry_valid(idx) {
                     return None;
                 }
                 if !plan.path_terms.is_empty() {
@@ -846,7 +852,7 @@ mod match_tests {
 
     /// 双段合成视图测试替身(tech.md §4.3 接口改造的核心契约钉):
     /// 同一条目号空间拆成两段连续 Entry 段——S3「Base + Overlay 各自连续,
-    /// 合成视图分段产出」的形态预演。arena/路径池委托源索引(段拆分不动 arena)。
+    /// 合成视图分段产出」的形态预演。名称/路径读取委托源索引(段拆分不动 arena)。
     struct SplitView<'a> {
         src: &'a Index,
         entries: Vec<Entry>,
@@ -873,17 +879,14 @@ mod match_tests {
         fn entry(&self, idx: u32) -> &Entry {
             &self.entries[idx as usize]
         }
-        fn display_arena(&self) -> &[u8] {
-            <Index as IndexView>::display_arena(self.src)
+        fn match_name(&self, idx: u32) -> &[u8] {
+            <Index as IndexView>::match_name(self.src, idx)
         }
-        fn match_arena(&self) -> &[u8] {
-            <Index as IndexView>::match_arena(self.src)
+        fn display_name(&self, idx: u32) -> &[u8] {
+            <Index as IndexView>::display_name(self.src, idx)
         }
-        fn path_pool(&self) -> &[u8] {
-            <Index as IndexView>::path_pool(self.src)
-        }
-        fn path_seg(&self, idx: u32) -> (u32, u32) {
-            <Index as IndexView>::path_seg(self.src, idx)
+        fn dir_path(&self, idx: u32) -> &[u8] {
+            <Index as IndexView>::dir_path(self.src, idx)
         }
     }
 

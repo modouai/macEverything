@@ -405,13 +405,18 @@ impl Default for Index {
 }
 
 /// 内存视图与 mmap 只读视图的统一读取面(ADR-3:查询代码无分支扩散)。
-/// 查询端只依赖本 trait:S3 的双源合成视图(Base + Overlay 各自连续,tech.md §4.3)
-/// 实现同一组方法后自动获得查询能力。必须实现的是「分段枚举 + 随机访问」与四个
-/// 存储访问原语;其余名称/路径读取有默认实现(按偏移切 arena)。
+/// 查询端只依赖本 trait:S3 的双源合成视图(Base + Overlay 各自连续,tech.md §4.2)
+/// 实现同一组方法后自动获得查询能力。
 ///
 /// 接口契约(tech.md §4.3 接口改造):**条目遍历是分段枚举,不存在「单一连续
 /// 切片」假设**——单源 Index 恒一段;双源各产一段。随机访问仅限低频点
 /// (结果行组装/排序键),全量扫描必须走分段枚举(每条目一次虚调用是热路径红线)。
+///
+/// T3 收窄(T4 前定形):名称/路径读取只暴露**语义方法**(match_name/display_name/
+/// dir_path/full_path_dyn),不再暴露裸 arena/池段访问——双源合成视图没有单一
+/// arena,按空间分发只能在语义层做;裸访问器会绕过分发读到错空间的字节。
+/// 匹配形态名是必答题的三个原语之一(match 折叠段/display 原始段/目录路径段),
+/// 各实现按自己的存储直接切取。
 pub trait IndexView: Sync {
     /// 连续条目段枚举(扫描原语):(段起始条目号, 连续 Entry 切片)序列。
     /// 前置契约:**各段不重叠,按条目号升序稠密覆盖 0..N−1**(段 i 末 + 1 == 段
@@ -424,30 +429,36 @@ pub trait IndexView: Sync {
     /// 随机访问:条目号 → 条目。越界行为与内存切片一致(panic,同一信任级别)。
     fn entry(&self, idx: u32) -> &Entry;
 
-    fn display_arena(&self) -> &[u8];
-    fn match_arena(&self) -> &[u8];
-    fn path_pool(&self) -> &[u8];
-    /// 条目在路径池中的段 (start, len);非目录条目为 (0, 0) 占位。
-    fn path_seg(&self, idx: u32) -> (u32, u32);
+    /// 匹配形态名(match 折叠段;case: 查询在查询端另取 display 归一)。
+    fn match_name(&self, idx: u32) -> &[u8];
 
-    /// 匹配形态名(match arena 折叠段;case: 查询在查询端另取 display 归一)。
-    fn match_name(&self, idx: u32) -> &[u8] {
-        let e = self.entry(idx);
-        let s = e.match_start as usize;
-        &self.match_arena()[s..s + e.match_len as usize]
+    /// 展示形态名(原始字节,未归一)。
+    fn display_name(&self, idx: u32) -> &[u8];
+
+    /// 目录条目的完整路径(match 形态);非目录条目返回空切片。
+    fn dir_path(&self, idx: u32) -> &[u8];
+
+    /// 条目有效性(tech.md §4.2 屏蔽判定挂点)。单源视图恒有效(零开销默认);
+    /// 合成视图覆写:Base 命中走 `valid(e)` 条目号链屏蔽,Overlay 命中抑制
+    /// 「base 背书的 anchor」双份命中。查询侧只对**命中候选**调用,不在全量扫描
+    /// 热路径上。
+    fn entry_valid(&self, _idx: u32) -> bool {
+        true
     }
 
-    /// 展示形态名(display arena 原始字节,未归一)。
-    fn display_name(&self, idx: u32) -> &[u8] {
-        let e = self.entry(idx);
-        let s = e.display_start as usize;
-        &self.display_arena()[s..s + e.display_len as usize]
-    }
-
-    /// 目录条目的完整路径(match 形态,path_pool 段);非目录条目返回空切片。
-    fn dir_path(&self, idx: u32) -> &[u8] {
-        let (s, l) = self.path_seg(idx);
-        &self.path_pool()[s as usize..(s + l) as usize]
+    /// 直接子项(活条目)。默认实现 O(n) 全表扫——与 `Index::children_of` 同已知
+    /// 设计(单目录 diff 2-4ms 预算内);合成视图对 Overlay 空间不覆写(写侧
+    /// 直接用 `Overlay::index` 的固有能力)。
+    fn children_of(&self, dir_idx: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &(start, seg) in &self.entry_segments() {
+            for (j, e) in seg.iter().enumerate() {
+                if e.parent == dir_idx && e.is_live() {
+                    out.push(start + j as u32);
+                }
+            }
+        }
+        out
     }
 
     /// 沿 parent 链拼 display 完整路径(Task 18 daemon 结果输出用)。
@@ -475,17 +486,18 @@ impl IndexView for Index {
     fn entry(&self, idx: u32) -> &Entry {
         &self.entries[idx as usize]
     }
-    fn display_arena(&self) -> &[u8] {
-        &self.display_arena.data
+    fn match_name(&self, idx: u32) -> &[u8] {
+        Index::match_name_of(self, idx)
     }
-    fn match_arena(&self) -> &[u8] {
-        &self.match_arena.data
+    fn display_name(&self, idx: u32) -> &[u8] {
+        Index::display_name_of(self, idx)
     }
-    fn path_pool(&self) -> &[u8] {
-        &self.path_pool.data
+    fn dir_path(&self, idx: u32) -> &[u8] {
+        let (s, l) = self.path_offsets[idx as usize];
+        &self.path_pool.data[s as usize..(s + l) as usize]
     }
-    fn path_seg(&self, idx: u32) -> (u32, u32) {
-        self.path_offsets[idx as usize]
+    fn children_of(&self, dir_idx: u32) -> Vec<u32> {
+        Index::children_of(self, dir_idx) // 固有能力(邻接直查),不用默认 O(n) 全表扫
     }
 }
 
@@ -749,8 +761,8 @@ mod tests {
         assert_eq!(v.match_name(1), b"a.txt");
         assert_eq!(v.display_name(1), b"a.txt");
         assert_eq!(v.dir_path(0), b"docs");
-        assert_eq!(v.path_seg(0).1, 4, "目录条目路径段有真值");
-        assert_eq!(v.path_seg(1), (0, 0), "文件条目占位段");
+        assert_eq!(v.dir_path(0), b"docs", "目录条目路径段有真值");
+        assert_eq!(v.dir_path(1), b"", "文件条目占位段为空");
         assert_eq!(v.full_path_dyn(1), "docs/a.txt");
     }
 }

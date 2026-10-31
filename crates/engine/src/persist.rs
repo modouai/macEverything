@@ -247,21 +247,14 @@ impl SharedView {
     }
 }
 
-impl IndexView for SharedView {
-    fn entry_segments(&self) -> Vec<(u32, &[Entry])> {
-        vec![(0, self.entries_slice())]
-    }
-    fn entry(&self, idx: u32) -> &Entry {
-        &self.entries_slice()[idx as usize]
-    }
+impl SharedView {
+    /// 三段存储区直切(mmap 区段;materialize 与 IndexView 实现共用)。
+    /// T3 起不再作为 trait 面暴露(合成视图无单一 arena,语义分发在实现层)。
     fn display_arena(&self) -> &[u8] {
         &self.mmap[self.display_off..self.match_off]
     }
     fn match_arena(&self) -> &[u8] {
         &self.mmap[self.match_off..self.path_pool_off]
-    }
-    fn path_pool(&self) -> &[u8] {
-        &self.mmap[self.path_pool_off..self.path_offsets_off]
     }
     fn path_seg(&self, idx: u32) -> (u32, u32) {
         let off = self.path_offsets_off + idx as usize * 8;
@@ -269,6 +262,29 @@ impl IndexView for SharedView {
             u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap()),
             u32::from_le_bytes(self.mmap[off + 4..off + 8].try_into().unwrap()),
         )
+    }
+}
+
+impl IndexView for SharedView {
+    fn entry_segments(&self) -> Vec<(u32, &[Entry])> {
+        vec![(0, self.entries_slice())]
+    }
+    fn entry(&self, idx: u32) -> &Entry {
+        &self.entries_slice()[idx as usize]
+    }
+    fn match_name(&self, idx: u32) -> &[u8] {
+        let e = self.entry(idx);
+        let s = e.match_start as usize;
+        &self.match_arena()[s..s + e.match_len as usize]
+    }
+    fn display_name(&self, idx: u32) -> &[u8] {
+        let e = self.entry(idx);
+        let s = e.display_start as usize;
+        &self.display_arena()[s..s + e.display_len as usize]
+    }
+    fn dir_path(&self, idx: u32) -> &[u8] {
+        let (s, l) = self.path_seg(idx);
+        &self.mmap[self.path_pool_off..self.path_offsets_off][s as usize..(s + l) as usize]
     }
 }
 
