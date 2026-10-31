@@ -177,9 +177,11 @@ struct Overlay {
 
 ### 4.4 dir_map intern 化（并入本规格）
 
-- 键从 `HashMap<PathBuf, u32>` 改为 `HashMap<u64, u32>`（键 = match 形态完整路径字节的 FxHash64），碰撞以 `path_pool` 字节二次比对消解（`SmallVec<u32>` 桶）。
-- 路径字节仅存于 path_pool（该说法在 P3 后仅指 **Base 侧**；Overlay 目录的 intern 键由「overlay 父链段 + 自身段」双段拼接路径后 hash，存于 overlay index 自身的 path_pool），dir_map 由 ~40MB → **~12MB**。
-- `diff_one`/补链/remove_prefix 逻辑不变，仅键编码与查表方式变；canonicalize 基址规则不变（`/tmp` 符号链接约定继续生效）。
+- 键从 `HashMap<PathBuf, u32>` 改为 intern 结构：`HashMap<u64, SmallVec<u32>>`（u64 = 键路径字节的 FNV-1a 64，手写实现不引新依赖；u32 = **路径字节池索引**），桶内以池中字节比对消解碰撞。
+- **字节池用独立 `Vec<String>`/`Vec<u8>` 池而非 path_pool**（评审修正 2026-10-30）：dir_map 键的历史形态是「根（canonical）+ 逐段 display 名拼接」，与 match 形态的 path_pool 大小写归一不一致，直接复用会错位。键的字节语义**完全不变**（现有测试 `daemon.rs` canonical 基址用例为钉），仅存储形态从散装 PathBuf 换为池化。
+- **`scanner::remove_prefix` 的前缀遍历改索引侧**：键 intern 化后 `starts_with` 遍历消失。摘除（ENOENT 子树/卷卸载，低频）改为遍历 entries 收集 `is_dir` + `full_path` 前缀匹配的受害者，dir_map 清键走同批路径的 hash——O(全目录) 单次几十 ms,低频可接受；签名不变。
+- 路径字节仅存于字节池（该说法在 P3 后仅指 **Base 侧**；Overlay 目录的 intern 键由「overlay 父链段 + 自身段」双段拼接路径后 hash，存于 overlay index 自身的池），dir_map 由 ~40MB → **~12MB**。
+- `diff_one`/补链逻辑不变，仅键编码与查表方式变；canonicalize 基址规则不变（`/tmp` 符号链接约定继续生效）。
 
 ### 4.5 内存账（1.26M 条目实机）
 
