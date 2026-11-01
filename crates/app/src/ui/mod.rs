@@ -166,10 +166,17 @@ const SYSTEM_UI_FONT_SPECS: [(&str, &str, egui::FontFamily); 2] = [
 /// 唯一收口点是 [`egui::Plugin::input_hook`](输入处理前改 RawInput)。
 const MAX_ATLAS_TEXTURE_SIDE: usize = 4096;
 
-/// 纯函数:把渲染端提供的纹理边长向下收口;`None`(后端未报)不放大,交回
-/// egui 自己的缺省(2048)。
+/// 纯函数:把渲染端提供的纹理边长统一收到 `Some(MAX)`。
+///
+/// **必须把 `None` 也统一成 `Some`**:eframe 只给挂了 `egui_winit` 的视口注入
+/// `max_texture_side`(glow_integration.rs:`if let Some(egui_winit)`);悬浮条
+/// 是 ADR-8 的 viewport hack,可能没有 egui_winit 实例 → 其 `RawInput` 的值为
+/// `None`。若这里保留 `None`,root(Some(x))与 palette(None)之间 `TextOptions`
+/// 每个 pass 交替变化,epaint `Fonts::begin_pass` 会**逐帧** `set_options` +
+/// 清空 galley 缓存 + 重建整张字形图集(实测中文列表滚动时 GL 纹理重建 32 次、
+/// 峰值 2.2GB)。统一收口后 TextOptions 恒定,重建只随图集真实增长发生。
 fn clamp_texture_side(side: Option<usize>) -> Option<usize> {
-    side.map(|s| s.min(MAX_ATLAS_TEXTURE_SIDE))
+    Some(side.map_or(MAX_ATLAS_TEXTURE_SIDE, |s| s.min(MAX_ATLAS_TEXTURE_SIDE)))
 }
 
 /// 图集边长收口插件(`install_atlas_cap` 注册;每 pass 输入处理前生效)。
@@ -1885,7 +1892,11 @@ mod tests {
     /// egui 由此值定 epaint 图集宽度。
     #[test]
     fn atlas_side_cap_clamps_raw_input() {
-        assert_eq!(clamp_texture_side(None), None, "后端未报缺省值,不放大");
+        assert_eq!(
+            clamp_texture_side(None),
+            Some(4096),
+            "None 必须统一为 Some:视口间 None/Some 交替会让 epaint 逐帧清空图集"
+        );
         assert_eq!(clamp_texture_side(Some(2048)), Some(2048), "小值不动");
         assert_eq!(clamp_texture_side(Some(8192)), Some(4096));
         assert_eq!(clamp_texture_side(Some(16384)), Some(4096));
