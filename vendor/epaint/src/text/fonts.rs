@@ -548,6 +548,7 @@ impl FontsImpl {
     ///
     /// The parsed faces and the fallback chains survive; only the atlas starts over.
     pub fn set_options(&mut self, options: TextOptions) {
+        crate::texture_atlas::MCE_SET_OPTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.faces.set_options(options);
         self.glyphs = GlyphAtlas::new(options);
     }

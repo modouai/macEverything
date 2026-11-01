@@ -54,6 +54,10 @@ objc2-app-kit = { version = "0.3", features = [
     "NSImage",
     "NSBitmapImageRep",
     "NSBezierPath",
+    # 图标解码:直接画进 64×64 NSBitmapImageRep(替代 TIFFRepresentation,
+    # 后者在本机为 32 页/≈37MB,每个图标一次大块分配)。
+    "NSGraphics",
+    "NSGraphicsContext",
     # Task 5 结果行真实图标:iconForContentType(UTI) 的 cfg 门槛(0.3.2 源码
     # NSWorkspace.rs:132 要求 NSImage + objc2-uniform-type-identifiers 两个 feature)。
     "objc2-uniform-type-identifiers",

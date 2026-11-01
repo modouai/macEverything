@@ -7,6 +7,15 @@ pub static MCE_IMAGE_CLONES: AtomicU64 = AtomicU64::new(0);
 /// MCE 诊断:部分增量上传缓冲的新分配次数。
 #[doc(hidden)]
 pub static MCE_UPLOAD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// MCE 诊断:图集实例创建次数(重建 = 从 32 高重新增长)。
+#[doc(hidden)]
+pub static MCE_ATLAS_CREATES: AtomicU64 = AtomicU64::new(0);
+/// MCE 诊断:图集高度倍增次数(每次倍增 = 一次大块重分配)。
+#[doc(hidden)]
+pub static MCE_ATLAS_GROWTHS: AtomicU64 = AtomicU64::new(0);
+/// MCE 诊断:Fonts 因 TextOptions 变化而重建整张字形图集的次数。
+#[doc(hidden)]
+pub static MCE_SET_OPTIONS: AtomicU64 = AtomicU64::new(0);
 
 use ecolor::Color32;
 use emath::{Rect, remap_clamp};
@@ -100,6 +109,7 @@ pub struct TextureAtlas {
 impl TextureAtlas {
     pub fn new(size: [usize; 2], options: TextOptions) -> Self {
         assert!(size[0] >= 1024, "Tiny texture atlas");
+        MCE_ATLAS_CREATES.fetch_add(1, Ordering::Relaxed);
         let mut atlas = Self {
             image: Arc::new(ColorImage::filled(size, Color32::TRANSPARENT)),
             upload: Vec::new(),
@@ -412,6 +422,7 @@ impl TextureAtlas {
 fn resize_to_min_height(image: &mut ColorImage, required_height: usize) -> bool {
     while required_height >= image.height() {
         image.size[1] *= 2; // double the height
+        MCE_ATLAS_GROWTHS.fetch_add(1, Ordering::Relaxed);
     }
 
     if image.width() * image.height() > image.pixels.len() {

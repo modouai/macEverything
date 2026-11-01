@@ -46,18 +46,19 @@ use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSBezierPath, NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSEvent,
-    NSEventModifierFlags, NSFloatingWindowLevel, NSImage, NSMenu, NSMenuItem, NSModalResponseAbort,
-    NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPanel, NSPasteboard,
-    NSPasteboardWriting, NSResponder, NSScreen, NSView, NSViewLayerContentsPlacement,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSBezierPath, NSBitmapImageRep, NSColor, NSCompositingOperation,
+    NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext,
+    NSImage, NSMenu, NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
+    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView,
+    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSDictionary, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest,
-    NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey,
-    NSURLRequestCachePolicy, NSURLResponse, NSURLSession, NSURL,
+    NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest, NSNotification,
+    NSObject, NSPoint, NSRect, NSSize, NSString, NSURLCustomIconKey, NSURLRequestCachePolicy,
+    NSURLResponse, NSURLSession, NSURL,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1720,60 +1721,65 @@ pub fn app_icon_rgba(path: &str) -> Option<Vec<u8>> {
     image_rgba(&icon)
 }
 
-/// `NSImage` → 64×64 **预乘** RGBA:TIFF 表示 → image 解码 → Lanczos 缩放。
+/// `NSImage` → 64×64 **预乘** RGBA:直接把图像画进 64×64 位图上下文。
 ///
-/// 系统图标源通常 ≥512px,缩到 64px 即满足 Retina 2x 的 32pt 行图标。
-/// 已知代价:`TIFFRepresentation` 本机为 32 页/约 36.9MB,`image` 只解第一页
-/// (32pt 图标取首个表示已够用);这里直接借用 NSData 字节,不再整份拷进 Vec。
+/// 旧实现走 `TIFFRepresentation` → `image` 解码 → Lanczos:本机系统图标是
+/// 多页 TIFF(类型图标 32 页/≈37MB;APP 图标 16bit float 1024×1024/≈74MB),
+/// 每个图标一次数十 MB 的临时分配,macOS 将其滞留为 `Malloc Large (empty)`。
+/// 现在只让 AppKit 把目标尺寸(64pt)画进位图 represent — 由 AppKit 自己挑
+/// 合适的表示并缩放,单次分配 ~16KB(加源表示解码,量级 MB 以内)。
+///
+/// 位图格式:8bit/通道、4 采样、alpha 在后、非 planar、deviceRGB、默认
+/// bitmapFormat(预乘)——正是图标图集要求的预乘 RGBA 内存序。
 fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
-    let tiff = icon.TIFFRepresentation()?;
-    let len = tiff.length();
-    if len == 0 {
+    let px = ICON_PX as NSInteger;
+    let bytes_per_row = px * 4;
+    // SAFETY:planes = null 让 NSBitmapImageRep 自行分配像素缓冲;其余参数为
+    // 常规 8bit RGBA 配置。返回对象在本函数内独占。
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            px,
+            px,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            bytes_per_row,
+            32,
+        )
+    }?;
+    let len = (bytes_per_row * px) as usize;
+    // SAFETY:非 planar + planes=null 时 AppKit 分配连续缓冲,长度 ≥
+    // bytes_per_row × height;先清零,未绘制区域保持透明。
+    unsafe {
+        let data = rep.bitmapData();
+        if data.is_null() {
+            return None;
+        }
+        std::slice::from_raw_parts_mut(data, len).fill(0);
+    }
+
+    let gc = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    let previous = NSGraphicsContext::currentContext();
+    NSGraphicsContext::setCurrentContext(Some(&gc));
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(px as f64, px as f64));
+    icon.drawInRect_fromRect_operation_fraction(
+        rect,
+        rect,
+        NSCompositingOperation::SourceOver,
+        1.0,
+    );
+    NSGraphicsContext::setCurrentContext(previous.as_deref());
+
+    // SAFETY:同上的连续缓冲;同步拷贝后 rep 即释放。
+    let data = rep.bitmapData();
+    if data.is_null() {
         return None;
     }
-    // SAFETY:`tiff` 在同步解码期间保持存活;`bytes` 返回其内部只读缓冲区指针,
-    // 长度恰为 `length()`。切片只传给 `image::load_from_memory` 同步解码,期间
-    // NSData 不被修改/释放,不越界。
-    // 返回类型须声明为 `*const c_void`(编码 `^v`):`NSData.bytes` 的 ABI 是
-    // `const void *`;写成 `*const u8`(objc2 编码 `*`,C 字符串)会在 debug 的
-    // 方法签名校验里 panic(2026-10-17 实机:图标 worker 整线程退出)。
-    let bytes = unsafe {
-        let ptr: *const std::ffi::c_void = msg_send![&*tiff, bytes];
-        std::slice::from_raw_parts(ptr.cast::<u8>(), len)
-    };
-    let decoded = decode_icon_tiff(&tiff, bytes)?;
-    let resized = decoded.resize_exact(ICON_PX, ICON_PX, image::imageops::FilterType::Lanczos3);
-    Some(resized.to_rgba8().into_raw())
-}
-
-/// TIFF 数据 → 8bit 解码图像。
-///
-/// 直解优先(类型图标的 TIFF 为 8bit,快路径);失败时经 `NSBitmapImageRep` 转
-/// PNG 中转重解——macOS 26 图标管线给 APP 图标(`iconForFile:`)输出 **16bit
-/// float 采样的多页 TIFF**(实测 1024×1024 bps=16 float,~74MB),`image` crate
-/// 不支持该采样格式,AppKit 的 PNG 导出会降到 8bit(实机 2026-10-29 探针验证)。
-/// 代价:PNG 中转约数百毫秒/次;worker 串行 + 路径缓存(每个 APP 只取一次),
-/// 首批 APP 结果渐次出现,可接受。
-/// 纯数据转换(NSBitmapImageRep 无视图/窗口操作),线程依据同 `ui/icons.rs`。
-fn decode_icon_tiff(tiff: &NSData, bytes: &[u8]) -> Option<image::DynamicImage> {
-    if let Ok(decoded) = image::load_from_memory(bytes) {
-        return Some(decoded);
-    }
-    let rep = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), tiff)?;
-    // SAFETY:rep 为有效对象,representationUsingType:properties: 是纯数据转换,
-    // 不创建/操作视图或窗口;PNG 属性字典为空。
-    let png = unsafe {
-        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
-    }?;
-    // SAFETY:同上调用方 `bytes`——PNG NSData 只读缓冲区,同步解码期间存活。
-    let png_bytes = unsafe {
-        let ptr: *const std::ffi::c_void = msg_send![&*png, bytes];
-        std::slice::from_raw_parts(ptr.cast::<u8>(), png.length())
-    };
-    // PNG 保留 16bit(Rgba16),先降 8bit 再交给调用方缩放(缩放按 u8 走,更快)。
-    image::load_from_memory(png_bytes)
-        .ok()
-        .map(|decoded| image::DynamicImage::ImageRgba8(decoded.to_rgba8()))
+    Some(unsafe { std::slice::from_raw_parts(data, len) }.to_vec())
 }
 
 /// 拉取 HTTPS 资源：同步返回响应体；非 200/非 HTTPS/超大/超时 = Err。
@@ -2229,6 +2235,102 @@ mod tests {
                 .expect_err("缺失/空主机必须拒绝");
             assert!(err.contains("URL 缺少主机"), "{url}: {err}");
         }
+    }
+
+    /// 图标解码钉:直接画进 64×64 位图(不走 TIFFRepresentation)。
+    /// 旧路径在本机每个图标产生 37–74MB 的临时分配,实测 1000 条真实结果、
+    /// 不滚动、仅加载可见行图标时峰值 845MB;直接光栅化后同场景 216MB。
+    /// 本测钉住输出形态:64×64、有可见像素、预乘 RGBA(各通道 ≤ alpha)。
+    #[test]
+    fn type_icon_rasterizes_64x64_premultiplied() {
+        let rgba = super::type_icon_rgba("public.folder").expect("系统文件夹图标");
+        assert_eq!(rgba.len(), (super::ICON_PX * super::ICON_PX * 4) as usize);
+        let mut visible = 0;
+        for p in rgba.as_chunks::<4>().0 {
+            assert!(
+                p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3],
+                "应为预乘 RGBA(通道不得大于 alpha):{p:?}"
+            );
+            if p[3] > 0 {
+                visible += 1;
+            }
+        }
+        assert!(visible > 64 * 64 / 10, "应有可见像素,实际 {visible}");
+    }
+
+    /// APP 图标(16bit float 多页表示)也必须能直接画出可见像素;
+    /// 旧路径正是卡在这种表示上走 TIFF/PNG 中转、产生数十 MB 分配。
+    #[test]
+    fn app_icon_rasterizes_visible_pixels() {
+        let path = "/System/Applications/Utilities/Terminal.app";
+        let rgba = super::app_icon_rgba(path).expect("系统终端图标");
+        assert_eq!(rgba.len(), (super::ICON_PX * super::ICON_PX * 4) as usize);
+        let visible = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
+        assert!(
+            visible > 64 * 64 / 10,
+            "APP 图标应有可见像素,实际 {visible}"
+        );
+    }
+
+    /// 进程生命周期峰值 footprint(MB;与 `scripts/mem-watch.sh` 同口径)。
+    fn lifetime_peak_mb() -> u64 {
+        let out = std::process::Command::new("/usr/bin/footprint")
+            .args(["-f", "bytes", &std::process::id().to_string()])
+            .output()
+            .expect("运行 /usr/bin/footprint 失败");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("phys_footprint_peak:") {
+                return rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    / (1024 * 1024);
+            }
+        }
+        0
+    }
+
+    /// footprint 采样(手动):图标解码不得再走 TIFFRepresentation。
+    /// 旧路径每个图标 37–74MB 临时分配;真实结果窗口 1000 条、仅可见行图标
+    /// 时峰值 845MB,直接光栅化后 216MB。20 个图标实测:新路径 +124MB,
+    /// 旧路径 +1557MB;阈值取 256MB。须单线程跑,避免并行测试抬高峰值:
+    /// `cargo test -p macEverything-app -- --ignored --nocapture --test-threads=1 icon_decode_footprint`
+    #[test]
+    #[ignore = "footprint 采样:手动单跑(--test-threads=1),旧 TIFF 路径会显著超标"]
+    #[expect(clippy::print_stderr)]
+    fn ignored_icon_decode_footprint() {
+        let before = lifetime_peak_mb();
+        for uti in [
+            "public.folder",
+            "public.plain-text",
+            "public.png",
+            "public.pdf",
+            "public.mpeg-4",
+            "public.audio",
+            "public.image",
+            "public.archive",
+            "public.executable",
+            "public.directory",
+            "com.apple.application-bundle",
+            "public.html",
+            "public.xml",
+            "public.rtf",
+            "public.spreadsheet",
+            "public.presentation",
+            "public.video",
+            "public.font",
+            "public.source-code",
+            "public.data",
+        ] {
+            let _ = super::type_icon_rgba(uti);
+        }
+        let after = lifetime_peak_mb();
+        eprintln!("HARNESS icon_decode footprint {before} -> {after} MB");
+        assert!(
+            after.saturating_sub(before) <= 256,
+            "图标解码峰值增量过大({before} -> {after} MB):疑似回到 TIFFRepresentation 路径"
+        );
     }
 
     /// 实机网络校验：拉取官网首页（不依赖 version.json 是否已部署）。

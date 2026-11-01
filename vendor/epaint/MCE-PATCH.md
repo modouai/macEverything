@@ -60,4 +60,8 @@
   `Cargo.toml`)。**升级 egui/epaint 时必须重新同步**:按新版本重新 vendor,
   把上述四项移植到新版 `take_delta` / `clear`(新版字段名可能变化),并跑
   上面六个钉子;否则升级会悄悄丢掉本修复(钉子会红)。
+- **诊断计数器**(`#[doc(hidden)]`,供现场归因;harness 退出时打印):
+  `MCE_IMAGE_CLONES`、`MCE_UPLOAD_ALLOCS`、`MCE_ATLAS_CREATES`、
+  `MCE_ATLAS_GROWTHS`、`MCE_SET_OPTIONS`。2026-11-01 真机复测据此排除
+  「图集反复重建」:真实结果窗口内 `creates=1 / growths=4 / set_options=0`。
 - 工作区 `exclude` 已含 `vendor/epaint`,不参与本仓三件套门禁。

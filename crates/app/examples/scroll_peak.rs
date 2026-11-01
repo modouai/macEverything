@@ -201,9 +201,12 @@ impl eframe::App for Harness {
         if self.started.elapsed() > duration() {
             use std::sync::atomic::Ordering::Relaxed;
             eprintln!(
-                "HARNESS counters image_clones={} upload_allocs={}",
+                "HARNESS counters image_clones={} upload_allocs={} atlas_creates={} growths={} set_options={}",
                 egui::epaint::MCE_IMAGE_CLONES.load(Relaxed),
                 egui::epaint::MCE_UPLOAD_ALLOCS.load(Relaxed),
+                egui::epaint::MCE_ATLAS_CREATES.load(Relaxed),
+                egui::epaint::MCE_ATLAS_GROWTHS.load(Relaxed),
+                egui::epaint::MCE_SET_OPTIONS.load(Relaxed),
             );
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;

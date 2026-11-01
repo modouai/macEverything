@@ -72,7 +72,10 @@ pub use self::{
     text::{FontFamily, FontId, Fonts, FontsView, Galley, TextOptions},
     texture_atlas::TextureAtlas,
     // MCE 诊断计数器(仅 vendor 补丁使用)
-    texture_atlas::{MCE_IMAGE_CLONES, MCE_UPLOAD_ALLOCS},
+    texture_atlas::{
+        MCE_ATLAS_CREATES, MCE_ATLAS_GROWTHS, MCE_IMAGE_CLONES, MCE_SET_OPTIONS,
+        MCE_UPLOAD_ALLOCS,
+    },
     texture_handle::TextureHandle,
     textures::TextureManager,
     viewport::ViewportInPixels,
