@@ -252,7 +252,11 @@ impl GlyphAtlas {
     ///
     /// Anything holding a [`UvRect`] into the old atlas (e.g. a cached galley) is now stale.
     pub fn clear(&mut self) {
-        *self = Self::new(*self.atlas.options());
+        // MCE: 原地清空,保留图集尺寸与像素缓冲容量。上游 `*self = Self::new(..)`
+        // 会按 32 高重建,并重新倍增到 4096,每轮产生 4/8/16/32MB 临时分配。
+        self.atlas.clear();
+        self.outline_glyphs.clear();
+        self.raster_glyphs.clear();
     }
 
     /// Forget what the [`GlyphRasterizer`]s produced, e.g. because they were replaced.

@@ -2083,6 +2083,119 @@ mod tests {
         );
     }
 
+    /// 本地补丁钉:整图增量(clear/扩容)与图集**共享同一块内存**,不再深拷贝。
+    /// 突变(改回 `self.image.clone()` 深拷贝)→ `Arc::ptr_eq` 为假,本测红。
+    #[test]
+    fn epaint_full_delta_shares_atlas_image() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        use std::sync::Arc;
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let delta = atlas.take_delta().expect("初始应产生整图增量");
+        let ImageData::Color(img) = delta.image;
+        assert!(
+            Arc::ptr_eq(&img, &atlas.image_shared()),
+            "整图增量应与图集共享同一块内存(不得深拷贝)"
+        );
+    }
+
+    /// 本地补丁钉:部分增量复用持久上传缓冲(按量化尺寸成池),
+    /// 同尺寸帧不新建 `ColorImage`,尺寸交替时也只各留一块。
+    /// 突变(每帧 `ColorImage::filled`)→ 分配次数随帧数线性增长,本测红。
+    #[test]
+    fn epaint_partial_delta_reuses_upload_buffers() {
+        use egui::epaint::{TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta(); // 清掉初始整图
+
+        for _ in 0..20 {
+            let _ = atlas.allocate((7, 8));
+            let _ = atlas.take_delta().expect("应有部分增量");
+        }
+        let same_size_allocs = atlas.upload_allocations();
+        assert!(
+            same_size_allocs <= 1,
+            "同尺寸帧应复用同一缓冲,实际分配 {same_size_allocs} 次"
+        );
+
+        for i in 0..20 {
+            let h = if i % 2 == 0 { 8 } else { 16 };
+            let _ = atlas.allocate((7, h));
+            let _ = atlas.take_delta().expect("应有部分增量");
+        }
+        let grew = atlas.upload_allocations() - same_size_allocs;
+        assert!(
+            grew <= 2,
+            "两种尺寸应各复用一块(≤2 次新分配),实际新增 {grew} 次"
+        );
+    }
+
+    /// 本地补丁钉:clear 是**原地清空**,保留图集尺寸与像素缓冲,
+    /// 不得重置到 32 高再走倍增链(每轮产生 4/8/16/32MB 临时分配)。
+    /// 突变(`*self = Self::new(..)` 或 clear 内重建)→ 尺寸回落到 32,本测红。
+    #[test]
+    fn epaint_clear_keeps_atlas_size() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        use std::sync::Arc;
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta();
+        let _ = atlas.allocate((7, 300)); // 触发一次高度倍增(256 -> 512)
+        let _ = atlas.take_delta();
+        let grown = atlas.size();
+        assert!(grown[1] >= 512, "前置:图集应已长大,实际 {grown:?}");
+
+        atlas.clear();
+        assert_eq!(
+            atlas.size(),
+            grown,
+            "clear 应保留尺寸(原地清空),实际 {}",
+            format_args!("{:?}", atlas.size())
+        );
+        assert!(atlas.fill_ratio() < 0.01, "clear 后填充率应归零");
+        let delta = atlas.take_delta().expect("clear 应产生整图增量");
+        let ImageData::Color(img) = delta.image;
+        assert!(
+            Arc::ptr_eq(&img, &atlas.image_shared()),
+            "clear 后的整图增量仍应共享图集内存"
+        );
+    }
+
+    /// 本地补丁钉(端到端):字形图集触达 0.8 clear 时走**原地清空**,
+    /// 图集尺寸不回落到 32;否则每轮 clear 都要重新倍增,产生 4/8/16/32MB
+    /// 临时分配。突变(GlyphAtlas::clear 改回 `*self = Self::new(..)`)→ 本测红。
+    #[test]
+    fn epaint_glyph_atlas_clear_stays_in_place() {
+        let ctx = egui::Context::default();
+        install_ui_fonts(&ctx, true);
+        let mut input = probe_input();
+        input.max_texture_side = Some(1024); // 小图集,一个 pass 即可填满
+        let chars: String = include_str!("atlas_charset.txt")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(chars.chars().count() > 1000, "前置:字符集应足够填满图集");
+
+        // pass 1:布局全部字符 → 图集增长/溢出。
+        let mut out = ctx.run_ui(input.clone(), |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(&chars)).wrap());
+        });
+        out.textures_delta.clear();
+        let grown = ctx.fonts(|f| f.font_image_size());
+        assert!(grown[1] > 32, "前置:图集应已长大,实际 {grown:?}");
+
+        // pass 2:空 pass 开头 fill>0.8 → clear;无文本,不再增长。
+        let mut out = ctx.run_ui(input, |_ui| {});
+        out.textures_delta.clear();
+        let after = ctx.fonts(|f| f.font_image_size());
+        assert!(
+            after[1] > 32,
+            "clear 应原地保留尺寸(实际回落到 {after:?},说明重建了图集)"
+        );
+        assert!(
+            ctx.fonts(|f| f.font_atlas_fill_ratio()) < 0.1,
+            "clear 后填充率应归零"
+        );
+    }
+
     /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。
     #[test]
     fn base_text_sizes_follow_scale() {

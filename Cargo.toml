@@ -22,9 +22,10 @@ fsevent-sys = "4"
 core-foundation-sys = "0.8"
 libc = "0.2"
 
-# 本地补丁:epaint 的字体图集增量上传按脏区任意尺寸分配,macOS malloc 按尺寸类
-# 缓存 VM 段 → 滚动时 Malloc Large (empty) 随高度种类无界累积(峰值 1.9–2.8GB)。
-# 补丁把增量区域量化到 2 的幂(见 vendor/epaint/src/texture_atlas.rs 的 MCE 标记)。
+# 本地补丁:epaint 字体图集的增量/清空路径在滚动时持续产生大块临时分配,
+# macOS malloc 按尺寸类缓存 VM 段 → Malloc Large (empty) 无界累积(峰值 2.8GB)。
+# 补丁四项:部分增量量化到 2 的幂、整图增量 Arc 共享、部分增量复用上传缓冲、
+# clear 原地清空(见 vendor/epaint/MCE-PATCH.md)。
 # **升级 egui/epaint 版本时必须重新同步此补丁**(vendor 目录以 0.37.0 为基线)。
 [patch.crates-io]
 epaint = { path = "vendor/epaint" }
