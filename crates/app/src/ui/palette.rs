@@ -311,6 +311,8 @@ pub struct PaletteState {
     /// 结果行系统图标缓存(UTI 纹理 + 路径自定义图标;`reset` 清路径无自定义/
     /// 失败条目,类型纹理与类型失败记录保留)。
     icons: icons::IconCache,
+    /// 上帧列表滚动偏移(滚动检测;变化即通知图标缓存进入滚动抑制窗)。
+    last_scroll_y: Option<f32>,
     /// 吉祥物纹理与姿态(跨帧持有;`reset` 不清纹理)。
     mascot: mascot::Mascot,
 
@@ -446,6 +448,7 @@ impl PaletteState {
             visible_rows: ROWS_INITIAL,
             full_window_request: None,
             icons,
+            last_scroll_y: None,
             mascot,
             paths,
             ctx: egui_ctx,
@@ -997,6 +1000,11 @@ impl PaletteState {
                     let icons = &mut self.icons;
                     let selected = self.selected;
                     let scroll_sel = self.scroll_to_selected;
+                    // 滚动检测(早于行绘制):滚轮输入即刻抑制图标加载;拖拽/惯性
+                    // 由上一帧偏移变化补上(见 show 之后)。抑制窗 150ms。
+                    if ui.input(|i| i.smooth_scroll_delta.y.abs() > 0.5) {
+                        icons.note_scroll(ui.ctx());
+                    }
                     let mut pointer: Option<(usize, RowPointerAction)> = None;
                     let out = egui::ScrollArea::vertical()
                         .max_height(LIST_MAX_H) // 行数少时收缩到内容高
@@ -1025,6 +1033,15 @@ impl PaletteState {
                                 }
                             }
                         });
+                    // 偏移变化(拖拽/惯性/滚到底增量渲染)→ 顺延滚动抑制窗。
+                    let y = out.state.clamped_offset().y;
+                    let scrolled = self
+                        .last_scroll_y
+                        .is_some_and(|prev| (prev - y).abs() > 0.5);
+                    self.last_scroll_y = Some(y);
+                    if scrolled {
+                        self.icons.note_scroll(ui.ctx());
+                    }
                     if let Some((i, action)) = pointer {
                         self.selected = i;
                         if action == RowPointerAction::Open {

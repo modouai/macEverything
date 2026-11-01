@@ -53,6 +53,9 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 /// 路径图标缓存上限(含自定义图标;内存规格 tech.md §6.2.3:2048→128 LRU,
 /// 上界 64×64×4×128 ≈ 2MB,对照原 2048 条 ≈ 32MB)。超出按**最久未用**淘汰。
 const MAX_PATH_ICONS: usize = 128;
+/// 滚动抑制的静默阈值:检测到滚动后再保持抑制 150ms,滚动停止且静默期满才
+/// 恢复按需加载(给惯性滚动/连续滚轮留余量,避免「停一下就建一批纹理」)。
+pub(crate) const SCROLL_SETTLE: Duration = Duration::from_millis(150);
 
 /// 目录的类型分组键(与扩展名分组键空间隔离,避免文件扩展名撞键)。
 const KEY_FOLDER: &str = "type:folder";
@@ -107,6 +110,11 @@ pub struct IconCache {
     cancel: Arc<AtomicBool>,
     /// 在途请求计时起点;任何响应落地后重置,超时则统一落失败。
     pending_since: Option<Instant>,
+    /// 滚动抑制截止时刻(见 [`SCROLL_SETTLE`]):此刻之前视为「列表正在滚动」——
+    /// 不发起新加载、不上传新纹理,只交付已缓存图标,其余行画占位。
+    /// 动机(A6b 归因):滚动经过的每一行都取图标 → 每个新图标建一张 GL 纹理,
+    /// LRU 淘汰的旧纹理被 GL 兼容层延迟释放,实测 311 块 × 8.9MB ≈ 2.7GB 滞留。
+    scroll_settle_until: Option<Instant>,
     /// 测试构造:无 worker;请求只记在途标记,由测试注入响应。
     #[cfg(test)]
     defer_requests: bool,
@@ -159,29 +167,46 @@ impl IconCache {
             resp_rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
             pending_since: None,
+            scroll_settle_until: None,
             #[cfg(test)]
             defer_requests: false,
         }
     }
 
     /// 每帧起点:drain worker 响应,限量上传纹理;有在途请求时轮询下一帧。
+    ///
+    /// 滚动期([`Self::note_scroll`] 后的静默窗)**不上传**:上传即建 GL 纹理,
+    /// 滚动经过的大量行会让驱动侧滞留大块纹理内存(A6b 归因);响应留在队列,
+    /// 滚动停止后一次性限量补齐(队列长度受在途请求上限约束,不会膨胀)。
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        self.begin_frame_at(ctx, Instant::now());
+    }
+
+    /// [`Self::begin_frame`] 的显式时钟版本(单测注入时间)。
+    pub(crate) fn begin_frame_at(&mut self, ctx: &egui::Context, now: Instant) {
         let drained = self.drain_responses();
-        for _ in 0..UPLOAD_BUDGET {
-            let Some(resp) = self.pending_uploads.pop_front() else {
-                break;
-            };
-            self.apply_response(ctx, resp);
+        let scrolling = self.scrolling_at(now);
+        if !scrolling {
+            for _ in 0..UPLOAD_BUDGET {
+                let Some(resp) = self.pending_uploads.pop_front() else {
+                    break;
+                };
+                self.apply_response(ctx, resp);
+            }
         }
-        if !self.pending_uploads.is_empty() {
-            ctx.request_repaint();
+        if scrolling || !self.pending_uploads.is_empty() {
+            // 滚动中:排队响应到期后再排一帧(静默窗结束即恢复上传)。
+            ctx.request_repaint_after(if scrolling {
+                SCROLL_SETTLE
+            } else {
+                RESPONSE_POLL
+            });
         }
         if self.pending_types.is_empty() && self.pending_paths.is_empty() {
             self.pending_since = None;
             return;
         }
         // 任何响应落地都重置超时计时;持续 5s 无响应则统一落失败,停止轮询。
-        let now = Instant::now();
         let since = if drained {
             now
         } else {
@@ -215,6 +240,34 @@ impl IconCache {
     /// 才能给到(自然含用户自定义);未命中/失败时本帧先用类型图标(KEY_APP →
     /// 通用 APP 图标,不是文件夹图标)。
     pub fn icon(&mut self, ctx: &egui::Context, entry: &HitEntry) -> Option<egui::TextureId> {
+        self.icon_at(ctx, entry, Instant::now())
+    }
+
+    /// 滚动状态采样:列表滚动中每帧调用(偏移变化帧 + 惯性/滚轮期间)。
+    ///
+    /// 语义:此后 [`SCROLL_SETTLE`] 内的调用只交付缓存图标;到期后自动恢复
+    /// 按需加载——调用方无需显式「恢复」。
+    pub fn note_scroll(&mut self, ctx: &egui::Context) {
+        self.scroll_settle_until = Some(Instant::now() + SCROLL_SETTLE);
+        // 静默窗到期后必须有一帧来恢复加载(否则滚动停止后不再有帧)。
+        ctx.request_repaint_after(SCROLL_SETTLE);
+    }
+
+    /// 当前是否处于滚动抑制窗(测试直接注入时间)。
+    fn scrolling_at(&self, now: Instant) -> bool {
+        self.scroll_settle_until.is_some_and(|until| now < until)
+    }
+
+    /// [`Self::icon`] 的显式时钟版本(单测注入时间,不依赖真实时钟)。
+    pub(crate) fn icon_at(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &HitEntry,
+        now: Instant,
+    ) -> Option<egui::TextureId> {
+        if self.scrolling_at(now) {
+            return self.cached_icon(entry);
+        }
         if is_app_bundle(&entry.name, entry.is_dir) {
             if self.path_icons.contains_key(&entry.path) {
                 self.touch(&entry.path);
@@ -237,6 +290,33 @@ impl IconCache {
             self.request_path(ctx, &entry.path);
         }
         self.type_icon(ctx, &entry.name, entry.is_dir)
+    }
+
+    /// 测试观测面:在途请求数(路径, 类型)。用于验证调用点确实报告了滚动。
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> (usize, usize) {
+        (self.pending_paths.len(), self.pending_types.len())
+    }
+
+    /// 只读缓存命中(滚动抑制窗内唯一允许的路径):不发起请求、不做 UTType 解析。
+    ///
+    /// 命中规则与 [`Self::icon`] 一致,但所有「未命中→请求」的分支都退化为
+    /// `None`(调用方画占位);类型图标只查**已解析过**的键。
+    fn cached_icon(&mut self, entry: &HitEntry) -> Option<egui::TextureId> {
+        if is_app_bundle(&entry.name, entry.is_dir) {
+            return self
+                .path_icons
+                .get(&entry.path)
+                .and_then(Option::as_ref)
+                .map(egui::TextureHandle::id);
+        }
+        if let Some(Some(tex)) = self.path_icons.get(&entry.path) {
+            return Some(tex.id());
+        }
+        // 类型图标:键已解析过才查(滚动期不做 UTType 查询)。
+        let key = type_key(&entry.name, entry.is_dir);
+        let uti = self.key_to_uti.get(&key)?;
+        self.type_icons.get(uti).map(egui::TextureHandle::id)
     }
 
     /// LRU 记账:命中的路径移到队尾(最近使用)。
@@ -1075,6 +1155,107 @@ mod tests {
         );
         assert_eq!(cache.path_icons[custom].as_ref().unwrap().id(), custom_id);
         assert_eq!(cache.path_order.len(), 1);
+    }
+
+    /// 滚动抑制:滚动窗内**不得**发起新请求(路径/类型都不发)——A6b 归因:
+    /// 滚动经过的每一行都取图标 → 每图标一张 GL 纹理 → 2.7GB 滞留。
+    /// 突变(去掉 scrolling 守卫)时本测必红:会发出一条 Path 请求。
+    #[test]
+    fn scrolling_suppresses_new_icon_requests() {
+        let ctx = egui::Context::default();
+        let (mut cache, req_rx, _resp_tx) = IconCache::with_test_channels();
+        let t = Instant::now();
+        cache.scroll_settle_until = Some(t + SCROLL_SETTLE);
+        let entry = hit("scrolling.txt");
+
+        assert_eq!(cache.icon_at(&ctx, &entry, t), None, "滚动期应落占位");
+        assert!(req_rx.try_recv().is_err(), "滚动期不得发起任何加载请求");
+        assert!(cache.pending_paths.is_empty(), "滚动期不得记在途路径");
+        assert!(cache.pending_types.is_empty(), "滚动期不得记在途类型");
+    }
+
+    /// 滚动期仍交付已缓存图标(缓存命中零成本,不新建纹理/请求)。
+    #[test]
+    fn scrolling_still_serves_cached_icons() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
+        let t = Instant::now();
+        cache.scroll_settle_until = Some(t + SCROLL_SETTLE);
+
+        // ① 类型图标已缓存(键已解析):滚动期照常返回。
+        let entry = hit("cached.pdf");
+        let tex = texture(&ctx, "scroll-type");
+        let id = tex.id();
+        cache
+            .key_to_uti
+            .insert("ext:pdf".to_owned(), "com.adobe.pdf".to_owned());
+        cache.type_icons.insert("com.adobe.pdf".to_owned(), tex);
+        cache.path_icons.insert(entry.path.clone(), None);
+        assert_eq!(cache.icon_at(&ctx, &entry, t), Some(id));
+
+        // ② 路径自定义图标已缓存:滚动期照常返回。
+        let custom = hit("custom.txt");
+        let ctex = texture(&ctx, "scroll-custom");
+        let cid = ctex.id();
+        cache.path_icons.insert(custom.path.clone(), Some(ctex));
+        assert_eq!(cache.icon_at(&ctx, &custom, t), Some(cid));
+
+        // ③ 未解析的类型键:滚动期不做 UTType 解析、不发请求。
+        let fresh = hit("fresh.xyz");
+        assert_eq!(cache.icon_at(&ctx, &fresh, t), None);
+        assert!(
+            !cache.key_to_uti.contains_key("ext:xyz"),
+            "滚动期不得解析 UTI"
+        );
+    }
+
+    /// 静默期满(150ms)自动恢复按需加载——调用方无需显式恢复。
+    #[test]
+    fn requests_resume_after_scroll_settle() {
+        let ctx = egui::Context::default();
+        let (mut cache, req_rx, _resp_tx) = IconCache::with_test_channels();
+        let t = Instant::now();
+        cache.scroll_settle_until = Some(t + SCROLL_SETTLE);
+
+        let entry = hit("resume.txt");
+        assert_eq!(cache.icon_at(&ctx, &entry, t), None);
+        assert!(req_rx.try_recv().is_err(), "窗内不请求");
+        assert_eq!(
+            cache.icon_at(&ctx, &entry, t + SCROLL_SETTLE),
+            None,
+            "到期帧仍落占位(本帧发请求,纹理下帧才有)"
+        );
+        assert!(
+            matches!(req_rx.try_recv(), Ok(IconRequest::Path(p)) if p == entry.path),
+            "静默期满应恢复发起路径检查请求"
+        );
+    }
+
+    /// 滚动期不上传纹理(响应留在队列),静默期满后一次性补齐——保证滚动期间
+    /// 零新建 GL 纹理,而不仅仅是零新请求。
+    #[test]
+    fn scrolling_defers_texture_uploads_until_settle() {
+        let ctx = egui::Context::default();
+        let (mut cache, _req_rx, resp_tx) = IconCache::with_test_channels();
+        let t = Instant::now();
+        resp_tx
+            .send(IconResponse::Path {
+                path: "/tmp/mce-icon-test/deferred".to_owned(),
+                rgba: None,
+            })
+            .unwrap();
+        cache.scroll_settle_until = Some(t + SCROLL_SETTLE);
+
+        cache.begin_frame_at(&ctx, t);
+        assert_eq!(cache.pending_uploads.len(), 1, "滚动期响应不得上传");
+        assert!(cache.path_icons.is_empty(), "滚动期不得落纹理/缓存");
+
+        cache.begin_frame_at(&ctx, t + SCROLL_SETTLE);
+        assert!(cache.pending_uploads.is_empty(), "静默期满应补齐上传");
+        assert!(
+            cache.path_icons.contains_key("/tmp/mce-icon-test/deferred"),
+            "静默期满后响应应落缓存"
+        );
     }
 
     /// 突变钉:容量常量必须是 128(内存规格 tech.md §6.2.3;若有人调回大容量,
