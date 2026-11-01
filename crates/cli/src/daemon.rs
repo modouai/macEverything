@@ -852,12 +852,16 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
             }
             // 节流起点按「尝试过 flush」推进:失败重试不密集化
             *state.last_flush.lock().unwrap() = Instant::now();
+            // 合并写的条目流/缓冲产物已释放,滞留的大块脏页在此归还内核
+            // (与重扫/compact 同构;缺此调用时稳态 footprint 高 ~90MB 死页)
+            engine::malloc_pressure::release_heap_pressure();
         }
         Err(e) => {
             log::error!("合并产物重载失败(保留增量态,下轮重试): {e}");
             // 节流起点照推进:dirty 已超批量阈值时,失败重试不得退化为
             // 消费循环逐轮密集全量重写
             *state.last_flush.lock().unwrap() = Instant::now();
+            engine::malloc_pressure::release_heap_pressure();
         }
     }
 }
