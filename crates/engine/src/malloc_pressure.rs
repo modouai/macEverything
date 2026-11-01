@@ -4,19 +4,25 @@
 //! 折叠。重扫 flush 后与 compact 后各调一次;GUI 空闲归还同用此入口。
 #![allow(unsafe_code)]
 
-/// 归还默认 malloc zone 的可折叠脏页(`flag=1` = 全力归还)。
+/// 归还默认 malloc zone 的可折叠脏页(`goal=0` = 尽力归还全部)。
 /// 幂等且开销低(仅在存在滞留页时有工作可做),不需要节流。
+///
+/// 签名以系统头 `malloc/malloc.h` 为准:**两参数**
+/// `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal)`;
+/// 曾误声明为三参数(多一个 flag),按 ABI 多余参数被忽略,但那是不依
+/// 赖实现细节的危险写法,已改为精确签名;返回值为实际归还字节数(仅
+/// debug 日志用)。
 #[cfg(target_os = "macos")]
 pub fn release_heap_pressure() {
-    use std::os::raw::{c_int, c_void};
+    use std::os::raw::c_void;
 
     unsafe extern "C" {
         fn malloc_default_zone() -> *mut c_void;
-        // 变长参数签名中我们只用到前两个固定参:len=0 表示整个 zone。
-        fn malloc_zone_pressure_relief(zone: *mut c_void, len: usize, flag: c_int);
+        fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
     }
-    unsafe {
-        malloc_zone_pressure_relief(malloc_default_zone(), 0, 1);
+    let relieved = unsafe { malloc_zone_pressure_relief(malloc_default_zone(), 0) };
+    if relieved > 0 {
+        log::debug!("malloc pressure relief 归还 {} KB", relieved / 1024);
     }
 }
 
