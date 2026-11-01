@@ -79,6 +79,45 @@ impl Overlay {
         self.epoch
     }
 
+    /// 清空账本与 overlay 索引但**保留容量**(合并 flush 换基后复用同一实例,
+    /// 见 daemon `spare_overlay`)。epoch 不重置:世代必须单调,旧快照号不得
+    /// 复用到新账本上。
+    pub fn reset(&mut self) {
+        self.overlaid.clear();
+        self.anchors.clear();
+        self.anchor_base.clear();
+        self.dir_ids.clear();
+        self.index.reset();
+    }
+
+    /// 基线容量预留:重放/事件风暴下单次增量可含 29 万子项目录,逐条 push 的
+    /// Vec 倍增链每次换块都留一块不可折叠死页。预留只占虚拟地址(malloc 大块
+    /// mmap,未触碰页不计 footprint),按需缺页;spare 复用后容量通常已够。
+    pub fn reserve_baseline(&mut self) {
+        self.index
+            .reserve_min(512 * 1024, 32 << 20, 32 << 20, 16 << 20);
+    }
+
+    /// 把 reset 后保留的空容量标为可回收(见 `release_reusable_pages`)。
+    pub fn release_pages(&mut self) {
+        crate::malloc_pressure::release_reusable_pages(&mut self.index.entries);
+        crate::malloc_pressure::release_reusable_pages(&mut self.index.display_arena.data);
+        crate::malloc_pressure::release_reusable_pages(&mut self.index.match_arena.data);
+        crate::malloc_pressure::release_reusable_pages(&mut self.index.path_pool.data);
+        crate::malloc_pressure::release_reusable_pages(&mut self.index.path_offsets);
+    }
+
+    /// 账本规模(flush 节流用):(条目数, 三段 arena 字节数)。条目数含墓碑,
+    /// 是增长上界;arena 字节反映实际名称/路径占用。
+    pub fn footprint(&self) -> (usize, usize) {
+        (
+            self.index.entries.len(),
+            self.index.display_arena.data.len()
+                + self.index.match_arena.data.len()
+                + self.index.path_pool.data.len(),
+        )
+    }
+
     /// 是否完全无增量(compact/整理只在无 Overlay 时安全:任何账本非空都可能
     /// 锚定 Base 条目号,整理重排会使其失效)。
     pub fn is_empty(&self) -> bool {
@@ -145,6 +184,41 @@ impl Overlay {
         excludes: &[PathBuf],
     ) -> std::io::Result<DiffStats> {
         let listing = crate::watcher::read_dir_listing(abs_dir, excludes)?;
+        // Base 直接子项名 → 条目号(仅为目录子项建 anchors 桥;O(n) 全表扫与既有
+        // diff_dir 的 children_of 同代价,预算内)。Overlay 目标无 Base 子项可桥。
+        let base_children: HashMap<String, u32> = match target {
+            DiffTarget::Base(b) => base
+                .children_of(b)
+                .into_iter()
+                .map(|k| {
+                    (
+                        String::from_utf8_lossy(base.display_name(k)).into_owned(),
+                        k,
+                    )
+                })
+                .collect(),
+            DiffTarget::OverlayDir(_) => HashMap::new(),
+        };
+        // 首次 diff 且与 Base 完全一致(重放/事件风暴的常态:事件只是提示):
+        // 不建 anchor、不把整份 listing 收进 Overlay,直接返回零漂移。否则目录
+        // 越大(实测 deps 29 万子项),每次重放/无关事件都会把整份 listing
+        // 复制进 Overlay(数十 MB + 后续合并写),查询语义不受影响——Base 即真相。
+        if let DiffTarget::Base(b) = target {
+            if !self.overlaid.contains(&b) {
+                let same = listing.len() == base_children.len()
+                    && listing.iter().all(|(n, is_dir)| {
+                        base_children
+                            .get(n)
+                            .is_some_and(|&k| base.entry(k).is_dir() == *is_dir)
+                    });
+                if same {
+                    return Ok(DiffStats {
+                        added: 0,
+                        removed: 0,
+                    });
+                }
+            }
+        }
         // 2. 确保 anchor:Base 目录复用既有 anchor(父层 diff 建的桥,父子链已正确);
         //    无则新建(parent = 最近已锚定祖先的 anchor,无则 NO_PARENT 桥接占位)。
         let (anchor, b0) = match target {
@@ -164,21 +238,33 @@ impl Overlay {
                 )
             })
             .collect();
-        // Base 直接子项名 → 条目号(仅为目录子项建 anchors 桥;O(n) 全表扫与既有
-        // diff_dir 的 children_of 同代价,预算内)。Overlay 目标无 Base 子项可桥。
-        let base_children: HashMap<String, u32> = match b0 {
-            Some(b) => base
-                .children_of(b)
-                .into_iter()
-                .map(|k| {
-                    (
-                        String::from_utf8_lossy(base.display_name(k)).into_owned(),
-                        k,
-                    )
-                })
-                .collect(),
-            None => HashMap::new(),
-        };
+        // 账本容量一次性预留:大目录(实测存在 29 万子项目录)逐条 push 会让
+        // entries/arena 反复倍增,旧块成为不可折叠死页。按「本 listing 中将被
+        // 新建的条目 + 名称字节 + 目录路径估算」预留到目标容量,把增长链缩成
+        // 一次分配(已存在条目不计入,避免二次 diff 过度预留)。
+        {
+            let mut new_entries = 0usize;
+            let mut new_names = 0usize;
+            let mut new_dirs = 0usize;
+            for (name, is_dir) in &listing {
+                let keep = old
+                    .get(name)
+                    .is_some_and(|&k| self.index.entries[k as usize].is_dir() == *is_dir);
+                if !keep {
+                    new_entries += 1;
+                    new_names += name.len();
+                    if *is_dir {
+                        new_dirs += 1;
+                    }
+                }
+            }
+            self.index.reserve_min(
+                self.index.entries.len() + new_entries,
+                self.index.display_arena.data.len() + new_names,
+                self.index.match_arena.data.len() + new_names,
+                self.index.path_pool.data.len() + new_dirs * 128,
+            );
+        }
 
         let mut added = 0u32;
         let mut removed = 0u32;
@@ -859,6 +945,30 @@ pub fn write_merged_atomic(
     meta: &crate::persist::IndexMeta,
     path: &Path,
 ) -> std::io::Result<u32> {
+    let mut base_remap = Vec::new();
+    let mut new_dirs = Vec::new();
+    write_merged_atomic_collect(base, overlay, meta, path, &mut base_remap, &mut new_dirs)
+}
+
+/// [`write_merged_atomic`] 的可复用收集版:除落盘外顺带产出合并写期间的
+/// **条目号重映射**与**新增目录路径**,供调用方在同一个换基临界区内增量修复
+/// 目录寻址表(dir_map),避免每次合并都整表重建:
+///
+/// - `base_remap`:旧 Base 条目号 → 新 Base 条目号(`NO_PARENT` = 未留存:
+///   墓碑/被 overlay 屏蔽)。长度 = 旧 Base 条目总数。
+/// - `new_dirs`:本次由 overlay 并入 Base 的活目录 `(新条目号, 完整路径原始字节)`。
+///   旧 Base 目录的路径不变,故无需重写;只有 overlay 新增目录需要补键。
+///
+/// 两个 Vec 由调用方持有并跨调用复用(`clear` 后重填),避免每次 flush 释放
+/// 百万级重映射表——macOS malloc Large 区实测不归还这类大块。
+pub fn write_merged_atomic_collect(
+    base: &dyn IndexView,
+    overlay: &Overlay,
+    meta: &crate::persist::IndexMeta,
+    path: &Path,
+    base_remap: &mut Vec<u32>,
+    new_dirs: &mut Vec<(u32, Vec<u8>)>,
+) -> std::io::Result<u32> {
     let base_count: u32 = base
         .entry_segments()
         .iter()
@@ -866,7 +976,10 @@ pub fn write_merged_atomic(
         .sum();
     let view = CompositeView::new(base, overlay);
     // base 条目号 → 合成条目号（墓碑/被屏蔽不占号；NO_PARENT = 未留存）
-    let mut base_map: Vec<u32> = vec![NO_PARENT; base_count as usize];
+    base_remap.clear();
+    base_remap.resize(base_count as usize, NO_PARENT);
+    let base_map = &mut *base_remap;
+    new_dirs.clear();
     // 纯 overlay 条目号 → 合成条目号（anchor 略去不占号）
     let mut merged_of: HashMap<u32, u32> = HashMap::new();
     let corrupted = |why: &str| {
@@ -963,6 +1076,15 @@ pub fn write_merged_atomic(
                 e.flags,
                 dir_path,
             )?;
+            if e.is_dir() {
+                // dir_map 键是**磁盘 display 形态**(FSEvents 路径逐字节比对);
+                // overlay 路径池段是 match 折叠形态,直接拿来当键会让事件侧
+                // 大小写不匹配 → 每次事件都 miss → 逐级补链重 diff,overlay
+                // 目录被反复重建(dir_map 与 Overlay 双膨胀)。按合成父链取
+                // display 形态完整路径。
+                let composite_idx = base_count + o;
+                new_dirs.push((new, view.full_path_composite(composite_idx).into_bytes()));
+            }
             merged_of.insert(o, new);
         }
         Ok(())
@@ -1944,6 +2066,71 @@ mod tests {
         assert_eq!(hit_paths_of(shared.as_ref()), reference, "对拍零差异");
     }
 
+    /// 零漂移短路钉:首次 diff 且 listing 与 Base 完全一致时,不得把整份
+    /// listing 收进 Overlay(重放/无关事件风暴下大目录会反复物化数十万条目)。
+    /// 突变「去掉 same 短路」→ is_empty 断言红;真实漂移仍须正常入账。
+    #[test]
+    fn no_drift_diff_does_not_materialize_overlay() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/b.txt"), "").unwrap();
+        let base = scan(&root);
+        let root_id = id_of(&base, &root);
+        let mut ov = Overlay::new();
+
+        let stats = ov
+            .apply_diff(&base, DiffTarget::Base(root_id), &root, &[])
+            .unwrap();
+        assert_eq!((stats.added, stats.removed), (0, 0));
+        assert!(ov.is_empty(), "零漂移不得物化任何 Overlay 条目");
+
+        // 真实漂移仍正常入账
+        std::fs::write(root.join("c.txt"), "").unwrap();
+        let stats = ov
+            .apply_diff(&base, DiffTarget::Base(root_id), &root, &[])
+            .unwrap();
+        assert_eq!((stats.added, stats.removed), (1, 0));
+        assert!(!ov.is_empty(), "有漂移必须建立 Overlay 账本");
+    }
+
+    /// 合并收集版给 daemon 的 `new_dirs` 路径必须是**磁盘 display 形态**:
+    /// dir_map 键与 FSEvents 事件路径逐字节比对,取 overlay 的 match(小写)
+    /// 路径段会让大小写命名的目录永远 miss(实测造成逐级补链重 diff、
+    /// dir_map/Overlay 双膨胀)。突变「改回 Index::dir_path」本测红。
+    #[test]
+    fn merged_collect_new_dirs_paths_are_display_form() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let base = scan(&root); // 先扫空目录
+        let mut ov = Overlay::new();
+        std::fs::create_dir(root.join("MiXeD")).unwrap();
+        let root_id = id_of(&base, &root);
+        ov.apply_diff(&base, DiffTarget::Base(root_id), &root, &[])
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut base_remap = Vec::new();
+        let mut new_dirs = Vec::new();
+        write_merged_atomic_collect(
+            &base,
+            &ov,
+            &crate::persist::IndexMeta::default(),
+            &dir.path().join("m.bin"),
+            &mut base_remap,
+            &mut new_dirs,
+        )
+        .unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let expect = root.join("MiXeD");
+        assert!(
+            new_dirs
+                .iter()
+                .any(|(_, p)| Path::new(std::ffi::OsStr::from_bytes(p)) == expect),
+            "新增目录路径须保留 display 大小写:{new_dirs:?}"
+        );
+    }
+
     /// 账本腐化哨兵钉：「活条目的父是墓碑」形态——f 活、parent 指向已墓碑的
     /// d，「活父必活」不变量破。合并写必须拒绝(腐化 Err,取证链入消息)而非
     /// 静默产出孤儿;is_ledger_corruption 恰好区分腐化与普通 io 错误。
@@ -1997,6 +2184,8 @@ mod tests {
         let base = scan(root);
         let root_id = id_of(&base, root);
         let sub_id = id_of(&base, &root.join("sub"));
+        // 制造真实漂移:零漂移 diff 走无物化短路(不建 anchor),本测需要桥存在
+        std::fs::write(root.join("sub/b.txt"), "").unwrap();
 
         let mut ov = Overlay::new();
         ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
@@ -2032,6 +2221,8 @@ mod tests {
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/inner.txt"), "").unwrap();
         let base = scan(root);
+        // 制造真实漂移:零漂移 diff 走无物化短路(不建桥),本测需要桥存在
+        std::fs::write(root.join("sub/inner2.txt"), "").unwrap();
 
         // 子先 diff:sub 的桥是顶层占位
         let mut ov = Overlay::new();

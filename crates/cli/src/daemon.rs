@@ -16,7 +16,9 @@ use engine::watcher::{self, DirBatcher};
 mod volumes;
 use protocol::{self, Gap, HitEntry, Request, Response};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -168,6 +170,12 @@ pub const REPLAY_DOWNTIME_THRESHOLD_SECS: u64 = 48 * 3600;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(120);
 /// 落盘节流:累计变更超过此条数 → 立即触发快照(放宽理由同上)。
 const FLUSH_DIRTY_LIMIT: u64 = 30_000;
+/// Overlay 规模上限:条目数或三段 arena 字节超限即触发合并(即便变更计数未到
+/// 阈值)。目录 diff 会把整份 listing 收进 Overlay,大目录/事件风暴下条目数可
+/// 远超 dirty 计数;无上限时单次增量可长到百万级(堆峰值与 flush 后死页都随之
+/// 放大)。超限合并把常驻 Overlay 钉在几十 MB 量级。
+const OVERLAY_FLUSH_ENTRIES: usize = 150_000;
+const OVERLAY_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 /// 事件合批静默窗(tech.md 增量管线)。
 const BATCH_WINDOW: Duration = Duration::from_millis(100);
 /// 首扫流式聚合批大小:每批持写锁聚合后即释放,批间查询可见已扫部分(product 场景 2)。
@@ -273,18 +281,21 @@ enum IndexHolder {
 /// diff 入口的态转换(T3:diff 直写 Overlay,不再物化整个 Base——tech.md §4.3
 /// 「ensure_mutable 退役」的 T3 形态):Shared/Mutable → Overlaid,已 Overlaid 原样。
 /// 转换保持条目号 1:1(Shared 本就是视图,Mutable 平移为 Heap 载体),dir_map 有效。
-fn ensure_overlay_ready(h: &mut IndexHolder) {
+fn ensure_overlay_ready(h: &mut IndexHolder, spare: Option<engine::overlay::Overlay>) {
     match h {
         IndexHolder::Shared(_) | IndexHolder::Mutable(_) => {
             let taken = std::mem::replace(h, IndexHolder::Empty);
+            let mut overlay = spare.unwrap_or_default();
+            overlay.reset(); // 防御:调用方交来的 spare 必须干净(复用契约)
+            overlay.reserve_baseline(); // 虚拟预留,避免大 listing 的增长换块死页
             *h = match taken {
                 IndexHolder::Shared(v) => IndexHolder::Overlaid(Box::new(OverlaidState {
                     base: BaseRef::Mmap(v),
-                    overlay: engine::overlay::Overlay::new(),
+                    overlay,
                 })),
                 IndexHolder::Mutable(idx) => IndexHolder::Overlaid(Box::new(OverlaidState {
                     base: BaseRef::Heap(idx),
-                    overlay: engine::overlay::Overlay::new(),
+                    overlay,
                 })),
                 other => other,
             };
@@ -371,6 +382,20 @@ pub struct EngineState {
     /// flush_merged 持 flush_lock,degrade_and_rescan 尾部 flush 重入自死锁;
     /// spawn_rescan 需要 Arc,消费循环持有。
     heal_requested: AtomicBool,
+    /// 合并 flush 的可复用暂存:旧号→新号重映射表(百万级 ~6MB)+ 新增目录清单。
+    /// 跨 flush 复用容量,避免在 macOS malloc Large 区反复「分配-释放」留下不
+    /// 可折叠脏页(单次 flush 的 entries/offsets Vec 已改溢写后,这是唯一的大块)。
+    merge_scratch: Mutex<MergeScratch>,
+    /// 合并 flush 换基后回收的 Overlay(已 reset;页已标可回收),下次首 diff
+    /// 直接复用——重放/事件风暴期长出的百万级 arena 不再每次 flush 释放成
+    /// 不可折叠死页。
+    spare_overlay: Mutex<Option<engine::overlay::Overlay>>,
+}
+
+#[derive(Default)]
+struct MergeScratch {
+    base_remap: Vec<u32>,
+    new_dirs: Vec<(u32, Vec<u8>)>,
 }
 
 impl EngineState {
@@ -405,6 +430,8 @@ impl EngineState {
             perm_denied: Mutex::new(HashSet::new()),
             diff_fail_counts: Mutex::new(HashMap::new()),
             heal_requested: AtomicBool::new(false),
+            merge_scratch: Mutex::new(MergeScratch::default()),
+            spare_overlay: Mutex::new(None),
         }
     }
 
@@ -633,43 +660,60 @@ fn build_dir_map(view: &dyn IndexView, literal_roots: &[PathBuf]) -> DirIndexMap
     // 两个形态各司其职:根条目名是「字面配置根」(scanner 契约,用于匹配);
     // map 键用 canonical 形态——/tmp 等系统符号链接下 FSEvents 上报真实路径
     // (/private/tmp/...),canonicalize 让事件侧与索引侧同形。
-    let mut map = DirIndexMap::default();
-    // 分段枚举建邻接表 + 收集根条目号(段内下标 + 段起始号 = 条目号)
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut root_ids: Vec<u32> = Vec::new();
+    //
+    // 顺序单趟建图(替代旧「邻接表 + BFS」):条目号契约保证父先于子,目录
+    // 只需父目录的已建路径 + 自身 display 名即可拼接。旧实现为 145 万条目建
+    // children: HashMap<u32, Vec<u32>>(百万级 push + 每父小 Vec)再 BFS 复制
+    // PathBuf,冷启动/重扫一次留下 ~40MB 不可折叠死页;单趟版临时内存只有
+    // 条目号→槽位表与一个路径缓冲,且按目录数精确预留 map 容量。
+    let mut n_dirs = 0usize;
+    let mut n_entries = 0usize;
+    let mut path_bytes = 0usize;
+    for &(start, seg) in &view.entry_segments() {
+        n_entries += seg.len();
+        for (j, e) in seg.iter().enumerate() {
+            if e.is_live() && e.is_dir() {
+                n_dirs += 1;
+                path_bytes += view.dir_path(start + j as u32).len();
+            }
+        }
+    }
+    // arena 还需每个路径一个 '/' 的余量;精确预留免去倍增换块。
+    let mut map = DirIndexMap::with_capacity(n_dirs, path_bytes + n_dirs);
+    // 条目号 → map 池槽(u32::MAX = 未收录)。仅目录条目有值。
+    let mut slots: Vec<u32> = vec![u32::MAX; n_entries];
+    let mut path: Vec<u8> = Vec::with_capacity(256);
     for &(start, seg) in &view.entry_segments() {
         for (j, e) in seg.iter().enumerate() {
             let i = start + j as u32;
-            if e.parent != NO_PARENT && e.is_live() {
-                children.entry(e.parent).or_default().push(i);
+            if !e.is_live() || !e.is_dir() {
+                continue;
             }
-            if e.parent == NO_PARENT && e.is_live() && e.is_dir() {
-                root_ids.push(i);
-            }
-        }
-    }
-    let mut queue: std::collections::VecDeque<(PathBuf, u32)> = std::collections::VecDeque::new();
-    for i in root_ids {
-        // 根条目名 = 完整绝对路径(scanner 契约),按字面根匹配
-        let name = String::from_utf8_lossy(view.display_name(i)).into_owned();
-        if let Some(r) = literal_roots.iter().find(|r| r.to_string_lossy() == name) {
-            let key = r.canonicalize().unwrap_or_else(|_| r.clone());
-            map.insert(&key, i);
-            queue.push_back((key, i));
-        }
-    }
-    while let Some((abs, idx_p)) = queue.pop_front() {
-        if let Some(kids) = children.get(&idx_p) {
-            for &k in kids {
-                if view.entry(k).is_dir() {
-                    let mut p = abs.clone();
-                    p.push(String::from_utf8_lossy(view.display_name(k)).into_owned());
-                    map.insert(&p, k);
-                    queue.push_back((p, k));
+            if e.parent == NO_PARENT {
+                // 根条目名 = 完整绝对路径(scanner 契约),按字面根匹配
+                let name = String::from_utf8_lossy(view.display_name(i));
+                if let Some(r) = literal_roots.iter().find(|r| r.to_string_lossy() == name) {
+                    let key = r.canonicalize().unwrap_or_else(|_| r.clone());
+                    slots[i as usize] = map.insert_get_slot(&key, i);
                 }
+                continue;
             }
+            let parent_slot = slots[e.parent as usize];
+            if parent_slot == u32::MAX {
+                continue; // 父目录不在任一扫描根下(未收录)
+            }
+            path.clear();
+            path.extend_from_slice(map.path_at(parent_slot).as_os_str().as_encoded_bytes());
+            path.push(b'/');
+            path.extend_from_slice(view.display_name(i));
+            let key = Path::new(OsStr::from_bytes(&path));
+            slots[i as usize] = map.insert_get_slot(key, i);
         }
     }
+    // 槽位表为临时大块:清空后标可回收再 drop(冷启动/重扫一次约 5-6MB)。
+    slots.clear();
+    engine::malloc_pressure::release_reusable_pages(&mut slots);
+    drop(slots);
     map
 }
 
@@ -804,7 +848,7 @@ fn apply_and_track(
         }
         Err(e) => {
             state.io_errors.fetch_add(1, Ordering::Relaxed);
-            handle_diff_error(state, base, overlay, map, abs_dir, &e);
+            handle_diff_error(state, base, overlay, map, abs_dir, excludes, &e);
             0
         }
     }
@@ -831,7 +875,11 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
     let excludes = reconcile::expand_excludes(&state.cfg.lock_recover().excluded);
     let mut h = state.holder.write_fail_fast("holder");
     // T3:diff 直写 Overlay,不再物化 Base(Shared/Mutable 首个 diff 转 Overlaid)。
-    ensure_overlay_ready(&mut h);
+    // 形态转换时才取 spare(已是 Overlaid 时保持当前账本不动)。
+    if matches!(&*h, IndexHolder::Shared(_) | IndexHolder::Mutable(_)) {
+        let spare = state.spare_overlay.lock_recover().take();
+        ensure_overlay_ready(&mut h, spare);
+    }
     let IndexHolder::Overlaid(st) = &mut *h else {
         return 0; // Empty(首扫中):无可 diff 目标
     };
@@ -951,6 +999,9 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
     if state.rescanning.load(Ordering::SeqCst) {
         return false;
     }
+    // 合并写顺带产出旧号→新号表与新增目录清单(暂存跨 flush 复用,见字段注释)
+    let mut scratch_guard = state.merge_scratch.lock_recover();
+    let scratch = &mut *scratch_guard;
     let written = {
         let h = state.holder.read_fail_fast("holder");
         let IndexHolder::Overlaid(st) = &*h else {
@@ -958,11 +1009,13 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
         };
         let epoch = st.overlay.epoch();
         let meta = build_meta(state);
-        match engine::overlay::write_merged_atomic(
+        match engine::overlay::write_merged_atomic_collect(
             st.base.as_view(),
             &st.overlay,
             &meta,
             &paths.index_file(),
+            &mut scratch.base_remap,
+            &mut scratch.new_dirs,
         ) {
             Ok(_) => Some(epoch),
             Err(e) => {
@@ -986,12 +1039,12 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
     let Some(epoch) = written else { return false };
     match persist::load_mmap(&paths.index_file()) {
         Ok(view) => {
-            // dir_map 必须与新 Base **同点提交**:先构建(锁外,旧 Base 照常服务),
-            // 再在 swap 的写锁内一并安装——否则「新 Base + 旧 map」窗口会把磁盘
-            // listing 挂到错条目下(毒 Base 事故的根因,见 install_holder_with_map)。
-            let literal_roots = state.roots.lock_recover().clone();
-            let map = build_dir_map(view.as_ref(), &literal_roots);
-            if swap_base_if_fresh(state, view, epoch, map) {
+            // dir_map 必须与新 Base **同点提交**:合并写已产出旧号→新号表与
+            // 新增目录清单,swap 写锁内直接增量修复现值/补键——与整表重建等价
+            // (旧 Base 目录路径不变,只有未被留存者要摘、overlay 新增目录要补),
+            // 但不再每次 flush 分配/释放百万级寻址表。原子性仍是硬约束:
+            // 修复与 holder 替换同处 holder(write) → dir_map 的临界区内。
+            if swap_base_if_fresh(state, view, epoch, &scratch.base_remap, &scratch.new_dirs) {
                 state.dirty.store(0, Ordering::Relaxed);
                 log::info!("合并 flush 完成,Base 已 remap 为 mmap,Overlay 清零");
             } else {
@@ -1010,6 +1063,12 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
             *state.last_flush.lock_recover() = Instant::now();
         }
     }
+    // 本轮重映射表用完即清:容量保留(跨 flush 复用),空页标可回收——下次
+    // resize 重新缺页,不再以 dirty 计入 footprint。
+    scratch.base_remap.clear();
+    scratch.new_dirs.clear();
+    engine::malloc_pressure::release_reusable_pages(&mut scratch.base_remap);
+    engine::malloc_pressure::release_reusable_pages(&mut scratch.new_dirs);
     true
 }
 
@@ -1021,7 +1080,8 @@ fn swap_base_if_fresh(
     state: &EngineState,
     view: Box<SharedView>,
     expected_epoch: u64,
-    map: DirIndexMap,
+    base_remap: &[u32],
+    new_dirs: &[(u32, Vec<u8>)],
 ) -> bool {
     let mut h = state.holder.write_fail_fast("holder");
     let fresh = match &*h {
@@ -1029,9 +1089,35 @@ fn swap_base_if_fresh(
         _ => false,
     };
     if fresh {
-        // holder + dir_map 同点替换(锁序 holder → dir_map,与 diff_one 一致)
-        *h = IndexHolder::Shared(view);
-        *state.dir_map.lock_fail_fast("dir_map") = map;
+        // dir_map 增量修复 + holder 同点替换(锁序 holder → dir_map,与 diff_one
+        // 一致)。映射语义:dir_map 值恒为 base 条目号;base_remap 给出去留与
+        // 新号,未留存者摘键;overlay 并入 Base 的新目录按合并号补键。
+        // 两把锁同时在手时完成,查询/增量都看不到「新 Base + 旧 map」窗口。
+        {
+            let mut map = state.dir_map.lock_fail_fast("dir_map");
+            map.remap(|old| match base_remap.get(old as usize) {
+                Some(&nv) if nv != NO_PARENT => Some(nv),
+                _ => None,
+            });
+            for (id, path) in new_dirs {
+                map.insert(Path::new(OsStr::from_bytes(path)), *id);
+            }
+        }
+        let old = std::mem::replace(&mut *h, IndexHolder::Shared(view));
+        // 回收旧 Overlay:清空保容量 + 空页标可回收,供下次增量复用。重放/
+        // 事件风暴期 overlay 可涨到数十万条目,直接 drop 会让 macOS 滞留
+        // 大块脏页(实测单次换基 ~100MB 级)。
+        if let IndexHolder::Overlaid(st) = old {
+            let OverlaidState { base, mut overlay } = *st;
+            // Heap base(ENOENT 根级兜底物化残留)同样清空打标后再 drop。
+            if let BaseRef::Heap(mut b) = base {
+                b.reset();
+                b.release_pages();
+            }
+            overlay.reset();
+            overlay.release_pages();
+            *state.spare_overlay.lock_recover() = Some(overlay);
+        }
     }
     fresh
 }
@@ -1143,13 +1229,35 @@ fn should_flush(state: &EngineState) -> bool {
     if dirty == 0 {
         return false;
     }
-    dirty >= FLUSH_DIRTY_LIMIT || state.last_flush.lock_recover().elapsed() >= FLUSH_INTERVAL
+    if dirty >= FLUSH_DIRTY_LIMIT || state.last_flush.lock_recover().elapsed() >= FLUSH_INTERVAL {
+        return true;
+    }
+    // 规模闸:变更计数不高但 Overlay 已长大(整份 listing 收录的目录多)时,
+    // 同样立即合并,防单次增量无界增长。
+    overlay_over_limit(state)
+}
+
+/// Overlay 是否已超过常驻规模上限(条目数或三段 arena 字节)。
+fn overlay_over_limit(state: &EngineState) -> bool {
+    let h = state.holder.read_fail_fast("holder");
+    match &*h {
+        IndexHolder::Overlaid(st) => {
+            let (entries, arena_bytes) = st.overlay.footprint();
+            entries >= OVERLAY_FLUSH_ENTRIES || arena_bytes >= OVERLAY_FLUSH_BYTES
+        }
+        _ => false,
+    }
 }
 
 /// 应用一批目录 diff,全部完成后推进已应用水位。
 /// 水位快照在 diff **之前**取:本批目录对应的全部事件此刻必已入 batcher,
 /// 快照覆盖它们且不含后续未入批事件(水位只落后、绝不超前于索引内容)。
-fn apply_batch(state: &EngineState, dirs: Vec<String>, track_watermark: bool) {
+fn apply_batch(
+    state: &EngineState,
+    dirs: Vec<String>,
+    track_watermark: bool,
+    paths: Option<&DaemonPaths>,
+) {
     if dirs.is_empty() {
         return;
     }
@@ -1163,6 +1271,16 @@ fn apply_batch(state: &EngineState, dirs: Vec<String>, track_watermark: bool) {
     };
     for dir in &dirs {
         diff_one(state, Path::new(dir));
+        // 批内规模闸:重放/事件风暴的单批可达数十万目录,等批末再 flush 会让
+        // Overlay 先长到百万级(堆峰值与换基死页同步放大)。每个目录后检查
+        // (读锁 + 两个长度比较,成本可忽略),超限即合并——单个大目录(实测
+        // 29 万子项)也至少在下个目录前收口。水位在批末才推进,盘面水位落后
+        // 于内容,安全。
+        if let Some(p) = paths {
+            if overlay_over_limit(state) {
+                flush(state, p);
+            }
+        }
     }
     if let Some(w) = batch_water {
         state.applied_event_id.fetch_max(w, Ordering::Relaxed);
@@ -1250,7 +1368,7 @@ fn consume_events(
                     if is_replay {
                         // 追平前强制应用窗口内 pending 事件:否则「就绪」早于索引追上,
                         // 紧随的查询会漏停机窗口内的变更(实机重放抽验曾因此为空)。
-                        apply_batch(&state, batcher.drain_all(), !volume_owned);
+                        apply_batch(&state, batcher.drain_all(), !volume_owned, Some(&paths));
                         // 判定一:零事件 + 停机超阈 → 重放不可信(spike 证实无可观测
                         // 信号,此为唯一确定性防线;原先该判定只在循环退出后执行,
                         // 常驻 daemon 下永不触发)。
@@ -1313,7 +1431,7 @@ fn consume_events(
                 break;
             }
         }
-        apply_batch(&state, batcher.drain_ready(), !volume_owned);
+        apply_batch(&state, batcher.drain_ready(), !volume_owned, Some(&paths));
         // 账本腐化自愈:flush_merged 无法同步降级(持 flush_lock 重入),经此位
         // 移交持 Arc 的消费循环;swap 语义保证并发置位不丢(重扫在途时 spawn
         // 内部 try_lock 弃权,在途重扫本身即重建)。
@@ -1328,7 +1446,7 @@ fn consume_events(
 
     // 退出前强制排空 pending:停止路径(或流断开)若跳过这一步,窗口内已收未应用的
     // 变更会因水位停在 diff 完成点而被正确重放,但此处仍排空以让落盘内容尽量新。
-    apply_batch(&state, batcher.drain_all(), !volume_owned);
+    apply_batch(&state, batcher.drain_all(), !volume_owned, Some(&paths));
 
     // 降级判定(统一走 reconcile::should_degrade,契约见其 doc):
     // 流断开 / 保守判定(零事件且停机超阈)——信号路径已由 spike 排除(ADR-5)。
@@ -1544,7 +1662,7 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
 /// swap 落地 Shared 即清 dirty:盘面 = 内存真相(flush 的「Shared 态 dirty==0」
 /// 前提;重扫路径后续 drain 重放会重新累积)。meta 取调用方当时的水位——崩溃
 /// 窗口内盘上水位偏旧,重启重放幂等追平。
-fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
+fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, mut idx: Index) {
     let literal_roots = state.roots.lock_recover().clone();
     let _flush_guard = state.flush_lock.lock_fail_fast("flush_lock");
     let n = idx.entry_count();
@@ -1560,7 +1678,12 @@ fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
                 let map = build_dir_map(view.as_ref(), &literal_roots);
                 install_holder_with_map(state, IndexHolder::Shared(view), map);
                 state.dirty.store(0, Ordering::Relaxed);
-                // 索引已让位 mmap(不计 footprint),扫描与产物堆的脏页在此归还
+                // 扫描堆索引已让位 mmap:先清空保容量并把空页标可回收再 drop,
+                // 否则百万级 entries/arena 会滞留成不可折叠死页(单次重扫实测
+                // ~150MB)。write_atomic 的内部整文件缓冲同样在写完后打标。
+                idx.reset();
+                idx.release_pages();
+                drop(idx);
                 engine::malloc_pressure::release_heap_pressure();
                 log::info!("扫描产物已落盘并 remap 为 mmap Base(条目数: {n})");
                 return;
@@ -1600,8 +1723,15 @@ fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
                 let map = build_dir_map(view.as_ref(), &literal_roots);
                 let mut h = state.holder.write_fail_fast("holder");
                 if let IndexHolder::Mutable(_) = &*h {
-                    // holder + dir_map 同点替换(见 install_holder_with_map)
-                    *h = IndexHolder::Shared(view);
+                    // holder + dir_map 同点替换(见 install_holder_with_map);
+                    // 旧堆索引清空保容量 + 空页标可回收后再 drop(见
+                    // mount_scan_product 同注:百万级 entries/arena 直接释放会
+                    // 在 malloc Large 区留下不可折叠死页)。
+                    let old = std::mem::replace(&mut *h, IndexHolder::Shared(view));
+                    if let IndexHolder::Mutable(mut old_idx) = old {
+                        old_idx.reset();
+                        old_idx.release_pages();
+                    }
                     *state.dir_map.lock_fail_fast("dir_map") = map;
                     swapped = true;
                 }
@@ -1686,6 +1816,56 @@ fn record_persistent_failure(state: &EngineState, abs_dir: &Path, reason: &str) 
     is_new
 }
 
+/// ENOENT 的常规收口:从被删目录逐级上溯到最近**已索引且存在**的祖先,对它做
+/// 一次普通 diff。祖先 listing 里已无该子项 → Overlay 的删除方向逻辑屏蔽整棵
+/// 子树(anchors 摘除 + purge_prefix)并摘除 dir_map 前缀键,与「父目录事件先到」
+/// 完全同一语义,无需把 Base 物化成堆索引。返回变更加数;无已索引祖先(删除
+/// 的是扫描根)返回 None,由调用方走物化兜底。
+fn mask_deleted_via_parent(
+    state: &EngineState,
+    base: &BaseRef,
+    overlay: &mut engine::overlay::Overlay,
+    map: &mut DirIndexMap,
+    abs_dir: &Path,
+    excludes: &[std::path::PathBuf],
+) -> Option<u32> {
+    let mut cur = abs_dir.to_path_buf();
+    loop {
+        let parent = cur.parent()?.to_path_buf();
+        if parent == cur {
+            return None;
+        }
+        cur = parent;
+        let view = base.as_view();
+        let Some(target) = resolve_target(map, overlay, &cur) else {
+            continue; // 该级未索引(如刚被删的中间目录):继续向上
+        };
+        match overlay.apply_diff(view, target, &cur, excludes) {
+            Ok(stats) => {
+                let mut changed = stats.added + stats.removed;
+                // 与 apply_and_track 的寻址面维护同构:祖先 diff 后补登其 base
+                // 目录子项键(随后 remove_prefix 清掉被删子树)。
+                if let engine::overlay::DiffTarget::Base(d0) = target {
+                    for k in view.children_of(d0) {
+                        if view.entry(k).is_dir() {
+                            let mut p = cur.clone();
+                            p.push(String::from_utf8_lossy(view.display_name(k)).into_owned());
+                            map.insert(&p, k);
+                        }
+                    }
+                }
+                let gone = map.remove_prefix(abs_dir);
+                changed += gone;
+                state.dirty.fetch_add(changed as u64, Ordering::Relaxed);
+                return Some(changed);
+            }
+            // 祖先本身也已被删:继续上溯(整链由更高层的 listing 一次屏蔽)。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
 /// diff 失败分派(tech.md §2):ENOENT → 磁盘已删,摘子树跟进 + Overlay 账本
 /// 同步作废(purge_prefix——摘除子树内被锚定的 base 条目号若不清账,查询侧会把
 /// 陈旧子树误判为有效);EPERM/EACCES → 保留条目(与首扫「入索引 + 记 gaps +
@@ -1697,11 +1877,21 @@ fn handle_diff_error(
     overlay: &mut engine::overlay::Overlay,
     map: &mut DirIndexMap,
     abs_dir: &Path,
+    excludes: &[std::path::PathBuf],
     e: &std::io::Error,
 ) {
     match e.kind() {
         std::io::ErrorKind::NotFound => {
-            // 摘除要写 base 墓碑:Mmap base 先按需物化(低频路径,条目号 1:1)
+            // 常规形态:被删目录仍有已索引祖先。对最近祖先做一次**普通 diff**
+            // 即可——父目录 listing 里已无该子项,Overlay 按既有语义把整棵
+            // Base 子树屏蔽(anchors/overlaid 账本),查询与合并写自然不再收录。
+            // 这避免了为一次删除把整份 Base 物化成堆索引(实机 145 万条目
+            // ≈150MB 堆,flush 换基后整块变不可折叠死页)的旧路径。
+            if mask_deleted_via_parent(state, base, overlay, map, abs_dir, excludes).is_some() {
+                return; // 变更加入 dirty 已由 helper 记账
+            }
+            // 兜底:删除的是扫描根本身(无已索引祖先可借 listing 屏蔽)——此时
+            // 只能物化 Base 写墓碑(根级删除低概率,且条目号 1:1)。
             base.ensure_mutable();
             let BaseRef::Heap(idx) = base else {
                 unreachable!("ensure_mutable 后必为 Heap")
@@ -2553,6 +2743,7 @@ mod tests {
             &state,
             vec![dir.path().to_string_lossy().into_owned()],
             true,
+            None,
         );
         assert_eq!(
             state.applied_event_id.load(Ordering::Relaxed),
@@ -2576,7 +2767,7 @@ mod tests {
     fn empty_batch_does_not_advance_watermark() {
         let state = EngineState::new();
         state.seen_event_id.store(7, Ordering::Relaxed);
-        apply_batch(&state, vec![], true);
+        apply_batch(&state, vec![], true, None);
         assert_eq!(state.applied_event_id.load(Ordering::Relaxed), 0);
     }
 
@@ -3104,8 +3295,9 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// ENOENT 目录语义钉:磁盘已删 → 摘子树 + 清映射(父 diff 不会重插,无振荡)。
-    /// 突变「NotFound 分支改为保留」→ live 计数断言红。
+    /// ENOENT 目录语义钉:磁盘已删 → 可见子树只剩根(Overlay 屏蔽,不再物化
+    /// Base 写墓碑)+ dir_map 前缀键清除。突变「NotFound 分支改为保留」→ 可见
+    /// 计数断言红。
     #[test]
     fn enoent_dir_diff_removes_subtree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3117,15 +3309,78 @@ mod tests {
 
         assert_eq!(diff_one(&state, &gone), 0);
         {
-            let mut h = state.holder.write_fail_fast("holder");
-            let idx = mutable_base_slot(&mut h).expect("holder 应持可变 base");
-            let live = idx.entries.iter().filter(|e| e.is_live()).count();
-            assert_eq!(live, 1, "仅剩根条目:gone 子树级联摘除");
+            let h = state.holder.read_fail_fast("holder");
+            let IndexHolder::Overlaid(st) = &*h else {
+                panic!("首个 diff 后应为 Overlaid")
+            };
+            let view = st.overlay.composite_view(st.base.as_view());
+            let visible = view
+                .entry_segments()
+                .iter()
+                .flat_map(|(start, seg)| {
+                    (0..seg.len() as u32).map(move |j| (start + j, &seg[j as usize]))
+                })
+                .filter(|(i, e)| e.is_live() && view.entry_valid(*i))
+                .count();
+            assert_eq!(visible, 1, "仅剩根条目:gone 子树被 Overlay 屏蔽");
         }
         assert!(
             !state.dir_map.lock_fail_fast("dir_map").contains_key(&gone),
             "dir_map 键同步清除"
         );
+    }
+
+    /// ENOENT 不得物化 mmap Base(实测:一次删除把 145 万条目整份物化 ≈150MB
+    /// 堆,flush 换基后成不可折叠死页)。突变「NotFound 分支恢复
+    /// base.ensure_mutable()」→ BaseRef 变体断言红。
+    #[test]
+    fn enoent_on_shared_base_keeps_mmap_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("gone").join("child")).unwrap();
+        let mut idx = Index::new();
+        let root_idx = idx.insert(root.to_string_lossy().as_ref(), NO_PARENT, true);
+        let gone_idx = idx.insert("gone", root_idx, true);
+        idx.insert("child", gone_idx, true);
+        let idx_file = data.path().join("index.bin");
+        persist::write_atomic(
+            &persist::EntryLayout::of(&idx),
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        let state = Arc::new(EngineState::new());
+        *state.holder.write_fail_fast("holder") =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        *state.roots.lock_recover() = vec![root.clone()];
+        rebuild_dir_map(&state);
+        let gone = root.join("gone");
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        assert_eq!(diff_one(&state, &gone), 0);
+        {
+            let h = state.holder.read_fail_fast("holder");
+            let IndexHolder::Overlaid(st) = &*h else {
+                panic!("首个 diff 后应为 Overlaid")
+            };
+            assert!(
+                matches!(st.base, BaseRef::Mmap(_)),
+                "ENOENT 摘除不得物化 mmap Base(改为父 listing 屏蔽)"
+            );
+            let view = st.overlay.composite_view(st.base.as_view());
+            let visible = view
+                .entry_segments()
+                .iter()
+                .flat_map(|(start, seg)| {
+                    (0..seg.len() as u32).map(move |j| (start + j, &seg[j as usize]))
+                })
+                .filter(|(i, e)| e.is_live() && view.entry_valid(*i))
+                .count();
+            assert_eq!(visible, 1, "根之外全部屏蔽");
+        }
+        assert!(!state.dir_map.lock_fail_fast("dir_map").contains_key(&gone));
     }
 
     /// 未知 errno 钉:连续 3 次失败才入负缓存(阈值防偶发错误被永久短路)。
@@ -3139,19 +3394,19 @@ mod tests {
         let e = std::io::Error::from_raw_os_error(5); // EIO,非 NotFound/EPERM
         {
             let mut h = state.holder.write_fail_fast("holder");
-            ensure_overlay_ready(&mut h); // handle_diff_error 消费 BaseRef + Overlay
+            ensure_overlay_ready(&mut h, None); // handle_diff_error 消费 BaseRef + Overlay
             let IndexHolder::Overlaid(st) = &mut *h else {
                 panic!("holder 应为 Overlaid")
             };
             let OverlaidState { base, overlay } = st.as_mut();
             let mut map = state.dir_map.lock_fail_fast("dir_map");
-            handle_diff_error(&state, base, overlay, &mut map, &dir, &e);
-            handle_diff_error(&state, base, overlay, &mut map, &dir, &e);
+            handle_diff_error(&state, base, overlay, &mut map, &dir, &[], &e);
+            handle_diff_error(&state, base, overlay, &mut map, &dir, &[], &e);
             assert!(
                 !state.perm_denied.lock_recover().contains(&dir),
                 "前两次不入负缓存"
             );
-            handle_diff_error(&state, base, overlay, &mut map, &dir, &e);
+            handle_diff_error(&state, base, overlay, &mut map, &dir, &[], &e);
         }
         assert!(
             state.perm_denied.lock_recover().contains(&dir),
@@ -3772,7 +4027,7 @@ mod tests {
 
         // 陈旧快照的替换必须被拒绝:保留增量态,查询可见
         assert!(
-            !swap_base_if_fresh(&state, stale_view, epoch_snapshot, DirIndexMap::default()),
+            !swap_base_if_fresh(&state, stale_view, epoch_snapshot, &[], &[]),
             "世代前移必须放弃替换"
         );
         assert!(

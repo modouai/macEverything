@@ -1,180 +1,357 @@
-//! dir_map:「绝对目录路径 → 条目号」映射的 intern 化存储(memory-footprint §4.4)。
+//! dir_map:「绝对目录路径 → 条目号」映射的紧凑存储(memory-footprint §4.4)。
 //!
-//! 旧实现 `HashMap<PathBuf, u32>`:每键占一份 hashbrown 槽内 PathBuf(24B)+ 一块
-//! 独立路径堆分配,20 万目录实测 ~40MB。改为两级结构:
+//! 三代形态演进:
+//! 1. `HashMap<PathBuf, u32>`:每键一份槽内 PathBuf + 独立路径堆分配,20 万目录
+//!    实测 ~40MB。
+//! 2. `HashMap<u64, Bucket>` + `Vec<(PathBuf, u32)>`:路径仍逐键堆分配,
+//!    HashMap 值 `Bucket` 含 Vec 分支(24B+tag),20 万键仍占 ~40MB。
+//! 3. 当前:开放寻址表 + 路径字节 arena + 定长槽(12B/目录)。路径字节集中在一
+//!    个 Vec,槽只存 (start, len, value);表项 `u32` 指向槽。20 万目录约
+//!    「17MB arena + 2.4MB 槽 + 1MB 表」,并把 15 万+ 次小对象分配到 3 个大块。
 //!
-//! - `buckets: HashMap<u64, Bucket>`:键 = 路径原始字节的 FNV-1a 64(手写,不引
-//!   新依赖),值 = 池槽桶。桶 SmallVec 风格:单元素内联(`One`)零堆分配,碰撞时
-//!   才升级堆向量(`Many`)。
-//! - `pool: Vec<(PathBuf, u32)>`:键路径字节池(保真原始字节)+ 对位值(目录条目
-//!   号)。键的**字节语义与旧 map 完全一致**(历史形态:根 canonical 路径 + 逐段
-//!   display 名拼接;`/tmp` 类符号链接由 daemon 侧 canonicalize 对齐),仅存储
-//!   形态从散装 PathBuf 改为集中池化。
+//! 键的**字节语义不变**(根 canonical 路径 + 逐段 display 名拼接;`/tmp` 类符号
+//! 链接由 daemon 侧 canonicalize 对齐)。哈希 FNV-1a 64 手写,不引新依赖;碰撞
+//! 以线性探测 + arena 字节全比对消解(单测以稠密插入钉死)。
 //!
-//! 哈希碰撞在 64 位 FNV-1a 下极罕见(20 万键 ~10⁻⁹)但必须正确:桶内以池中字节
-//! 全比对消解,同桶兄弟互不串扰(单测钉)。摘除腾出的池槽经 `free` 复用,键反复
-//! 增删不使池单调增长;daemon 在 compact/重扫后 `rebuild_dir_map` 整体重建,池随
-//! 之回收。
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+//! 摘除只清槽位并记垃圾字节,路径 arena 在垃圾过半时整体压实;daemon 在
+//! compact/重扫后 `rebuild_dir_map` 整体重建,arena 随之回收。
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
-/// daemon 侧「绝对目录路径 → 条目号」映射(intern 化,内存形态见模块注释)。
-#[derive(Default)]
+/// 空表项。
+const EMPTY: u32 = 0;
+/// 摘除墓碑(探测链上继续前进,插入可复用)。
+const TOMBSTONE: u32 = u32::MAX;
+/// 垃圾字节超过此值且过半才整体压实(避免频繁重建)。
+const COMPACT_MIN_GARBAGE: usize = 4 * 1024 * 1024;
+
+/// 池槽(12B):路径在 arena 中的区间 + 目录条目号。
+#[derive(Clone, Copy)]
+struct Slot {
+    start: u32,
+    len: u32,
+    value: u32,
+}
+
+/// daemon 侧「绝对目录路径 → 条目号」映射(内存形态见模块注释)。
 pub struct DirIndexMap {
-    /// FNV-1a 64(键路径原始字节)→ 池槽桶(常态单元素)。
-    buckets: HashMap<u64, Bucket>,
-    /// 池槽 = (键路径原始字节, 对位值 = 目录条目号)。死槽为空路径哨兵:键必为
-    /// 非空绝对路径,空路径即空闲,`keys` 据此跳过(摘除即清字节,不滞留)。
-    pool: Vec<(PathBuf, u32)>,
-    /// 摘除后待复用的池槽。
+    /// 开放寻址表:`0` 空、`u32::MAX` 墓碑、其余 = 槽号+1。
+    table: Vec<u32>,
+    /// 定长槽;`len == 0` 表示已摘除(空路径不是合法键)。
+    slots: Vec<Slot>,
+    /// 路径字节 arena(保真原始字节)。
+    bytes: Vec<u8>,
+    /// 摘除后待复用的槽。
     free: Vec<u32>,
+    /// 活键数。
+    len: usize,
+    /// 墓碑数(触发扩容/重哈希)。
+    tombstones: usize,
+    /// arena 中已无槽引用的字节数。
+    garbage: usize,
 }
 
-/// 哈希桶:SmallVec 风格——单元素内联零堆分配,碰撞才升级堆向量。
-enum Bucket {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-impl Bucket {
-    fn slots(&self) -> &[u32] {
-        match self {
-            Bucket::One(s) => std::slice::from_ref(s),
-            Bucket::Many(v) => v,
-        }
-    }
-
-    fn push(&mut self, s: u32) {
-        match self {
-            Bucket::One(prev) => *self = Bucket::Many(vec![*prev, s]),
-            Bucket::Many(v) => v.push(s),
-        }
+impl Default for DirIndexMap {
+    fn default() -> Self {
+        Self::with_capacity(0, 0)
     }
 }
 
 impl DirIndexMap {
-    /// 查键:hash 定桶,桶内以池中字节全比对消解碰撞。
+    /// 按预期目录数与路径总字节预留容量(顺序建图时用,避免逐级倍增)。
+    pub fn with_capacity(dirs: usize, path_bytes: usize) -> Self {
+        let mut cap = 16usize;
+        while cap < (dirs + 1) * 2 {
+            cap <<= 1;
+        }
+        Self {
+            table: vec![EMPTY; cap],
+            slots: Vec::with_capacity(dirs),
+            bytes: Vec::with_capacity(path_bytes),
+            free: Vec::new(),
+            len: 0,
+            tombstones: 0,
+            garbage: 0,
+        }
+    }
+
+    /// 查键:hash 定起点,线性探测至空位,槽内 arena 字节全比对。
     pub fn get(&self, key: &Path) -> Option<u32> {
         let bytes = key.as_os_str().as_encoded_bytes();
-        let h = fnv1a64(bytes);
-        self.slot_of(h, bytes).map(|s| self.pool[s as usize].1)
+        self.find(fnv1a64(bytes), bytes)
+            .map(|(_, s)| self.slots[s as usize].value)
     }
 
     pub fn contains_key(&self, key: &Path) -> bool {
         self.get(key).is_some()
     }
 
-    /// 插入/更新:同键覆盖值(池槽与键字节不动);新键入池。
+    /// 插入/更新:同键覆盖值(槽与路径字节不动);新键入池。
     pub fn insert(&mut self, key: &Path, idx: u32) {
+        let _ = self.insert_get_slot(key, idx);
+    }
+
+    /// 同 [`insert`](Self::insert),额外返回槽号(顺序建图时子目录直接引用
+    /// 父路径,免二次查表与临时 PathBuf)。
+    pub fn insert_get_slot(&mut self, key: &Path, idx: u32) -> u32 {
         let bytes = key.as_os_str().as_encoded_bytes();
-        // 空键会与死槽哨兵(空路径)混淆,keys() 会漏掉它——键必为非空绝对路径。
+        // 空键会与死槽哨兵(len == 0)混淆——键必为非空绝对路径。
         debug_assert!(!bytes.is_empty(), "dir_map 键不得为空路径");
         let h = fnv1a64(bytes);
-        // 先查既键(共享借用),后动桶与池,避免可变借用交叠。
-        if let Some(s) = self.slot_of(h, bytes) {
-            self.pool[s as usize].1 = idx;
-            return;
+        if let Some((_, s)) = self.find(h, bytes) {
+            self.slots[s as usize].value = idx;
+            return s;
         }
-        let s = self.alloc_slot(key, idx);
-        match self.buckets.get_mut(&h) {
-            Some(bucket) => bucket.push(s),
-            None => {
-                self.buckets.insert(h, Bucket::One(s));
+        self.ensure_insert_capacity();
+        let start = self.bytes.len() as u32;
+        self.bytes.extend_from_slice(bytes);
+        let slot = match self.free.pop() {
+            Some(s) => {
+                self.slots[s as usize] = Slot {
+                    start,
+                    len: bytes.len() as u32,
+                    value: idx,
+                };
+                s
             }
-        }
+            None => {
+                self.slots.push(Slot {
+                    start,
+                    len: bytes.len() as u32,
+                    value: idx,
+                });
+                (self.slots.len() - 1) as u32
+            }
+        };
+        let i = self.probe_insert_slot(h);
+        self.table[i] = slot + 1;
+        self.len += 1;
+        slot
+    }
+
+    /// 池槽对应的键路径(顺序建图拼接父路径用);槽必须为活槽。
+    pub fn path_at(&self, slot: u32) -> &Path {
+        let s = self.slots[slot as usize];
+        Path::new(OsStr::from_bytes(
+            &self.bytes[s.start as usize..(s.start + s.len) as usize],
+        ))
     }
 
     /// 摘键,返回旧值。幂等:键不在返回 None。
     pub fn remove(&mut self, key: &Path) -> Option<u32> {
         let bytes = key.as_os_str().as_encoded_bytes();
-        let h = fnv1a64(bytes);
-        let s = self.slot_of(h, bytes)?;
-        self.bucket_evict(h, s);
-        let v = self.pool[s as usize].1;
-        self.pool[s as usize] = (PathBuf::new(), 0); // 清字节释放路径堆块;空路径即死槽
-        self.free.push(s);
+        let (ti, s) = self.find(fnv1a64(bytes), bytes)?;
+        let v = self.slots[s as usize].value;
+        self.evict(ti, s);
         Some(v)
     }
 
-    /// 按值谓词保留:键保留当且仅当 `f(值)` 为真。摘除路径(scanner::remove_prefix)
-    /// 的清键方法——受害者条目墓碑后,连同历史滞留的「条目已死、键仍在」陈旧键
-    /// 一并清扫。O(池长),仅低频摘除路径调用。
+    /// 按值谓词保留:键保留当且仅当 `f(值)` 为真。
+    /// 摘除路径(scanner::remove_prefix)的清键方法——低频调用。
     pub fn retain(&mut self, mut f: impl FnMut(u32) -> bool) {
-        // 先按原字节重算 hash 从桶中摘槽(清字节后就无从定位桶了),再清池槽。
-        let mut dead: Vec<(u64, u32)> = Vec::new();
-        for (s, (k, v)) in self.pool.iter().enumerate() {
-            if !k.as_os_str().is_empty() && !f(*v) {
-                dead.push((fnv1a64(k.as_os_str().as_encoded_bytes()), s as u32));
+        let mut removed = 0usize;
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.len != 0 && !f(sl.value) {
+                self.slots[s].len = 0;
+                self.garbage += sl.len as usize;
+                self.free.push(s as u32);
+                self.len -= 1;
+                removed += 1;
             }
         }
-        for (h, s) in dead {
-            self.bucket_evict(h, s);
-            self.pool[s as usize] = (PathBuf::new(), 0);
-            self.free.push(s);
+        if removed > 0 {
+            self.tombstones = 0;
+            self.rebuild_table();
+            self.maybe_compact();
         }
     }
 
-    /// 全部活键(池序,不保证键序;调用方仅做抽样/过滤,不依赖序)。
+    /// 摘除全部「路径以 `prefix` 为前缀」的键(含 prefix 自身),返回摘除数。
+    pub fn remove_prefix(&mut self, prefix: &Path) -> u32 {
+        let mut victims: Vec<u32> = Vec::new();
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.len == 0 {
+                continue;
+            }
+            let p = Path::new(OsStr::from_bytes(
+                &self.bytes[sl.start as usize..(sl.start + sl.len) as usize],
+            ));
+            if p.starts_with(prefix) {
+                victims.push(s as u32);
+            }
+        }
+        let n = victims.len() as u32;
+        for s in victims {
+            let sl = self.slots[s as usize];
+            self.slots[s as usize].len = 0;
+            self.garbage += sl.len as usize;
+            self.free.push(s);
+            self.len -= 1;
+        }
+        if n > 0 {
+            self.tombstones = 0;
+            self.rebuild_table();
+            self.maybe_compact();
+        }
+        n
+    }
+
+    /// 按函数重映射全部值;返回 None 的键整键摘除。
+    /// 合并 flush 换基的唯一用法:值 = 旧 Base 条目号,`f` = 旧号→新号表,
+    /// 未留存(NO_PARENT)即摘键。键字节不变,不触发重哈希,仅重建探测表。
+    pub fn remap(&mut self, mut f: impl FnMut(u32) -> Option<u32>) {
+        let mut removed = 0usize;
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.len == 0 {
+                continue;
+            }
+            match f(sl.value) {
+                Some(nv) => self.slots[s].value = nv,
+                None => {
+                    self.slots[s].len = 0;
+                    self.garbage += sl.len as usize;
+                    self.free.push(s as u32);
+                    self.len -= 1;
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            self.tombstones = 0;
+            self.rebuild_table();
+            self.maybe_compact();
+        }
+    }
+
+    /// 全部活键(不保证键序;调用方仅做抽样/过滤,不依赖序)。
     pub fn keys(&self) -> impl Iterator<Item = &Path> {
-        self.pool
-            .iter()
-            .map(|(k, _)| k.as_path())
-            .filter(|k| !k.as_os_str().is_empty())
+        self.slots.iter().filter(|s| s.len != 0).map(move |s| {
+            Path::new(OsStr::from_bytes(
+                &self.bytes[s.start as usize..(s.start + s.len) as usize],
+            ))
+        })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pool.len() == self.free.len()
+        self.len == 0
     }
 
-    /// 桶内字节比对定位槽(碰撞消解唯一入口:同桶兄弟以池中原始字节区分)。
-    fn slot_of(&self, h: u64, bytes: &[u8]) -> Option<u32> {
-        self.buckets
-            .get(&h)?
-            .slots()
-            .iter()
-            .copied()
-            .find(|&s| self.bytes_at(s) == bytes)
-    }
-
-    fn bytes_at(&self, slot: u32) -> &[u8] {
-        self.pool[slot as usize].0.as_os_str().as_encoded_bytes()
-    }
-
-    /// 从桶中摘槽;桶空则整桶删除。
-    fn bucket_evict(&mut self, h: u64, s: u32) {
-        let empty = match self.buckets.get_mut(&h) {
-            // One 桶的单槽必是 s(slot_of 在本桶命中),违约即桶内定位已坏,响亮暴露。
-            Some(Bucket::One(x)) => {
-                debug_assert_eq!(*x, s, "One 桶单槽应为待摘槽");
-                true
+    /// 探测定位 (表项下标, 槽号)。槽内 arena 字节全比对消解碰撞。
+    fn find(&self, h: u64, bytes: &[u8]) -> Option<(usize, u32)> {
+        let mask = self.table.len() - 1;
+        let mut i = (h as usize) & mask;
+        loop {
+            let e = self.table[i];
+            if e == EMPTY {
+                return None;
             }
-            Some(Bucket::Many(slots)) => {
-                let pos = slots.iter().position(|&x| x == s).expect("待摘槽必在桶内");
-                slots.swap_remove(pos); // 桶内顺序无语义
-                slots.is_empty()
+            if e != TOMBSTONE {
+                let s = e - 1;
+                let sl = self.slots[s as usize];
+                if &self.bytes[sl.start as usize..(sl.start + sl.len) as usize] == bytes {
+                    return Some((i, s));
+                }
             }
-            None => panic!("待摘槽必在桶内"),
-        };
-        if empty {
-            self.buckets.remove(&h);
+            i = (i + 1) & mask;
         }
     }
 
-    fn alloc_slot(&mut self, key: &Path, idx: u32) -> u32 {
-        match self.free.pop() {
-            Some(s) => {
-                self.pool[s as usize] = (key.to_path_buf(), idx);
-                s
-            }
-            None => {
-                self.pool.push((key.to_path_buf(), idx));
-                (self.pool.len() - 1) as u32
-            }
+    /// 插入前的容量检查:活键+墓碑超 3/4 载入即原地重哈希(表容量翻倍)。
+    fn ensure_insert_capacity(&mut self) {
+        if (self.len + self.tombstones + 1) * 4 < self.table.len() * 3 {
+            return;
         }
+        let old = std::mem::take(&mut self.table);
+        self.table = vec![EMPTY; old.len() * 2];
+        self.tombstones = 0;
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.len == 0 {
+                continue;
+            }
+            let h = fnv1a64(&self.bytes[sl.start as usize..(sl.start + sl.len) as usize]);
+            let i = self.probe_insert_slot(h);
+            self.table[i] = s as u32 + 1;
+        }
+    }
+
+    /// 从 `h` 起找到可写表项(优先首个墓碑,否则首个空位)。调用前保证存在空位。
+    fn probe_insert_slot(&self, h: u64) -> usize {
+        let mask = self.table.len() - 1;
+        let mut i = (h as usize) & mask;
+        let mut tomb = None;
+        loop {
+            let e = self.table[i];
+            if e == EMPTY {
+                return tomb.unwrap_or(i);
+            }
+            if e == TOMBSTONE && tomb.is_none() {
+                tomb = Some(i);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// 摘除一个槽:表项改墓碑、arena 字节计入垃圾、槽入 freelist。
+    fn evict(&mut self, table_idx: usize, slot: u32) {
+        self.table[table_idx] = TOMBSTONE;
+        self.tombstones += 1;
+        let len = self.slots[slot as usize].len as usize;
+        self.slots[slot as usize].len = 0;
+        self.garbage += len;
+        self.free.push(slot);
+        self.len -= 1;
+        self.maybe_compact();
+    }
+
+    /// 清空表并按活槽重建探测链(不分配;remap/retain 摘除后收口)。
+    fn rebuild_table(&mut self) {
+        self.table.fill(EMPTY);
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.len == 0 {
+                continue;
+            }
+            let h = fnv1a64(&self.bytes[sl.start as usize..(sl.start + sl.len) as usize]);
+            let i = self.probe_insert_slot(h);
+            self.table[i] = s as u32 + 1;
+        }
+    }
+
+    /// 垃圾字节过半且够大时整体压实(重建 slots/arena;低频删除路径才触发)。
+    fn maybe_compact(&mut self) {
+        if self.garbage < COMPACT_MIN_GARBAGE || self.garbage * 2 <= self.bytes.len() {
+            return;
+        }
+        let mut new = DirIndexMap::with_capacity(self.len, self.bytes.len() - self.garbage);
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.len == 0 {
+                continue;
+            }
+            let bytes = &self.bytes[sl.start as usize..(sl.start + sl.len) as usize];
+            let h = fnv1a64(bytes);
+            let start = new.bytes.len() as u32;
+            new.bytes.extend_from_slice(bytes);
+            let ns = new.slots.len() as u32;
+            new.slots.push(Slot {
+                start,
+                len: sl.len,
+                value: sl.value,
+            });
+            let i = new.probe_insert_slot(h);
+            new.table[i] = ns + 1;
+            new.len += 1;
+        }
+        *self = new;
     }
 }
 
-/// FNV-1a 64(手写,不引新依赖):键路径原始字节 → 桶键。
+/// FNV-1a 64(手写,不引新依赖):键路径原始字节 → 表起点。
 /// 已知向量(FNV 官方):空串 = offset basis;`a` = 0xaf63dc4c8601ec8c。
 fn fnv1a64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -225,38 +402,37 @@ mod tests {
         assert!(m.is_empty());
     }
 
-    /// 碰撞消解钉:同桶两键必须以池中字节各自命中,互不串扰。
-    /// 构造:正常插入两键后,把 a 的 hash 桶手工改为「b 的槽在前、a 的槽在后」
-    /// (模拟真实碰撞里另一键先入桶)。突变「桶内只取首槽不比字节」→ get(a)
-    /// 返回 b 的值,本测红。
+    /// 稠密插入钉:千级键必然产生探测链碰撞(载入 3/4 内线性探测),每个键
+    /// 都必须按 arena 字节命中自身值、不被邻槽串扰。突变「探测只取首个非空
+    /// 槽不比字节」/「墓碑处停止探测」本测红。
     #[test]
-    fn colliding_keys_resolved_by_pool_bytes() {
+    fn dense_insert_resolves_collisions_without_crosstalk() {
         let mut m = DirIndexMap::default();
-        let a = Path::new("/tmp/x/a");
-        let b = Path::new("/tmp/x/b");
-        m.insert(a, 1);
-        m.insert(b, 2);
-        let bytes_a = a.as_os_str().as_encoded_bytes();
-        let bytes_b = b.as_os_str().as_encoded_bytes();
-        let slot_of_bytes = |m: &DirIndexMap, bytes: &[u8]| {
-            (0..m.pool.len() as u32)
-                .find(|&s| m.bytes_at(s) == bytes)
-                .expect("键应在池中")
-        };
-        let (slot_a, slot_b) = (slot_of_bytes(&m, bytes_a), slot_of_bytes(&m, bytes_b));
-        let ha = fnv1a64(bytes_a);
-        m.buckets.insert(ha, Bucket::Many(vec![slot_b, slot_a]));
-
-        assert_eq!(m.get(a), Some(1), "桶内字节比对:跳过兄弟槽命中自身值");
-        assert_eq!(m.get(b), Some(2), "同桶兄弟互不串扰");
-        // 碰撞桶内的摘除:只摘 a,b 幸存
-        assert_eq!(m.remove(a), Some(1));
-        assert_eq!(m.get(a), None);
-        assert_eq!(m.get(b), Some(2), "摘除不得误伤同桶兄弟");
+        for i in 0..2000u32 {
+            m.insert(Path::new(&format!("/tmp/dir-{i:04}")), i);
+        }
+        for i in 0..2000u32 {
+            assert_eq!(
+                m.get(Path::new(&format!("/tmp/dir-{i:04}"))),
+                Some(i),
+                "键 {i} 必须命中自身值"
+            );
+        }
+        assert_eq!(m.keys().count(), 2000);
+        // 摘除中间一段后其余键仍可命中(墓碑不截断探测链)
+        for i in 1000..1500u32 {
+            assert_eq!(m.remove(Path::new(&format!("/tmp/dir-{i:04}"))), Some(i));
+        }
+        for i in (0..1000).chain(1500..2000u32) {
+            assert_eq!(m.get(Path::new(&format!("/tmp/dir-{i:04}"))), Some(i));
+        }
+        for i in 1000..1500u32 {
+            assert_eq!(m.get(Path::new(&format!("/tmp/dir-{i:04}"))), None);
+        }
     }
 
-    /// 池槽复用钉:摘除腾出的槽被新键复用,池不随增删单调增长;复用后旧键消失
-    /// (槽字节已覆盖,不复活)、新键可查。
+    /// 槽复用钉:摘除腾出的槽被新键复用,槽数组不随增删单调增长;复用后旧键
+    /// 消失(槽字节已覆盖,不复活)、新键可查。
     #[test]
     fn removed_slot_is_reused_and_old_key_vanishes() {
         let mut m = DirIndexMap::default();
@@ -265,14 +441,38 @@ mod tests {
         assert_eq!(m.remove(a), Some(1));
         let c = Path::new("/tmp/x/c");
         m.insert(c, 3);
-        assert_eq!(m.pool.len(), 1, "复用摘除槽,池不长高");
-        assert_eq!(m.get(a), None, "旧键不复活(槽字节已覆盖)");
+        assert_eq!(m.slots.len(), 1, "复用摘除槽,槽数组不长高");
+        assert_eq!(m.get(a), None, "旧键不复活(槽已改写)");
         assert_eq!(m.get(c), Some(3));
         assert_eq!(m.keys().collect::<Vec<_>>(), vec![c]);
     }
 
-    /// retain 钉:按值谓词清扫——不满足谓词的键整键消失(桶与池同步),满足的
-    /// 连同同桶兄弟一起幸存;清扫腾出的槽可复用。
+    /// remap 钉:值经映射函数改写,返回 None 的键整键摘除且槽可复用;
+    /// 键字节与命中关系不变。
+    #[test]
+    fn remap_rewrites_values_and_drops_unmapped_keys() {
+        let mut m = DirIndexMap::default();
+        let a = Path::new("/tmp/x/a");
+        let b = Path::new("/tmp/x/b");
+        let c = Path::new("/tmp/x/c");
+        m.insert(a, 1);
+        m.insert(b, 2);
+        m.insert(c, 3);
+        m.remap(|v| match v {
+            2 => None,
+            v => Some(v * 10),
+        });
+        assert_eq!(m.get(a), Some(10));
+        assert_eq!(m.get(b), None, "未映射键必须摘除");
+        assert_eq!(m.get(c), Some(30));
+        assert_eq!(m.keys().count(), 2);
+        m.insert(Path::new("/tmp/x/d"), 4);
+        assert_eq!(m.slots.len(), 3, "remap 摘除的槽可复用");
+        assert_eq!(m.get(Path::new("/tmp/x/d")), Some(4));
+    }
+
+    /// retain 钉:按值谓词清扫——不满足谓词的键整键消失,满足的连同邻槽
+    /// 兄弟一起幸存;清扫腾出的槽可复用。
     #[test]
     fn retain_keeps_only_predicated_values() {
         let mut m = DirIndexMap::default();
@@ -287,9 +487,23 @@ mod tests {
         assert_eq!(m.get(a), Some(1));
         assert_eq!(m.get(c), Some(3));
         assert_eq!(m.keys().count(), 2);
-        assert_eq!(m.pool.len(), 3, "retain 不缩池,槽回 freelist");
+        assert_eq!(m.slots.len(), 3, "retain 不缩槽数组,槽回 freelist");
         m.insert(Path::new("/tmp/x/d"), 4);
-        assert_eq!(m.pool.len(), 3, "新键复用被清槽");
+        assert_eq!(m.slots.len(), 3, "新键复用被清槽");
         assert_eq!(m.get(Path::new("/tmp/x/d")), Some(4));
+    }
+
+    /// remove_prefix 钉:仅前缀组件匹配的键被摘除(同名前缀不误伤),
+    /// 其余键命中不变。
+    #[test]
+    fn remove_prefix_matches_path_components_only() {
+        let mut m = DirIndexMap::default();
+        m.insert(Path::new("/tmp/x/a"), 1);
+        m.insert(Path::new("/tmp/x/ab"), 2);
+        m.insert(Path::new("/tmp/y"), 3);
+        assert_eq!(m.remove_prefix(Path::new("/tmp/x")), 2);
+        assert_eq!(m.get(Path::new("/tmp/x/a")), None);
+        assert_eq!(m.get(Path::new("/tmp/x/ab")), None);
+        assert_eq!(m.get(Path::new("/tmp/y")), Some(3));
     }
 }

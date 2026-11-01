@@ -67,6 +67,64 @@ impl Index {
         }
     }
 
+    /// 清空内容但保留全部容量(Overlay 跨 flush 复用:重放/增量期长出的
+    /// 大块 arena 不再每次合并后释放成不可折叠死页)。调用方可随后
+    /// `release_reusable_pages` 把空容量标为可回收。
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.display_arena.data.clear();
+        self.match_arena.data.clear();
+        self.path_pool.data.clear();
+        self.path_offsets.clear();
+        self.live_count = 0;
+        self.tombstones = 0;
+        self.orphan_pool_bytes = 0;
+    }
+
+    /// 把容量预留到至少给定绝对量(不足才 `reserve`,摊还增长,避免每次
+    /// diff 都 realloc)。Overlay 大目录 diff 前调用:百万级 listing 逐条 push
+    /// 会让 Vec 反复倍增,每次换块都把旧块留成不可折叠死页;按目标容量预留
+    /// 可把增长链压到对数级。
+    pub fn reserve_min(
+        &mut self,
+        entries: usize,
+        display_bytes: usize,
+        match_bytes: usize,
+        pool_bytes: usize,
+    ) {
+        if self.entries.capacity() < entries {
+            self.entries.reserve(entries - self.entries.len());
+        }
+        if self.display_arena.data.capacity() < display_bytes {
+            self.display_arena
+                .data
+                .reserve(display_bytes - self.display_arena.data.len());
+        }
+        if self.match_arena.data.capacity() < match_bytes {
+            self.match_arena
+                .data
+                .reserve(match_bytes - self.match_arena.data.len());
+        }
+        if self.path_pool.data.capacity() < pool_bytes {
+            self.path_pool
+                .data
+                .reserve(pool_bytes - self.path_pool.data.len());
+        }
+        if self.path_offsets.capacity() < entries {
+            self.path_offsets.reserve(entries - self.path_offsets.len());
+        }
+    }
+
+    /// 把 reset 后保留的空容量标为可回收(见 `malloc_pressure::release_reusable_pages`)。
+    /// 必须在 `reset`(len == 0)之后调用才有效。
+    pub fn release_pages(&mut self) {
+        crate::malloc_pressure::release_reusable_pages(&mut self.entries);
+        crate::malloc_pressure::release_reusable_pages(&mut self.display_arena.data);
+        crate::malloc_pressure::release_reusable_pages(&mut self.match_arena.data);
+        crate::malloc_pressure::release_reusable_pages(&mut self.path_pool.data);
+        crate::malloc_pressure::release_reusable_pages(&mut self.path_offsets);
+    }
+
     pub fn entry_count(&self) -> u32 {
         self.live_count
     }

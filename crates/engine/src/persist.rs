@@ -213,6 +213,11 @@ where
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(&buf)?;
+        // 整份索引镜像(百万级 ~150MB)已写完;释放前把空页标为可回收,避免
+        // drop 后在 macOS malloc Large 区滞留成不可折叠脏页(重扫/首扫落盘
+        // 每次会留下同尺寸死页)。
+        buf.clear();
+        crate::malloc_pressure::release_reusable_pages(&mut buf);
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
@@ -262,22 +267,42 @@ pub fn cleanup_stale_index_tmp(dir: &Path) {
 
 // —— 流式写侧(T4 合并 flush,tech.md §4.3) ——
 
-/// 条目流生产者的汇聚端:三段 arena 字节**边产边写**进溢写文件(有界内存),
-/// entries 与 path_offsets 进有限 Vec(24B + 8B 每条,百万级 ~40MB)。文件布局
-/// 要求「display|match|pool 段先于 offsets/entries 段」,而合成条目流的 arena
-/// 字节是逐条产出的副产物(逐条交错),故溢写 + 收尽后按序拼接是唯一既保布局
-/// 又不经全量堆物化的路径。
+/// 条目流生产者的汇聚端:五段字节**全部边产边写**进溢写文件(有界内存):
+/// 三段 arena、path_offsets、entries。文件布局要求「display|match|pool 段先于
+/// offsets/entries 段」,而合成条目流的 arena 字节是逐条产出的副产物(逐条交错),
+/// 故溢写 + 收尽后按序拼接是唯一既保布局又不经全量堆物化的路径。
+///
+/// 历史实现把 entries/path_offsets 收进 Vec(百万级 ~46MB 堆),收尽后还要再把
+/// offsets 复制成一份整段 buf;每次合并 flush 释放后,这些大块在 macOS malloc
+/// Large 区滞留成不可折叠脏页(`malloc_zone_pressure_relief` 实测返回 0),
+/// 单次 flush 常驻 footprint +60MB。落盘本就是一个顺序写,条目与偏移表同样
+/// 溢写即可把 flush 的堆峰值压到 BufWriter 的 MB 级。
 pub(crate) struct StreamWriter {
     display: BufWriter<std::fs::File>,
     match_w: BufWriter<std::fs::File>,
     pool: BufWriter<std::fs::File>,
+    offsets: BufWriter<std::fs::File>,
+    entries: BufWriter<std::fs::File>,
     display_len: u64,
     match_len: u64,
     pool_len: u64,
-    entries: Vec<Entry>,
-    path_offsets: Vec<(u32, u32)>,
+    n_entries: u32,
+    n_offsets: u32,
     live: u32,
     tombstones: u32,
+}
+
+/// 单条 entry 的 24B 落盘形态(逐字段 LE,禁裸内存拷贝:repr(C) 的 3 字节
+/// 填充内容未定义,与 `write_atomic` 同一理由)。
+fn entry_record(e: &Entry) -> [u8; 24] {
+    let mut rec = [0u8; 24];
+    rec[0..4].copy_from_slice(&e.display_start.to_le_bytes());
+    rec[4..8].copy_from_slice(&e.display_len.to_le_bytes());
+    rec[8..12].copy_from_slice(&e.match_start.to_le_bytes());
+    rec[12..16].copy_from_slice(&e.match_len.to_le_bytes());
+    rec[16..20].copy_from_slice(&e.parent.to_le_bytes());
+    rec[20] = e.flags;
+    rec
 }
 
 impl StreamWriter {
@@ -300,8 +325,8 @@ impl StreamWriter {
         self.match_w.write_all(match_name)?;
         let ms = self.match_len;
         self.match_len += match_name.len() as u64;
-        let idx = self.entries.len() as u32;
-        self.entries.push(Entry {
+        let idx = self.n_entries;
+        let record = entry_record(&Entry {
             display_start: ds as u32,
             display_len: display.len() as u32,
             match_start: ms as u32,
@@ -309,15 +334,22 @@ impl StreamWriter {
             parent,
             flags,
         });
-        match dir_path {
+        self.entries.write_all(&record)?;
+        let (os, ol) = match dir_path {
             Some(p) => {
                 let s = self.pool_len as u32;
                 self.pool.write_all(p)?;
                 self.pool_len += p.len() as u64;
-                self.path_offsets.push((s, p.len() as u32));
+                (s, p.len() as u32)
             }
-            None => self.path_offsets.push((0, 0)),
-        }
+            None => (0, 0),
+        };
+        let mut off = [0u8; 8];
+        off[0..4].copy_from_slice(&os.to_le_bytes());
+        off[4..8].copy_from_slice(&ol.to_le_bytes());
+        self.offsets.write_all(&off)?;
+        self.n_entries += 1;
+        self.n_offsets += 1;
         if flags & FLAG_TOMBSTONE == 0 {
             self.live += 1;
         } else {
@@ -328,7 +360,7 @@ impl StreamWriter {
 
     /// 已产出的条目数。
     pub(crate) fn len(&self) -> u32 {
-        self.entries.len() as u32
+        self.n_entries
     }
 
     /// 活条目数(persist_final 的条目数回报复用)。
@@ -383,16 +415,24 @@ pub(crate) fn write_stream_atomic(
     let mut p_name = tmp.clone().into_os_string();
     p_name.push(".p");
     let spill_p = PathBuf::from(p_name);
+    let mut o_name = tmp.clone().into_os_string();
+    o_name.push(".o");
+    let spill_o = PathBuf::from(o_name);
+    let mut e_name = tmp.clone().into_os_string();
+    e_name.push(".e");
+    let spill_e = PathBuf::from(e_name);
 
     let mut sink = StreamWriter {
         display: BufWriter::with_capacity(1 << 20, spill_file(&spill_d)?),
         match_w: BufWriter::with_capacity(1 << 20, spill_file(&spill_m)?),
         pool: BufWriter::with_capacity(1 << 20, spill_file(&spill_p)?),
+        offsets: BufWriter::with_capacity(1 << 20, spill_file(&spill_o)?),
+        entries: BufWriter::with_capacity(1 << 20, spill_file(&spill_e)?),
         display_len: 0,
         match_len: 0,
         pool_len: 0,
-        entries: Vec::new(),
-        path_offsets: Vec::new(),
+        n_entries: 0,
+        n_offsets: 0,
         live: 0,
         tombstones: 0,
     };
@@ -403,6 +443,8 @@ pub(crate) fn write_stream_atomic(
         sink.display.flush()?;
         sink.match_w.flush()?;
         sink.pool.flush()?;
+        sink.offsets.flush()?;
+        sink.entries.flush()?;
         Ok(())
     })();
     let result = match (produced, flushed) {
@@ -419,6 +461,8 @@ pub(crate) fn write_stream_atomic(
     let _ = std::fs::remove_file(&spill_d);
     let _ = std::fs::remove_file(&spill_m);
     let _ = std::fs::remove_file(&spill_p);
+    let _ = std::fs::remove_file(&spill_o);
+    let _ = std::fs::remove_file(&spill_e);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -438,7 +482,7 @@ fn assemble_streamed(
     let mut out = BufWriter::with_capacity(1 << 20, file);
     let hp = write_header(&mut out, meta, Some(lens))?;
     // 布局对齐硬校验(write_atomic 同一不变量;结构性同产同长,保留为防线)
-    if sink.path_offsets.len() != sink.len() as usize {
+    if sink.n_offsets != sink.n_entries {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "流式条目流与路径偏移表失配,拒绝写出",
@@ -453,27 +497,15 @@ fn assemble_streamed(
     copy_spill(&mut m, &mut out)?;
     let mut p = sink.pool.get_ref().try_clone()?;
     copy_spill(&mut p, &mut out)?;
-    let mut offsets_buf: Vec<u8> = Vec::with_capacity(sink.path_offsets.len() * 8);
-    for (s, l) in &sink.path_offsets {
-        put_u32(&mut offsets_buf, *s);
-        put_u32(&mut offsets_buf, *l);
-    }
-    out.write_all(&offsets_buf)?;
+    let mut o = sink.offsets.get_ref().try_clone()?;
+    copy_spill(&mut o, &mut out)?;
     // entries 段起始向上对齐 4B(mmap 裸转型对齐前提,读侧同公式切界)
     let pos = out.stream_position()?;
     for _ in 0..(pos.next_multiple_of(4) - pos) {
         out.write_all(&[0u8])?;
     }
-    for e in &sink.entries {
-        // 逐字段 LE 写,禁裸内存拷贝(与 write_atomic 同理由)
-        out.write_all(&e.display_start.to_le_bytes())?;
-        out.write_all(&e.display_len.to_le_bytes())?;
-        out.write_all(&e.match_start.to_le_bytes())?;
-        out.write_all(&e.match_len.to_le_bytes())?;
-        out.write_all(&e.parent.to_le_bytes())?;
-        out.write_all(&[e.flags])?;
-        out.write_all(&[0u8; 3])?;
-    }
+    let mut e = sink.entries.get_ref().try_clone()?;
+    copy_spill(&mut e, &mut out)?;
     out.flush()?;
     let mut f = out.into_inner().map_err(|e| e.into_error())?;
     // header 回填(seek 定位;此后无追加写,游标不须还原)
