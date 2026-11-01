@@ -157,6 +157,8 @@ pub struct ResultsState {
     copy_latch: CopyShortcutLatch,
     /// 下一帧把表格滚动到该行(键盘导航用;绘制表格时消费)。
     scroll_to_row: Option<usize>,
+    /// 上帧表格滚动偏移(滚动检测;变化即通知图标缓存进入滚动抑制窗)。
+    last_scroll_y: Option<f32>,
     /// 结果表格是否持键盘焦点(点击过行;搜索框聚焦时清除;空格 Quick Look 的门槛)。
     table_focused: bool,
     paths: DaemonPaths,
@@ -226,6 +228,7 @@ impl ResultsState {
             return_focus_on_release: None,
             copy_latch: CopyShortcutLatch::default(),
             scroll_to_row: None,
+            last_scroll_y: None,
             table_focused: false,
             paths,
             ctx,
@@ -810,6 +813,12 @@ impl ResultsState {
                 // 滚动/虚拟化路径。
                 table_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                 table_ui.spacing_mut().scroll.floating = true;
+                // 滚动检测(早于本帧行绘制):滚轮输入即刻进入图标抑制窗,
+                // 避免本帧新可见行发起加载(拖拽/惯性由上一帧偏移变化补上,
+                // 见下方 show_rows 之后的比对)。
+                if table_ui.input(|i| i.smooth_scroll_delta.y.abs() > 0.5) {
+                    icons.note_scroll(table_ui.ctx());
+                }
                 let mut scroll_area = egui::ScrollArea::vertical()
                     .id_salt("results-table")
                     .auto_shrink([false, false])
@@ -819,7 +828,7 @@ impl ResultsState {
                     scroll_area = scroll_area
                         .vertical_scroll_offset(scroll_offset_for_row(row, table_rect.height()));
                 }
-                scroll_area.show_rows(
+                let scroll_out = scroll_area.show_rows(
                     &mut table_ui,
                     window_tokens::ROW_H,
                     results.len(),
@@ -850,6 +859,16 @@ impl ResultsState {
                         }
                     },
                 );
+                // 偏移变化(拖拽滚动条/惯性滚动/键盘跳行)→ 抑制窗顺延到下一帧
+                // 之后;滚轮已在上方提前拦截。偏移稳定 150ms 后自动恢复加载。
+                let y = scroll_out.state.clamped_offset().y;
+                if self
+                    .last_scroll_y
+                    .is_some_and(|prev| (prev - y).abs() > 0.5)
+                {
+                    icons.note_scroll(table_ui.ctx());
+                }
+                self.last_scroll_y = Some(y);
             });
 
         // —— 交互落地(表格闭包外:借用结束)——
@@ -1592,13 +1611,9 @@ fn draw_row(
     let painter = ui.painter();
     painter.rect_filled(cells.rect, egui::CornerRadius::ZERO, bg);
     match icons.icon(ui.ctx(), entry) {
-        Some(id) => {
-            painter.image(
-                id,
-                cells.icon,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        Some(draw) => {
+            // 图集绘制:同一张纹理,UV 定位到该图标的 64×64 单元格。
+            painter.image(draw.texture, cells.icon, draw.uv, egui::Color32::WHITE);
         }
         None => icons::draw_fallback(painter, cells.icon, palette.column_text),
     }
@@ -4219,6 +4234,51 @@ mod tests {
     }
 
     /// 测试数据目录(不存在的路径:任何线程(spawn_status)在隔离下快速失败,不碰真实数据)。
+    /// 接线钉:结果表格的滚轮帧必须把「正在滚动」传给图标缓存——该帧不得
+    /// 发起任何图标请求;非滚动帧照常请求。突变(删掉 draw_impl 里的
+    /// `icons.note_scroll(...)` 调用)时本测必红。
+    #[test]
+    fn scrolling_frame_suppresses_icon_requests_in_results_table() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
+        st.results = (0..120)
+            .map(|i| HitEntry {
+                name: format!("项目报告_{i}.pdf"),
+                path: format!("/tmp/项目报告_{i}.pdf"),
+                size: Some(2048),
+                mtime: Some(1_700_000_000),
+                is_dir: false,
+            })
+            .collect();
+        let screen = egui::vec2(1080.0, 700.0);
+
+        // ① 普通帧:可见行应发起图标请求(缓存空)。
+        let mut icons = IconCache::without_worker();
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![]);
+        let (paths, types) = icons.pending_count();
+        assert!(
+            paths + types > 0,
+            "非滚动帧应发起图标请求(实际 paths={paths} types={types})"
+        );
+
+        // ② 滚轮帧:新一批可见行不得发起任何请求。
+        let mut icons = IconCache::without_worker();
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run_frame_with_events(&ctx, &mut st, &mut icons, screen, vec![wheel]);
+        assert_eq!(
+            icons.pending_count(),
+            (0, 0),
+            "滚动帧不得发起图标请求(A6b:滚动期建纹理是峰值根因)"
+        );
+    }
+
     fn daemon_paths_for_test() -> DaemonPaths {
         DaemonPaths {
             data_dir: std::path::PathBuf::from("/nonexistent-mce-test"),

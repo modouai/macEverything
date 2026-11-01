@@ -52,22 +52,26 @@
 //! 全隐藏期不排帧(隐藏态 CPU 0% 红线);唤起时 `ThemeFollow::check_now_with`
 //! 立即应用锁外探测到的外观。
 //!
-//! 中文字体(2026-10-16 调查结论,不显式加载字体文件):
-//! ① 苹方已无稳定路径——macOS 26 起移入 AssetsV2 哈希目录,本机实测
-//!    `/System/Library/Fonts/PingFang.ttc` 不存在;
-//! ② 稳定路径备选均为 .ttc 集合且 face 0 不是简体面(PingFang.ttc face0=HK、
-//!    STHeiti Light.ttc face0=TC,fontTools 实查)——静默 pin index 0 会把简体
-//!    用户引向错字形面;按名取面须自解析 name 表,成本/风险不划算;
-//! ③ 系统回退已给出期望字体:CoreText(zh_CN 语境)对汉字回退即
-//!    PingFangSC-Regular(`CTFontCreateForString` 探针实测);egui `system_fonts`
-//!    的 fontique 走同一系统回退源。
-//! 回退链(现状,实测生效):egui 默认字体(拉丁/图标)→ FontProvider 按缺失字形
-//! 逐簇查系统字体(zh 语境 → 苹方;韩文 → AppleSDGothicNeo;emoji → Apple Color Emoji)。
-//! `probe_fonts()` 启动留痕候选存在性;运行期实际命中字体在 `ui()` 留痕一次。
+//! 中文字体与覆盖链(2026-11-01 定案 v2;A6b 实测推翻 T5「极生僻字形偶发」假设):
+//! 内置 OFL 字体注入 chain,`system_fonts`(fontique)回退**整体移除**。
+//! 裁决依据:fontique 单次查询是**固定枚举开销**(MSL 实测 194MB/次,与命中
+//! 字体无关);真实文件名长尾(符号/假名/生僻字)不可控,任何一次触发即击穿
+//! 内存验收(A6b 实测:纯数字查询 + 滚动 → 峰值 2.4GB,验收线 400MB)。
+//! 移除后,覆盖集外的未知字形按 `MissingGlyphPolicy::Tofu`(egui 默认)显示
+//! ——纯显示退化,搜索/复制不受影响;彩色 emoji 退为 egui 内置黑白 NotoEmoji。
+//! 覆盖链(每 family):SF Pro/SF Mono(拉丁)→ Noto Sans SC(汉字)→
+//! egui 默认字体 → Noto Sans KR(韩文)→ Noto Sans Symbols/2(符号 ⌥⌘ 等);
+//! KR 与 Symbols 排尾部的机制见 `BUNDLED_FONTS` 注释——长尾由此压到几乎
+//! 不出现,扩展 B 级真生僻字显示 tofu。
+//! 字节经 `include_bytes!` 进二进制只读段,`FontData::from_static` 零拷贝,
+//! 载入无堆分配;图集上限见 `MAX_ATLAS_TEXTURE_SIDE`。
+//! `ui()` 留痕 `discovered_fonts`:provider 已不存在,此列表应恒空——非空即
+//! 有人重新接入了 provider,按内存回归处理(A6b 教训单点钉住)。
 
 pub mod font;
 pub mod hotkey_keys;
 pub mod icons;
+pub mod idle;
 pub mod mascot;
 pub mod menu_actions;
 pub mod palette;
@@ -98,14 +102,48 @@ use crate::update;
 use crate::update::UpdatePhase;
 use crate::window_state::{self, SizeUpdate, WindowSize, WindowSizeTracker};
 
-/// 系统 CJK 字体候选路径(探测用;结论见模块注释「中文字体」)。
-const CJK_FONT_CANDIDATES: [&str; 2] = [
-    "/System/Library/Fonts/PingFang.ttc", // 苹方(macOS ≤ 15 路径)
-    "/System/Library/Fonts/STHeiti Light.ttc", // 黑体(旧备选)
+/// 内置覆盖字体(全 SIL OFL 1.1,`assets/fonts/`;许可文本两份——
+/// `OFL.txt`(noto-cjk:SC/KR)与 `OFL-NotoSansSymbols.txt`(notofonts:
+/// Symbols/2),bundle.sh 打包时拷入 `Contents/Resources/fonts/` 随 app 分发,
+/// 缺失在脚本自检段硬失败)。
+///
+/// chain 位置:`SC` 用 `Highest`(排拉丁之后,维持「拉丁 SF Pro、汉字 SC」);
+/// `KR/Symbols/Symbols2` 用 `Lowest`(chain **尾部**,egui 默认字体之后)——
+/// 韩文与 `⌥⌘` 类符号链上前段都没有,尾部只兜「别人都没有」的字形;
+/// KR 自带的 KS 符号/汉字被前段(含 SC 的 20,976 汉字全集)遮蔽,**不改变
+/// 现有任何字形的来源**,视觉零回退。
+const NOTO_SANS_SC: &[u8] = include_bytes!("../../../../assets/fonts/NotoSansSC-Regular.otf");
+const NOTO_SANS_KR: &[u8] = include_bytes!("../../../../assets/fonts/NotoSansKR-Regular.otf");
+const NOTO_SYMBOLS: &[u8] = include_bytes!("../../../../assets/fonts/NotoSansSymbols-Regular.ttf");
+const NOTO_SYMBOLS2: &[u8] =
+    include_bytes!("../../../../assets/fonts/NotoSansSymbols2-Regular.ttf");
+
+/// 内置覆盖字体表(Proportional 与 Monospace 同表)。
+/// 顺序 = 注入序,即 Lowest 段的 chain 顺序(KR → Symbols → Symbols2);
+/// 覆盖盘点(2026-11-01 fontTools 实测):SC = BMP 汉字 20,976(≈全集)+
+/// 假名 + 全角标点;KR = 韩文音节 11,172(全集);Symbols/2 = 846/2,660 符号
+/// (⌥⌘⇧⏎✓⚙ 等)。扩展 B 生僻字与彩色 emoji 无覆盖 → tofu / 黑白 emoji。
+const BUNDLED_FONTS: [(&str, &[u8], egui::FontPriority); 4] = [
+    ("Noto Sans SC", NOTO_SANS_SC, egui::FontPriority::Highest),
+    ("Noto Sans KR", NOTO_SANS_KR, egui::FontPriority::Lowest),
+    (
+        "Noto Sans Symbols",
+        NOTO_SYMBOLS,
+        egui::FontPriority::Lowest,
+    ),
+    (
+        "Noto Sans Symbols 2",
+        NOTO_SYMBOLS2,
+        egui::FontPriority::Lowest,
+    ),
 ];
 
-/// macOS 原生 UI 字体：拉丁优先 SF Pro / SF Mono；CJK 缺失字形仍由
-/// `system_fonts` 的 CoreText 回退（苹方/AppleSDGothicNeo 等）。
+/// 诊断开关:置位后不注入任何内置覆盖字体(韩文/符号与汉字一样 tofu)——
+/// 仅供 footprint A/B 对比与排障;生产不设置。
+const CJK_FONT_DISABLE_ENV: &str = "MCE_NO_CJK_FONT";
+
+/// macOS 原生 UI 字体:拉丁主字体 SF Pro / SF Mono;其外字形见
+/// [`BUNDLED_FONTS`](内置覆盖链),未知字形 tofu(system_fonts 已移除)。
 const SYSTEM_UI_FONT_SPECS: [(&str, &str, egui::FontFamily); 2] = [
     (
         "SF Pro",
@@ -119,47 +157,135 @@ const SYSTEM_UI_FONT_SPECS: [(&str, &str, egui::FontFamily); 2] = [
     ),
 ];
 
+/// 字形图集纹理边长上限(内存规格 tech.md §6.2.4,防扩散封顶)。
+///
+/// epaint 图集宽度 = `max_texture_side`(eframe 每帧从 GL_MAX_TEXTURE_SIZE
+/// 塞进 RawInput,本机 8192),高度按倍增涨到与宽度同值,单块满图 8192² RGBA
+/// ≈ 256MB;收到 4096 后上界 64MB。egui 对该值无公开配置面——style 里
+/// `visuals.text_options.max_texture_side` 每帧被输入值覆盖(`update_fonts_mut`),
+/// 唯一收口点是 [`egui::Plugin::input_hook`](输入处理前改 RawInput)。
+const MAX_ATLAS_TEXTURE_SIDE: usize = 4096;
+
+/// 纯函数:把渲染端提供的纹理边长统一收到 `Some(MAX)`。
+///
+/// **必须把 `None` 也统一成 `Some`**:eframe 只给挂了 `egui_winit` 的视口注入
+/// `max_texture_side`(glow_integration.rs:`if let Some(egui_winit)`);悬浮条
+/// 是 ADR-8 的 viewport hack,可能没有 egui_winit 实例 → 其 `RawInput` 的值为
+/// `None`。若这里保留 `None`,root(Some(x))与 palette(None)之间 `TextOptions`
+/// 每个 pass 交替变化,epaint `Fonts::begin_pass` 会**逐帧** `set_options` +
+/// 清空 galley 缓存 + 重建整张字形图集(实测中文列表滚动时 GL 纹理重建 32 次、
+/// 峰值 2.2GB)。统一收口后 TextOptions 恒定,重建只随图集真实增长发生。
+fn clamp_texture_side(side: Option<usize>) -> Option<usize> {
+    Some(side.map_or(MAX_ATLAS_TEXTURE_SIDE, |s| s.min(MAX_ATLAS_TEXTURE_SIDE)))
+}
+
+/// 图集边长收口插件(`install_atlas_cap` 注册;每 pass 输入处理前生效)。
+struct AtlasSideCap;
+
+impl egui::Plugin for AtlasSideCap {
+    fn debug_name(&self) -> &'static str {
+        "atlas-side-cap"
+    }
+
+    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        input.max_texture_side = clamp_texture_side(input.max_texture_side);
+    }
+}
+
 /// 首帧接线轮询上限(悬浮条视口窗创建于注册 pass 之后,补丁须下一帧才找得到;
 /// 上限防「窗口永不出现」时无限排帧烧 CPU)。
 const PATCH_ATTACH_ATTEMPTS: u32 = 300;
 
-/// 启动探测候选字体存在性并留痕(不加载——理由见模块注释「中文字体」)。
-fn probe_fonts() {
-    for path in CJK_FONT_CANDIDATES {
-        log::info!(
-            "CJK 字体候选 {path}:{}",
-            if std::path::Path::new(path).exists() {
-                "存在"
-            } else {
-                "不存在"
-            }
-        );
-    }
-}
-
-/// 安装 macOS 原生 UI 字体（拉丁主字体）。
+/// 安装 UI 字体:内置覆盖字体(`BUNDLED_FONTS`,Proportional + Monospace
+/// 同表)+ macOS 原生拉丁字体(SF Pro / SF Mono)。
 ///
-/// 只把 SF Pro / SF Mono 放到对应 family 的**首位**，保留 egui 默认字体与
-/// system_fonts 回退链；中文等 CJK 字形仍由 CoreText 回退到苹方。
-fn install_system_ui_fonts(ctx: &egui::Context) {
+/// 优先级语义:egui 的 `Highest` = 插到 family 表**下标 0**(后插者排前),
+/// `Lowest` = 追加到表尾。拉丁最后插 → 稳居首位;SC 以 Highest 紧随;
+/// KR/Symbols 以 Lowest 追加到表尾(机制见 `BUNDLED_FONTS` 注释:只兜
+/// 链上前段都没有的字形,不改变现有字形的来源)。system_fonts 回退已随
+/// feature 移除(tech.md §6.2.1,A6b 裁决),未知字形走
+/// `MissingGlyphPolicy::Tofu`(egui 默认,纯显示退化)。
+fn install_ui_fonts(ctx: &egui::Context, install_bundled: bool) {
+    if install_bundled {
+        let total_kb: usize = BUNDLED_FONTS.iter().map(|(_, b, _)| b.len() / 1024).sum();
+        let names: Vec<&str> = BUNDLED_FONTS.iter().map(|(n, _, _)| *n).collect();
+        for (name, bytes, priority) in BUNDLED_FONTS {
+            ctx.add_font(egui::FontInsert::new(
+                name,
+                egui::FontData::from_static(bytes),
+                vec![
+                    egui::InsertFontFamily {
+                        family: egui::FontFamily::Proportional,
+                        priority,
+                    },
+                    egui::InsertFontFamily {
+                        family: egui::FontFamily::Monospace,
+                        priority,
+                    },
+                ],
+            ));
+        }
+        log::info!("内置覆盖字体已注册:{}(共 {total_kb} KB)", names.join(" / "));
+    }
     for (name, path, family) in SYSTEM_UI_FONT_SPECS {
-        match std::fs::read(path) {
-            Ok(bytes) => {
+        match mapped_font_data(path) {
+            Ok(data) => {
+                let bytes = data.0.as_ref().len();
                 ctx.add_font(egui::FontInsert::new(
                     name,
-                    egui::FontData::from_owned(bytes),
+                    egui::FontData::from_blob(std::sync::Arc::new(data), 0),
                     vec![egui::InsertFontFamily {
                         family,
                         priority: egui::FontPriority::Highest,
                     }],
                 ));
-                log::info!("系统 UI 字体已加载:{name}({path})");
+                log::info!("系统 UI 字体已加载:{name}({path},{bytes} 字节,mmap 只读)");
             }
             Err(err) => {
                 log::warn!("系统 UI 字体加载失败({path}),保留 egui 默认字体: {err}");
             }
         }
     }
+}
+
+/// 只读 mmap 的字体文件(`FontData::from_blob` 的 Blob 载体)。
+///
+/// 堆粗查易修项(tech.md §6.2.5):原实现 `std::fs::read` + `from_owned` 把
+/// SFNS.ttf/SFNSMono.ttf 各 ~4MB 拷进堆并终身持有(实测 Malloc 大块 7.7MB);
+/// mmap 后为 clean file-backed 页,不计 phys_footprint,也没有堆拷贝。
+struct MappedFont(memmap2::Mmap);
+
+impl AsRef<[u8]> for MappedFont {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+/// 只读映射系统字体文件。
+///
+/// SAFETY:常规文件的只读映射,无写共享面;映射由 `MappedFont` 持有保活,
+/// 生命周期与 `FontData` 一致。文件被系统替换时 mmap 语义仍是读到一致内容
+/// (私有的已映射快照),不存在悬垂。
+fn mapped_font_data(path: &str) -> std::io::Result<MappedFont> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY:见函数注释。
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(MappedFont(mmap))
+}
+
+/// 生产入口:诊断开关 [`CJK_FONT_DISABLE_ENV`] 置位时跳过内置覆盖字体注入
+/// (footprint A/B 对比用;system_fonts 已移除,关掉即覆盖集外全 tofu)。
+fn install_system_ui_fonts(ctx: &egui::Context) {
+    let install_bundled = std::env::var_os(CJK_FONT_DISABLE_ENV).is_none();
+    if !install_bundled {
+        log::info!("{CJK_FONT_DISABLE_ENV} 置位:不注入内置覆盖字体(覆盖集外全 tofu)");
+    }
+    install_ui_fonts(ctx, install_bundled);
+}
+
+/// 注册图集边长收口插件(见 [`MAX_ATLAS_TEXTURE_SIDE`])。
+fn install_atlas_cap(ctx: &egui::Context) {
+    ctx.add_plugin(AtlasSideCap);
 }
 
 /// 悬浮条视口 id(注册与命令定向同一处,勿散落)。
@@ -493,9 +619,14 @@ impl App {
         hotkey: hotkey::HotkeyRuntime,
         tray: Option<tray::TrayRuntime>,
     ) -> Self {
-        probe_fonts();
-        // 拉丁主字体用 macOS 原生 SF Pro / SF Mono；CJK 仍走系统回退。
+        // 图集边长收口(防扩散;须在可能触发排版的首帧前注册)。
+        install_atlas_cap(&cc.egui_ctx);
+        // 拉丁主字体用 macOS 原生 SF Pro / SF Mono,汉字/韩文/符号用内置
+        // OFL 覆盖链;system_fonts(fontique)已随 feature 移除(A6b 裁决),
+        // 未知字形 tofu。诊断开关见 CJK_FONT_DISABLE_ENV。
         install_system_ui_fonts(&cc.egui_ctx);
+        // 空闲死页归还看门狗(输入静默 60s 后归还 Malloc Large 滞留脏页)。
+        idle::spawn_watchdog();
         // 全局字号倍率先于基准安装（设置 · 字号：只缩放文字，几何尺寸不变）。
         font::set_scale(settings_file.font_size.scale());
         // 字号基准(全局长大两号);悬浮条另有更细的字号档(ui/palette.rs 常量)。
@@ -1222,6 +1353,12 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // 空闲判定采样(根视口;悬浮条/设置在各自绘制入口采样)。采样点必须在
+        // 真渲染 pass:logic() 在根窗隐藏期也会被 eframe 唤起,而那时读到的是
+        // 上一显示帧的陈旧 events,反复记活跃会把 60s 静默计时无限后推,
+        // 「全隐藏归还」就永远不会触发。
+        idle::note_viewport_activity(&ctx);
+
         // ⌘W = 关闭完整窗口（与红点同语义：隐藏，不退出 App）。
         // 仅根视口持焦时处理，避免悬浮条持焦时误关背后的完整窗口。
         let root_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
@@ -1230,8 +1367,10 @@ impl eframe::App for App {
             self.window_size.flush(&self.paths.data_dir);
         }
 
-        // 运行期字体回退留痕一次(诊断:实际命中的系统 CJK 字体;
-        // 延迟到 ui() 因 ctx.fonts() 在首个 pass 前不可用)。
+        // 回退留痕哨兵(延迟到 ui() 因 ctx.fonts() 在首个 pass 前不可用):
+        // system_fonts 已移除、provider 恒零,discovered_fonts 应**恒空**;
+        // 非空 = 有人重新接入了 provider——fontique 单次查询固定枚举开销
+        // 194MB(A6b 实测),按内存回归立即处理。
         if !self.fonts_logged {
             let names: Vec<String> = ctx.fonts(|f| {
                 f.discovered_fonts()
@@ -1240,7 +1379,7 @@ impl eframe::App for App {
                     .collect()
             });
             if !names.is_empty() {
-                log::info!("系统字体回退命中:{names:?}");
+                log::warn!("字体 provider 回归(应恒空):{names:?}");
                 self.fonts_logged = true;
             }
         }
@@ -1323,6 +1462,8 @@ impl eframe::App for App {
 /// 悬浮条视口的绘制回调(deferred:自己的 pass 内运行,含 tick/主题/动作落地)。
 fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
+    // 空闲判定采样(悬浮条视口输入;常驻交互频繁,空闲口径见 idle 模块注释)。
+    idle::note_viewport_activity(&ctx);
     let now = Instant::now();
     let mut s = match shared.lock() {
         Ok(g) => g,
@@ -1478,7 +1619,7 @@ mod tests {
     }
 
     /// macOS 原生拉丁字体：SF Pro / SF Mono 必须排在 family 首位，且能实际排版
-    /// （中文仍由 system_fonts 回退，不要求出现在定义表里）。
+    /// （中文由内置 Noto Sans SC 覆盖，见 cjk 字体专项测试）。
     #[cfg(target_os = "macos")]
     #[test]
     fn system_ui_fonts_are_primary_and_rasterize() {
@@ -1498,7 +1639,7 @@ mod tests {
         };
         let mut out = ctx.run_ui(input(), |_ui| {});
         out.textures_delta.clear();
-        install_system_ui_fonts(&ctx);
+        install_ui_fonts(&ctx, true);
         let mut out = ctx.run_ui(input(), |_ui| {});
         out.textures_delta.clear();
 
@@ -1520,6 +1661,539 @@ mod tests {
             );
         }
         assert!(galley.size().x > 0.0, "SF Pro 排版失败（空 galley）");
+    }
+
+    /// 生成一批「文件名」行(去重,galley 缓存必 miss,模拟结果窗口滚动逐行
+    /// 布局的真实形态)。字符集含真实长尾:汉字 + 韩文 + 假名 + 符号 + 数字
+    /// ——A6b 实测「纯数字查询也能命中长尾字形」,行集必须混入。
+    fn cjk_result_rows(n: usize) -> Vec<String> {
+        const CHARSET: [char; 60] = [
+            '项', '目', '文', '件', '夹', '报', '告', '终', '稿', '会', '议', '纪', '要', '设',
+            '计', '图', '纸', '数', '据', '备', '份', '照', '片', '视', '频', '音', '乐', '系',
+            '统', '日', '志', '配', '置', '用', '户', '下', '载', '客', '户', '端', '服', '务',
+            '器', '端', '口', '密', '码', '한', '국', '어', 'メ', 'モ', '⌘', '⌥', '✓', '★', '→',
+            '•', '§', '⚙',
+        ];
+        (0..n)
+            .map(|i| {
+                let a = CHARSET[i % CHARSET.len()];
+                let b = CHARSET[(i * 7 + 3) % CHARSET.len()];
+                let c = CHARSET[(i * 13 + 11) % CHARSET.len()];
+                format!("{a}{b}{c}_报告_Q{i}.docx")
+            })
+            .collect()
+    }
+
+    /// 肯定无字形的探针字符(CJK 扩展 B 生僻字;fontTools 实测四个内置字体
+    /// 与 SF Pro 均无 cmap 项),以及对应文件名行。
+    const MISSING_GLYPH_PROBE: char = '\u{2A6B2}';
+
+    /// 测试哨兵:统计 provider 被询问的次数(恒返回 None → 缺字形走 tofu,
+    /// 但「有没有问」正是被测信号)。生产构建已无任何 provider;把它挂上
+    /// 是为了证明「内置覆盖链内的字形根本不会问到 provider」——即使未来
+    /// 有人误接了 provider(A6b 回归面),覆盖链也把它挡住。
+    #[derive(Default)]
+    struct CountingProvider(std::sync::atomic::AtomicUsize);
+
+    impl egui::epaint::text::FontProvider for CountingProvider {
+        fn font_for(
+            &self,
+            _request: &egui::epaint::text::FallbackRequest<'_>,
+        ) -> Option<egui::FontInsert> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+
+    fn probe_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn run_layout_pass(ctx: &egui::Context, rows: &[String]) {
+        let mut out = ctx.run_ui(probe_input(), |ui| {
+            for row in rows {
+                ui.label(row.as_str());
+            }
+        });
+        out.textures_delta.clear();
+    }
+
+    /// 覆盖链钉(tech.md §6.2.1,A6b 后形态):每 family 前两位 =「拉丁 +
+    /// Noto Sans SC」(Highest),尾部 = KR/Symbols/Symbols2(Lowest);
+    /// 汉字/韩文/符号长尾全部命中已装字体——provider 即使存在也轮不到。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundled_font_chain_order_and_long_tail_coverage() {
+        let ctx = egui::Context::default();
+        install_ui_fonts(&ctx, true);
+        let mut out = ctx.run_ui(probe_input(), |_ui| {});
+        out.textures_delta.clear();
+
+        let families = ctx.fonts(|f| f.definitions().families.clone());
+        let tail: Vec<&str> = BUNDLED_FONTS
+            .iter()
+            .filter(|(_, _, p)| *p == egui::FontPriority::Lowest)
+            .map(|(n, _, _)| *n)
+            .collect();
+        for (family, latin) in [
+            (egui::FontFamily::Proportional, "SF Pro"),
+            (egui::FontFamily::Monospace, "SF Mono"),
+        ] {
+            let list = families.get(&family).expect("family 表缺失");
+            assert_eq!(
+                &list[0..2],
+                &[latin, "Noto Sans SC"],
+                "{family:?} 前两位应为「{latin} + Noto Sans SC」,实际 {list:?}"
+            );
+            assert_eq!(
+                &list[list.len() - tail.len()..],
+                &tail[..],
+                "{family:?} 尾部应为 KR/Symbols Lowest 段,实际 {list:?}"
+            );
+        }
+        // 按键帽全覆盖钉:键帽文案是**字面量**而非长尾样本,必须在生产同款
+        // 字体链里逐一可渲染(曾因 `↵` U+21B5 在所有内置字体与 SF Pro 中均缺失,
+        // 移除 system_fonts 后状态栏显示 tofu;测试只覆盖 `⏎` 漏掉了它)。
+        // 新增键帽符号时此处自动纳入,不必再靠人工挑样本。
+        ctx.fonts_mut(|f| {
+            let keys: Vec<&str> = crate::ui::palette::footer_groups()
+                .iter()
+                .map(|(_, keys)| *keys)
+                .collect();
+            for keys in keys {
+                for family in [
+                    egui::FontId::proportional(11.0),
+                    egui::FontId::monospace(11.0),
+                ] {
+                    assert!(
+                        f.has_glyphs(&family, keys),
+                        "键帽 {keys:?} 在 {family:?} 下缺字形(检查 BUNDLED_FONTS 覆盖)"
+                    );
+                }
+            }
+        });
+
+        // 长尾字形全部命中已装字体(汉字/韩文/假名/符号/数字混排)。
+        ctx.fonts_mut(|f| {
+            for sample in [
+                "项目文件报告终稿.docx……《会议》纪要！（数据）备份～v2",
+                "한국어_문서_대하여.hwp",
+                "メモ_設定ファイル.txt",
+                "ショートカット ⌥⌘⇧ ⏎ ✓★→•§⚙ 123",
+            ] {
+                assert!(
+                    f.has_glyphs(&egui::FontId::proportional(15.0), sample),
+                    "长尾字形应全部由已装字体覆盖:{sample}"
+                );
+                assert!(
+                    f.has_glyphs(&egui::FontId::monospace(13.0), sample),
+                    "Monospace family 同样要覆盖:{sample}"
+                );
+            }
+        });
+    }
+
+    /// 长尾布局不得询问 provider(A6b 回归钉):内置覆盖链就位时,即使有人
+    /// 误挂了 provider(fontique 194MB/次固定枚举开销),汉字/韩文/符号混排
+    /// 行也一次都不该问到它。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn long_tail_layout_never_consults_provider() {
+        let ctx = egui::Context::default();
+        let provider = std::sync::Arc::new(CountingProvider::default());
+        ctx.add_font_provider(std::sync::Arc::clone(&provider) as _);
+        install_ui_fonts(&ctx, true);
+        // 字体经 add_font 排队,首个 pass 应用;之后分批布局去重行
+        // (galley 缓存 miss,等价结果窗口滚动)。
+        run_layout_pass(&ctx, &[]);
+        let rows = cjk_result_rows(300);
+        for chunk in rows.chunks(64) {
+            run_layout_pass(&ctx, chunk);
+        }
+
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "覆盖链内的字形不得触发 provider 询问"
+        );
+        assert!(
+            ctx.fonts(|f| f.discovered_fonts().is_empty()),
+            "provider 命中过的字体不得出现在 discovered_fonts"
+        );
+    }
+
+    /// 未知字形行为钉(A6b 裁决形态):覆盖集外的生僻字(扩展 B)在
+    /// **无任何 provider** 的生产形态下——
+    /// ① 按 `MissingGlyphPolicy::Tofu`(egui 默认)显示:galley 照常产出
+    ///    非 tofu 零宽;
+    /// ② `has_glyph` 如实报 false(供上层判断覆盖面);
+    /// ③ 不 panic、不拖垮布局。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unknown_glyph_renders_tofu_without_any_provider() {
+        assert_eq!(
+            MISSING_GLYPH_PROBE, '\u{2A6B2}',
+            "探针字符须为扩展 B 生僻字(资源实测无字形)"
+        );
+        let ctx = egui::Context::default();
+        assert_eq!(
+            ctx.missing_glyph_policy(),
+            egui::epaint::text::MissingGlyphPolicy::Tofu,
+            "tofu 是 egui 默认策略,显式依赖之(勿改 Panic/Invisible)"
+        );
+        install_ui_fonts(&ctx, true);
+        run_layout_pass(&ctx, &[]);
+        ctx.fonts_mut(|f| {
+            assert!(
+                !f.has_glyph(&egui::FontId::proportional(15.0), MISSING_GLYPH_PROBE),
+                "探针字符应确实无字形(否则失去探针意义)"
+            );
+            let galley = f.layout_no_wrap(
+                format!("报告_{MISSING_GLYPH_PROBE}_终稿.docx"),
+                egui::FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+            assert!(
+                galley.size().x > 0.0,
+                "含未知字形的行必须照常布局(tofu 占位,非空 galley)"
+            );
+        });
+    }
+
+    /// 突变验证:同一探针行,若(误)有 provider 在场——fontique 慢路径的
+    /// 入口 `FontProvider::font_for` **必须**被问到。证明上两钉真的拦在
+    /// 「provider 不存在 + 覆盖链兜住」上,而非断言恒绿。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unknown_glyph_would_consult_a_provider_if_one_existed() {
+        let ctx = egui::Context::default();
+        let provider = std::sync::Arc::new(CountingProvider::default());
+        ctx.add_font_provider(std::sync::Arc::clone(&provider) as _);
+        install_ui_fonts(&ctx, false); // 突变:覆盖链缺位(等价 MCE_NO_CJK_FONT)
+        run_layout_pass(&ctx, &[]);
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                MISSING_GLYPH_PROBE.to_string(),
+                egui::FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+        });
+
+        assert!(
+            provider.0.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "无覆盖链且有 provider 时,未知字形应触发询问(sentinel 必须有效)"
+        );
+    }
+
+    /// 系统 UI 字体走只读 mmap(堆粗查易修项 §6.2.5):映射字节与文件一致、
+    /// 带有效字体魔数;突变(退回 fs::read 拷贝)不经过本函数,由堆采样对账。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_fonts_load_via_readonly_mmap() {
+        for (name, path, _) in SYSTEM_UI_FONT_SPECS {
+            let mapped = mapped_font_data(path).unwrap_or_else(|e| panic!("{name} mmap 失败: {e}"));
+            let bytes = mapped.0.as_ref();
+            let file_len = std::fs::metadata(path).expect("元数据").len();
+            assert_eq!(bytes.len() as u64, file_len, "{name} 映射长度应等于文件");
+            // TrueType sfnt 版本:SFNS.ttf 是 0x00010000(OTTO/CFF 是 "OTTO")。
+            let sfnt = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert!(
+                sfnt == 0x0001_0000 || &bytes[0..4] == b"OTTO",
+                "{name} 首 4 字节应为 sfnt 版本,实际 {sfnt:#010x}"
+            );
+        }
+    }
+
+    /// 图集边长收口(tech.md §6.2.4):插件在输入处理前把 8192 收到 4096;
+    /// egui 由此值定 epaint 图集宽度。
+    #[test]
+    fn atlas_side_cap_clamps_raw_input() {
+        assert_eq!(
+            clamp_texture_side(None),
+            Some(4096),
+            "None 必须统一为 Some:视口间 None/Some 交替会让 epaint 逐帧清空图集"
+        );
+        assert_eq!(clamp_texture_side(Some(2048)), Some(2048), "小值不动");
+        assert_eq!(clamp_texture_side(Some(8192)), Some(4096));
+        assert_eq!(clamp_texture_side(Some(16384)), Some(4096));
+
+        let ctx = egui::Context::default();
+        install_atlas_cap(&ctx);
+        let mut input = probe_input();
+        input.max_texture_side = Some(8192);
+        let mut out = ctx.run_ui(input, |_ui| {});
+        out.textures_delta.clear();
+        assert_eq!(
+            ctx.input(|i| i.max_texture_side),
+            MAX_ATLAS_TEXTURE_SIDE,
+            "插件收口必须先于输入处理生效(本 pass 的图集宽度由此值决定)"
+        );
+    }
+
+    /// footprint 采样(`#[ignore]`,单进程单跑,一次只测一侧):
+    /// 注入侧 `cargo test -p macEverything-app -- --ignored --nocapture ignored_cjk_footprint`;
+    /// 对照侧前置 `MCE_NO_CJK_FONT=1`(与生产同一开关;provider 已移除,对照侧
+    /// = 覆盖集外全 tofu 的最小形态)。行集含 A6b 长尾(韩文/假名/符号/数字),
+    /// 峰值应停留在百 MB 内——若显著回升,优先怀疑有人重新接入 provider。
+    #[cfg(target_os = "macos")]
+    #[ignore = "footprint 采样:手动单跑,输出供规格验收(A6/A6b)引用;MCE_NO_CJK_FONT=1 选对照侧"]
+    #[test]
+    fn ignored_cjk_footprint() {
+        let install_bundled = std::env::var_os(CJK_FONT_DISABLE_ENV).is_none();
+        footprint_harness(install_bundled);
+    }
+
+    /// 当前进程 phys_footprint(MB;口径与 scripts/mem-watch.sh 相同)。
+    /// `/usr/bin/footprint -f bytes` 的 `phys_footprint:` 行。
+    #[cfg(target_os = "macos")]
+    fn phys_footprint_mb() -> u64 {
+        let out = std::process::Command::new("/usr/bin/footprint")
+            .args(["-f", "bytes", &std::process::id().to_string()])
+            .output()
+            .expect("运行 /usr/bin/footprint 失败");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("phys_footprint:") {
+                let bytes: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                return bytes / (1024 * 1024);
+            }
+        }
+        0
+    }
+
+    /// 进程生命周期峰值 footprint(MB;同 `footprint` 工具的
+    /// `phys_footprint_peak:` 行,免起 vmmap 附加)。
+    #[cfg(target_os = "macos")]
+    fn lifetime_peak_mb() -> u64 {
+        let out = std::process::Command::new("/usr/bin/footprint")
+            .args(["-f", "bytes", &std::process::id().to_string()])
+            .output()
+            .expect("运行 /usr/bin/footprint 失败");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("phys_footprint_peak:") {
+                let bytes: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                return bytes / (1024 * 1024);
+            }
+        }
+        0
+    }
+
+    #[cfg(target_os = "macos")]
+    #[expect(clippy::print_stderr)]
+    fn footprint_harness(install_bundled: bool) {
+        let started = std::time::Instant::now();
+        let ctx = egui::Context::default();
+        // 生产同形态:无任何 provider(system_fonts 已随 feature 移除)。
+        install_ui_fonts(&ctx, install_bundled);
+        run_layout_pass(&ctx, &[]);
+        let rows = cjk_result_rows(2000);
+        for chunk in rows.chunks(64) {
+            run_layout_pass(&ctx, chunk);
+        }
+        let discovered = ctx.fonts(|f| {
+            f.discovered_fonts()
+                .iter()
+                .map(|i| i.name.clone())
+                .collect::<Vec<_>>()
+        });
+        eprintln!(
+            "HARNESS install_bundled={install_bundled} rows={} elapsed={:?} discovered_fonts={discovered:?} phys_footprint={} MB lifetime_peak={} MB",
+            rows.len(),
+            started.elapsed(),
+            phys_footprint_mb(),
+            lifetime_peak_mb(),
+        );
+    }
+
+    /// 本地补丁钉(vendor/epaint 的 MCE 标记):字体图集**部分增量**必须量化到
+    /// 2 的幂尺寸。原因:每帧增量按脏区任意尺寸分配 ColorImage,macOS malloc 按
+    /// 尺寸类缓存 VM 段 → 滚动时尺寸类无界、Malloc Large (empty) 持续累积
+    /// (实测 71 块 × 4–10MB、峰值 1.9–2.8GB)。量化把尺寸类压回十几个。
+    /// 突变(去掉补丁 / 上游升级覆盖 vendor)→ 尺寸不再为 2 的幂,本测红。
+    #[test]
+    fn epaint_partial_delta_is_size_quantized() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta(); // 清掉初始 EVERYTHING
+        let ((_x, _y), region) = atlas.allocate((7, 30));
+        for px in region.pixels.iter_mut() {
+            *px = egui::Color32::from_rgb(1, 2, 3);
+        }
+        let delta = atlas.take_delta().expect("脏区应产生增量");
+        let [w, h] = delta.image.size();
+        assert!(
+            w.is_power_of_two() && h.is_power_of_two(),
+            "增量尺寸应量化到 2 的幂,实际 {w}x{h}"
+        );
+        assert!(w >= 7 && h >= 30, "量化不得裁掉脏区({w}x{h} < 7x30)");
+        let pos = delta.pos.expect("部分增量应带 pos");
+        assert!(
+            pos[0] + w <= 4096 && pos[1] + h <= 256,
+            "量化后应仍在图集内"
+        );
+        // 多传区域必须取自图集现有像素(只多传,不改变内容)。
+        let ImageData::Color(img) = &delta.image;
+        let atlas_img = atlas.image();
+        let aw = atlas_img.width();
+        for yy in 0..h {
+            for xx in 0..w {
+                let a = atlas_img.pixels[(pos[1] + yy) * aw + pos[0] + xx];
+                let b = img.pixels[yy * w + xx];
+                assert_eq!(
+                    (a.r(), a.g(), a.b(), a.a()),
+                    (b.r(), b.g(), b.b(), b.a()),
+                    "增量像素应与图集一致 @({xx},{yy})"
+                );
+            }
+        }
+    }
+
+    /// 本地补丁钉:不同脏区高度只产生**有界**的尺寸类(量化到 2 的幂),
+    /// 这是「Malloc Large (empty) 不再随滚动线性累积」的机制保证。
+    #[test]
+    fn epaint_delta_size_classes_are_bounded() {
+        use egui::epaint::{TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 2048], TextOptions::default());
+        let _ = atlas.take_delta();
+        let mut classes = std::collections::BTreeSet::new();
+        for h in 1..=40usize {
+            let _ = atlas.allocate((7, h));
+            if let Some(delta) = atlas.take_delta() {
+                classes.insert(delta.image.size());
+            }
+        }
+        assert!(!classes.is_empty(), "应产生增量(否则测试失去意义)");
+        assert!(
+            classes.len() <= 16,
+            "增量尺寸类应有界(≤16),实际 {} 个: {classes:?}",
+            classes.len()
+        );
+    }
+
+    /// 本地补丁钉:整图增量(clear/扩容)与图集**共享同一块内存**,不再深拷贝。
+    /// 突变(改回 `self.image.clone()` 深拷贝)→ `Arc::ptr_eq` 为假,本测红。
+    #[test]
+    fn epaint_full_delta_shares_atlas_image() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        use std::sync::Arc;
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let delta = atlas.take_delta().expect("初始应产生整图增量");
+        let ImageData::Color(img) = delta.image;
+        assert!(
+            Arc::ptr_eq(&img, &atlas.image_shared()),
+            "整图增量应与图集共享同一块内存(不得深拷贝)"
+        );
+    }
+
+    /// 本地补丁钉:部分增量复用持久上传缓冲(按量化尺寸成池),
+    /// 同尺寸帧不新建 `ColorImage`,尺寸交替时也只各留一块。
+    /// 突变(每帧 `ColorImage::filled`)→ 分配次数随帧数线性增长,本测红。
+    #[test]
+    fn epaint_partial_delta_reuses_upload_buffers() {
+        use egui::epaint::{TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta(); // 清掉初始整图
+
+        for _ in 0..20 {
+            let _ = atlas.allocate((7, 8));
+            let _ = atlas.take_delta().expect("应有部分增量");
+        }
+        let same_size_allocs = atlas.upload_allocations();
+        assert!(
+            same_size_allocs <= 1,
+            "同尺寸帧应复用同一缓冲,实际分配 {same_size_allocs} 次"
+        );
+
+        for i in 0..20 {
+            let h = if i % 2 == 0 { 8 } else { 16 };
+            let _ = atlas.allocate((7, h));
+            let _ = atlas.take_delta().expect("应有部分增量");
+        }
+        let grew = atlas.upload_allocations() - same_size_allocs;
+        assert!(
+            grew <= 2,
+            "两种尺寸应各复用一块(≤2 次新分配),实际新增 {grew} 次"
+        );
+    }
+
+    /// 本地补丁钉:clear 是**原地清空**,保留图集尺寸与像素缓冲,
+    /// 不得重置到 32 高再走倍增链(每轮产生 4/8/16/32MB 临时分配)。
+    /// 突变(`*self = Self::new(..)` 或 clear 内重建)→ 尺寸回落到 32,本测红。
+    #[test]
+    fn epaint_clear_keeps_atlas_size() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        use std::sync::Arc;
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta();
+        let _ = atlas.allocate((7, 300)); // 触发一次高度倍增(256 -> 512)
+        let _ = atlas.take_delta();
+        let grown = atlas.size();
+        assert!(grown[1] >= 512, "前置:图集应已长大,实际 {grown:?}");
+
+        atlas.clear();
+        assert_eq!(
+            atlas.size(),
+            grown,
+            "clear 应保留尺寸(原地清空),实际 {}",
+            format_args!("{:?}", atlas.size())
+        );
+        assert!(atlas.fill_ratio() < 0.01, "clear 后填充率应归零");
+        let delta = atlas.take_delta().expect("clear 应产生整图增量");
+        let ImageData::Color(img) = delta.image;
+        assert!(
+            Arc::ptr_eq(&img, &atlas.image_shared()),
+            "clear 后的整图增量仍应共享图集内存"
+        );
+    }
+
+    /// 本地补丁钉(端到端):字形图集触达 0.8 clear 时走**原地清空**,
+    /// 图集尺寸不回落到 32;否则每轮 clear 都要重新倍增,产生 4/8/16/32MB
+    /// 临时分配。突变(GlyphAtlas::clear 改回 `*self = Self::new(..)`)→ 本测红。
+    #[test]
+    fn epaint_glyph_atlas_clear_stays_in_place() {
+        let ctx = egui::Context::default();
+        install_ui_fonts(&ctx, true);
+        let mut input = probe_input();
+        input.max_texture_side = Some(1024); // 小图集,一个 pass 即可填满
+        let chars: String = include_str!("atlas_charset.txt")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(chars.chars().count() > 1000, "前置:字符集应足够填满图集");
+
+        // pass 1:布局全部字符 → 图集增长/溢出。
+        let mut out = ctx.run_ui(input.clone(), |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(&chars)).wrap());
+        });
+        out.textures_delta.clear();
+        let grown = ctx.fonts(|f| f.font_image_size());
+        assert!(grown[1] > 32, "前置:图集应已长大,实际 {grown:?}");
+
+        // pass 2:空 pass 开头 fill>0.8 → clear;无文本,不再增长。
+        let mut out = ctx.run_ui(input, |_ui| {});
+        out.textures_delta.clear();
+        let after = ctx.fonts(|f| f.font_image_size());
+        assert!(
+            after[1] > 32,
+            "clear 应原地保留尺寸(实际回落到 {after:?},说明重建了图集)"
+        );
+        assert!(
+            ctx.fonts(|f| f.font_atlas_fill_ratio()) < 0.1,
+            "clear 后填充率应归零"
+        );
     }
 
     /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。

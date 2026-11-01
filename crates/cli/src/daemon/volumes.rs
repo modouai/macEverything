@@ -19,7 +19,20 @@ use std::time::Duration;
 use engine::config::Config;
 use engine::fsevents::{self};
 
-use super::{consume_events, flush, DaemonPaths, EngineState, IndexHolder, SCAN_CHUNK};
+use super::{
+    consume_events, ensure_mutable, flush, mutable_base_slot, DaemonPaths, EngineState,
+    IndexHolder, SCAN_CHUNK,
+};
+
+/// 摘除子树后同步作废 Overlay 账本(anchors/overlaid/dir_ids 锚定被摘 base 条目号,
+/// 不清账则查询侧把陈旧子树误判为有效)。仅在 Overlaid 态需要;_holder 借用在
+/// 调用方持锁期间传入。
+fn purge_overlay_after_prefix_removal(holder: &mut IndexHolder, prefix: &Path) {
+    if let IndexHolder::Overlaid(st) = holder {
+        let view = st.base.as_view();
+        st.overlay.purge_prefix(view, prefix);
+    }
+}
 
 /// 卷轮询间隔。
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -158,10 +171,12 @@ fn reconcile(state: &Arc<EngineState>, paths: &DaemonPaths) -> anyhow::Result<()
 /// 顺序执行:同一时刻至多一个卷在扫,不与主索引争写锁带宽。
 fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     log::info!("卷挂载,开始索引: {}", vol.display());
+    // 冷启动直挂 Shared 后的卷写入在此按需物化(条目号 1:1,dir_map 免重建)
+    ensure_mutable(state);
     state.roots.lock().unwrap().push(vol.to_path_buf());
     {
         let mut h = state.holder.write().unwrap();
-        let IndexHolder::Mutable(idx) = &mut *h else {
+        let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷索引推迟(主索引非可变态,如冷启动/整理中),下轮重试");
             state.roots.lock().unwrap().retain(|r| r != vol);
             return;
@@ -204,14 +219,22 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     // 本轮扫描的世代快照:任一卸载(含本轮自己的中止路径)推进世代即失效,
     // 批间校验不过直接放弃,不与新一轮扫描交错应用。
     let my_epoch = state.volume_scan_epoch.load(Ordering::Relaxed);
+    // 直挂 Shared 态同样在此按需物化(运行期补扫路径不经 mount_volume 时)
+    ensure_mutable(state);
     {
         let mut h = state.holder.write().unwrap();
-        let IndexHolder::Mutable(idx) = &mut *h else {
+        let mut map = state.dir_map.lock().unwrap();
+        let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷扫描推迟(主索引非可变态),下轮重试: {}", vol.display());
             return;
         };
-        let mut map = state.dir_map.lock().unwrap();
         engine::scanner::remove_prefix(idx, &mut map, vol);
+        // 前缀清除先行:Overlay 账本同步作废(残留 anchor 会让陈旧子树在合成视图复活)。
+        // 与 seed 分两段取槽:purge 需 holder 全借用,与 idx 槽借用不交叠。
+        purge_overlay_after_prefix_removal(&mut h, vol);
+        let Some(idx) = mutable_base_slot(&mut h) else {
+            unreachable!("purge 不改 holder 形态,槽位必仍在")
+        };
         engine::scanner::seed_roots(idx, &mut map, std::slice::from_ref(&vol.to_path_buf()));
     }
     let cfg = state.cfg.lock().unwrap().clone();
@@ -219,7 +242,8 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let (recs, gaps) = engine::scanner::collect_records(&[vol.to_path_buf()], &excludes, threads);
+    let (recs, table, gaps) =
+        engine::scanner::collect_records(&[vol.to_path_buf()], &excludes, threads);
     let mut applied = 0usize;
     for chunk in recs.chunks(SCAN_CHUNK) {
         // 批间检查:扫描中途拔盘 → 中止,清除由下一轮对账兜底;
@@ -234,9 +258,9 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
             return;
         }
         let mut h = state.holder.write().unwrap();
-        if let IndexHolder::Mutable(idx) = &mut *h {
+        if let Some(idx) = mutable_base_slot(&mut h) {
             let mut map = state.dir_map.lock().unwrap();
-            engine::scanner::apply_records(idx, &mut map, chunk);
+            engine::scanner::apply_records(idx, &mut map, chunk, &table);
             applied += chunk.len();
             state.dirty.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         }
@@ -260,14 +284,18 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     if let Some(mut stream) = state.volume_streams.lock().unwrap().remove(vol) {
         stream.stop(); // Drop 内 stop;卷消费线程因 rx 断开退出,volume_owned 不触发降级
     }
+    // 直挂 Shared 态在此按需物化,前缀清除照常生效(否则只能靠重试路径)
+    ensure_mutable(state);
     let removed = {
         let mut h = state.holder.write().unwrap();
-        let IndexHolder::Mutable(idx) = &mut *h else {
+        let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷清除推迟(主索引非可变态),下轮重试");
             return;
         };
         let mut map = state.dir_map.lock().unwrap();
-        engine::scanner::remove_prefix(idx, &mut map, vol)
+        let removed = engine::scanner::remove_prefix(idx, &mut map, vol);
+        purge_overlay_after_prefix_removal(&mut h, vol);
+        removed
     };
     state.roots.lock().unwrap().retain(|r| r != vol);
     flush(state, paths);
@@ -283,18 +311,24 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
         .lock()
         .unwrap()
         .keys()
-        .filter_map(|p| volume_root_of(p))
+        .filter_map(volume_root_of)
         .filter(|v| !desired.contains(v))
         .collect();
+    // 有待清卷才物化:无卷变更的冷启动保持 Shared 常驻(零堆索引),不清白付
+    if !stale.is_empty() {
+        ensure_mutable(state);
+    }
     for vol in stale {
         let removed = {
             let mut h = state.holder.write().unwrap();
-            let IndexHolder::Mutable(idx) = &mut *h else {
+            let Some(idx) = mutable_base_slot(&mut h) else {
                 log::warn!("启动清除跳过(主索引非可变态): {}", vol.display());
                 continue;
             };
             let mut map = state.dir_map.lock().unwrap();
-            engine::scanner::remove_prefix(idx, &mut map, &vol)
+            let removed = engine::scanner::remove_prefix(idx, &mut map, &vol);
+            purge_overlay_after_prefix_removal(&mut h, &vol);
+            removed
         };
         if removed > 0 {
             log::info!("启动清除未挂载卷前缀: {} 条目 {removed} 条", vol.display());

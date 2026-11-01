@@ -114,6 +114,16 @@ FSEvents 回调(专用线程 runloop)
 
 App 需要与 CLI 同款协议与客户端行为(连接 / 按需 stat / 离线降级 / 状态常量),照搬即复制且双漂移(契约与行为两处真相)。定案:提升为 `crates/protocol`(纯契约,零业务依赖)+ `crates/client`(客户端承载层);cli 与 app 共用,engine 零业务改动(仅 query 排序扩展)。
 
+### ADR-9:索引驻留 = mmap Base + 内存 Overlay(替代全量物化)
+
+旧实现冷启动 `materialize()` 把索引全量拷进堆(1.4M 条目 ≈113MB),增量全程堆驻留。定案:**常驻 = mmap Base(clean file-backed 页不计 phys_footprint)+ 小内存 Overlay**;落盘时 Base+Overlay 合并写条目流、remap 新 Base、清 Overlay。
+
+- **Overlay**:`overlaid`(被 diff 目录的 base 号集)+ `anchors`(base 号 → overlay 内 anchor)+ 自有小 Index;子项全集单一真相只存 overlay index。
+- **查询屏蔽**:Base 命中经纯条目号链 `valid(e)` 判定(零字符串比较,排除大小写/Unicode 形态差异导致的漏屏蔽)——E 的父 P 在 overlaid 中则以 anchors 是否含 E 裁决,否则递归上溯;遇「有 anchor 不在 overlaid」终止为有效。
+- **合成视图**:两段稠密拼接(base 全段 + overlay 全段),`entry_segments` 契约要求有序无缝覆盖 0..N−1;`parent_idx` 负责 overlay 号 → 合成号重映射(query 的 dir_hits 按下标消费)。
+- **换 Base 必重建 dir_map**:flush/重扫替换 holder 后立即 `rebuild_dir_map`(原子安装:同一 holder 写锁内提交 holder+map)——漏做会让旧号命中新索引无关条目,产生副本风暴(实测 23 次背靠背合并 flush、索引 2.4M 条膨胀、daemon 挂起)。
+- **腐化自愈**:合并写遇到账本腐化(死父/未留存父)拒绝写出并触发全量重扫(ADR-5 一致性闸门的延伸);启动时按采样判毒(ENOENT 占比 >20%)主动重扫。
+
 ### ADR-8:悬浮条 = eframe/egui 单栈 + 运行期 NSPanel 改类
 
 跨 Space(含他人全屏)、浮动级别在 winit 公开 API 无路径(PoC-1 实证:普通 NSWindow 四种组合全部失败,外证 tauri#11488)。定案:eframe 单技术栈 + 运行期 `object_setClass` 把 winit 窗口换成自定义 NSPanel 子类。生效组合**五要素缺一不可**:

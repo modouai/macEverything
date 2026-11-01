@@ -14,13 +14,17 @@ protocol = { path = "../protocol" }
 # session 直接复用 engine::query::SortKey(ADR-7:app 经 client 承载层依赖 engine 已许可;
 # Rust 2018+ 依赖非传递可见,故显式声明)。
 engine = { path = "../engine" }
-# 0.37 一律带 system_fonts:仅 default_fonts 时中文渲染为方框(PoC-1 实测,
-# 见 docs/specs/v2-ui/poc-results.md「与 plan 示意的接线差异」#3)。
+# system_fonts 不带(A6b 裁决,2026-11-01):fontique 回退单次查询固定枚举开销
+# 191-194MB,与命中字体无关;真实文件名长尾不可控,任何一次触发即击穿内存
+# 验收(实测峰值 2.4GB,线 400MB)。未知字形按 MissingGlyphPolicy::Tofu 显示,
+# 汉字/韩文/符号由内置 OFL 字体覆盖(ui/mod.rs BUNDLED_FONTS)。
+# 旧注释「0.37 一律带 system_fonts:仅 default_fonts 时中文渲染为方框」已作废
+# ——当时无内置 CJK 字体,如今方框只出现在覆盖集外的真生僻字形上,属预期。
 # clipboard(2026-10-16 修「输入框无法粘贴」):default-features=false 会一并关掉
 # egui-winit/clipboard,剪贴板集成(arboard)随之缺席——egui-winit 的 handle_key_event
 # 只在 clipboard_shortcuts 下把 ⌘V 译成 Event::Paste,而 Clipboard::get 无 arboard 时
 # 只读进程内兜底串(恒空,空串不再 push 事件),⌘V/⌘C/⌘X 三键全哑。
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts", "clipboard"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 objc2 = "0.6"
 # NSResponder/NSAppearance:ui/theme.rs 经 NSApplication.effectiveAppearance 读系统外观
 # (sharedApplication 挂在 NSResponder feature 下、外观 API 挂在 NSAppearance 下;
@@ -50,6 +54,10 @@ objc2-app-kit = { version = "0.3", features = [
     "NSImage",
     "NSBitmapImageRep",
     "NSBezierPath",
+    # 图标解码:直接画进 64×64 NSBitmapImageRep(替代 TIFFRepresentation,
+    # 后者在本机为 32 页/≈37MB,每个图标一次大块分配)。
+    "NSGraphics",
+    "NSGraphicsContext",
     # Task 5 结果行真实图标:iconForContentType(UTI) 的 cfg 门槛(0.3.2 源码
     # NSWorkspace.rs:132 要求 NSImage + objc2-uniform-type-identifiers 两个 feature)。
     "objc2-uniform-type-identifiers",
@@ -122,6 +130,9 @@ raw-window-handle = "0.6"
 # 注意 crate 文档:macOS 上 manager 必须在主线程创建,且需主线程事件循环在跑
 # (eframe 的 NSApplication::run 即此循环;事件泵细节见 src/hotkey.rs 模块注释)。
 global-hotkey = { version = "0.6", features = ["serde"] }
+# 系统 UI 字体(SF Pro/SF Mono)只读 mmap 载入(堆粗查易修项:替代 fs::read 的
+# ~8MB 堆拷贝;版本随 engine 已入锁文件)。
+memmap2.workspace = true
 # Task 21:热键动作「主队列直调」(`DispatchQueue::main().exec_async`,不等被节流的帧)。
 # 版本与 PoC-4(scripts/poc/poc4_idle)实锁一致;macOS SDK 的 dispatch_get_main_queue
 # 已内联为全局量,直接声明符号会链接失败,故走该 crate(其实现即 `&_dispatch_main_q`)。

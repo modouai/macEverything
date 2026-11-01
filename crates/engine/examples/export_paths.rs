@@ -9,14 +9,16 @@ fn main() {
         .nth(1)
         .expect("用法: export_paths <index.bin>");
     let view = persist::load_mmap(std::path::Path::new(&path)).expect("加载索引失败");
-    let entries = view.entries();
     let mut out = String::new();
-    for i in 0..entries.len() as u32 {
-        if !entries[i as usize].is_live() {
-            continue;
+    // 分段枚举(tech.md §4.3):段内下标 + 段起始号 = 条目号
+    for (start, seg) in view.entry_segments() {
+        for (j, e) in seg.iter().enumerate() {
+            if !e.is_live() {
+                continue;
+            }
+            out.push_str(&view.full_path_dyn(start + j as u32));
+            out.push('\n');
         }
-        out.push_str(&view.full_path_dyn(i));
-        out.push('\n');
     }
     print!("{out}");
 }

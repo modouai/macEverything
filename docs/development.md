@@ -120,6 +120,11 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - **`/tmp` 是符号链接**:FSEvents 上报 canonical 路径;daemon 的 dir_map 键与事件路径经 canonicalize 对齐。
 - **重放追平语义**:HistoryDone 前强制 drain pending 事件,否则「就绪」早于索引追上。
 - **新目录事件先于父 diff 到达**:`diff_one` 的补链逻辑(逐级向下)不得简化回直查。
+- **换 Base 必重建 dir_map**:任何替换 holder 的路径(flush 合并写/重扫挂载/冷启动)必须同时重建 dir_map,否则旧条目号命中新索引无关活条目 → diff 副本风暴 → 索引膨胀 + 挂起。
+- **负缓存键用路径不用条目号**:`compact` 全量重排条目号,条目号键会错杀无辜目录(内容静默不更新)。
+- **图标解码不要走 TIFFRepresentation**:每个图标 37–74MB 多页 TIFF(APP 图标 16bit float),一屏 30 个 = 2GB 级临时块;用 `NSImage.drawInRect` 直接光栅化到目标尺寸(16KB)。`fromRect` 必须是图像完整逻辑边界,传目标矩形会只画左上 1/4。
+- **图集增量尺寸要收敛**:epaint `take_delta` 按任意脏区尺寸分配 ColorImage,macOS malloc 按尺寸类缓存 → 无界增长;vendor patch 已做(2 的幂量化 + 缓冲复用 + Arc 共享 + 原地 clear)。
+- **`max_texture_side` 必须把所有视口统一成 Some**:eframe 只给挂了 egui_winit 的视口注入值,悬浮条(ADR-8 viewport hack)可能为 None;None/Some 交替会让 epaint 每 pass 清空图集并重排全部文本。
 
 ## 规格与文档
 

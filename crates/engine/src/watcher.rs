@@ -1,5 +1,5 @@
 //! 增量:事件 → 目录集合(100ms 静默窗)→ apply_dir_diff(唯一真相)。
-use crate::index::{DiffStats, Index};
+use crate::index::{DiffStats, DirListing, Index};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -62,21 +62,12 @@ pub fn system_now() -> fn() -> Instant {
     Instant::now
 }
 
-/// 目录 diff:重读磁盘目录与索引比对(事件只当信号、目录 diff 才是真相,tech.md)。
+/// 磁盘目录现项清单读取(T3 起 listing 产出单点化,Overlay 写侧共用):
+/// symlink 跳过、排除目录不入清单(与首扫共用 `scanner::is_excluded`)。
 ///
-/// 失败语义:打开或遍历中途任一失败一律上抛,不应用。理由——diff 的输入是
-/// 「完整真相」,部分读取的 listing 会把「读不到」的条目误判为「已删除」打墓碑。
-/// 调用方(增量 worker)记录错误并等待后续事件重试;目录已被删的竞态由父目录
-/// 的 diff 兜底(remove 级联)。
-///
-/// 排除:与首扫共用 `scanner::is_excluded`——排除目录不入 listing,防增量把
-/// 首扫排除掉的子树(如 ~/Library)重新拉回索引(两条路径语义一致)。
-pub fn apply_dir_diff(
-    index: &mut Index,
-    dir_idx: u32,
-    abs_dir: &Path,
-    excludes: &[PathBuf],
-) -> std::io::Result<DiffStats> {
+/// 失败语义:打开或遍历中途任一失败一律上抛。理由——diff 的输入是「完整真相」,
+/// 部分读取的 listing 会把「读不到」的条目误判为「已删除」打墓碑。
+pub fn read_dir_listing(abs_dir: &Path, excludes: &[PathBuf]) -> std::io::Result<DirListing> {
     let rd = std::fs::read_dir(abs_dir)?;
     let mut listing = std::collections::BTreeMap::new();
     for e in rd {
@@ -91,6 +82,20 @@ pub fn apply_dir_diff(
         }
         listing.insert(e.file_name().to_string_lossy().into_owned(), is_dir);
     }
+    Ok(listing)
+}
+
+/// 目录 diff:重读磁盘目录与索引比对(事件只当信号、目录 diff 才是真相,tech.md)。
+/// Mutable 全量索引路径的原语(T3 起 daemon 增量改走 `overlay::Overlay::apply_diff`,
+/// 本函数保留为该路径的基元与测试面)。目录已被删的竞态由父目录的 diff 兜底
+/// (remove 级联)。
+pub fn apply_dir_diff(
+    index: &mut Index,
+    dir_idx: u32,
+    abs_dir: &Path,
+    excludes: &[PathBuf],
+) -> std::io::Result<DiffStats> {
+    let listing = read_dir_listing(abs_dir, excludes)?;
     Ok(index.diff_dir(dir_idx, &listing))
 }
 

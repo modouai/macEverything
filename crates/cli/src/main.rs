@@ -256,7 +256,9 @@ fn print_status(
         other => other,
     };
     println!("状态: {label}");
-    println!("条目数: {entry_count}");
+    // T3 起条目数为近似值(增量窗口内被屏蔽条目不预枚举,product.md §4.1),
+    // 措辞统一「约」,落盘/重启后精确。
+    println!("条目数: 约 {entry_count} 条");
     println!("索引生成: {}", fmt_time(built_at));
     println!("索引文件: {index_file}");
     if io_errors > 0 {

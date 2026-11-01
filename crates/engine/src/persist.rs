@@ -1,12 +1,17 @@
 //! 落盘:布局与内存同构(ADR-3),mmap 零反序列化加载的前提;
 //! last_event_id 供停机重放(ADR-5);写 = 临时文件 + fsync + rename 原子替换。
-//! 读侧:load_mmap 产出 SharedView(mmap 只读视图,立即可查),materialize 物化为可变 Index。
-use std::io::Write;
+//! 读侧:load_mmap 产出 SharedView(mmap 只读,冷启动直挂、查询零物化);
+//! materialize 保留为 flush 合并等价性的测试基线。写侧两条路:
+//! write_atomic 按条目流 + 既有布局写出(内存索引直接落盘);
+//! write_stream_atomic 消费条目流生产者边产边写(T4 合并 flush,tech.md §4.3,
+//! 不经全量堆物化——文件布局要求 arena 段先于 entries 段,而合成流的 arena
+//! 字节是逐条产出的副产物,故三段 arena 经临时溢写文件按序拼接)。
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::arena::ArenaBuilder;
-use crate::entry::Entry;
+use crate::entry::{Entry, FLAG_TOMBSTONE};
 use crate::index::{Index, IndexView};
 
 pub const MAGIC: &[u8; 4] = b"MCEI";
@@ -27,33 +32,44 @@ fn put_u64(v: &mut Vec<u8>, x: u64) {
     v.extend_from_slice(&x.to_le_bytes());
 }
 
-/// 布局(与内存同构,读侧 mmap 零反序列化,Task 12 消费):
-/// header: magic[4] | u32 version | u32 n_entries | u32 tombstone_count |
-///         u32 n_path_offsets | u64 built_at | u64 last_event_id |
-///         u32 n_roots + 逐个 (u32 len + bytes) |
-///         u32 n_excluded + 逐个 (u32 len + bytes) |
-///         u64 display_arena_len | u64 match_arena_len | u64 path_pool_len
-/// body(顺序):display_arena | match_arena | path_pool |
-///         path_offsets 逐对 (u32, u32)(与条目号全量对齐,含 (0,0) 占位)|
-///         [4B 对齐填充] |
-///         entries 逐条 24 字节(五 u32 LE + flags u8 + 3 字节 0 填充)
-/// 对齐规则:entries 段起始向上对齐到 4B,写侧补零;读侧同规则
-/// entries_off = align_up(path_offsets 段末, 4)(mmap 裸转型 *const Entry 的对齐前提)。
-/// 取舍:rename 原子替换保证崩溃不损坏——断电最坏整体回滚 rename,旧文件复活,数据不损坏;
-/// 「断电必达」需 F_FULLFSYNC + 目录 fsync,暂不做(product 边界外)。
-pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Result<()> {
-    debug_assert_eq!(
-        index.path_offsets.len(),
-        index.entries.len(),
-        "path_offsets 与条目号全量对齐是落盘布局不变量"
-    );
-    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+/// header 固定段里需收尽后回填的字段偏移(两代写侧共用同一实现,防格式漂移)。
+struct HeaderPositions {
+    n_entries: usize,
+    tombstones: usize,
+    n_offsets: usize,
+    display_len: usize,
+    match_len: usize,
+    pool_len: usize,
+}
+
+/// header 写出(写侧唯一实现):MAGIC/version/三计数占位/水位/roots/excluded/
+/// 三段 arena 长度。lens = None 时长度以 0 占位(流式写侧收尽后回填;常规写侧
+/// 直接写真值)。计数三字段恒占位——由条目流统计回填。
+fn write_header<W: Write>(
+    w: &mut W,
+    meta: &IndexMeta,
+    lens: Option<(u64, u64, u64)>,
+) -> std::io::Result<HeaderPositions> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut p = HeaderPositions {
+        n_entries: 0,
+        tombstones: 0,
+        n_offsets: 0,
+        display_len: 0,
+        match_len: 0,
+        pool_len: 0,
+    };
     buf.extend_from_slice(MAGIC);
     put_u32(&mut buf, FORMAT_VERSION);
-    put_u32(&mut buf, index.entries.len() as u32);
-    put_u32(&mut buf, index.tombstone_count());
-    // n_path_offsets 存条目总数(非有真值的目录段数):读侧按 n×8 定位 entries 段起点
-    put_u32(&mut buf, index.path_offsets.len() as u32);
+    // 三个流收尽才可知的 header 计数:先写占位,收尽后回填(偏移固定)
+    p.n_entries = buf.len();
+    put_u32(&mut buf, 0);
+    p.tombstones = buf.len();
+    put_u32(&mut buf, 0);
+    // n_path_offsets 存条目总数(非有真值的目录段数):读侧按 n×8 定位 entries 段起点;
+    // 与条目流长度的一致性在收尽后断言(布局不变量)
+    p.n_offsets = buf.len();
+    put_u32(&mut buf, 0);
     put_u64(&mut buf, meta.built_at);
     put_u64(&mut buf, meta.last_event_id);
     put_u32(&mut buf, meta.scan_roots.len() as u32);
@@ -66,13 +82,84 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
         put_u32(&mut buf, e.len() as u32);
         buf.extend_from_slice(e);
     }
-    put_u64(&mut buf, index.display_arena.data.len() as u64);
-    put_u64(&mut buf, index.match_arena.data.len() as u64);
-    put_u64(&mut buf, index.path_pool.data.len() as u64);
-    buf.extend_from_slice(&index.display_arena.data);
-    buf.extend_from_slice(&index.match_arena.data);
-    buf.extend_from_slice(&index.path_pool.data);
-    for (s, l) in &index.path_offsets {
+    let (d, m, q) = lens.unwrap_or((0, 0, 0));
+    p.display_len = buf.len();
+    put_u64(&mut buf, d);
+    p.match_len = buf.len();
+    put_u64(&mut buf, m);
+    p.pool_len = buf.len();
+    put_u64(&mut buf, q);
+    w.write_all(&buf)?;
+    Ok(p)
+}
+
+fn put_u32_at(buf: &mut [u8], pos: usize, v: u32) {
+    buf[pos..pos + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// 写侧布局入参:条目流所属视图的三段 arena 字节 + 与条目号全量对齐的路径段表。
+/// S3 后写入对象是「合成条目流」(Base + Overlay 顺序产出,tech.md §4.3),
+/// 布局段与条目流解耦传递——调用方保证 path_offsets 与条目号全量对齐
+/// (下标 == 条目号,目录真值/其余 (0,0) 占位)。
+pub struct EntryLayout<'a> {
+    pub display_arena: &'a [u8],
+    pub match_arena: &'a [u8],
+    pub path_pool: &'a [u8],
+    pub path_offsets: &'a [(u32, u32)],
+}
+
+impl<'a> EntryLayout<'a> {
+    /// 从内存索引取布局段(常规 flush 路径;T4 合并流由物化产物提供)。
+    pub fn of(index: &'a Index) -> Self {
+        Self {
+            display_arena: &index.display_arena.data,
+            match_arena: &index.match_arena.data,
+            path_pool: &index.path_pool.data,
+            path_offsets: &index.path_offsets,
+        }
+    }
+}
+
+/// 布局(与内存同构,读侧 mmap 零反序列化,Task 12 消费):
+/// header: magic[4] | u32 version | u32 n_entries | u32 tombstone_count |
+///         u32 n_path_offsets | u64 built_at | u64 last_event_id |
+///         u32 n_roots + 逐个 (u32 len + bytes) |
+///         u32 n_excluded + 逐个 (u32 len + bytes) |
+///         u64 display_arena_len | u64 match_arena_len | u64 path_pool_len
+/// body(顺序):display_arena | match_arena | path_pool |
+///         path_offsets 逐对 (u32, u32)(与条目号全量对齐,含 (0,0) 占位)|
+///         [4B 对齐填充] |
+///         entries 逐条 24 字节(五 u32 LE + flags u8 + 3 字节 0 填充)
+/// 对齐规则:entries 段起始向上对齐到 4B,写侧补零;读侧同规则
+/// entries_off = align_up(path_offsets 段末, 4)(mmap 裸转型 *const Entry 的对齐前提)。
+///
+/// 写入对象是**条目流**(迭代器逐条产出):总数/墓碑数在流收尽前不可知,
+/// header 相应字段先写占位、收尽后按固定偏移回填(不移动任何后续字节)。
+/// 取舍:rename 原子替换保证崩溃不损坏——断电最坏整体回滚 rename,旧文件复活,数据不损坏;
+/// 「断电必达」需 F_FULLFSYNC + 目录 fsync,暂不做(product 边界外)。
+pub fn write_atomic<'a, I>(
+    layout: &EntryLayout<'a>,
+    entries: I,
+    meta: &IndexMeta,
+    path: &Path,
+) -> std::io::Result<()>
+where
+    I: Iterator<Item = &'a Entry>,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+    let hp = write_header(
+        &mut buf,
+        meta,
+        Some((
+            layout.display_arena.len() as u64,
+            layout.match_arena.len() as u64,
+            layout.path_pool.len() as u64,
+        )),
+    )?;
+    buf.extend_from_slice(layout.display_arena);
+    buf.extend_from_slice(layout.match_arena);
+    buf.extend_from_slice(layout.path_pool);
+    for (s, l) in layout.path_offsets {
         put_u32(&mut buf, *s);
         put_u32(&mut buf, *l);
     }
@@ -83,7 +170,9 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
     }
     // 逐字段 LE 写,禁裸内存拷贝:repr(C) 的 3 字节填充内容未定义,
     // 裸拷贝会把未初始化垃圾写进文件(不可复现、且污染同构布局假设)
-    for e in &index.entries {
+    let mut n: u32 = 0;
+    let mut tombstones: u32 = 0;
+    for e in entries {
         buf.extend_from_slice(&e.display_start.to_le_bytes());
         buf.extend_from_slice(&e.display_len.to_le_bytes());
         buf.extend_from_slice(&e.match_start.to_le_bytes());
@@ -91,7 +180,28 @@ pub fn write_atomic(index: &Index, meta: &IndexMeta, path: &Path) -> std::io::Re
         buf.extend_from_slice(&e.parent.to_le_bytes());
         buf.push(e.flags);
         buf.extend_from_slice(&[0u8; 3]); // 对齐填充
+        n += 1;
+        if !e.is_live() {
+            tombstones += 1;
+        }
     }
+    // 布局对齐硬校验(release 生效,非 debug_assert):失配即拒绝写出——
+    // 布局段与条目流不对齐时产物 load 必失败(Truncated),用户侧表现为
+    // 无感知的全量重扫,必须在写盘前拦截。
+    if layout.path_offsets.len() != n as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "path_offsets({}) 与条目流长度({}) 不对齐,拒绝写出 load 必失败的布局",
+                layout.path_offsets.len(),
+                n
+            ),
+        ));
+    }
+    // header 计数回填
+    put_u32_at(&mut buf, hp.n_entries, n);
+    put_u32_at(&mut buf, hp.tombstones, tombstones);
+    put_u32_at(&mut buf, hp.n_offsets, n);
 
     let tmp = tmp_path_for(path)?;
     {
@@ -131,6 +241,258 @@ pub(crate) fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
     )))
 }
 
+/// 启动清扫:删除数据目录内上次会话残留的索引临时文件(写侧 tmp 与溢写段
+/// `.tmp`/`.tmp.d`/`.tmp.m`/`.tmp.p`)。崩溃/强杀时 rename 前的中断产物,
+/// 与目标同目录;按「`index.bin.` 前缀 + 含 `.tmp`」精确匹配,不误删他物。
+pub fn cleanup_stale_index_tmp(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if n.starts_with("index.bin.")
+            && n.contains(".tmp")
+            && std::fs::remove_file(e.path()).is_ok()
+        {
+            log::info!("清理残留索引临时文件: {n}");
+        }
+    }
+}
+
+// —— 流式写侧(T4 合并 flush,tech.md §4.3) ——
+
+/// 条目流生产者的汇聚端:三段 arena 字节**边产边写**进溢写文件(有界内存),
+/// entries 与 path_offsets 进有限 Vec(24B + 8B 每条,百万级 ~40MB)。文件布局
+/// 要求「display|match|pool 段先于 offsets/entries 段」,而合成条目流的 arena
+/// 字节是逐条产出的副产物(逐条交错),故溢写 + 收尽后按序拼接是唯一既保布局
+/// 又不经全量堆物化的路径。
+pub(crate) struct StreamWriter {
+    display: BufWriter<std::fs::File>,
+    match_w: BufWriter<std::fs::File>,
+    pool: BufWriter<std::fs::File>,
+    display_len: u64,
+    match_len: u64,
+    pool_len: u64,
+    entries: Vec<Entry>,
+    path_offsets: Vec<(u32, u32)>,
+    live: u32,
+    tombstones: u32,
+}
+
+impl StreamWriter {
+    /// 产出一条留存条目,返回其新条目号(调用方据此重映射后续条目的父号)。
+    /// `dir_path`:活目录传完整路径(match 形态)——留存条目的父链全是留存条目
+    /// (级联墓碑 + 屏蔽沿子树闭合),链上名称与源空间一致,故合成完整路径可
+    /// 直取源空间的目录路径段(mmap 池段/overlay 预写段,零拷贝),无需回看
+    /// 新空间父链重建;其余传 None((0,0) 占位)。
+    pub(crate) fn push(
+        &mut self,
+        display: &[u8],
+        match_name: &[u8],
+        parent: u32,
+        flags: u8,
+        dir_path: Option<&[u8]>,
+    ) -> std::io::Result<u32> {
+        self.display.write_all(display)?;
+        let ds = self.display_len;
+        self.display_len += display.len() as u64;
+        self.match_w.write_all(match_name)?;
+        let ms = self.match_len;
+        self.match_len += match_name.len() as u64;
+        let idx = self.entries.len() as u32;
+        self.entries.push(Entry {
+            display_start: ds as u32,
+            display_len: display.len() as u32,
+            match_start: ms as u32,
+            match_len: match_name.len() as u32,
+            parent,
+            flags,
+        });
+        match dir_path {
+            Some(p) => {
+                let s = self.pool_len as u32;
+                self.pool.write_all(p)?;
+                self.pool_len += p.len() as u64;
+                self.path_offsets.push((s, p.len() as u32));
+            }
+            None => self.path_offsets.push((0, 0)),
+        }
+        if flags & FLAG_TOMBSTONE == 0 {
+            self.live += 1;
+        } else {
+            self.tombstones += 1;
+        }
+        Ok(idx)
+    }
+
+    /// 已产出的条目数。
+    pub(crate) fn len(&self) -> u32 {
+        self.entries.len() as u32
+    }
+
+    /// 活条目数(persist_final 的条目数回报复用)。
+    pub(crate) fn live_count(&self) -> u32 {
+        self.live
+    }
+}
+
+/// 溢写文件按序拼接到输出流(1MB 有界缓冲,不整块载入)。
+fn copy_spill(src: &mut std::fs::File, dst: &mut impl Write) -> std::io::Result<()> {
+    src.seek(SeekFrom::Start(0))?;
+    let mut buf = [0u8; 1 << 20];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        dst.write_all(&buf[..n])?;
+    }
+}
+
+/// 以 0600 打开临时写侧文件（读写：溢写文件写完还要读回拼接）。
+fn spill_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// 流式合成写出(T4,tech.md §4.3):`produce` 按「Base + Overlay 顺序遍历」向
+/// sink 逐条产出留存条目,三段 arena 直写溢写文件,收尽后按布局拼接 +
+/// header 回填——全程不经全量堆物化(峰值 ≈ entries/offsets 有限 Vec + 1MB
+/// 拼接缓冲,对照 materialize 路径的全量 Index + 整文件 buf)。产物与
+/// 「materialize + [`write_atomic`]」路径**字节级等价**(overlay 测试钉)。
+/// 返回活条目数。
+pub(crate) fn write_stream_atomic(
+    meta: &IndexMeta,
+    path: &Path,
+    produce: impl FnOnce(&mut StreamWriter) -> std::io::Result<()>,
+) -> std::io::Result<u32> {
+    let tmp = tmp_path_for(path)?;
+    // 溢写名 = tmp 名再加段后缀(with_extension 只替换最后一个后缀,恒不同名)
+    let mut d_name = tmp.clone().into_os_string();
+    d_name.push(".d");
+    let spill_d = PathBuf::from(d_name);
+    let mut m_name = tmp.clone().into_os_string();
+    m_name.push(".m");
+    let spill_m = PathBuf::from(m_name);
+    let mut p_name = tmp.clone().into_os_string();
+    p_name.push(".p");
+    let spill_p = PathBuf::from(p_name);
+
+    let mut sink = StreamWriter {
+        display: BufWriter::with_capacity(1 << 20, spill_file(&spill_d)?),
+        match_w: BufWriter::with_capacity(1 << 20, spill_file(&spill_m)?),
+        pool: BufWriter::with_capacity(1 << 20, spill_file(&spill_p)?),
+        display_len: 0,
+        match_len: 0,
+        pool_len: 0,
+        entries: Vec::new(),
+        path_offsets: Vec::new(),
+        live: 0,
+        tombstones: 0,
+    };
+    // 产出失败也必须冲刷已缓冲字节后再清理,否则溢写文件句柄 drop 丢数据无妨,
+    // 但 Err 语义要求调用方状态不变——统一走下方清理,不 rename。
+    let produced = produce(&mut sink);
+    let flushed = (|| -> std::io::Result<()> {
+        sink.display.flush()?;
+        sink.match_w.flush()?;
+        sink.pool.flush()?;
+        Ok(())
+    })();
+    let result = match (produced, flushed) {
+        (Ok(()), Ok(())) => assemble_streamed(
+            &tmp,
+            path,
+            (sink.display_len, sink.match_len, sink.pool_len),
+            &sink,
+            meta,
+        ),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    // 溢写与失败产物一律清理(成功路径 rename 后 tmp 已不存在,remove 容错)
+    let _ = std::fs::remove_file(&spill_d);
+    let _ = std::fs::remove_file(&spill_m);
+    let _ = std::fs::remove_file(&spill_p);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map(|()| sink.live_count())
+}
+
+/// 收尽后的拼接段:header(真值长度)→ display → match → pool → offsets →
+/// 对齐填充 → entries → header 计数回填 → fsync → rename。
+fn assemble_streamed(
+    tmp: &Path,
+    target: &Path,
+    lens: (u64, u64, u64),
+    sink: &StreamWriter,
+    meta: &IndexMeta,
+) -> std::io::Result<()> {
+    let file = spill_file(tmp)?;
+    let mut out = BufWriter::with_capacity(1 << 20, file);
+    let hp = write_header(&mut out, meta, Some(lens))?;
+    // 布局对齐硬校验(write_atomic 同一不变量;结构性同产同长,保留为防线)
+    if sink.path_offsets.len() != sink.len() as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "流式条目流与路径偏移表失配,拒绝写出",
+        ));
+    }
+    // get_ref().try_clone():复制出的 fd 与 BufWriter 持有的**共享同一文件偏移**
+    // ——冲刷后游标在段末,copy_spill 内 seek(Start(0)) 归位才能从段首读;
+    // 段与段互不重叠,顺序消费无需在两次 copy 之间恢复游标。
+    let mut d = sink.display.get_ref().try_clone()?;
+    copy_spill(&mut d, &mut out)?;
+    let mut m = sink.match_w.get_ref().try_clone()?;
+    copy_spill(&mut m, &mut out)?;
+    let mut p = sink.pool.get_ref().try_clone()?;
+    copy_spill(&mut p, &mut out)?;
+    let mut offsets_buf: Vec<u8> = Vec::with_capacity(sink.path_offsets.len() * 8);
+    for (s, l) in &sink.path_offsets {
+        put_u32(&mut offsets_buf, *s);
+        put_u32(&mut offsets_buf, *l);
+    }
+    out.write_all(&offsets_buf)?;
+    // entries 段起始向上对齐 4B(mmap 裸转型对齐前提,读侧同公式切界)
+    let pos = out.stream_position()?;
+    for _ in 0..(pos.next_multiple_of(4) - pos) {
+        out.write_all(&[0u8])?;
+    }
+    for e in &sink.entries {
+        // 逐字段 LE 写,禁裸内存拷贝(与 write_atomic 同理由)
+        out.write_all(&e.display_start.to_le_bytes())?;
+        out.write_all(&e.display_len.to_le_bytes())?;
+        out.write_all(&e.match_start.to_le_bytes())?;
+        out.write_all(&e.match_len.to_le_bytes())?;
+        out.write_all(&e.parent.to_le_bytes())?;
+        out.write_all(&[e.flags])?;
+        out.write_all(&[0u8; 3])?;
+    }
+    out.flush()?;
+    let mut f = out.into_inner().map_err(|e| e.into_error())?;
+    // header 回填(seek 定位;此后无追加写,游标不须还原)
+    let mut backfill = |pos: usize, bytes: &[u8]| -> std::io::Result<()> {
+        f.seek(SeekFrom::Start(pos as u64))?;
+        f.write_all(bytes)
+    };
+    backfill(hp.n_entries, &sink.len().to_le_bytes())?;
+    backfill(hp.tombstones, &sink.tombstones.to_le_bytes())?;
+    backfill(hp.n_offsets, &sink.len().to_le_bytes())?;
+    backfill(hp.display_len, &lens.0.to_le_bytes())?;
+    backfill(hp.match_len, &lens.1.to_le_bytes())?;
+    backfill(hp.pool_len, &lens.2.to_le_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(tmp, target)?;
+    Ok(())
+}
+
 // —— 读侧:mmap 零反序列化加载(ADR-3) ——
 
 /// 编译期钉:Entry 定长 24B 是 mmap 裸转型 *const Entry 的前提(布局同构契约),
@@ -153,9 +515,9 @@ pub enum LoadError {
     Io(#[from] std::io::Error),
 }
 
-/// mmap 只读视图:五原语直切 mmap 区段,零反序列化。冷启动两段式第一步——
-/// load_mmap 后立即可查(query::execute 直消费 &dyn IndexView,零分支扩散);
-/// 第二步 materialize() 物化为可变 Index。
+/// mmap 只读视图:五原语直切 mmap 区段,零反序列化。冷启动直挂(T2 起,tech.md
+/// §4.3)——查询全程消费本视图,零堆驻留;物化(materialize)退役为 T4 flush
+/// 合并的内部步骤。
 ///
 /// 一致性信任级别:load 侧对 magic/version/段长做 need 全覆盖校验;
 /// 条目内 arena 偏移与 path_seg 的 idx 不逐一校验——越界属文件损坏或调用方 bug,
@@ -171,13 +533,14 @@ pub struct SharedView {
     n_entries: usize,
 }
 
-impl IndexView for SharedView {
-    fn entries(&self) -> &[Entry] {
-        // SAFETY:三前提在 load_mmap 已逐一成立——
-        // 1) 对齐:mmap 基址页对齐,entries_off 经 align_up(…, 4) 且 Entry 对齐值 = 4(repr(C) 全 u32);
-        // 2) 边界:need(entries_off, n_entries*24) 校验通过,切片不越出 mmap;
-        // 3) 位型合法:Entry 全字段 u32/u8,任意位型皆合法值(repr(C) 无失效位型)。
-        // 生命周期:返回切片借用 &self,与 mmap 同寿,不出借圈。
+impl SharedView {
+    /// 条目连续切片(mmap 裸视图;entry_segments/entry/materialize 共用)。
+    // SAFETY:三前提在 load_mmap 已逐一成立——
+    // 1) 对齐:mmap 基址页对齐,entries_off 经 align_up(…, 4) 且 Entry 对齐值 = 4(repr(C) 全 u32);
+    // 2) 边界:need(entries_off, n_entries*24) 校验通过,切片不越出 mmap;
+    // 3) 位型合法:Entry 全字段 u32/u8,任意位型皆合法值(repr(C) 无失效位型)。
+    // 生命周期:返回切片借用 &self,与 mmap 同寿,不出借圈。
+    fn entries_slice(&self) -> &[Entry] {
         unsafe {
             std::slice::from_raw_parts(
                 self.mmap[self.entries_off..].as_ptr() as *const Entry,
@@ -185,14 +548,16 @@ impl IndexView for SharedView {
             )
         }
     }
+}
+
+impl SharedView {
+    /// 三段存储区直切(mmap 区段;materialize 与 IndexView 实现共用)。
+    /// T3 起不再作为 trait 面暴露(合成视图无单一 arena,语义分发在实现层)。
     fn display_arena(&self) -> &[u8] {
         &self.mmap[self.display_off..self.match_off]
     }
     fn match_arena(&self) -> &[u8] {
         &self.mmap[self.match_off..self.path_pool_off]
-    }
-    fn path_pool(&self) -> &[u8] {
-        &self.mmap[self.path_pool_off..self.path_offsets_off]
     }
     fn path_seg(&self, idx: u32) -> (u32, u32) {
         let off = self.path_offsets_off + idx as usize * 8;
@@ -203,13 +568,39 @@ impl IndexView for SharedView {
     }
 }
 
+impl IndexView for SharedView {
+    fn entry_segments(&self) -> Vec<(u32, &[Entry])> {
+        vec![(0, self.entries_slice())]
+    }
+    fn entry(&self, idx: u32) -> &Entry {
+        &self.entries_slice()[idx as usize]
+    }
+    fn match_name(&self, idx: u32) -> &[u8] {
+        let e = self.entry(idx);
+        let s = e.match_start as usize;
+        &self.match_arena()[s..s + e.match_len as usize]
+    }
+    fn display_name(&self, idx: u32) -> &[u8] {
+        let e = self.entry(idx);
+        let s = e.display_start as usize;
+        &self.display_arena()[s..s + e.display_len as usize]
+    }
+    fn dir_path(&self, idx: u32) -> &[u8] {
+        let (s, l) = self.path_seg(idx);
+        &self.mmap[self.path_pool_off..self.path_offsets_off][s as usize..(s + l) as usize]
+    }
+}
+
 impl SharedView {
-    /// 冷启动两段式第二步:从 mmap 物化为可变 Index(零逻辑重建——直接拷字节)。
-    /// 条目 1:1 拷贝(条目号不变、墓碑保留),父指针无需重映射;
-    /// live 目录路径池经父链重建(与 compact 同法,复用 dir_path_bytes 唯一实现),
-    /// 墓碑目录的陈旧池段不重建(置 (0,0) 占位)——查询只读活目录段,行为无差。
+    /// 从 mmap 物化为可变 Index(零逻辑重建——直接拷字节)。
+    /// **冷启动不再调用**(T2 起 daemon 直挂 Shared 常驻,tech.md §4.3);
+    /// 本函数保留为 T4 flush 合并的内部步骤入口(合成条目流产出前的物化),
+    /// 并作为物化等价性的测试锚。条目 1:1 拷贝(条目号不变、墓碑保留),
+    /// 父指针无需重映射;live 目录路径池经父链重建(与 compact 同法,复用
+    /// dir_path_bytes 唯一实现),墓碑目录的陈旧池段不重建(置 (0,0) 占位)
+    /// ——查询只读活目录段,行为无差。
     pub fn materialize(&self) -> Index {
-        let entries = self.entries();
+        let entries = self.entries_slice();
         let display = self.display_arena();
         let match_arena = self.match_arena();
         let mut new_entries: Vec<Entry> = Vec::with_capacity(entries.len());
@@ -374,6 +765,12 @@ fn rd_bytes(buf: &[u8], cur: &mut usize) -> Result<Vec<u8>, LoadError> {
 mod tests {
     use super::*;
 
+    /// 写侧统一入口(条目流形态):测试共用,顺手钉住「切片迭代器即合法条目流」。
+    fn save(i: &Index, meta: &IndexMeta, path: &Path) -> std::io::Result<()> {
+        let layout = EntryLayout::of(i);
+        write_atomic(&layout, i.entries.iter(), meta, path)
+    }
+
     #[test]
     fn write_header_magic_version() {
         let mut i = Index::new();
@@ -387,7 +784,7 @@ mod tests {
             scan_roots: vec![b"/Users/t".to_vec()],
             excluded: vec![],
         };
-        write_atomic(&i, &meta, &path).unwrap();
+        save(&i, &meta, &path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[0..4], MAGIC);
         assert_eq!(
@@ -413,9 +810,55 @@ mod tests {
         };
         let p1 = dir.path().join("a.bin");
         let p2 = dir.path().join("b.bin");
-        write_atomic(&i, &meta, &p1).unwrap();
-        write_atomic(&i, &meta, &p2).unwrap();
+        save(&i, &meta, &p1).unwrap();
+        save(&i, &meta, &p2).unwrap();
         assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap());
+    }
+
+    /// 条目流写入钉(tech.md §4.3 写侧改造):总数/墓碑数由**流统计**(header 先写
+    /// 占位、收尽后回填),且非切片迭代器(T3 合成流同形态)与切片直引产出
+    /// 字节级一致。突变「占位不回填」→ header 计数为 0,load_mmap 返回空视图必红;
+    /// 突变「墓碑计数恒 0」→ 计数断言必红。
+    #[test]
+    fn write_from_entry_stream_counts_and_matches_slice_form() {
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        let gone = i.insert("gone.txt", d, false);
+        i.insert("kept.txt", d, false);
+        i.remove(gone); // 1 墓碑 + 2 活
+        let dir = tempfile::tempdir().unwrap();
+        let meta = IndexMeta::default();
+        let p1 = dir.path().join("stream.bin");
+        let p2 = dir.path().join("slice.bin");
+        let layout = EntryLayout::of(&i);
+        // 流形态:经 filter 适配的非切片迭代器
+        let stream: Box<dyn Iterator<Item = &Entry>> = Box::new(i.entries.iter().filter(|_| true));
+        write_atomic(&layout, stream, &meta, &p1).unwrap();
+        write_atomic(&layout, i.entries.iter(), &meta, &p2).unwrap();
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            std::fs::read(&p2).unwrap(),
+            "流形态与切片形态字节级一致"
+        );
+        // header 计数由流统计:总条数含墓碑、墓碑数与索引内部计数一致
+        let view = load_mmap(&p1).unwrap();
+        let segs = view.entry_segments();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(
+            segs[0].1.len() as u32,
+            i.entry_count() + i.tombstone_count(),
+            "n_entries = 条目流长度(含墓碑)"
+        );
+        // 墓碑计数按布局位(12..16)回填自条目 flags(突变「恒 0」此断言必红)
+        let bytes = std::fs::read(&p1).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            i.tombstone_count(),
+            "tombstone_count 由条目流统计"
+        );
+        // 墓碑计数回填自条目 flags(mmap 视图经查询可证:活条目可查)
+        let out = crate::query::execute(&*view, &crate::query::parse("kept").unwrap(), 10);
+        assert_eq!(out.total, 1);
     }
 
     #[test]
@@ -424,13 +867,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.bin");
         let meta = IndexMeta::default();
-        write_atomic(&i, &meta, &path).unwrap();
-        write_atomic(&i, &meta, &path).unwrap(); // 二次覆盖
+        save(&i, &meta, &path).unwrap();
+        save(&i, &meta, &path).unwrap(); // 二次覆盖
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(left.len(), 1); // 无 .tmp 残留
+    }
+
+    /// 布局对齐硬校验钉(release 生效):path_offsets 与条目流长度失配 →
+    /// Err(InvalidData),且零产物落盘(检查在 tmp 写入前)。突变「校验退回
+    /// debug_assert」时:debug profile 本测因 panic 必红;`cargo test --release`
+    /// 下失配文件被静默写出、断言同样必红——两种 profile 都杀得死。
+    #[test]
+    fn write_rejects_misaligned_layout_without_side_effects() {
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        i.insert("a.txt", d, false);
+        // 故意短的 path_offsets(1 对,条目流 2 条):模拟失配合成视图
+        let layout = EntryLayout {
+            display_arena: &i.display_arena.data,
+            match_arena: &i.match_arena.data,
+            path_pool: &i.path_pool.data,
+            path_offsets: &[(0, 4)],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.bin");
+        let err = write_atomic(&layout, i.entries.iter(), &IndexMeta::default(), &path)
+            .expect_err("失配布局必须被拒绝");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!path.exists(), "目标文件不得产出");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "无 .tmp 残留(检查先于临时文件写入)"
+        );
     }
 
     // 临时文件名钉:目标名本身以 .tmp 结尾时,临时文件不得与目标同名
@@ -455,7 +927,7 @@ mod tests {
         i.insert("a.txt", crate::entry::NO_PARENT, false);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.bin");
-        write_atomic(&i, &IndexMeta::default(), &path).unwrap();
+        save(&i, &IndexMeta::default(), &path).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -473,13 +945,134 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.bin");
         let meta = IndexMeta::default();
-        write_atomic(&i, &meta, &path).unwrap();
+        save(&i, &meta, &path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_atomic(&i, &meta, &path).unwrap();
+        save(&i, &meta, &path).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
             "再次落盘应把改宽的旧文件收敛回 0600"
+        );
+    }
+
+    // —— 流式写侧(T4) ——
+
+    /// 流式写与常规写的**字节级等价**钉(T4 合并 flush 的产物契约):同一逻辑
+    /// 条目流,write_atomic(布局 + 流)与 write_stream_atomic(生产者逐条产出,
+    /// arena 溢写拼接)产出完全相同的文件。突变「拼接段序错乱 / header 回填偏移
+    /// 漂移 / padding 缺失」此断言必红。
+    #[test]
+    fn stream_writer_matches_write_atomic_byte_for_byte() {
+        let mut i = Index::new();
+        let d = i.insert("docs", crate::entry::NO_PARENT, true);
+        i.insert("a.txt", d, false);
+        let sub = i.insert("sub", d, true);
+        i.insert("x", sub, false);
+        // 大小写混排名:display("A.txt") ≠ match(折叠后 "a.txt")——display/match
+        // 两段字节不同,「拼接段序错乱」类突变才有区分力(全小写夹具下两段逐位
+        // 相同,对调拷贝顺序测试仍绿,评审实测)
+        i.insert("A.txt", d, false);
+        let gone = i.insert("gone.txt", d, false);
+        i.remove(gone); // 墓碑文件:生产者按原样产出(等价性不含语义过滤)
+        let dir = tempfile::tempdir().unwrap();
+        let meta = IndexMeta {
+            built_at: 5,
+            last_event_id: 6,
+            scan_roots: vec![b"/t".to_vec()],
+            excluded: vec![b"~/Library".to_vec()],
+        };
+        let p1 = dir.path().join("atomic.bin");
+        let p2 = dir.path().join("stream.bin");
+        let layout = EntryLayout::of(&i);
+        write_atomic(&layout, i.entries.iter(), &meta, &p1).unwrap();
+        let v: &dyn IndexView = &i;
+        let live = write_stream_atomic(&meta, &p2, |sink| {
+            for (idx, e) in i.entries.iter().enumerate() {
+                let idx = idx as u32;
+                let dp = if e.is_dir() {
+                    Some(v.dir_path(idx))
+                } else {
+                    None
+                };
+                sink.push(
+                    v.display_name(idx),
+                    v.match_name(idx),
+                    e.parent,
+                    e.flags,
+                    dp,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(live, i.entry_count(), "活条目数由流统计（墓碑不计）");
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            std::fs::read(&p2).unwrap(),
+            "流式写与常规写字节级等价"
+        );
+        // 溢写文件不残留;产物可加载可查
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        let view = load_mmap(&p2).unwrap();
+        // whole:x 精确整词:子串 "a.txt" 会同时命中 a.txt 与 A.txt(折叠同名)
+        let out =
+            crate::query::execute(view.as_ref(), &crate::query::parse("whole:x").unwrap(), 10);
+        assert_eq!(out.total, 1);
+        let path_out = crate::query::execute(
+            view.as_ref(),
+            &crate::query::parse("path:docs").unwrap(),
+            10,
+        );
+        assert_eq!(
+            path_out.total, 4,
+            "路径池拼接正确(docs + a.txt + sub + A.txt)"
+        );
+    }
+
+    /// 启动清扫钉:残留的 tmp 与溢写段(tmp.d/.m/.p)被清,目标与无关文件不动。
+    /// 突变「匹配条件放宽(删前缀)」→ 无关文件被误删,断言红;「漏 .tmp.d」
+    /// → 残留断言红。
+    #[test]
+    fn cleanup_stale_index_tmp_removes_only_index_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "index.bin.6280.5840.tmp",
+            "index.bin.6280.5840.tmp.d",
+            "index.bin.6280.5841.tmp.m",
+            "index.bin.6280.5842.tmp.p",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join("index.bin"), b"keep").unwrap();
+        std::fs::write(dir.path().join("daemon.log"), b"keep").unwrap();
+        std::fs::write(dir.path().join("config.tmp"), b"keep-other-tmp").unwrap();
+        cleanup_stale_index_tmp(dir.path());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 3, "只留目标/日志/无关 tmp: {left:?}");
+        assert!(left.contains(&"index.bin".to_string()));
+        assert!(left.contains(&"daemon.log".to_string()));
+        assert!(left.contains(&"config.tmp".to_string()), "无关 tmp 不误删");
+    }
+
+    /// 流式写的原子性钉:生产者中途失败 → 目标不得产出、溢写文件全清理。
+    #[test]
+    fn stream_writer_error_leaves_no_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("index.bin");
+        let err = write_stream_atomic(&IndexMeta::default(), &target, |sink| {
+            sink.push(b"a", b"a", crate::entry::NO_PARENT, 0, None)?;
+            Err(std::io::Error::other("produce boom"))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(!target.exists(), "失败不得产出目标文件");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "溢写文件与半成品全清理"
         );
     }
 }
@@ -505,7 +1098,8 @@ mod load_tests {
             scan_roots: vec![],
             excluded: vec![],
         };
-        write_atomic(&i, &meta, &path).unwrap();
+        let layout = EntryLayout::of(&i);
+        write_atomic(&layout, i.entries.iter(), &meta, &path).unwrap();
         (i, path)
     }
 
@@ -515,8 +1109,10 @@ mod load_tests {
         let (src, path) = build_and_save(&dir, 7);
         let view = load_mmap(&path).unwrap();
         let v: &dyn IndexView = &*view;
+        let segs = v.entry_segments();
+        assert_eq!(segs.len(), 1, "单源 mmap 视图恰一段");
         assert_eq!(
-            v.entries().len() as u32,
+            segs[0].1.len() as u32,
             src.entry_count() + src.tombstone_count()
         );
         assert_eq!(v.match_name(1), src.match_name_of(1));
@@ -530,7 +1126,8 @@ mod load_tests {
             scan_roots: vec![b"/Users/t".to_vec()],
             excluded: vec![b"~/Library".to_vec()],
         };
-        write_atomic(&src, &meta2, &path2).unwrap();
+        let layout2 = EntryLayout::of(&src);
+        write_atomic(&layout2, src.entries.iter(), &meta2, &path2).unwrap();
         let view2 = load_mmap(&path2).unwrap();
         assert_eq!(view2.meta.scan_roots, vec![b"/Users/t".to_vec()]);
         assert_eq!(view2.meta.excluded, vec![b"~/Library".to_vec()]);
@@ -590,7 +1187,8 @@ mod load_tests {
         i.insert("kept.txt", d, false);
         i.remove(gone);
         let path = dir.path().join("tomb.bin");
-        write_atomic(&i, &IndexMeta::default(), &path).unwrap();
+        let layout = EntryLayout::of(&i);
+        write_atomic(&layout, i.entries.iter(), &IndexMeta::default(), &path).unwrap();
         let m = load_mmap(&path).unwrap().materialize();
         assert_eq!(m.entry_count(), i.entry_count());
         assert_eq!(m.tombstone_count(), i.tombstone_count());

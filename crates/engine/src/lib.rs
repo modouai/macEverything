@@ -1,8 +1,11 @@
 pub mod arena;
 pub mod config;
+pub mod dir_map;
 pub mod entry;
 pub mod fsevents;
 pub mod index;
+pub mod malloc_pressure;
+pub mod overlay;
 pub mod persist;
 pub mod query;
 pub mod reconcile;

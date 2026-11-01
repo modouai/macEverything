@@ -1,5 +1,5 @@
 //! 查询计划:解析(product.md §4 契约)→ 匹配内核与打分。
-use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, NO_PARENT};
+use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, Entry, NO_PARENT};
 use crate::index::IndexView;
 use memchr::memmem::Finder;
 use rayon::prelude::*;
@@ -141,80 +141,121 @@ pub struct QueryOutcome {
 
 /// 执行查询:path 命中目录集 → rayon 分块候选过滤与文件名匹配(块内串行)→
 /// 主线程 top-limit 选择(O(n) 划分 + 前 k ≤ limit 排序)。
+///
+/// 条目遍历走分段枚举(tech.md §4.3 接口改造):视图产出若干连续 Entry 段
+/// (单源一段,S3 双源合成视图两段),本函数不假设单一切片——各段再切成定长块
+/// 作为 rayon 并行粒度,块内直切切片零逐条目虚调用,块间工作窃取并行。
 pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOutcome {
     let t = std::time::Instant::now();
-    let entries = view.entries();
     // 预编译:Finder 构建一次,百万条目匹配零重建(主开销消除)。
     let c_name: Vec<CPattern> = plan.name_terms.iter().map(CPattern::compile).collect();
     let c_path: Vec<CPattern> = plan.path_terms.iter().map(CPattern::compile).collect();
+
+    // 分段 → 定长块:(块起始条目号, 块切片)。16k 条/块:百万级单段切成 ~77 块,
+    // 负载均衡足够;块内串行逐条(条目号 = 块起始号 + 块内下标)。
+    const BLOCK: usize = 16 * 1024;
+    let segments = view.entry_segments();
+    // 分段稠密性自检(debug):trait 契约要求段按序无缝拼满 0..N-1(见
+    // IndexView::entry_segments)——首段起于 0,且每段「起始号 + 段长」等于下
+    // 一段起始号;违反即 dir_hits/父指针的全局下标访问失去意义(稀疏编号越界
+    // 或错位),测试期先红。
+    debug_assert!(
+        segments.is_empty()
+            || (segments[0].0 == 0
+                && segments
+                    .windows(2)
+                    .all(|w| w[0].0 + w[0].1.len() as u32 == w[1].0)),
+        "entry_segments 必须按序稠密覆盖条目号空间 0..N-1"
+    );
+    let mut blocks: Vec<(u32, &[Entry])> = Vec::new();
+    for &(start, seg) in &segments {
+        for (i, chunk) in seg.chunks(BLOCK).enumerate() {
+            blocks.push((start + (i * BLOCK) as u32, chunk));
+        }
+    }
 
     // path 命中目录集:目录条目的路径池段命中全部 path_terms。池段是折叠形态,
     // 路径词在解析侧恒按折叠编译(case: 只作用于文件名侧),此处比对两侧同形态;
     // whole: 同样作用于路径侧(见 path_terms_match)。墓碑目录的池段可能是改名前
     // 的陈旧值,不参与;其子项必同为墓碑,无行为差。
+    // dir_hits 与条目号全量对齐(块间并行产出后按块序拼接 = 条目号序)。
+    // 块内 (start..) 前缀 id 序 zip 切片:块起始号按值进入迭代链,内层闭包只借
+    // execute 栈帧上的 view/plan/编译产物,不持外层闭包局部量。
+    // dir_hits 不做有效性判定(entry_valid):被屏蔽目录只影响其自身与子项的
+    // 候选资格,子项在候选层逐条判定;此处仅为预过滤器,多放进来的失效目录
+    // 不会产出结果,避免 path 查询对全量目录做上溯链判定。
     let dir_hits: Vec<bool> = if plan.path_terms.is_empty() {
         Vec::new()
     } else {
-        (0..entries.len() as u32)
-            .into_par_iter()
-            .map(|idx| {
-                let e = &entries[idx as usize];
-                e.is_dir()
-                    && e.is_live()
-                    && path_terms_match(view.dir_path(idx), &c_path, plan.whole_word)
+        blocks
+            .par_iter()
+            .flat_map_iter(|&(start, chunk)| {
+                (start..).zip(chunk.iter()).map(|(idx, e)| {
+                    e.is_dir()
+                        && e.is_live()
+                        && path_terms_match(view.dir_path(idx), &c_path, plan.whole_word)
+                })
             })
             .collect()
     };
 
     // 候选行:(分数, 名长, 条目号)。case: 候选名 = NFC(display)(不折叠);
     // 否则 = match 名(arena 已折叠,零拷贝借用)。
-    let mut rows: Vec<(u8, usize, u32)> = (0..entries.len() as u32)
-        .into_par_iter()
-        .filter_map(|idx| {
-            let e = &entries[idx as usize];
-            if !e.is_live() {
-                return None;
-            }
-            if !plan.path_terms.is_empty() {
-                // 命中目录的直接子项全取(含文件与子目录);文件路径不入池,
-                // 以自身 match 名命中 path 词补「词落在文件名段」的情形。
-                // 目录自身不按名字入选(命中目录本身不是结果,path 语义测已钉死)。
-                // 已知限制:path 词不横跨目录段与文件名——目录池无文件名、
-                // 文件只取自身名;tech.md「父路径+名称短拼」留待需求出现再落
-                // (Task 21 回填 tech.md),现行为即已知限制。
-                let under_hit_dir = e.parent != NO_PARENT && dir_hits[e.parent as usize];
-                let name_hits_path =
-                    !e.is_dir() && path_terms_match(view.match_name(idx), &c_path, plan.whole_word);
-                if !under_hit_dir && !name_hits_path {
+    // entry_valid 为 T3 合成视图的屏蔽判定挂点(tech.md §4.2):Base 命中经
+    // 条目号链上溯屏蔽陈旧子树,Overlay 命中抑制 base 背书 anchor 的双份;
+    // 单源视图默认恒真,零开销。
+    let mut rows: Vec<(u8, usize, u32)> = blocks
+        .par_iter()
+        .flat_map_iter(|&(start, chunk)| {
+            (start..).zip(chunk.iter()).filter_map(|(idx, e)| {
+                if !e.is_live() || !view.entry_valid(idx) {
                     return None;
                 }
-            }
-            let target: std::borrow::Cow<'_, [u8]> = if plan.case_sensitive {
-                // NFC 直通零拷贝:display 名绝大多数为 ASCII/NFC,直接借用原始字节;
-                // 仅真非 NFC 形态才归一分配(百万条目逐条 nfc().collect 是百万次小分配)。
-                match std::str::from_utf8(view.display_name(idx)) {
-                    Ok(s) if is_nfc(s) => std::borrow::Cow::Borrowed(view.display_name(idx)),
-                    Ok(s) => {
-                        std::borrow::Cow::Owned(normalize_for_match_case_sensitive(s).into_bytes())
+                if !plan.path_terms.is_empty() {
+                    // 命中目录的直接子项全取(含文件与子目录);文件路径不入池,
+                    // 以自身 match 名命中 path 词补「词落在文件名段」的情形。
+                    // 目录自身不按名字入选(命中目录本身不是结果,path 语义测已钉死)。
+                    // 已知限制:path 词不横跨目录段与文件名——目录池无文件名、
+                    // 文件只取自身名;tech.md「父路径+名称短拼」留待需求出现再落
+                    // (Task 21 回填 tech.md),现行为即已知限制。
+                    // parent_idx:T3 合成视图的父号重映射挂点——dir_hits 按全局
+                    // 合成号对齐,Overlay 条目的 parent 是 overlay 空间号,直接
+                    // 下标会命中无关槽位(path 查询随机丢失/误收)。
+                    let parent = view.parent_idx(idx);
+                    let under_hit_dir = parent != NO_PARENT && dir_hits[parent as usize];
+                    let name_hits_path = !e.is_dir()
+                        && path_terms_match(view.match_name(idx), &c_path, plan.whole_word);
+                    if !under_hit_dir && !name_hits_path {
+                        return None;
                     }
-                    // 索引侧名称来自 &str 入库,必为合法 UTF-8;此臂兜损坏数据
-                    Err(_) => std::borrow::Cow::Owned(
-                        normalize_for_match_case_sensitive(&String::from_utf8_lossy(
-                            view.display_name(idx),
-                        ))
-                        .into_bytes(),
-                    ),
                 }
-            } else {
-                std::borrow::Cow::Borrowed(view.match_name(idx))
-            };
-            if !c_name.is_empty() && !c_name.iter().all(|pt| match_pattern(&target, pt)) {
-                return None;
-            }
-            if plan.whole_word && !all_parts_word_bounded(&target, &c_name) {
-                return None;
-            }
-            Some((score_of(&target, &c_name), target.len(), idx))
+                let target: std::borrow::Cow<'_, [u8]> = if plan.case_sensitive {
+                    // NFC 直通零拷贝:display 名绝大多数为 ASCII/NFC,直接借用原始字节;
+                    // 仅真非 NFC 形态才归一分配(百万条目逐条 nfc().collect 是百万次小分配)。
+                    match std::str::from_utf8(view.display_name(idx)) {
+                        Ok(s) if is_nfc(s) => std::borrow::Cow::Borrowed(view.display_name(idx)),
+                        Ok(s) => std::borrow::Cow::Owned(
+                            normalize_for_match_case_sensitive(s).into_bytes(),
+                        ),
+                        // 索引侧名称来自 &str 入库,必为合法 UTF-8;此臂兜损坏数据
+                        Err(_) => std::borrow::Cow::Owned(
+                            normalize_for_match_case_sensitive(&String::from_utf8_lossy(
+                                view.display_name(idx),
+                            ))
+                            .into_bytes(),
+                        ),
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(view.match_name(idx))
+                };
+                if !c_name.is_empty() && !c_name.iter().all(|pt| match_pattern(&target, pt)) {
+                    return None;
+                }
+                if plan.whole_word && !all_parts_word_bounded(&target, &c_name) {
+                    return None;
+                }
+                Some((score_of(&target, &c_name), target.len(), idx))
+            })
         })
         .collect();
 
@@ -226,7 +267,7 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // 判定(display 名 `.app` 后缀,4 字节比较,O(log n) 次比较开销可忽略)。
     let cmp = |a: &(u8, usize, u32), b: &(u8, usize, u32)| {
         let app = |row: &(u8, usize, u32)| {
-            is_app_entry(entries[row.2 as usize].is_dir(), view.display_name(row.2))
+            is_app_entry(view.entry(row.2).is_dir(), view.display_name(row.2))
         };
         app(b)
             .cmp(&app(a))
@@ -811,6 +852,75 @@ mod match_tests {
         let _ = i.insert("alpha.txt", d, false);
         let out = execute(&i, &parse("a").unwrap(), 1);
         assert_eq!(names(&i, &out.hits), vec!["zeta.app"]);
+    }
+
+    /// 双段合成视图测试替身(tech.md §4.3 接口改造的核心契约钉):
+    /// 同一条目号空间拆成两段连续 Entry 段——S3「Base + Overlay 各自连续,
+    /// 合成视图分段产出」的形态预演。名称/路径读取委托源索引(段拆分不动 arena)。
+    struct SplitView<'a> {
+        src: &'a Index,
+        entries: Vec<Entry>,
+        split_at: usize,
+    }
+
+    impl<'a> SplitView<'a> {
+        fn new(src: &'a Index, split_at: usize) -> Self {
+            Self {
+                src,
+                entries: src.entries.clone(),
+                split_at,
+            }
+        }
+    }
+
+    impl IndexView for SplitView<'_> {
+        fn entry_segments(&self) -> Vec<(u32, &[Entry])> {
+            vec![
+                (0, &self.entries[..self.split_at]),
+                (self.split_at as u32, &self.entries[self.split_at..]),
+            ]
+        }
+        fn entry(&self, idx: u32) -> &Entry {
+            &self.entries[idx as usize]
+        }
+        fn match_name(&self, idx: u32) -> &[u8] {
+            <Index as IndexView>::match_name(self.src, idx)
+        }
+        fn display_name(&self, idx: u32) -> &[u8] {
+            <Index as IndexView>::display_name(self.src, idx)
+        }
+        fn dir_path(&self, idx: u32) -> &[u8] {
+            <Index as IndexView>::dir_path(self.src, idx)
+        }
+    }
+
+    /// 双段视图与单段视图查询逐位一致,且两段都被遍历、段内命中以全局条目号回填。
+    /// 突变「execute 只扫首段」→ 第二段命中丢失必红;
+    /// 突变「段内下标直报为条目号(不加速度偏移)」→ 第二段命中号错位必红。
+    #[test]
+    fn two_segment_view_queries_identically_to_single_slice() {
+        let mut i = Index::new();
+        let d = i.insert("docs", NO_PARENT, true); // 条目 0
+        let _ = i.insert("alpha.txt", d, false); // 条目 1(段 1)
+        let _ = i.insert("beta.txt", d, false); // 条目 2(段 2)
+        let _ = i.insert("gamma.md", d, false); // 条目 3(段 2,不命中 *.txt)
+        let full = execute(&i, &parse("*.txt").unwrap(), 10);
+        assert_eq!(full.total, 2);
+
+        let split = SplitView::new(&i, 2); // 段界切在第 2 条:两段各含一条命中
+        let out = execute(&split, &parse("*.txt").unwrap(), 10);
+        assert_eq!(out.total, full.total, "双段视图命中总数一致(两段都遍历)");
+        assert_eq!(out.hits, full.hits, "命中条目号为全局号,顺序与单段一致");
+
+        // 段 2 命中条目经全局号可正确取名(arena 委托 + 偏移对位)
+        assert_eq!(split.display_name(out.hits[0]), b"beta.txt");
+        assert_eq!(split.display_name(out.hits[1]), b"alpha.txt");
+
+        // path: 词同样双段可查:dir_hits 按全局号对齐,段 2 条目的父判定不错位
+        let path_full = execute(&i, &parse("path:docs").unwrap(), 10);
+        let path_split = execute(&split, &parse("path:docs").unwrap(), 10);
+        assert_eq!(path_split.total, path_full.total);
+        assert_eq!(path_split.hits, path_full.hits);
     }
 }
 
