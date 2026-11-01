@@ -21,7 +21,7 @@ use engine::fsevents::{self};
 
 use super::{
     consume_events, ensure_mutable, flush, mutable_base_slot, DaemonPaths, EngineState,
-    IndexHolder, SCAN_CHUNK,
+    IndexHolder, LockFailFast, LockRecover, RwLockFailFast, SCAN_CHUNK,
 };
 
 /// 摘除子树后同步作废 Overlay 账本(anchors/overlaid/dir_ids 锚定被摘 base 条目号,
@@ -147,12 +147,11 @@ pub fn monitor_loop(state: Arc<EngineState>, paths: DaemonPaths) {
 
 /// 一轮对账:收敛「当前索引卷集」到「期望挂载集」。先卸后挂。
 fn reconcile(state: &Arc<EngineState>, paths: &DaemonPaths) -> anyhow::Result<()> {
-    let cfg = state.cfg.lock().unwrap().clone();
+    let cfg = state.cfg.lock_recover().clone();
     let desired: HashSet<PathBuf> = desired_roots(&cfg).into_iter().collect();
     let current: HashSet<PathBuf> = state
         .roots
-        .lock()
-        .unwrap()
+        .lock_recover()
         .iter()
         .filter(|r| volume_root_of(r).is_some())
         .cloned()
@@ -173,15 +172,15 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     log::info!("卷挂载,开始索引: {}", vol.display());
     // 冷启动直挂 Shared 后的卷写入在此按需物化(条目号 1:1,dir_map 免重建)
     ensure_mutable(state);
-    state.roots.lock().unwrap().push(vol.to_path_buf());
+    state.roots.lock_recover().push(vol.to_path_buf());
     {
-        let mut h = state.holder.write().unwrap();
+        let mut h = state.holder.write_fail_fast("holder");
         let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷索引推迟(主索引非可变态,如冷启动/整理中),下轮重试");
-            state.roots.lock().unwrap().retain(|r| r != vol);
+            state.roots.lock_recover().retain(|r| r != vol);
             return;
         };
-        let mut map = state.dir_map.lock().unwrap();
+        let mut map = state.dir_map.lock_fail_fast("dir_map");
         engine::scanner::seed_roots(idx, &mut map, std::slice::from_ref(&vol.to_path_buf()));
     }
     // 建卷流:先于扫描。SINCE_NOW 之后的变化由流事件补,扫描覆盖当下,重叠 diff 幂等。
@@ -195,13 +194,12 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
         Ok((stream, rx)) => {
             state
                 .volume_streams
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .insert(vol.to_path_buf(), stream);
             let st = state.clone();
             let p = paths.clone();
             // 卷流消费:不写水位(见模块注释),退出不触发降级(有意 stop,非故障)。
-            std::thread::spawn(move || {
+            super::spawn_guarded("volume-consume", move || {
                 consume_events(st, p, None, rx, false, false, true);
             });
         }
@@ -222,8 +220,8 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
     // 直挂 Shared 态同样在此按需物化(运行期补扫路径不经 mount_volume 时)
     ensure_mutable(state);
     {
-        let mut h = state.holder.write().unwrap();
-        let mut map = state.dir_map.lock().unwrap();
+        let mut h = state.holder.write_fail_fast("holder");
+        let mut map = state.dir_map.lock_fail_fast("dir_map");
         let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷扫描推迟(主索引非可变态),下轮重试: {}", vol.display());
             return;
@@ -237,7 +235,7 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
         };
         engine::scanner::seed_roots(idx, &mut map, std::slice::from_ref(&vol.to_path_buf()));
     }
-    let cfg = state.cfg.lock().unwrap().clone();
+    let cfg = state.cfg.lock_recover().clone();
     let excludes = engine::reconcile::expand_excludes(&cfg.excluded);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -257,9 +255,9 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
             log::info!("卷扫描世代漂移,放弃本轮残余批次: {}", vol.display());
             return;
         }
-        let mut h = state.holder.write().unwrap();
+        let mut h = state.holder.write_fail_fast("holder");
         if let Some(idx) = mutable_base_slot(&mut h) {
-            let mut map = state.dir_map.lock().unwrap();
+            let mut map = state.dir_map.lock_fail_fast("dir_map");
             engine::scanner::apply_records(idx, &mut map, chunk, &table);
             applied += chunk.len();
             state.dirty.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -281,23 +279,23 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     // 旧线程的 vol.exists() 检查对重插后的卷恒真,无世代则残余批次会在
     // 新扫之后继续应用,产生重复/陈旧条目(自审 2026-10-21)。
     state.volume_scan_epoch.fetch_add(1, Ordering::Relaxed);
-    if let Some(mut stream) = state.volume_streams.lock().unwrap().remove(vol) {
+    if let Some(mut stream) = state.volume_streams.lock_recover().remove(vol) {
         stream.stop(); // Drop 内 stop;卷消费线程因 rx 断开退出,volume_owned 不触发降级
     }
     // 直挂 Shared 态在此按需物化,前缀清除照常生效(否则只能靠重试路径)
     ensure_mutable(state);
     let removed = {
-        let mut h = state.holder.write().unwrap();
+        let mut h = state.holder.write_fail_fast("holder");
         let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷清除推迟(主索引非可变态),下轮重试");
             return;
         };
-        let mut map = state.dir_map.lock().unwrap();
+        let mut map = state.dir_map.lock_fail_fast("dir_map");
         let removed = engine::scanner::remove_prefix(idx, &mut map, vol);
         purge_overlay_after_prefix_removal(&mut h, vol);
         removed
     };
-    state.roots.lock().unwrap().retain(|r| r != vol);
+    state.roots.lock_recover().retain(|r| r != vol);
     flush(state, paths);
     log::info!("卷清除完成: {} 条目 {removed} 条", vol.display());
 }
@@ -308,8 +306,7 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
 pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
     let stale: HashSet<PathBuf> = state
         .dir_map
-        .lock()
-        .unwrap()
+        .lock_fail_fast("dir_map")
         .keys()
         .filter_map(volume_root_of)
         .filter(|v| !desired.contains(v))
@@ -320,12 +317,12 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
     }
     for vol in stale {
         let removed = {
-            let mut h = state.holder.write().unwrap();
+            let mut h = state.holder.write_fail_fast("holder");
             let Some(idx) = mutable_base_slot(&mut h) else {
                 log::warn!("启动清除跳过(主索引非可变态): {}", vol.display());
                 continue;
             };
-            let mut map = state.dir_map.lock().unwrap();
+            let mut map = state.dir_map.lock_fail_fast("dir_map");
             let removed = engine::scanner::remove_prefix(idx, &mut map, &vol);
             purge_overlay_after_prefix_removal(&mut h, &vol);
             removed

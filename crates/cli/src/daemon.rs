@@ -20,8 +20,144 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// —— 锁中毒策略 ——
+//
+// 后台线程的任何 panic 都经 `spawn_guarded` 记录后 `exit(1)`(fail-fast,GUI
+// 存活监控负责拉起)。但线程 panic 到进程退出之间,以及未受看护的测试/主线程
+// 路径,仍可能留下中毒锁;此处按「锁保护什么」二分:
+//
+// * 快照/配置/弱一致数据(state_name、gaps、roots、cfg、缓存、统计、流登记等)
+//   → `lock_recover`:取 inner 继续,一次 panic 不得级联成全部查询失败。
+// * 索引结构/寻址面/落盘串行域(holder、dir_map、flush_lock)→ `*_fail_fast`:
+//   中毒意味着前持有者可能在半改状态中 panic,继续读写会静默污染索引或盘面;
+//   记录后立即退出,由 GUI 拉起干净进程。
+//
+// rescan_lock / exclude_op_lock 只做串行化且已有显式清毒逻辑(见
+// acquire_rescan_blocking / try_acquire_rescan),保持 recover。
+
+/// 快照/配置类互斥锁的恢复入口:毒锁取 inner 继续(不 panic)。
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 快照/配置类读写锁的恢复入口(生产只有 holder 用 RwLock,且属完整性锁;
+/// 此处保留通用入口供测试/后续弱一致 RwLock 使用)。
+#[cfg(test)]
+fn read_recover<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+fn write_recover<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 完整性锁中毒的 fail-fast 出口。日志自身也包一层 catch_unwind:诊断失败
+/// 不得阻断退出路径。
+fn fatal_lock_poison(what: &str) -> ! {
+    let _ = std::panic::catch_unwind(|| {
+        log::error!(
+            "锁 `{what}` 中毒(前持有线程 panic),索引/落盘完整性不可保证;按 fail-fast 退出进程,等待 GUI 拉起"
+        );
+    });
+    std::process::exit(1);
+}
+
+pub(crate) trait LockRecover<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T> {
+        lock_recover(self)
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait RwLockRecover<T> {
+    fn read_recover(&self) -> RwLockReadGuard<'_, T>;
+    fn write_recover(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+#[cfg(test)]
+impl<T> RwLockRecover<T> for RwLock<T> {
+    fn read_recover(&self) -> RwLockReadGuard<'_, T> {
+        read_recover(self)
+    }
+
+    fn write_recover(&self) -> RwLockWriteGuard<'_, T> {
+        write_recover(self)
+    }
+}
+
+pub(crate) trait LockFailFast<T> {
+    fn lock_fail_fast(&self, what: &'static str) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockFailFast<T> for Mutex<T> {
+    fn lock_fail_fast(&self, what: &'static str) -> MutexGuard<'_, T> {
+        match self.lock() {
+            Ok(g) => g,
+            Err(_) => fatal_lock_poison(what),
+        }
+    }
+}
+
+pub(crate) trait RwLockFailFast<T> {
+    fn read_fail_fast(&self, what: &'static str) -> RwLockReadGuard<'_, T>;
+    fn write_fail_fast(&self, what: &'static str) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RwLockFailFast<T> for RwLock<T> {
+    fn read_fail_fast(&self, what: &'static str) -> RwLockReadGuard<'_, T> {
+        match self.read() {
+            Ok(g) => g,
+            Err(_) => fatal_lock_poison(what),
+        }
+    }
+
+    fn write_fail_fast(&self, what: &'static str) -> RwLockWriteGuard<'_, T> {
+        match self.write() {
+            Ok(g) => g,
+            Err(_) => fatal_lock_poison(what),
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "非字符串 panic payload".to_owned()
+    }
+}
+
+/// 后台线程统一看护:捕获 panic → 记录 → `exit(1)`(fail-fast)。
+/// 替代裸 `thread::spawn`:任何后台线程静默死亡都会让 daemon「socket 照常
+/// 应答、索引永不更新」,必须由进程退出 + GUI 存活监控收敛。
+pub(crate) fn spawn_guarded<F>(name: &'static str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let spawned = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                let msg = panic_payload_message(payload.as_ref());
+                log::error!("后台线程 `{name}` panic: {msg};按 fail-fast 退出进程,等待 GUI 拉起");
+                std::process::exit(1);
+            }
+        });
+    if let Err(e) = spawned {
+        log::error!("后台线程 `{name}` 启动失败: {e};按 fail-fast 退出进程");
+        std::process::exit(1);
+    }
+}
 
 /// 停机时长超过此阈值且重放零事件 → 判重放不可信,转全量重扫(ADR-5 保守判定器)。
 pub const REPLAY_DOWNTIME_THRESHOLD_SECS: u64 = 48 * 3600;
@@ -273,7 +409,7 @@ impl EngineState {
     }
 
     fn set_state(&self, s: &'static str) {
-        *self.state_name.lock().unwrap() = s;
+        *self.state_name.lock_recover() = s;
     }
 }
 
@@ -348,7 +484,7 @@ fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc:
                 .par_iter()
                 .map(|&i| stat_of(&v.full_path_dyn(i)))
                 .collect();
-            let mut c = cache.lock().unwrap();
+            let mut c = cache.lock_recover();
             for (&i, m) in ids.iter().zip(&metas) {
                 c.insert(i, *m);
             }
@@ -401,7 +537,7 @@ fn stat_with_cache(
     let mut meta: Vec<MetaRow> = Vec::with_capacity(rows.len());
     let mut miss: Vec<usize> = Vec::new();
     {
-        let c = cache.lock().unwrap();
+        let c = cache.lock_recover();
         for (i, (id, ..)) in rows.iter().enumerate() {
             match c.get(id) {
                 Some(&m) => meta.push(m),
@@ -438,7 +574,7 @@ fn stat_with_cache(
 }
 
 fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Option<R> {
-    let h = state.holder.read().unwrap();
+    let h = state.holder.read_fail_fast("holder");
     match &*h {
         IndexHolder::Shared(v) => Some(f(v.as_ref())),
         IndexHolder::Mutable(i) => Some(f(i)),
@@ -456,7 +592,7 @@ fn with_view<R>(state: &EngineState, f: impl FnOnce(&dyn IndexView) -> R) -> Opt
 /// 全程持 holder 写锁:读者在锁上等待,唤醒后见到的已是可变态,无 Empty 观察窗。
 /// 成本(实测,release):1.02M 条目 ~9ms,首次含 mmap 缺页 ~95ms;一次性。
 fn ensure_mutable(state: &EngineState) {
-    let mut h = state.holder.write().unwrap();
+    let mut h = state.holder.write_fail_fast("holder");
     match &mut *h {
         IndexHolder::Shared(_) => {
             let shared = std::mem::replace(&mut *h, IndexHolder::Empty);
@@ -475,8 +611,8 @@ fn ensure_mutable(state: &EngineState) {
 /// 读侧经 IndexView:Shared(直挂 Base)与 Mutable 皆可建——冷启动不再物化,
 /// dir_map 直接从 mmap 视图建立;后续按需转可变时条目号 1:1,映射继续有效。
 fn rebuild_dir_map(state: &EngineState) {
-    let literal_roots = state.roots.lock().unwrap().clone();
-    let h = state.holder.read().unwrap();
+    let literal_roots = state.roots.lock_recover().clone();
+    let h = state.holder.read_fail_fast("holder");
     // 只按 Base 建:dir_map 是「绝对路径 → base 条目号」的寻址面,overlay 目录的
     // 寻址在 Overlay::dir_ids(纯 overlay 目录),两空间不混号。
     let view: &dyn IndexView = match &*h {
@@ -487,7 +623,7 @@ fn rebuild_dir_map(state: &EngineState) {
     };
     let map = build_dir_map(view, &literal_roots);
     drop(h);
-    *state.dir_map.lock().unwrap() = map;
+    *state.dir_map.lock_fail_fast("dir_map") = map;
 }
 
 /// 从给定视图构建「绝对目录路径 → 条目号」映射(**纯函数**:不触碰 holder/
@@ -544,9 +680,9 @@ fn build_dir_map(view: &dyn IndexView, literal_roots: &[PathBuf]) -> DirIndexMap
 /// listing 挂到错父下,海量垃圾路径随下次合并写固化(实机:heal 重扫后条目数
 /// 2.39M→2.04M 不降、index.bin 313MB 反复复写;毒 Base 规模下窗口被放大)。
 fn install_holder_with_map(state: &EngineState, next: IndexHolder, map: DirIndexMap) {
-    let mut h = state.holder.write().unwrap();
+    let mut h = state.holder.write_fail_fast("holder");
     *h = next;
-    *state.dir_map.lock().unwrap() = map;
+    *state.dir_map.lock_fail_fast("dir_map") = map;
 }
 
 /// 索引健全性抽检的采样条数(冷启动 load 后一次,~256 次 stat,数 ms)。
@@ -682,7 +818,7 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
         .unwrap_or_else(|_| abs_dir.to_path_buf());
     // 持久失败负缓存:短路(含补链路径)。EPERM 目录保留索引条目但不再重试。
     // 重启清零——用户补授权限后重启即自动重新索引。
-    if state.perm_denied.lock().unwrap().contains(&base) {
+    if state.perm_denied.lock_recover().contains(&base) {
         return 0;
     }
     // 重扫窗口记账:替换段完成后重放追平。push 不持 holder 锁(在取锁之前);
@@ -690,10 +826,10 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
     // 挂 holder 也持写锁」的互斥保证:「先 push 后 drain → 基于旧索引 → 被重放」
     // 或「后 push → 基于新索引 → 不重放」,无第三种交错。
     if state.rescanning.load(Ordering::SeqCst) {
-        state.rescan_dirty.lock().unwrap().insert(base.clone());
+        state.rescan_dirty.lock_recover().insert(base.clone());
     }
-    let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
-    let mut h = state.holder.write().unwrap();
+    let excludes = reconcile::expand_excludes(&state.cfg.lock_recover().excluded);
+    let mut h = state.holder.write_fail_fast("holder");
     // T3:diff 直写 Overlay,不再物化 Base(Shared/Mutable 首个 diff 转 Overlaid)。
     ensure_overlay_ready(&mut h);
     let IndexHolder::Overlaid(st) = &mut *h else {
@@ -704,7 +840,7 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
         base: holder_base,
         overlay,
     } = st.as_mut();
-    let mut map = state.dir_map.lock().unwrap();
+    let mut map = state.dir_map.lock_fail_fast("dir_map");
     let mut changed = 0u32;
 
     // 目标未索引:事件风暴下子目录事件可能先于其父目录的 diff 到达(新建目录树),
@@ -741,14 +877,13 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
 }
 
 fn build_meta(state: &EngineState) -> IndexMeta {
-    let cfg = state.cfg.lock().unwrap().clone();
+    let cfg = state.cfg.lock_recover().clone();
     IndexMeta {
         built_at: state.built_at.load(Ordering::Relaxed),
         last_event_id: state.applied_event_id.load(Ordering::Relaxed),
         scan_roots: state
             .roots
-            .lock()
-            .unwrap()
+            .lock_recover()
             .iter()
             .map(|p| p.to_string_lossy().into_owned().into_bytes())
             .collect(),
@@ -765,24 +900,36 @@ fn build_meta(state: &EngineState) -> IndexMeta {
 /// Overlaid 态(T4 正式形态):合并流式直写 + remap 换 Base + 清 Overlay,
 /// 见 [`flush_merged`]。
 fn flush(state: &EngineState, paths: &DaemonPaths) {
-    let _guard = state.flush_lock.lock().unwrap();
-    // Overlaid 分流:合并写需要「放读锁 → 取写锁」的锁形态,单独走 flush_merged
-    if matches!(&*state.holder.read().unwrap(), IndexHolder::Overlaid(_)) {
-        flush_merged(state, paths);
-        return;
-    }
-    let h = state.holder.read().unwrap();
-    let mut dirty_now = false;
-    match &*h {
-        IndexHolder::Mutable(idx) => {
-            dirty_now = write_holder_index(idx, state, paths).is_ok();
+    // 落盘串行域只覆盖写盘/换基;压力归还在锁释放后执行——8 轮
+    // malloc_zone_pressure_relief 不需要与其它落盘路径互斥,持锁跑会无谓拉长
+    // flush 串行段(消费循环的落盘节流、stop 落盘都在等这把锁)。
+    let relieve = {
+        let _guard = state.flush_lock.lock_fail_fast("flush_lock");
+        // Overlaid 分流:合并写需要「放读锁 → 取写锁」的锁形态,单独走 flush_merged
+        if matches!(
+            &*state.holder.read_fail_fast("holder"),
+            IndexHolder::Overlaid(_)
+        ) {
+            flush_merged(state, paths)
+        } else {
+            let h = state.holder.read_fail_fast("holder");
+            let mut dirty_now = false;
+            match &*h {
+                IndexHolder::Mutable(idx) => {
+                    dirty_now = write_holder_index(idx, state, paths).is_ok();
+                }
+                IndexHolder::Shared(_) | IndexHolder::Empty => {}
+                IndexHolder::Overlaid(_) => {} // 上方已分流
+            }
+            if dirty_now {
+                state.dirty.store(0, Ordering::Relaxed);
+                *state.last_flush.lock_recover() = Instant::now();
+            }
+            false
         }
-        IndexHolder::Shared(_) | IndexHolder::Empty => {}
-        IndexHolder::Overlaid(_) => {} // 上方已分流
-    }
-    if dirty_now {
-        state.dirty.store(0, Ordering::Relaxed);
-        *state.last_flush.lock().unwrap() = Instant::now();
+    };
+    if relieve {
+        engine::malloc_pressure::release_heap_pressure();
     }
 }
 
@@ -796,17 +943,18 @@ fn flush(state: &EngineState, paths: &DaemonPaths) {
 /// diff 会把改动写进即将被丢弃的 Overlay(丢更新)。替换前在写锁内复核
 /// `Overlay::epoch`:世代前移则放弃本次替换(dirty 保留、last_flush 照刷以免
 /// 密集重试),下轮 flush 重新合并——绝不丢弃窗口内增量。
-fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
+/// 返回是否实际尝试过合并写(调用方据此在 flush_lock 释放后归还堆压力)。
+fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
     // 重扫在途:holder 即将被替换,合并旧 Base 无意义——且毒 Base 下每次尝试都
     // 跑完全量遍历才撞腐化(实测 25s+),会把消费循环钉在写盘上。跳过即可,增量
     // 由重扫产物的 base 覆盖 + rescan_dirty 重放追平(重扫结束自有 flush)。
     if state.rescanning.load(Ordering::SeqCst) {
-        return;
+        return false;
     }
     let written = {
-        let h = state.holder.read().unwrap();
+        let h = state.holder.read_fail_fast("holder");
         let IndexHolder::Overlaid(st) = &*h else {
-            return;
+            return false;
         };
         let epoch = st.overlay.epoch();
         let meta = build_meta(state);
@@ -827,7 +975,7 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
                     state.heal_requested.store(true, Ordering::SeqCst);
                     log::error!("合并写遇账本腐化,已置降级重扫自愈位: {e}");
                     state.dirty.store(0, Ordering::Relaxed);
-                    *state.last_flush.lock().unwrap() = Instant::now();
+                    *state.last_flush.lock_recover() = Instant::now();
                 } else {
                     log::error!("合并落盘失败: {e}");
                 }
@@ -835,13 +983,13 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
             }
         }
     };
-    let Some(epoch) = written else { return };
+    let Some(epoch) = written else { return false };
     match persist::load_mmap(&paths.index_file()) {
         Ok(view) => {
             // dir_map 必须与新 Base **同点提交**:先构建(锁外,旧 Base 照常服务),
             // 再在 swap 的写锁内一并安装——否则「新 Base + 旧 map」窗口会把磁盘
             // listing 挂到错条目下(毒 Base 事故的根因,见 install_holder_with_map)。
-            let literal_roots = state.roots.lock().unwrap().clone();
+            let literal_roots = state.roots.lock_recover().clone();
             let map = build_dir_map(view.as_ref(), &literal_roots);
             if swap_base_if_fresh(state, view, epoch, map) {
                 state.dirty.store(0, Ordering::Relaxed);
@@ -851,19 +999,18 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
                 defer_stale_merge(state);
             }
             // 节流起点按「尝试过 flush」推进:失败重试不密集化
-            *state.last_flush.lock().unwrap() = Instant::now();
-            // 合并写的条目流/缓冲产物已释放,滞留的大块脏页在此归还内核
-            // (与重扫/compact 同构;缺此调用时稳态 footprint 高 ~90MB 死页)
-            engine::malloc_pressure::release_heap_pressure();
+            *state.last_flush.lock_recover() = Instant::now();
+            // 合并写的条目流/缓冲产物已释放;堆压力归还在 flush_lock 释放后
+            // 由 flush 统一执行(见 flush 的块作用域)。
         }
         Err(e) => {
             log::error!("合并产物重载失败(保留增量态,下轮重试): {e}");
             // 节流起点照推进:dirty 已超批量阈值时,失败重试不得退化为
             // 消费循环逐轮密集全量重写
-            *state.last_flush.lock().unwrap() = Instant::now();
-            engine::malloc_pressure::release_heap_pressure();
+            *state.last_flush.lock_recover() = Instant::now();
         }
     }
+    true
 }
 
 /// 写锁内复核快照世代并替换 Shared(替换即清 Overlay)。返回是否替换。
@@ -876,7 +1023,7 @@ fn swap_base_if_fresh(
     expected_epoch: u64,
     map: DirIndexMap,
 ) -> bool {
-    let mut h = state.holder.write().unwrap();
+    let mut h = state.holder.write_fail_fast("holder");
     let fresh = match &*h {
         IndexHolder::Overlaid(st) => st.overlay.epoch() == expected_epoch,
         _ => false,
@@ -884,7 +1031,7 @@ fn swap_base_if_fresh(
     if fresh {
         // holder + dir_map 同点替换(锁序 holder → dir_map,与 diff_one 一致)
         *h = IndexHolder::Shared(view);
-        *state.dir_map.lock().unwrap() = map;
+        *state.dir_map.lock_fail_fast("dir_map") = map;
     }
     fresh
 }
@@ -895,7 +1042,7 @@ fn swap_base_if_fresh(
 /// 世代前移,自激成风暴(P0 实测 23 次背靠背全量写的放大器之一)。
 fn defer_stale_merge(state: &EngineState) {
     state.dirty.store(0, Ordering::Relaxed);
-    *state.last_flush.lock().unwrap() = Instant::now();
+    *state.last_flush.lock_recover() = Instant::now();
 }
 
 /// 单一 holder 内容的落盘(Mutable 索引或合成物化产物);失败留痕返回 Err。
@@ -917,8 +1064,8 @@ fn write_holder_index(
 
 /// 最终落盘(stop 路径):持 flush_lock 串行化;返回 (落盘成功, 条目数)。
 fn persist_final(state: &EngineState, paths: &DaemonPaths) -> (bool, u32) {
-    let _guard = state.flush_lock.lock().unwrap();
-    let h = state.holder.read().unwrap();
+    let _guard = state.flush_lock.lock_fail_fast("flush_lock");
+    let h = state.holder.read_fail_fast("holder");
     match &*h {
         IndexHolder::Mutable(idx) => {
             let meta = build_meta(state);
@@ -978,7 +1125,7 @@ fn live_count_of(view: &dyn IndexView) -> u32 {
 /// Base 陈旧条目**不预枚举**,仍计入近似值,落盘(物化去屏蔽)/重启后精确。
 /// 一次锁内完成计数——不得经 with_view 再入 holder(见 persist_final 再入钉)。
 fn status_entry_count(state: &EngineState) -> u32 {
-    let h = state.holder.read().unwrap();
+    let h = state.holder.read_fail_fast("holder");
     match &*h {
         IndexHolder::Shared(v) => live_count_of(v.as_ref()),
         IndexHolder::Mutable(i) => i.entry_count(),
@@ -996,7 +1143,7 @@ fn should_flush(state: &EngineState) -> bool {
     if dirty == 0 {
         return false;
     }
-    dirty >= FLUSH_DIRTY_LIMIT || state.last_flush.lock().unwrap().elapsed() >= FLUSH_INTERVAL
+    dirty >= FLUSH_DIRTY_LIMIT || state.last_flush.lock_recover().elapsed() >= FLUSH_INTERVAL
 }
 
 /// 应用一批目录 diff,全部完成后推进已应用水位。
@@ -1031,7 +1178,7 @@ fn apply_batch(state: &EngineState, dirs: Vec<String>, track_watermark: bool) {
 /// (清 Overlay)后再整理。
 fn maybe_compact(state: &EngineState) {
     let (before, after) = {
-        let mut h = state.holder.write().unwrap();
+        let mut h = state.holder.write_fail_fast("holder");
         match &mut *h {
             IndexHolder::Mutable(idx) => {
                 if !idx.needs_compaction() {
@@ -1142,7 +1289,7 @@ fn consume_events(
                     // 冷却双保险:rescan_floor 兜住重扫期间积压的旧标记,但重扫**之后**
                     // 新产生的 dropped(重扫自身引起的缓冲溢出)仍需限频,防退化振荡。
                     // 重扫已异步化(后台线程),消费不再停摆,本分支应趋于绝迹。
-                    if let Some(t) = *state.last_rescan.lock().unwrap() {
+                    if let Some(t) = *state.last_rescan.lock_recover() {
                         if t.elapsed() < RESCAN_COOLDOWN {
                             log::warn!(
                                 "重扫冷却期内再收丢弃标记({:.0}s 前刚重扫过),已忽略",
@@ -1217,7 +1364,7 @@ fn sampling_finds_gap(state: &Arc<EngineState>, paths: &DaemonPaths) -> bool {
     const SAMPLE_DIRS: usize = 100;
     const MISMATCH_PCT_LIMIT: usize = 5;
     let bases: Vec<PathBuf> = {
-        let map = state.dir_map.lock().unwrap();
+        let map = state.dir_map.lock_fail_fast("dir_map");
         if map.is_empty() {
             return false;
         }
@@ -1313,8 +1460,8 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     state.rescanning.store(true, Ordering::SeqCst);
     let _rescanning = ResetRescanning(&state.rescanning);
     let floor = fsevents::current_event_id();
-    let roots = state.roots.lock().unwrap().clone();
-    let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
+    let roots = state.roots.lock_recover().clone();
+    let excludes = reconcile::expand_excludes(&state.cfg.lock_recover().excluded);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
@@ -1325,7 +1472,7 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
         path: p.to_string_lossy().into_owned(),
         reason: r.clone(),
     }));
-    *state.gaps.lock().unwrap() = gap_list;
+    *state.gaps.lock_recover() = gap_list;
     state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
     // 重扫替换段(T4 迁移,tech.md §4.3「P0 替换段衔接」收口):产物**直写落盘 →
     // remap mmap Base → 清 Overlay**,不挂堆上 Mutable(与首扫共用
@@ -1350,7 +1497,7 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     // 基于旧索引 → 被 drain 带走重放」或「push 在 drain 后 → 基于新索引 →
     // 不重放」,无丢失。
     state.rescanning.store(false, Ordering::SeqCst);
-    let replayed: Vec<PathBuf> = state.rescan_dirty.lock().unwrap().drain().collect();
+    let replayed: Vec<PathBuf> = state.rescan_dirty.lock_recover().drain().collect();
     for dir in &replayed {
         diff_one(state, dir);
     }
@@ -1362,7 +1509,7 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     // (实测 254MB)在此一次性归还内核。
     engine::malloc_pressure::release_heap_pressure();
     state.set_state(state::READY);
-    *state.last_rescan.lock().unwrap() = Some(Instant::now());
+    *state.last_rescan.lock_recover() = Some(Instant::now());
     log::info!(
         "重扫完成(条目数: {:?})",
         with_view(state, |v| live_count_of(v))
@@ -1398,8 +1545,8 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
 /// 前提;重扫路径后续 drain 重放会重新累积)。meta 取调用方当时的水位——崩溃
 /// 窗口内盘上水位偏旧,重启重放幂等追平。
 fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
-    let literal_roots = state.roots.lock().unwrap().clone();
-    let _flush_guard = state.flush_lock.lock().unwrap();
+    let literal_roots = state.roots.lock_recover().clone();
+    let _flush_guard = state.flush_lock.lock_fail_fast("flush_lock");
     let n = idx.entry_count();
     let meta = build_meta(state);
     let layout = persist::EntryLayout::of(&idx);
@@ -1433,10 +1580,10 @@ fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
 /// 窗):flush_lock 内写盘 → 重载 → 形态复核 swap Shared。
 /// 锁序与窗口语义见 [`mount_scan_product`]。
 fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
-    let literal_roots = state.roots.lock().unwrap().clone();
-    let _flush_guard = state.flush_lock.lock().unwrap();
+    let literal_roots = state.roots.lock_recover().clone();
+    let _flush_guard = state.flush_lock.lock_fail_fast("flush_lock");
     let written = {
-        let h = state.holder.read().unwrap();
+        let h = state.holder.read_fail_fast("holder");
         let IndexHolder::Mutable(idx) = &*h else {
             return; // 已被转 Overlaid(理论不可达:刚挂的 Mutable);flush 兜底
         };
@@ -1451,11 +1598,11 @@ fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
         match persist::load_mmap(&paths.index_file()) {
             Ok(view) => {
                 let map = build_dir_map(view.as_ref(), &literal_roots);
-                let mut h = state.holder.write().unwrap();
+                let mut h = state.holder.write_fail_fast("holder");
                 if let IndexHolder::Mutable(_) = &*h {
                     // holder + dir_map 同点替换(见 install_holder_with_map)
                     *h = IndexHolder::Shared(view);
-                    *state.dir_map.lock().unwrap() = map;
+                    *state.dir_map.lock_fail_fast("dir_map") = map;
                     swapped = true;
                 }
                 // 形态已变(Overlaid):盘面已是本产物,增量交 flush 合并收敛
@@ -1474,13 +1621,13 @@ fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
     // 未换基(落盘/重载失败,或形态已变):确保 dir_map 与当前 holder 一致
     // ——首扫路径此前从未建过 map,cold_start 不再单独 rebuild。
     let map = {
-        let h = state.holder.read().unwrap();
+        let h = state.holder.read_fail_fast("holder");
         match &*h {
             IndexHolder::Mutable(idx) => build_dir_map(idx, &literal_roots),
             _ => return,
         }
     };
-    *state.dir_map.lock().unwrap() = map;
+    *state.dir_map.lock_fail_fast("dir_map") = map;
 }
 
 /// Overlaid{mmap Base, 空 Overlay} → Shared:刚写盘的 Base 即盘上真相,直挂免
@@ -1490,7 +1637,7 @@ fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
 /// (盘上即当前真相;否则 Shared 臂 flush 无操作且 dirty 滞留会让 should_flush
 /// 恒真,消费循环空转)。
 fn collapse_empty_overlay(state: &EngineState) {
-    let mut h = state.holder.write().unwrap();
+    let mut h = state.holder.write_fail_fast("holder");
     let taken = std::mem::replace(&mut *h, IndexHolder::Empty);
     let (landed, collapsed) = match taken {
         IndexHolder::Overlaid(st) if st.overlay.is_empty() => match st.base {
@@ -1516,7 +1663,7 @@ fn collapse_empty_overlay(state: &EngineState) {
 fn spawn_rescan(state: &Arc<EngineState>, paths: &DaemonPaths) {
     let st = state.clone();
     let p = paths.clone();
-    std::thread::spawn(move || degrade_and_rescan(&st, &p, false));
+    spawn_guarded("rescan", move || degrade_and_rescan(&st, &p, false));
 }
 
 /// 记录持久失败目录:入负缓存(去重)+ gaps 记账(去重,上限 256 条)。
@@ -1524,11 +1671,10 @@ fn spawn_rescan(state: &Arc<EngineState>, paths: &DaemonPaths) {
 fn record_persistent_failure(state: &EngineState, abs_dir: &Path, reason: &str) -> bool {
     let is_new = state
         .perm_denied
-        .lock()
-        .unwrap()
+        .lock_recover()
         .insert(abs_dir.to_path_buf());
     if is_new {
-        let mut gaps = state.gaps.lock().unwrap();
+        let mut gaps = state.gaps.lock_recover();
         let path_str = abs_dir.to_string_lossy().into_owned();
         if gaps.len() < 256 && !gaps.iter().any(|g| g.path == path_str) {
             gaps.push(Gap {
@@ -1584,7 +1730,7 @@ fn handle_diff_error(
             }
         }
         _ => {
-            let mut counts = state.diff_fail_counts.lock().unwrap();
+            let mut counts = state.diff_fail_counts.lock_recover();
             let n = counts.entry(abs_dir.to_path_buf()).or_insert(0);
             *n += 1;
             if *n >= 3 {
@@ -1605,7 +1751,7 @@ fn handle_diff_error(
 /// 冷启动编排(独立线程):有索引 → 直挂 Shared 秒开(零物化)→ 重放;无/损坏 → 首扫。
 fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     let cfg = config::load(&paths.config_file());
-    *state.cfg.lock().unwrap() = cfg.clone();
+    *state.cfg.lock_recover() = cfg.clone();
     // 外接卷(external-volumes):挂载中的期望卷并入初始 roots——落盘索引路径
     // 由此获得流覆盖(停机窗口重放追平卷内漂移);首扫路径一并纳入首扫。
     let desired_volumes = volumes::desired_roots(&cfg);
@@ -1615,8 +1761,8 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     let desired_set: std::collections::HashSet<PathBuf> = desired_volumes.iter().cloned().collect();
     let mut roots = default_roots()?;
     roots.extend(desired_volumes.iter().cloned());
-    *state.roots.lock().unwrap() = roots.clone();
-    let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
+    *state.roots.lock_recover() = roots.clone();
+    let excludes = reconcile::expand_excludes(&state.cfg.lock_recover().excluded);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
@@ -1644,7 +1790,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
                 state.set_state(state::DEGRADED);
                 spawn_rescan(&state, &paths);
             }
-            *state.holder.write().unwrap() = IndexHolder::Shared(view);
+            *state.holder.write_fail_fast("holder") = IndexHolder::Shared(view);
             state.set_state(state::RECONCILING);
             rebuild_dir_map(&state);
             // 启动清除:上次会话的卷前缀中,本次未挂载(或已停用)的移除——
@@ -1666,7 +1812,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             let mut index = Index::new();
             let mut staging_map = DirIndexMap::default();
             engine::scanner::seed_roots(&mut index, &mut staging_map, &roots);
-            *state.holder.write().unwrap() = IndexHolder::Mutable(index);
+            *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(index);
             let (recs, table, gaps) = engine::scanner::collect_records(&roots, &excludes, threads);
             state.built_at.store(now_secs(), Ordering::Relaxed);
             let mut gap_list = invalid_roots_gaps(&roots);
@@ -1674,10 +1820,10 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
                 path: p.to_string_lossy().into_owned(),
                 reason: r.clone(),
             }));
-            *state.gaps.lock().unwrap() = gap_list;
+            *state.gaps.lock_recover() = gap_list;
             state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
             for chunk in recs.chunks(SCAN_CHUNK) {
-                let mut h = state.holder.write().unwrap();
+                let mut h = state.holder.write_fail_fast("holder");
                 if let IndexHolder::Mutable(idx) = &mut *h {
                     engine::scanner::apply_records(idx, &mut staging_map, chunk, &table);
                 }
@@ -1720,7 +1866,9 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     }
     let st = state.clone();
     let p = paths.clone();
-    std::thread::spawn(move || {
+    // 消费线程是 daemon 的索引心跳:panic 若只死线程,进程仍应答 socket 但索引
+    // 永不更新(静默返回旧索引)。看护层记录后 exit(1),由 GUI 存活监控拉起。
+    spawn_guarded("consume-events", move || {
         consume_events(
             st,
             p,
@@ -1735,7 +1883,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     {
         let st = state.clone();
         let p = paths.clone();
-        std::thread::spawn(move || volumes::monitor_loop(st, p));
+        spawn_guarded("volume-monitor", move || volumes::monitor_loop(st, p));
     }
     Ok(())
 }
@@ -1831,12 +1979,12 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
             ..
         } => run_query(state, &query, limit, sort.as_deref(), desc.unwrap_or(false)),
         Request::Status { .. } => {
-            let name = *state.state_name.lock().unwrap();
+            let name = *state.state_name.lock_recover();
             let entry_count = status_entry_count(state);
             Response::Status {
                 state: name.into(),
                 entry_count,
-                gaps: state.gaps.lock().unwrap().clone(),
+                gaps: state.gaps.lock_recover().clone(),
                 io_error_count: state.io_errors.load(Ordering::Relaxed),
                 built_at: state.built_at.load(Ordering::Relaxed),
                 index_file: paths.index_file().to_string_lossy().into_owned(),
@@ -1855,7 +2003,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         }
         Request::ExcludeList { .. } => Response::Exclude {
             ok: true,
-            excluded: state.cfg.lock().unwrap().excluded.clone(),
+            excluded: state.cfg.lock_recover().excluded.clone(),
             message: None,
         },
         Request::ExcludeAdd { path, .. } => exclude_response(state, paths, &path, ExcludeOp::Add),
@@ -1885,7 +2033,7 @@ fn volumes_set(
     cleaned.sort();
     cleaned.dedup();
     let (auto_now, excluded_now, message) = {
-        let mut c = state.cfg.lock().unwrap();
+        let mut c = state.cfg.lock_recover();
         c.auto_index_volumes = auto;
         c.volumes_excluded = cleaned.clone();
         match config::save(&c, &paths.config_file()) {
@@ -1911,7 +2059,7 @@ fn volumes_set(
 
 /// 卷偏好读(设置页回显)。
 fn volumes_prefs_response(state: &Arc<EngineState>) -> Response {
-    let c = state.cfg.lock().unwrap();
+    let c = state.cfg.lock_recover();
     Response::VolumesPrefs {
         auto: c.auto_index_volumes,
         excluded: c.volumes_excluded.clone(),
@@ -1926,7 +2074,7 @@ fn exclude_response(
     path: &str,
     op: ExcludeOp,
 ) -> Response {
-    let excluded = || state.cfg.lock().unwrap().excluded.clone();
+    let excluded = || state.cfg.lock_recover().excluded.clone();
     match apply_exclude_change(state, paths, path, op) {
         Ok(()) => Response::Exclude {
             ok: true,
@@ -1953,17 +2101,17 @@ enum ExcludeOp {
 /// 不持 `cfg` 锁跨越保存/重扫;成功后一次全量重扫使默认排除项同时生效。
 fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
     // 与 add/remove 共用变更锁:保存/内存替换/重扫整体串行,防配置与内存错位。
-    let _op = state.exclude_op_lock.lock().unwrap();
+    let _op = state.exclude_op_lock.lock_recover();
     let defaults = config::default_config();
     if let Err(e) = config::save(&defaults, &paths.config_file()) {
         log::error!("恢复默认排除目录:配置保存失败: {e}");
         return Response::Exclude {
             ok: false,
-            excluded: state.cfg.lock().unwrap().excluded.clone(),
+            excluded: state.cfg.lock_recover().excluded.clone(),
             message: Some(format!("配置保存失败({e}),排除目录未改变")),
         };
     }
-    *state.cfg.lock().unwrap() = defaults.clone();
+    *state.cfg.lock_recover() = defaults.clone();
     degrade_and_rescan(state, paths, true); // 同步:响应语义「返回时排除项已生效」
     Response::Exclude {
         ok: true,
@@ -2004,25 +2152,25 @@ fn apply_exclude_change(
     op: ExcludeOp,
 ) -> Result<(), String> {
     // 跨连接串行化:校验/内存更新/落盘/重扫期间不允许另一 Exclude 变更穿插。
-    let _op = state.exclude_op_lock.lock().unwrap();
+    let _op = state.exclude_op_lock.lock_recover();
     match op {
         ExcludeOp::Add => {
-            let roots = state.roots.lock().unwrap().clone();
+            let roots = state.roots.lock_recover().clone();
             validate_exclude_in_roots(path, &roots)?;
-            let mut cfg = state.cfg.lock().unwrap();
+            let mut cfg = state.cfg.lock_recover();
             if !cfg.excluded.iter().any(|e| e == path) {
                 cfg.excluded.push(path.to_string());
             }
         }
         ExcludeOp::Remove => {
-            let mut cfg = state.cfg.lock().unwrap();
+            let mut cfg = state.cfg.lock_recover();
             if !cfg.excluded.iter().any(|e| e == path) {
                 return Err(format!("条目不存在: {path}"));
             }
             cfg.excluded.retain(|e| e != path);
         }
     }
-    let cfg = state.cfg.lock().unwrap().clone();
+    let cfg = state.cfg.lock_recover().clone();
     if let Err(e) = config::save(&cfg, &paths.config_file()) {
         log::error!("配置保存失败: {e}");
         return Err(format!("配置保存失败({e}),变更未持久化,重启后将丢失"));
@@ -2049,19 +2197,22 @@ pub fn serve(paths: DaemonPaths) -> Result<()> {
     // 上次会话崩溃/强杀残留的索引临时文件(tmp 与溢写段):与目标同目录、前缀
     // 精确匹配,启动即清扫(实机曾见 40MB 残留)。
     persist::cleanup_stale_index_tmp(&paths.data_dir);
-    // 后台线程 panic 默认只写 stderr(随启动方式可能丢失),且会让 rescan_lock
-    // 等 Mutex 中毒——统一经 log 留痕,排障时不再「静默死线程」。
+    // 后台线程 panic 默认只写 stderr(随启动方式可能丢失)——统一经 log 留痕,
+    // 排障时不再「静默死线程」。hook 只做诊断,退出由 spawn_guarded 的
+    // catch_unwind 负责;hook 自身包 catch_unwind,避免诊断路径反过来阻断退出。
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log::error!("线程 panic: {info}");
-        default_hook(info);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log::error!("线程 panic: {info}");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| default_hook(info)));
     }));
     let listener = bind_single_instance(&paths.socket())?;
     let state = Arc::new(EngineState::new());
     {
         let st = state.clone();
         let p = paths.clone();
-        std::thread::spawn(move || {
+        spawn_guarded("cold-start", move || {
             if let Err(e) = cold_start(st, p) {
                 log::error!("冷启动失败: {e:#}");
             }
@@ -2074,7 +2225,7 @@ pub fn serve(paths: DaemonPaths) -> Result<()> {
         let Ok(mut stream) = stream else { continue };
         let st = state.clone();
         let p = paths.clone();
-        std::thread::spawn(move || {
+        spawn_guarded("conn", move || {
             if let Err(e) = handle_conn(&mut stream, &st, &p) {
                 log::warn!("连接处理失败: {e:#}");
             }
@@ -2165,7 +2316,7 @@ mod tests {
             "清洗:去空白/去空串/排序去重"
         );
         {
-            let c = state.cfg.lock().unwrap();
+            let c = state.cfg.lock_recover();
             assert!(
                 !c.auto_index_volumes && c.volumes_excluded == excluded,
                 "内存态生效"
@@ -2187,11 +2338,11 @@ mod tests {
         let mut idx = Index::new();
         let root = idx.insert(dir.to_string_lossy().as_ref(), NO_PARENT, true);
         {
-            let mut map = state.dir_map.lock().unwrap();
+            let mut map = state.dir_map.lock_fail_fast("dir_map");
             let key = dir.canonicalize().unwrap();
             map.insert(&key, root);
         }
-        *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
         state
     }
 
@@ -2221,17 +2372,16 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
         // Shared 态建 dir_map(rebuild 改读 IndexView,不再要求 Mutable;
         // 突变「rebuild 仍只认 Mutable 提前返回」→ map 被清空,断言必红)
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         rebuild_dir_map(&state);
         assert!(
             state
                 .dir_map
-                .lock()
-                .unwrap()
+                .lock_fail_fast("dir_map")
                 .contains_key(&dir.path().canonicalize().unwrap()),
             "Shared 态 rebuild_dir_map 应建立根映射"
         );
@@ -2244,7 +2394,7 @@ mod tests {
         std::fs::write(dir.path().join("c.txt"), b"").unwrap();
         assert_eq!(diff_one(&state, dir.path()), 1, "首个 diff 应生效");
         {
-            let h = state.holder.read().unwrap();
+            let h = state.holder.read_fail_fast("holder");
             assert!(
                 matches!(&*h, IndexHolder::Overlaid(_)),
                 "diff 后应为 Overlaid 态(Base + Overlay),不再物化全量索引"
@@ -2291,7 +2441,7 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
         // data_dir 指向不存在目录:Shared 分支不得尝试写(写即失败 ok=false)
         let paths = DaemonPaths {
@@ -2324,11 +2474,11 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
         let st = state.clone();
         let writer = std::thread::spawn(move || {
-            let _g = st.holder.write().unwrap(); // 短暂持写后释放
+            let _g = st.holder.write_fail_fast("holder"); // 短暂持写后释放
         });
         std::thread::sleep(std::time::Duration::from_millis(5));
         let paths = DaemonPaths {
@@ -2356,15 +2506,15 @@ mod tests {
         let probe = {
             let lock = Arc::clone(&lock);
             std::thread::spawn(move || {
-                let g1 = lock.read().unwrap(); // A 持读
+                let g1 = lock.read_recover(); // A 持读
                 let w = {
                     let lock = Arc::clone(&lock);
                     std::thread::spawn(move || {
-                        let _w = lock.write().unwrap(); // B 请求写 → 入队阻塞
+                        let _w = lock.write_recover(); // B 请求写 → 入队阻塞
                     })
                 };
                 std::thread::sleep(std::time::Duration::from_millis(200)); // 确保 B 入队
-                let g2 = lock.read().unwrap(); // A 二次读 → 阻塞(平台若放行则返回)
+                let g2 = lock.read_recover(); // A 二次读 → 阻塞(平台若放行则返回)
                 drop(g1);
                 drop(g2); // 先放全部读锁再等写者,否则 join 永挂
                 w.join().unwrap();
@@ -2411,7 +2561,7 @@ mod tests {
         );
         // T3:diff 写 Overlay,holder 转 Overlaid;status 近似计数扣掉桥 anchor
         // 后 = 根 + a.txt(被屏蔽 Base 条目不预枚举,一般情形为近似,此处恰精确)
-        let h = state.holder.read().unwrap();
+        let h = state.holder.read_fail_fast("holder");
         assert!(
             matches!(&*h, IndexHolder::Overlaid(_)),
             "diff 后应为 Overlaid 态"
@@ -2462,7 +2612,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         let state = EngineState::new();
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         let paths = DaemonPaths {
             data_dir: dir.path().join("data"),
         };
@@ -2472,7 +2622,7 @@ mod tests {
         let floor = state.rescan_floor.load(Ordering::Relaxed);
         assert!(floor >= before, "覆盖水位取重扫开始时刻");
         assert!(state.applied_event_id.load(Ordering::Relaxed) >= floor);
-        assert_eq!(*state.state_name.lock().unwrap(), state::READY);
+        assert_eq!(*state.state_name.lock_recover(), state::READY);
         assert!(paths.index_file().exists(), "重扫后落盘");
     }
 
@@ -2510,7 +2660,7 @@ mod tests {
         std::fs::write(dir.path().join("hit_file.txt"), b"x").unwrap();
         let state = mounted_state(dir.path());
         {
-            let mut h = state.holder.write().unwrap();
+            let mut h = state.holder.write_fail_fast("holder");
             let IndexHolder::Mutable(idx) = &mut *h else {
                 panic!("应为可变索引")
             };
@@ -2570,8 +2720,8 @@ mod tests {
         let root = tmp.path().join("scan");
         std::fs::create_dir(&root).unwrap();
         let state = Arc::new(EngineState::new());
-        *state.roots.lock().unwrap() = vec![root];
-        *state.cfg.lock().unwrap() = config::Config {
+        *state.roots.lock_recover() = vec![root];
+        *state.cfg.lock_recover() = config::Config {
             excluded: excluded.iter().map(|e| (*e).to_string()).collect(),
             auto_index_volumes: true,
             volumes_excluded: vec![],
@@ -2591,7 +2741,7 @@ mod tests {
         apply_exclude_change(&state, &paths, "node_modules", ExcludeOp::Remove)
             .expect("已存在的相对名条目应可移除");
         assert_eq!(
-            state.cfg.lock().unwrap().excluded,
+            state.cfg.lock_recover().excluded,
             vec!["/abs/x".to_string()]
         );
         assert_eq!(
@@ -2605,12 +2755,12 @@ mod tests {
     #[test]
     fn exclude_remove_missing_entry_errors_without_change() {
         let (_tmp, state, paths) = exclude_fixture(&["node_modules", "/abs/x"]);
-        config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
+        config::save(&state.cfg.lock_recover(), &paths.config_file()).unwrap();
         let err = apply_exclude_change(&state, &paths, "/not/existing", ExcludeOp::Remove)
             .expect_err("不存在的条目应拒绝移除");
         assert_eq!(err, "条目不存在: /not/existing");
         assert_eq!(
-            state.cfg.lock().unwrap().excluded,
+            state.cfg.lock_recover().excluded,
             vec!["node_modules".to_string(), "/abs/x".to_string()],
             "失败不得改动内存配置"
         );
@@ -2627,15 +2777,15 @@ mod tests {
     #[test]
     fn exclude_reset_restores_defaults_and_rescans_with_new_excludes() {
         let (_tmp, state, paths) = exclude_fixture(&["node_modules"]);
-        let root = state.roots.lock().unwrap()[0].clone();
+        let root = state.roots.lock_recover()[0].clone();
         // 自定义排除目录里放一个文件:重置前整棵子树被剪枝,重置后应被索引。
         let custom_dir = root.join("custom_excluded");
         std::fs::create_dir(&custom_dir).unwrap();
         let hidden_file = custom_dir.join("inside.txt");
         std::fs::write(&hidden_file, b"x").unwrap();
         let custom = custom_dir.to_string_lossy().into_owned();
-        state.cfg.lock().unwrap().excluded.push(custom.clone());
-        config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
+        state.cfg.lock_recover().excluded.push(custom.clone());
+        config::save(&state.cfg.lock_recover(), &paths.config_file()).unwrap();
 
         let resp = reset_excludes(&state, &paths);
         let defaults = config::default_config();
@@ -2652,7 +2802,7 @@ mod tests {
             other => panic!("意外响应: {other:?}"),
         }
 
-        let memory = state.cfg.lock().unwrap().excluded.clone();
+        let memory = state.cfg.lock_recover().excluded.clone();
         assert_eq!(memory, defaults.excluded, "内存配置须恢复默认排除项");
         assert!(
             !memory.iter().any(|e| e == &custom),
@@ -2664,7 +2814,7 @@ mod tests {
             "默认配置须落盘"
         );
         assert!(
-            *state.state_name.lock().unwrap() == state::READY,
+            *state.state_name.lock_recover() == state::READY,
             "恢复默认须完成一次重扫(状态 READY)"
         );
         let hidden_path = hidden_file.to_string_lossy().into_owned();
@@ -2713,12 +2863,12 @@ mod tests {
             other => panic!("意外响应: {other:?}"),
         }
         assert_eq!(
-            state.cfg.lock().unwrap().excluded,
+            state.cfg.lock_recover().excluded,
             vec!["/custom/x".to_string(), "node_modules".to_string()],
             "保存失败不得改动内存配置"
         );
         assert!(
-            *state.state_name.lock().unwrap() == state::BUILDING,
+            *state.state_name.lock_recover() == state::BUILDING,
             "保存失败不得触发重扫(状态保持原样)"
         );
     }
@@ -2732,13 +2882,13 @@ mod tests {
         use std::time::Duration;
 
         let (tmp, state, paths) = exclude_fixture(&["node_modules"]);
-        config::save(&state.cfg.lock().unwrap(), &paths.config_file()).unwrap();
+        config::save(&state.cfg.lock_recover(), &paths.config_file()).unwrap();
         let sub = tmp.path().join("scan").join("sub");
         std::fs::create_dir(&sub).unwrap();
         let sub = sub.to_string_lossy().into_owned();
 
         // add:持锁时线程必须阻塞,释放后成功。
-        let guard = state.exclude_op_lock.lock().unwrap();
+        let guard = state.exclude_op_lock.lock_recover();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let st = state.clone();
@@ -2768,7 +2918,7 @@ mod tests {
         assert!(added.is_ok(), "{added:?}");
 
         // reset:同样必须等待变更锁。
-        let guard = state.exclude_op_lock.lock().unwrap();
+        let guard = state.exclude_op_lock.lock_recover();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let st = state.clone();
@@ -2813,7 +2963,7 @@ mod tests {
             .expect_err("根外绝对路径不得加入");
         assert!(err.contains("路径不在扫描根内"));
         assert!(
-            state.cfg.lock().unwrap().excluded.is_empty(),
+            state.cfg.lock_recover().excluded.is_empty(),
             "被拒绝的 Add 不得改动配置"
         );
         assert!(!paths.config_file().exists(), "被拒绝的 Add 不得落盘");
@@ -2823,7 +2973,7 @@ mod tests {
         let inside = inside.to_string_lossy().into_owned();
         apply_exclude_change(&state, &paths, &inside, ExcludeOp::Add)
             .expect("根内绝对路径应可加入");
-        assert_eq!(state.cfg.lock().unwrap().excluded, vec![inside.clone()]);
+        assert_eq!(state.cfg.lock_recover().excluded, vec![inside.clone()]);
         assert_eq!(
             config::load(&paths.config_file()).excluded,
             vec![inside],
@@ -2910,8 +3060,8 @@ mod tests {
             let k = idx.insert(&name, pidx, true);
             map.insert(&p, k);
         }
-        *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
-        *state.dir_map.lock().unwrap() = map;
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        *state.dir_map.lock_fail_fast("dir_map") = map;
         state
     }
 
@@ -2932,17 +3082,17 @@ mod tests {
         assert_eq!(diff_one(&state, &locked), 0, "diff 失败返回 0 变更");
         {
             // T3:diff 路径转 Overlaid,base 经可变槽位读取(mounted_state 为 Heap 载体)
-            let mut h = state.holder.write().unwrap();
+            let mut h = state.holder.write_fail_fast("holder");
             let idx = mutable_base_slot(&mut h).expect("holder 应持可变 base");
-            let map = state.dir_map.lock().unwrap();
+            let map = state.dir_map.lock_fail_fast("dir_map");
             let locked_idx = map.get(&locked).expect("locked 键应在");
             assert!(
                 idx.entries[locked_idx as usize].is_live(),
                 "EPERM 目录保留条目(与首扫「入索引+空子树+gaps」语义一致)"
             );
         }
-        assert!(state.perm_denied.lock().unwrap().contains(&locked));
-        assert_eq!(state.gaps.lock().unwrap().len(), 1, "gaps 记账一次");
+        assert!(state.perm_denied.lock_recover().contains(&locked));
+        assert_eq!(state.gaps.lock_recover().len(), 1, "gaps 记账一次");
 
         let mid = state.io_errors.load(Ordering::Relaxed);
         assert_eq!(diff_one(&state, &locked), 0);
@@ -2967,13 +3117,13 @@ mod tests {
 
         assert_eq!(diff_one(&state, &gone), 0);
         {
-            let mut h = state.holder.write().unwrap();
+            let mut h = state.holder.write_fail_fast("holder");
             let idx = mutable_base_slot(&mut h).expect("holder 应持可变 base");
             let live = idx.entries.iter().filter(|e| e.is_live()).count();
             assert_eq!(live, 1, "仅剩根条目:gone 子树级联摘除");
         }
         assert!(
-            !state.dir_map.lock().unwrap().contains_key(&gone),
+            !state.dir_map.lock_fail_fast("dir_map").contains_key(&gone),
             "dir_map 键同步清除"
         );
     }
@@ -2988,26 +3138,26 @@ mod tests {
         let state = seeded_state(tmp.path(), &["d"]);
         let e = std::io::Error::from_raw_os_error(5); // EIO,非 NotFound/EPERM
         {
-            let mut h = state.holder.write().unwrap();
+            let mut h = state.holder.write_fail_fast("holder");
             ensure_overlay_ready(&mut h); // handle_diff_error 消费 BaseRef + Overlay
             let IndexHolder::Overlaid(st) = &mut *h else {
                 panic!("holder 应为 Overlaid")
             };
             let OverlaidState { base, overlay } = st.as_mut();
-            let mut map = state.dir_map.lock().unwrap();
+            let mut map = state.dir_map.lock_fail_fast("dir_map");
             handle_diff_error(&state, base, overlay, &mut map, &dir, &e);
             handle_diff_error(&state, base, overlay, &mut map, &dir, &e);
             assert!(
-                !state.perm_denied.lock().unwrap().contains(&dir),
+                !state.perm_denied.lock_recover().contains(&dir),
                 "前两次不入负缓存"
             );
             handle_diff_error(&state, base, overlay, &mut map, &dir, &e);
         }
         assert!(
-            state.perm_denied.lock().unwrap().contains(&dir),
+            state.perm_denied.lock_recover().contains(&dir),
             "第三次入负缓存"
         );
-        assert_eq!(state.gaps.lock().unwrap().len(), 1);
+        assert_eq!(state.gaps.lock_recover().len(), 1);
     }
 
     /// 负缓存键稳定性钉:键为 canonical 路径——条目号在 compact/重扫替换后失效,
@@ -3025,7 +3175,7 @@ mod tests {
         let locked = root.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         diff_one(&state, &locked);
-        assert!(state.perm_denied.lock().unwrap().contains(&locked));
+        assert!(state.perm_denied.lock_recover().contains(&locked));
 
         {
             // T3:diff_one 后 holder 为 Overlaid(Overlay 活跃,直接 compact 会重排
@@ -3040,8 +3190,8 @@ mod tests {
                 let k = idx.insert(sub, r, true);
                 map.insert(&p, k);
             }
-            *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
-            *state.dir_map.lock().unwrap() = map;
+            *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+            *state.dir_map.lock_fail_fast("dir_map") = map;
         }
         let mid = state.io_errors.load(Ordering::Relaxed);
         diff_one(&state, &locked);
@@ -3074,7 +3224,7 @@ mod tests {
         std::fs::write(d.join("x.txt"), "").unwrap();
         assert!(diff_one(&state, &d) > 0, "窗口内变更照常 diff(旧索引)");
         assert!(
-            state.rescan_dirty.lock().unwrap().contains(&d),
+            state.rescan_dirty.lock_recover().contains(&d),
             "窗口内 diff 记集合"
         );
 
@@ -3085,13 +3235,13 @@ mod tests {
         map.insert(&root, r);
         let d_idx = idx.insert("d", r, true);
         map.insert(&d, d_idx);
-        *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
-        *state.dir_map.lock().unwrap() = map;
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        *state.dir_map.lock_fail_fast("dir_map") = map;
         assert_eq!(status_entry_count(&state), 2, "替换后快照不含窗口变更");
 
         // 替换段追平:清标志(rescanning)→ drain → 逐目录重放
         state.rescanning.store(false, Ordering::SeqCst);
-        let replayed: Vec<PathBuf> = state.rescan_dirty.lock().unwrap().drain().collect();
+        let replayed: Vec<PathBuf> = state.rescan_dirty.lock_recover().drain().collect();
         assert_eq!(replayed.len(), 1);
         for dir in &replayed {
             diff_one(&state, dir);
@@ -3124,7 +3274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         let state = Arc::new(EngineState::new());
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         let paths = DaemonPaths {
             data_dir: dir.path().join("data"),
         };
@@ -3134,7 +3284,7 @@ mod tests {
         state.dirty.store(9, Ordering::Relaxed);
         degrade_and_rescan(&state, &paths, true);
         {
-            let h = state.holder.read().unwrap();
+            let h = state.holder.read_fail_fast("holder");
             assert!(
                 matches!(&*h, IndexHolder::Shared(_)),
                 "重扫后应直挂 mmap Base(Shared),不得挂堆 Mutable"
@@ -3174,14 +3324,20 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
         let stale_key = stale.canonicalize().unwrap();
-        state.dir_map.lock().unwrap().insert(&stale_key, 999);
+        state
+            .dir_map
+            .lock_fail_fast("dir_map")
+            .insert(&stale_key, 999);
         // diff 走到越界键:清映射返回 0,不 panic
         assert_eq!(diff_one(&state, &stale), 0, "越界键按死键处理");
         assert!(
-            !state.dir_map.lock().unwrap().contains_key(&stale_key),
+            !state
+                .dir_map
+                .lock_fail_fast("dir_map")
+                .contains_key(&stale_key),
             "陈旧键应被清出"
         );
     }
@@ -3207,16 +3363,16 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         rebuild_dir_map(&state);
 
         // 磁盘漂移 + diff → Overlaid(增量在 Overlay,未落盘)
         std::fs::write(dir.path().join("new.txt"), b"").unwrap();
         assert_eq!(diff_one(&state, dir.path()), 1);
         assert!(matches!(
-            &*state.holder.read().unwrap(),
+            &*state.holder.read_fail_fast("holder"),
             IndexHolder::Overlaid(_)
         ));
 
@@ -3226,7 +3382,10 @@ mod tests {
         };
         flush(&state, &paths);
         assert!(
-            matches!(&*state.holder.read().unwrap(), IndexHolder::Shared(_)),
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Shared(_)
+            ),
             "flush 后应为 Shared(remap 完成、Overlay 清零)"
         );
         // 内存查询:增量保留(合并写不得丢更新)
@@ -3252,6 +3411,7 @@ mod tests {
         let lock = Arc::new(Mutex::new(()));
         let l2 = lock.clone();
         let _ = std::thread::spawn(move || {
+            // 故意裸 lock:本测要制造真实中毒(不能用 lock_recover)
             let _g = l2.lock().unwrap();
             panic!("模拟重扫线程 panic");
         })
@@ -3264,6 +3424,88 @@ mod tests {
         );
         drop(g);
         assert!(try_acquire_rescan(&lock).is_some(), "释放后可再取");
+    }
+
+    /// 快照/配置类锁的恢复钉:前持有线程 panic → 锁中毒 → 后续 lock_recover
+    /// 必须取 inner 继续,不得再次 panic(否则一次后台 panic 会把所有查询级联
+    /// 打死)。突变「lock_recover 改回 .lock().unwrap()」本测红。
+    #[test]
+    fn lock_recover_survives_poison_and_keeps_data() {
+        let m = Arc::new(Mutex::new(41u32));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("模拟持锁线程 panic");
+        })
+        .join();
+        assert!(m.is_poisoned(), "前提:锁已中毒");
+        assert_eq!(*m.lock_recover(), 41, "中毒后仍可读到 panic 前的数据");
+        *m.lock_recover() += 1;
+        assert_eq!(*m.lock_recover(), 42, "恢复后写入照常生效");
+    }
+
+    /// 看护层退出钉(子进程):后台线程 panic → 进程必须 exit(1),而不是只死
+    /// 线程、daemon 继续应答旧索引。突变「去掉 spawn_guarded 的 catch_unwind +
+    /// exit」→ 子进程走到末尾的 exit(99),父测红。
+    #[test]
+    fn guarded_thread_panic_exits_process() {
+        const ENV: &str = "MCE_TEST_GUARDED_EXIT_CHILD";
+        if std::env::var_os(ENV).is_some() {
+            spawn_guarded("guard-test", || panic!("模拟消费线程 panic"));
+            std::thread::sleep(Duration::from_secs(5));
+            std::process::exit(99); // 未捕获到 panic 才会走到这里
+        }
+        let out = run_exit_child("daemon::tests::guarded_thread_panic_exits_process", ENV);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "后台线程 panic 应 fail-fast 退出(1);stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("模拟消费线程 panic"),
+            "panic 信息应留痕: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 完整性锁 fail-fast 钉(子进程):holder/dir_map/flush_lock 中毒后继续
+    /// 使用可能基于半改状态,必须退出而非恢复。突变「lock_fail_fast 改 recover」
+    /// → 子进程走到 exit(99),父测红。
+    #[test]
+    fn integrity_lock_poison_exits_process() {
+        const ENV: &str = "MCE_TEST_FAILFAST_EXIT_CHILD";
+        if std::env::var_os(ENV).is_some() {
+            let m = Arc::new(Mutex::new(()));
+            let m2 = Arc::clone(&m);
+            let _ = std::thread::spawn(move || {
+                let _g = m2.lock().unwrap();
+                panic!("模拟持完整性锁线程 panic");
+            })
+            .join();
+            assert!(m.is_poisoned(), "前提:锁已中毒");
+            let _g = m.lock_fail_fast("test-integrity-lock");
+            std::process::exit(99); // fail-fast 未生效才会走到这里
+        }
+        let out = run_exit_child("daemon::tests::integrity_lock_poison_exits_process", ENV);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "完整性锁中毒应 fail-fast 退出(1);stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 以当前测试二进制再跑单个用例(子进程),用于断言「进程退出」语义。
+    fn run_exit_child(test_name: &str, env_key: &str) -> std::process::Output {
+        let exe = std::env::current_exe().expect("测试二进制路径");
+        std::process::Command::new(exe)
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(env_key, "1")
+            .output()
+            .expect("启动测试子进程")
     }
 
     /// 重扫中标志兜底复位钉:重扫线程 panic 时 rescanning 必须复位,否则
@@ -3366,12 +3608,12 @@ mod tests {
         let mut map = DirIndexMap::default();
         let key = dir.path().canonicalize().unwrap();
         map.insert(&key, 0);
-        *state.holder.write().unwrap() = IndexHolder::Overlaid(Box::new(OverlaidState {
+        *state.holder.write_fail_fast("holder") = IndexHolder::Overlaid(Box::new(OverlaidState {
             base: BaseRef::Heap(idx),
             overlay: engine::overlay::Overlay::new(),
         }));
-        *state.dir_map.lock().unwrap() = map;
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.dir_map.lock_fail_fast("dir_map") = map;
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         // 数据目录不存在:合并写 io NotFound(非腐化)
         let paths = DaemonPaths {
             data_dir: dir.path().join("absent"),
@@ -3409,9 +3651,9 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         rebuild_dir_map(&state);
         // 磁盘树与 v1 索引同构(扫描语义)
         std::fs::create_dir(dir.path().join("d")).unwrap();
@@ -3430,7 +3672,7 @@ mod tests {
         };
         flush(&state, &paths);
         assert!(matches!(
-            &*state.holder.read().unwrap(),
+            &*state.holder.read_fail_fast("holder"),
             IndexHolder::Shared(_)
         ));
 
@@ -3449,7 +3691,7 @@ mod tests {
         .expect("新索引应含 d");
         assert_ne!(new_d_id, 2, "夹具应保证编号前移(d: 2→{new_d_id})");
         assert_eq!(
-            state.dir_map.lock().unwrap().get(&d_path),
+            state.dir_map.lock_fail_fast("dir_map").get(&d_path),
             Some(new_d_id),
             "合并 swap 后 dir_map 必须重建(d 值应为新号)",
         );
@@ -3493,9 +3735,9 @@ mod tests {
             &idx_file,
         )
         .unwrap();
-        *state.holder.write().unwrap() =
+        *state.holder.write_fail_fast("holder") =
             IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
-        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
         rebuild_dir_map(&state);
         let paths = DaemonPaths {
             data_dir: data.path().to_path_buf(),
@@ -3505,12 +3747,12 @@ mod tests {
         // 增量」的盘面(flush 读锁快照段的等价物)
         std::fs::write(dir.path().join("new.txt"), b"").unwrap();
         assert_eq!(diff_one(&state, dir.path()), 1);
-        let epoch_snapshot = match &*state.holder.read().unwrap() {
+        let epoch_snapshot = match &*state.holder.read_fail_fast("holder") {
             IndexHolder::Overlaid(st) => st.overlay.epoch(),
             _ => panic!("diff 后应为 Overlaid"),
         };
         {
-            let h = state.holder.read().unwrap();
+            let h = state.holder.read_fail_fast("holder");
             let IndexHolder::Overlaid(st) = &*h else {
                 panic!("应为 Overlaid")
             };
@@ -3534,7 +3776,10 @@ mod tests {
             "世代前移必须放弃替换"
         );
         assert!(
-            matches!(&*state.holder.read().unwrap(), IndexHolder::Overlaid(_)),
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Overlaid(_)
+            ),
             "拒绝替换后保留增量态"
         );
         // P0 加固钉:放弃替换的收尾必须清 dirty(盘面已含快照增量)——否则
@@ -3557,7 +3802,10 @@ mod tests {
         // 下轮 flush:重新合并落盘(含 c.txt)→ 以当前世代替换成功 → Shared
         flush(&state, &paths);
         assert!(
-            matches!(&*state.holder.read().unwrap(), IndexHolder::Shared(_)),
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Shared(_)
+            ),
             "下轮 flush 应替换成功(世代一致)"
         );
         match run_query(&state, "whole:c.txt", 10, None, false) {
@@ -3591,14 +3839,17 @@ mod tests {
         )
         .unwrap();
         // Overlaid{Mmap, 空 Overlay} + 预置 dirty(模拟窗口计数滞留)
-        *state.holder.write().unwrap() = IndexHolder::Overlaid(Box::new(OverlaidState {
+        *state.holder.write_fail_fast("holder") = IndexHolder::Overlaid(Box::new(OverlaidState {
             base: BaseRef::Mmap(persist::load_mmap(&idx_file).unwrap()),
             overlay: engine::overlay::Overlay::new(),
         }));
         state.dirty.store(7, Ordering::Relaxed);
         collapse_empty_overlay(&state);
         assert!(
-            matches!(&*state.holder.read().unwrap(), IndexHolder::Shared(_)),
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Shared(_)
+            ),
             "空 Overlay 的 mmap Base 应收敛 Shared"
         );
         assert_eq!(
