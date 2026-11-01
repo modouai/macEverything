@@ -39,9 +39,14 @@ fn main() -> anyhow::Result<()> {
     // 0) 单实例(eframe 前):二次启动在 acquire 内「唤起已有实例 + exit(0)」
     let (instance, incoming) = single_instance::acquire(&paths)?;
 
-    // 1) 引擎探测/拉起:失败不阻塞 UI(错误展示 Task 12 接,此处 stderr 留痕)
-    if let Err(err) = engine_launcher::ensure_engine(&paths) {
-        eprintln!("引擎未就绪: {err:#}");
+    // 1) 引擎探测/拉起:失败不阻塞 UI(错误展示 Task 12 接,此处 stderr 留痕)。
+    // 成功才置「期望运行」:启动即离线是合法状态,存活监控不得擅自拉起。
+    match engine_launcher::ensure_engine(&paths) {
+        Ok(()) => engine_launcher::set_expected_running(true),
+        Err(err) => {
+            engine_launcher::set_expected_running(false);
+            eprintln!("引擎未就绪: {err:#}");
+        }
     }
 
     // 2) 开机自启(Task 20,product §4):首次启动默认注册;用户曾主动关闭

@@ -500,6 +500,19 @@ impl PaletteState {
         self.show_at = Some(now);
     }
 
+    /// daemon 被存活监控自动拉起后:离线角标改「引擎启动中」,输入非空则重发
+    /// 当前查询(下次唤起仍走 reset,不残留旧状态)。
+    pub fn on_engine_restarted(&mut self) {
+        if matches!(self.session.state, State::Offline) {
+            self.session.mark_engine_starting();
+        }
+        self.status_note = badge_note(&self.session.state, None);
+        if !self.input.is_empty() {
+            self.session.on_input(&self.input, Instant::now());
+        }
+        self.ctx.request_repaint_of(self.viewport);
+    }
+
     /// 唤起时按屏幕回填面板宽(平台层实际落地宽;防御 clamp 到 [480, PANEL_W])。
     /// 须在 `reset` 前调用——reset 内的 `send_h(INITIAL_H)` 以本宽下发。
     pub fn set_panel_width(&mut self, w: f32) {

@@ -686,6 +686,22 @@ impl App {
                 log::error!("定时检查更新线程启动失败:{err}");
             }
         }
+        // daemon 存活监控(每 5s):daemon 后台线程 panic 会 fail-fast 退出(见
+        // cli/daemon.rs spawn_guarded);此处负责在 socket 断续后自动拉起,并清
+        // UI 离线提示/重查。期望运行标志由 main/托盘/手动重启维护——启动即
+        // 离线或用户主动 stop 时不会误拉起。
+        {
+            let shared = Arc::clone(&shared);
+            let ctx = cc.egui_ctx.clone();
+            engine_launcher::spawn_health_monitor(paths.clone(), move || {
+                let mut s = lock_shared(&shared);
+                s.results.on_engine_restarted();
+                s.palette.on_engine_restarted();
+                drop(s);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                ctx.request_repaint_of(palette_viewport_id());
+            });
+        }
         // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
         // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,
         // 动作转帧内兜底队列,不阻塞。预检通过后,实际实现内部短锁读写、
@@ -912,6 +928,8 @@ impl App {
                     let paths = self.paths.clone();
                     let refresh = self.tray.as_ref().map(tray::TrayRuntime::refresh_handle);
                     std::thread::spawn(move || {
+                        // 用户显式拉起 = 期望运行(失败也保留,由存活监控重试)
+                        engine_launcher::set_expected_running(true);
                         match engine_launcher::ensure_engine(&paths) {
                             Ok(()) => log::info!("引擎拉起完成"),
                             Err(err) => log::warn!("引擎拉起失败:{err:#}"),

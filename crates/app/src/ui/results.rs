@@ -1060,6 +1060,10 @@ impl ResultsState {
         let ctx = self.ctx.clone();
         let tx = self.restart_tx.clone();
         std::thread::spawn(move || {
+            // 手动重启的 stop 窗口不得被存活监控当成崩溃(RAII 恢复暂停闸);
+            // 用户显式要求运行,失败也保留期望位由监控重试。
+            let _pause = engine_launcher::pause_health_monitor();
+            engine_launcher::set_expected_running(true);
             let t0 = Instant::now();
             match client::stop(&paths) {
                 Ok(n) => log::info!("重启引擎:已停 daemon(最终 {n} 条)"),
@@ -1103,6 +1107,25 @@ impl ResultsState {
                 self.status_note_is_error = true;
             }
         }
+    }
+
+    /// daemon 被存活监控自动拉起后:清离线/排序旧提示、补查索引状态,并按当前
+    /// 列/方向重发已有查询(与手动重启的 apply_restart 同语义;不占用重启按钮态)。
+    pub fn on_engine_restarted(&mut self) {
+        self.sort_stale = false;
+        self.status_note = None;
+        self.status_note_is_error = false;
+        self.status_refresh_pending = true;
+        if matches!(self.session.state, State::Offline) {
+            self.session.mark_engine_starting();
+        }
+        self.session.on_sort_change(
+            self.sort,
+            request_desc(self.sort, self.sort_asc),
+            Instant::now(),
+        );
+        self.ctx
+            .request_repaint_after_for(palette::DEBOUNCE, egui::ViewportId::ROOT);
     }
 
     /// 右键菜单(Task 18):标准表格语义先把点击行并入选中(不在选中集 → 单选它),
@@ -3745,6 +3768,39 @@ mod tests {
         assert!(!st.engine_restarting);
         assert_eq!(st.status_note, Some(StatusNote::Raw(failure)));
         assert!(st.status_note_is_error, "重启失败是错误态");
+    }
+
+    /// 存活监控自动拉起后的 UI 收敛:离线/排序旧提示清空、状态补查,已有查询
+    /// 同串重发。突变「on_engine_restarted 不清 Offline」→ 状态断言红。
+    #[test]
+    fn engine_restarted_clears_offline_and_refires_query() {
+        let ctx = egui::Context::default();
+        let mut st = ResultsState::new(ctx, daemon_paths_for_test());
+        let now = Instant::now();
+        st.session.on_input("报告", now);
+        let fire = st
+            .session
+            .pending_at(now + palette::DEBOUNCE)
+            .expect("防抖到期应发起");
+        st.apply(hits_resp(fire.generation, "", Some("")));
+        // 制造离线 + 红字 + 排序警示
+        st.session.mark_offline();
+        st.status_note = Some(StatusNote::QueryFailed);
+        st.status_note_is_error = true;
+        st.sort_stale = true;
+
+        st.on_engine_restarted();
+
+        assert!(matches!(st.session.state, State::EngineStarting));
+        assert!(st.status_note.is_none(), "离线红字应清");
+        assert!(!st.status_note_is_error);
+        assert!(!st.sort_stale);
+        assert!(st.status_refresh_pending, "重启后补查引擎状态");
+        let refire = st
+            .session
+            .pending_at(Instant::now() + palette::DEBOUNCE * 2)
+            .expect("重启后同串重查");
+        assert_eq!(refire.query, "报告");
     }
 
     /// 齿轮真实点击:1200×800 帧内点击齿轮中心 → 置设置请求;消费一次即清

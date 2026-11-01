@@ -11,6 +11,7 @@ use anyhow::Result;
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::i18n;
@@ -18,6 +19,120 @@ use crate::i18n;
 /// 拉起后连通轮询:总超时与间隔(tech「进程编排」:≤3s,250ms 间隔)。
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// daemon 存活监控:低频连接探测,连续 2 次不可连才判定退出(单次抖动不拉起)。
+const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
+const MONITOR_FAIL_THRESHOLD: u32 = 2;
+
+/// GUI 是否「期望 daemon 运行」。启动拉起成功 / 托盘手动拉起成功后置 true;
+/// 用户主动停止(手动重启的 stop 段)或启动时就是离线态则保持 false —— 离线
+/// 是用户可见的合法状态,监控不得擅自把 daemon 拉回来。
+static EXPECTED_RUNNING: AtomicBool = AtomicBool::new(false);
+/// 用户主动 stop/重启期间的暂停闸:期间探测失败不计入、不触发拉起。
+static MONITOR_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_expected_running(expected: bool) {
+    EXPECTED_RUNNING.store(expected, Ordering::SeqCst);
+}
+
+pub fn expected_running() -> bool {
+    EXPECTED_RUNNING.load(Ordering::SeqCst)
+}
+
+/// 暂停存活监控(RAII):手动「重启引擎」的 stop 窗口不得被监控当成崩溃。
+/// Drop 自动恢复;直接用 `suspend_monitor()/resume_monitor()` 易漏配平。
+pub struct HealthMonitorPause;
+
+impl Drop for HealthMonitorPause {
+    fn drop(&mut self) {
+        MONITOR_SUSPENDED.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn pause_health_monitor() -> HealthMonitorPause {
+    MONITOR_SUSPENDED.store(true, Ordering::SeqCst);
+    HealthMonitorPause
+}
+
+/// 连续失败计数与重启判定(纯逻辑,单测钉住不依赖线程/时钟)。
+#[derive(Default)]
+struct LivenessTracker {
+    failures: u32,
+}
+
+impl LivenessTracker {
+    /// 返回本轮是否应拉起。`expected=false`(离线/用户停止)或 `suspended`
+    /// (手动重启窗口)一律清零且不触发。
+    fn observe(&mut self, connectable: bool, expected: bool, suspended: bool) -> bool {
+        if connectable || !expected || suspended {
+            self.failures = 0;
+            return false;
+        }
+        self.failures = self.failures.saturating_add(1);
+        self.failures >= MONITOR_FAIL_THRESHOLD
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+/// 启动 daemon 存活监控线程(每 5s 探测 socket)。判定退出 → `ensure_engine`
+/// 拉起;成功后调用 `on_restarted`(主线程外的 UI 清离线提示/重查入口,由
+/// 调用方自行切回 UI 锁)。
+pub fn spawn_health_monitor<F>(paths: client::DaemonPaths, on_restarted: F)
+where
+    F: Fn() + Send + 'static,
+{
+    let spawned = std::thread::Builder::new()
+        .name("daemon-health".to_owned())
+        .spawn(move || {
+            let mut tracker = LivenessTracker::default();
+            loop {
+                std::thread::sleep(MONITOR_INTERVAL);
+                let connectable = client::connect(&paths).is_some();
+                let expected = expected_running();
+                let suspended = MONITOR_SUSPENDED.load(Ordering::SeqCst);
+                if connectable {
+                    tracker.reset();
+                    continue;
+                }
+                if !expected || suspended {
+                    tracker.reset();
+                    continue;
+                }
+                if !tracker.observe(false, expected, suspended) {
+                    log::warn!(
+                        "daemon 存活探测失败({}/{MONITOR_FAIL_THRESHOLD}),继续观察",
+                        tracker.failures
+                    );
+                    continue;
+                }
+                // 进入拉起前再复核暂停闸:用户可能恰在探测后发起手动重启。
+                if MONITOR_SUSPENDED.load(Ordering::SeqCst) {
+                    tracker.reset();
+                    continue;
+                }
+                log::error!(
+                    "daemon 连续 {MONITOR_FAIL_THRESHOLD} 次不可连,判定已退出,自动拉起引擎"
+                );
+                match ensure_engine(&paths) {
+                    Ok(()) => {
+                        log::info!("daemon 存活监控:自动重启完成,清 UI 离线提示并重查");
+                        tracker.reset();
+                        on_restarted();
+                    }
+                    Err(err) => {
+                        log::error!("daemon 存活监控:自动重启失败: {err:#}");
+                        tracker.reset();
+                    }
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        log::error!("daemon 存活监控线程启动失败: {err}");
+    }
+}
 
 /// 引擎可执行文件名(与 CLI bin 名一致)。
 const ENGINE_BIN: &str = "macEverything";
@@ -202,6 +317,41 @@ mod tests {
 
     fn cands(exe_dir: &str, path: Option<&str>) -> Vec<PathBuf> {
         engine_candidates(Path::new(exe_dir), path.map(OsStr::new))
+    }
+
+    /// 存活判定钉:单次不可连不拉起(抖动容忍),连续 2 次才触发;任何一次
+    /// 可连即清零。突变「阈值改 1」→ 首次断言红。
+    #[test]
+    fn liveness_tracker_restarts_only_after_consecutive_failures() {
+        let mut t = LivenessTracker::default();
+        assert!(!t.observe(false, true, false), "第 1 次不可连:仅观察");
+        assert!(t.observe(false, true, false), "第 2 次不可连:触发拉起");
+        t.reset();
+        assert!(!t.observe(false, true, false));
+        assert!(!t.observe(true, true, false), "可连即清零");
+        assert!(!t.observe(false, true, false), "清零后重新从 1 计数");
+        assert!(t.observe(false, true, false));
+    }
+
+    /// 离线态 / 用户主动 stop / 手动重启窗口:探测失败也不得拉起,且计数清零
+    /// (否则用户停止后监控会擅自把 daemon 拉回来)。突变「忽略 expected」→ 红。
+    #[test]
+    fn liveness_tracker_respects_expected_and_suspend() {
+        let mut t = LivenessTracker::default();
+        assert!(!t.observe(false, false, false), "离线态(期望不运行):不拉起");
+        assert!(!t.observe(false, false, false));
+        assert!(!t.observe(false, true, true), "手动重启窗口:不拉起");
+        assert!(!t.observe(false, true, false), "恢复后重新从 1 计数");
+        assert!(t.observe(false, true, false), "期望运行 + 连续 2 次才触发");
+    }
+
+    #[test]
+    fn expected_running_is_process_wide_flag() {
+        // 仅验证 setter/getter 语义;不并行断言时序(其他测试可能读写同一全局)。
+        set_expected_running(true);
+        assert!(expected_running());
+        set_expected_running(false);
+        assert!(!expected_running());
     }
 
     #[test]

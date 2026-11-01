@@ -42,7 +42,7 @@ cargo test -p engine --test fsevents_live -- --ignored    # FSEvents 实机集�
 
 核心设计：FSEvents 事件只是提示，daemon 收到后重读该目录、与索引 diff，始终以磁盘为准；任何增量改动不得信任 FSEvents 的单事件语义。
 
-GUI 平台层（ADR-8，改动前先读 `docs/specs/v2-ui/tech.md`）：悬浮条 = eframe 单栈 + 运行期 `object_setClass` 换成自定义 NSPanel 子类，五要素组合（canBecomeKeyWindow/NonactivatingPanel/Floating/CanJoinAllSpaces/orderFrontRegardless）缺一不可；改类后窗口销毁前必须还原窗口类（否则 winit drop abort）。unsafe 集中在 `crates/app/src/platform/mac.rs` 单模块。
+GUI 平台层（ADR-8，改动前先读 `docs/specs/v2-ui/tech.md`）：悬浮条 = eframe 单栈 + 运行期 `object_setClass` 换成自定义 NSPanel 子类，五要素组合（canBecomeKeyWindow/NonactivatingPanel/Floating/CanJoinAllSpaces/orderFrontRegardless）缺一不可；改类后窗口销毁前必须还原窗口类（否则 winit drop abort）。GUI 平台层 unsafe 集中在 `crates/app/src/platform/`（mac.rs + mac_quicklook.rs + mod.rs）；例外零散分布在 `autostart.rs`、`cli_install/`、`ui/mod.rs`、`ui/results.rs`、`ui/theme.rs`（收敛为后续项，不在本次迁移）。
 
 ## 关键约定（全部实测踩坑，见 development.md）
 
