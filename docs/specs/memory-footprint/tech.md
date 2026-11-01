@@ -256,6 +256,8 @@ struct Overlay {
 
 移除后实测（2026-11-01）：headless 采样（harness 同长尾行集 2000 行）峰值 **6MB**（对照侧 `MCE_NO_CJK_FONT=1` 5MB；fontique 不在依赖图）；真 GUI 空闲 A/B：内置字体注入与否 footprint 持平（202 vs 203MB，字体字节为 clean file-backed 页，自身 ≈1MB）；空闲构成 IOSurface 90MB/46 块 + Malloc Small 死页 58MB（`malloc_zone_pressure_relief` 只折叠大块，Small 段滞留）——均为阶段二（视口 surface 释放、堆治理细化）范围。
 
+**A6c 复测裁决（2026-11-01，字形图集修复后）**：真实索引（150 万条）取 1000 条结果、不滚动、仅加载可见行图标（约 12 个）：旧 `TIFFRepresentation` 图标解码峰值 **845MB**，改为直接画进 64×64 位图后同场景 **216MB**；20 个系统图标的受控 A/B 为 +1557MB vs +124MB。`Malloc Large (empty)` 的 4/8/16/32MB 块来自 APPKIT 图标解码的临时缓冲（类型图标 TIFF 32 页/≈37MB，APP 图标 16bit float 1024×1024/≈74MB），**不是字形图集 resize 链**——同期诊断计数器为 `atlas_creates=1 / growths=4 / set_options=0`，图集稳定在 4096×512。修复见 `platform/mac.rs::image_rgba`：`NSImage.drawInRect` 进 64×64 `NSBitmapImageRep`（预乘 RGBA），不再物化整份 TIFF；钉子 `type_icon_rasterizes_64x64_premultiplied`、`app_icon_rasterizes_visible_pixels` 与手动 `ignored_icon_decode_footprint`（突变回 TIFF 实测 +1557MB）。
+
 **剩余探索项**：视口 surface 释放（上述）；CoreText 栅格化缓存驻留限制；图集重烘节流（上述②）；每帧分配审计（style 克隆热点）。修复项落地后按数据决定是否继续冲 ≤ 100MB 或回评审定线。
 
 ### 6.4 阶段二出口条件

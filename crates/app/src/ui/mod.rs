@@ -1757,6 +1757,28 @@ mod tests {
                 "{family:?} 尾部应为 KR/Symbols Lowest 段,实际 {list:?}"
             );
         }
+        // 按键帽全覆盖钉:键帽文案是**字面量**而非长尾样本,必须在生产同款
+        // 字体链里逐一可渲染(曾因 `↵` U+21B5 在所有内置字体与 SF Pro 中均缺失,
+        // 移除 system_fonts 后状态栏显示 tofu;测试只覆盖 `⏎` 漏掉了它)。
+        // 新增键帽符号时此处自动纳入,不必再靠人工挑样本。
+        ctx.fonts_mut(|f| {
+            let keys: Vec<&str> = crate::ui::palette::footer_groups()
+                .iter()
+                .map(|(_, keys)| *keys)
+                .collect();
+            for keys in keys {
+                for family in [
+                    egui::FontId::proportional(11.0),
+                    egui::FontId::monospace(11.0),
+                ] {
+                    assert!(
+                        f.has_glyphs(&family, keys),
+                        "键帽 {keys:?} 在 {family:?} 下缺字形(检查 BUNDLED_FONTS 覆盖)"
+                    );
+                }
+            }
+        });
+
         // 长尾字形全部命中已装字体(汉字/韩文/假名/符号/数字混排)。
         ctx.fonts_mut(|f| {
             for sample in [
@@ -1993,6 +2015,184 @@ mod tests {
             started.elapsed(),
             phys_footprint_mb(),
             lifetime_peak_mb(),
+        );
+    }
+
+    /// 本地补丁钉(vendor/epaint 的 MCE 标记):字体图集**部分增量**必须量化到
+    /// 2 的幂尺寸。原因:每帧增量按脏区任意尺寸分配 ColorImage,macOS malloc 按
+    /// 尺寸类缓存 VM 段 → 滚动时尺寸类无界、Malloc Large (empty) 持续累积
+    /// (实测 71 块 × 4–10MB、峰值 1.9–2.8GB)。量化把尺寸类压回十几个。
+    /// 突变(去掉补丁 / 上游升级覆盖 vendor)→ 尺寸不再为 2 的幂,本测红。
+    #[test]
+    fn epaint_partial_delta_is_size_quantized() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta(); // 清掉初始 EVERYTHING
+        let ((_x, _y), region) = atlas.allocate((7, 30));
+        for px in region.pixels.iter_mut() {
+            *px = egui::Color32::from_rgb(1, 2, 3);
+        }
+        let delta = atlas.take_delta().expect("脏区应产生增量");
+        let [w, h] = delta.image.size();
+        assert!(
+            w.is_power_of_two() && h.is_power_of_two(),
+            "增量尺寸应量化到 2 的幂,实际 {w}x{h}"
+        );
+        assert!(w >= 7 && h >= 30, "量化不得裁掉脏区({w}x{h} < 7x30)");
+        let pos = delta.pos.expect("部分增量应带 pos");
+        assert!(
+            pos[0] + w <= 4096 && pos[1] + h <= 256,
+            "量化后应仍在图集内"
+        );
+        // 多传区域必须取自图集现有像素(只多传,不改变内容)。
+        let ImageData::Color(img) = &delta.image;
+        let atlas_img = atlas.image();
+        let aw = atlas_img.width();
+        for yy in 0..h {
+            for xx in 0..w {
+                let a = atlas_img.pixels[(pos[1] + yy) * aw + pos[0] + xx];
+                let b = img.pixels[yy * w + xx];
+                assert_eq!(
+                    (a.r(), a.g(), a.b(), a.a()),
+                    (b.r(), b.g(), b.b(), b.a()),
+                    "增量像素应与图集一致 @({xx},{yy})"
+                );
+            }
+        }
+    }
+
+    /// 本地补丁钉:不同脏区高度只产生**有界**的尺寸类(量化到 2 的幂),
+    /// 这是「Malloc Large (empty) 不再随滚动线性累积」的机制保证。
+    #[test]
+    fn epaint_delta_size_classes_are_bounded() {
+        use egui::epaint::{TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 2048], TextOptions::default());
+        let _ = atlas.take_delta();
+        let mut classes = std::collections::BTreeSet::new();
+        for h in 1..=40usize {
+            let _ = atlas.allocate((7, h));
+            if let Some(delta) = atlas.take_delta() {
+                classes.insert(delta.image.size());
+            }
+        }
+        assert!(!classes.is_empty(), "应产生增量(否则测试失去意义)");
+        assert!(
+            classes.len() <= 16,
+            "增量尺寸类应有界(≤16),实际 {} 个: {classes:?}",
+            classes.len()
+        );
+    }
+
+    /// 本地补丁钉:整图增量(clear/扩容)与图集**共享同一块内存**,不再深拷贝。
+    /// 突变(改回 `self.image.clone()` 深拷贝)→ `Arc::ptr_eq` 为假,本测红。
+    #[test]
+    fn epaint_full_delta_shares_atlas_image() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        use std::sync::Arc;
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let delta = atlas.take_delta().expect("初始应产生整图增量");
+        let ImageData::Color(img) = delta.image;
+        assert!(
+            Arc::ptr_eq(&img, &atlas.image_shared()),
+            "整图增量应与图集共享同一块内存(不得深拷贝)"
+        );
+    }
+
+    /// 本地补丁钉:部分增量复用持久上传缓冲(按量化尺寸成池),
+    /// 同尺寸帧不新建 `ColorImage`,尺寸交替时也只各留一块。
+    /// 突变(每帧 `ColorImage::filled`)→ 分配次数随帧数线性增长,本测红。
+    #[test]
+    fn epaint_partial_delta_reuses_upload_buffers() {
+        use egui::epaint::{TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta(); // 清掉初始整图
+
+        for _ in 0..20 {
+            let _ = atlas.allocate((7, 8));
+            let _ = atlas.take_delta().expect("应有部分增量");
+        }
+        let same_size_allocs = atlas.upload_allocations();
+        assert!(
+            same_size_allocs <= 1,
+            "同尺寸帧应复用同一缓冲,实际分配 {same_size_allocs} 次"
+        );
+
+        for i in 0..20 {
+            let h = if i % 2 == 0 { 8 } else { 16 };
+            let _ = atlas.allocate((7, h));
+            let _ = atlas.take_delta().expect("应有部分增量");
+        }
+        let grew = atlas.upload_allocations() - same_size_allocs;
+        assert!(
+            grew <= 2,
+            "两种尺寸应各复用一块(≤2 次新分配),实际新增 {grew} 次"
+        );
+    }
+
+    /// 本地补丁钉:clear 是**原地清空**,保留图集尺寸与像素缓冲,
+    /// 不得重置到 32 高再走倍增链(每轮产生 4/8/16/32MB 临时分配)。
+    /// 突变(`*self = Self::new(..)` 或 clear 内重建)→ 尺寸回落到 32,本测红。
+    #[test]
+    fn epaint_clear_keeps_atlas_size() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        use std::sync::Arc;
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta();
+        let _ = atlas.allocate((7, 300)); // 触发一次高度倍增(256 -> 512)
+        let _ = atlas.take_delta();
+        let grown = atlas.size();
+        assert!(grown[1] >= 512, "前置:图集应已长大,实际 {grown:?}");
+
+        atlas.clear();
+        assert_eq!(
+            atlas.size(),
+            grown,
+            "clear 应保留尺寸(原地清空),实际 {}",
+            format_args!("{:?}", atlas.size())
+        );
+        assert!(atlas.fill_ratio() < 0.01, "clear 后填充率应归零");
+        let delta = atlas.take_delta().expect("clear 应产生整图增量");
+        let ImageData::Color(img) = delta.image;
+        assert!(
+            Arc::ptr_eq(&img, &atlas.image_shared()),
+            "clear 后的整图增量仍应共享图集内存"
+        );
+    }
+
+    /// 本地补丁钉(端到端):字形图集触达 0.8 clear 时走**原地清空**,
+    /// 图集尺寸不回落到 32;否则每轮 clear 都要重新倍增,产生 4/8/16/32MB
+    /// 临时分配。突变(GlyphAtlas::clear 改回 `*self = Self::new(..)`)→ 本测红。
+    #[test]
+    fn epaint_glyph_atlas_clear_stays_in_place() {
+        let ctx = egui::Context::default();
+        install_ui_fonts(&ctx, true);
+        let mut input = probe_input();
+        input.max_texture_side = Some(1024); // 小图集,一个 pass 即可填满
+        let chars: String = include_str!("atlas_charset.txt")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(chars.chars().count() > 1000, "前置:字符集应足够填满图集");
+
+        // pass 1:布局全部字符 → 图集增长/溢出。
+        let mut out = ctx.run_ui(input.clone(), |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(&chars)).wrap());
+        });
+        out.textures_delta.clear();
+        let grown = ctx.fonts(|f| f.font_image_size());
+        assert!(grown[1] > 32, "前置:图集应已长大,实际 {grown:?}");
+
+        // pass 2:空 pass 开头 fill>0.8 → clear;无文本,不再增长。
+        let mut out = ctx.run_ui(input, |_ui| {});
+        out.textures_delta.clear();
+        let after = ctx.fonts(|f| f.font_image_size());
+        assert!(
+            after[1] > 32,
+            "clear 应原地保留尺寸(实际回落到 {after:?},说明重建了图集)"
+        );
+        assert!(
+            ctx.fonts(|f| f.font_atlas_fill_ratio()) < 0.1,
+            "clear 后填充率应归零"
         );
     }
 
