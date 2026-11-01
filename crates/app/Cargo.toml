@@ -75,6 +75,9 @@ objc2-app-kit = { version = "0.3", features = [
     "NSControl",
     # v2.3 拷贝文件:NSPasteboard.writeObjects(NSURL 数组)。
     "NSPasteboard",
+    # 隐藏视口 surface 释放(全隐 30s 后 clearDrawable + setView 停到 1×1 视图;
+    # 见 platform/mac.rs 的 shrink_hidden_windows / docs/specs/memory-footprint §6.2.7)。
+    "NSOpenGL",
 ] }
 # objc2-app-kit 的公开签名用 NSPoint/NSRect/NSString(来自 objc2-foundation);
 # 依赖非传递可见,Rust 侧须显式声明。NSObject 为自建观察者类的超类,NSNotification

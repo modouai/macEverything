@@ -254,14 +254,40 @@ struct Overlay {
 
 **未采用**：wgpu 后端（常驻实测 166MB 中位 vs glow 155MB，峰值相当，二进制 +5.2MB/编译 +16min；唯一优势 IOSurface 归零，不足抵偿）。
 
-**遗留**：IOSurface 85.7MB（三视口 GL drawable 池，隐藏不释放）→ 后续课题，需 eframe/glow 内部 spike。
+**遗留**：IOSurface 85.7MB（三视口 GL drawable 池，隐藏不释放）→ **已由 §6.2.7 收口（2026-11-01）**。
+
+### 6.2.7 隐藏视口 surface 释放（IOSurface 77.9MB → ≈0.2MB，2026-11-01）
+
+**根因（spike 实测）**：三视口常驻（隐藏 = `orderOut`），每窗 1 块 `IOGPUSurfaceMTL` + 3 块 AppKit 共享 WindowServer 后备用 surface（drawable 池）。两个关键事实：
+
+1. `clearDrawable` 只释放当前 drawable，且 AppKit 数秒内会重建；直接 `setView(nil)` 还会触发 glutin `context to have a current view` panic（`is_view_current` 的 `expect`）。
+2. eframe 0.37 在 macOS 上 `ViewportInfo.visible()` 恒 `None`（`update_viewport_info` 不刷新 visible/occluded）→ `is_visible` 回退 true，**任何一帧都会重绘隐藏视口**；因此在帧内做释放必被同帧/下一帧的绘制冲掉。
+
+**机制**：三窗全隐 **30s** 后（主队列一次性定时器；任何显示动作按代号作废旧定时器），对 root/palette/settings 依次：
+
+1. `contentSize` 缩到 **1×1**（窗口服务器/GL 真正回收面片）；
+2. 对三个 drawable 调 `clearDrawable`；
+3. 把 GL 上下文停在已缩为 1×1 的 root 视图（`view` 非 nil，且当前 drawable 只有 2×2 像素）。
+
+显示前在 `show_palette` / `show_root_window` / `show_settings_window` 恢复保存的 `contentSize`，再 `orderFrontRegardless` + 首帧重绘。视口仍不销毁（ADR-8 五要素/还原/hack 路径不变）。
+
+**实测**（隔离实例，裸二进制；`vmmap`）：
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 隐藏态 IOSurface | 85.7MB / 19 块 | **176KB / 11 块**（仅 2×2 面片） |
+| 启动即隐 footprint | 203.5MB | **65.0MB** |
+| 三窗使用后全隐 footprint | 235MB 量级 | **≈119MB** |
+| 悬浮条唤起首帧 | 13.6–20ms | **17–21ms**（红线 <100ms） |
+
+**边界**：最小化/全屏窗口不缩（Dock/系统恢复路径绕过显示侧尺寸恢复）；隐藏期若出现零星帧，1×1 窗口只会重建 2×2 面片，无需重复缩窗；`MCE_SURFACE_SHRINK_SECS` 仅供实机验证调参（默认 30）。
 
 ### 6.3 阶段二（归因驱动，目标 ≤ 100MB；S0.3 归因结论已回填）
 
 **归因结论（2026-10-30，MallocStackLogging 复现实测）**：
 
 - **峰值真凶**：结果窗口打开 + 中文文件名列表 → 每个 galley 布局遇 CJK 字形走 `egui_system_font_provider` → fontique 系统回退慢路径——`Query::matches` 单次分配 191MB×3、`SourceCache::load_blob` 把苹方 ttc 整块载入 76MB×2；galley 缓存 miss 反复触发，mmap 大块堆积，malloc 归还滞后 → `Malloc Large (empty)` 3GB/362 块滞留 → 复现 peak 4.3GB。**嫌疑序中的 tessellation 巨量与字形图集多轮扩容均被排除**（Malloc Large 活跃仅 12.8MB，纹理在 IOSurface/IOAccelerator 侧且未涨）。
-- **IOSurface 归属（常驻态 85.8MB/28 个，结果窗口关闭也不释放）**：2160×1254 BGRA 10.4MB×3 = 结果窗口 drawable 三缓冲（IOGPUSurfaceMTL + AppKit 镜像）；1400×492 2.7MB×4 = 悬浮条；1240×1200 5.8MB×2 = 第三视口。滚动时 `NSIOSurfacePool nextUnusedSurface` 增配 18.8MB 块。处置：视口关闭显式释放 surface（egui viewport 生命周期钩子；drawable 池行为随实现调查）——预期常驻 -55MB。
+- **IOSurface 归属（常驻态 85.8MB/28 个，结果窗口关闭也不释放）**：2160×1254 BGRA 10.4MB×3 = 结果窗口 drawable 三缓冲（IOGPUSurfaceMTL + AppKit 镜像）；1400×492 2.7MB×4 = 悬浮条；1240×1200 5.8MB×2 = 第三视口。滚动时 `NSIOSurfacePool nextUnusedSurface` 增配 18.8MB 块。处置：**已由 §6.2.7 收口**（三窗全隐 30s 后 contentSize 缩 1×1 + clearDrawable + 上下文停 1×1 视图；实测常驻 85.7MB → 176KB）。
 - **CG Image**：8–18MB（图标，随查询内容浮动），§6.2.3 治理已覆盖。
 
 **A6b 复测裁决（2026-11-01，T5 修复后）**：同款操作（纯数字查询 + 滚动）峰值 **2.4GB**、空闲期 447→729MB 不降。MSL 再归因：① 4×194MB mmap = fontique 回退**再次**触发（`resolve_slow` → `Query::matches` → `load_blob`，栈与首归因同源）——查询是纯数字，触发行的文件名含注入字体集外的字形；**查询内容与命中字体均无关，194MB 是 fontique 查询的固定枚举开销**，真实长尾不可控，任何一次触发即击穿 A6b。裁决：推翻「极生僻字形偶发」假设，`system_fonts` 整体移除（最终形态见 §6.2.1）。② 次级贡献：40×8MB + 32×2MB glTexImage2D/IOGPUResourceCreate ≈ 390MB——egui 图集在滚动中持续引入新字形、反复重烘上传（图集逐出机制），**先记录**：缓解候选 = 覆盖链扩容减少新字形引入、图集周期性重建，阶段二按数据处置。

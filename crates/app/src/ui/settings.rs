@@ -1742,6 +1742,7 @@ fn hide(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
 fn hide_with_command(state: &mut SettingsState, ctx: &egui::Context) {
     state.mark_hidden();
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    crate::platform::schedule_surface_shrink();
     ctx.request_repaint_of(egui::ViewportId::ROOT);
 }
 

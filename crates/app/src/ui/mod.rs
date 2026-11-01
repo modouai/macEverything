@@ -370,6 +370,8 @@ fn hide_palette_state(s: &mut Shared) {
 /// 只入 egui 队列、无 AppKit 调用 → 可在外层持锁时调用。
 fn send_palette_hide(ctx: &egui::Context, reason: &str) {
     ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
+    // 三窗全隐后缩窗释放 GL surface(定时器触发时再核对真实可见性)。
+    platform::schedule_surface_shrink();
     log::info!("悬浮条隐藏({reason})");
 }
 
@@ -431,6 +433,7 @@ fn handle_root_close_shortcut(ctx: &egui::Context) -> bool {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
         crate::platform::quick_look_dismiss();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        platform::schedule_surface_shrink();
         // 图标互查:设置窗口仍可见则保留(图标跟随「任一主窗口可见」)
         if platform::settings_visible() != Some(true) {
             platform::set_dock_icon(false);
@@ -1248,6 +1251,8 @@ impl eframe::App for App {
                 egui::ViewportId::ROOT,
                 egui::ViewportCommand::Visible(false),
             );
+            // 启动即三窗全隐:排缩窗定时器(否则首帧渲染留下的 surface 常驻)。
+            platform::schedule_surface_shrink();
             ctx.request_repaint(); // 排下一帧做原生回读(纠偏命令在本帧末才应用)
             log::info!("根窗首帧纠偏:Visible(false)(产品形态三窗皆隐)");
         } else if !self.root_hide_verified {
@@ -1414,6 +1419,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 platform::quick_look_dismiss();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                platform::schedule_surface_shrink();
                 // 图标互查:设置窗口仍可见则保留
                 if platform::settings_visible() != Some(true) {
                     platform::set_dock_icon(false);
@@ -1521,6 +1527,7 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             s.palette_visible = false;
             s.palette.reset();
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            platform::schedule_surface_shrink();
             // 根窗走平台层原生(activate + 置前;单发 egui 命令不切 Space,实测):
             // 出锁再调(锁纪律——原生调用可被 winit 同步派发,持锁即自锁)。
             drop(s);

@@ -117,6 +117,7 @@ pub fn execute_sorted(
 |---|---|
 | 跨 Space(含他人全屏) | **NSPanel 改类五要素**(见 ADR-8;poc1b spike 定稿:`scripts/poc/poc1b_nspanel` 为可直接移植的实现参考);补丁施加时机 = 视口窗创建后首见(`NSApp.windows()` 按标题定位),可见期每帧漂移核对 |
 | 视口形态 | **deferred 视口 + 常驻**(`show_viewport_deferred`,每根视口 pass 注册;builder 逐 pass 常量防重建);隐藏 = `Visible(false)`(winit `orderOut`,不销毁);窗口唯一销毁点 = 进程退出(改类还原补丁落 `App::on_exit`) |
+| 隐藏态内存(surface) | 三窗全隐 **30s** 后:三窗 contentSize 缩 **1×1** + 三 drawable `clearDrawable` + GL 上下文停到 1×1 的 root 视图(非 nil,防 glutin panic);显示路径先恢复尺寸再 orderFront。视口仍不销毁(五要素/还原不变)。实测 IOSurface 77.9MB→176KB、唤起 17–21ms;细节见 `docs/specs/memory-footprint/tech.md` §6.2.7 |
 | 浮动级别 | `setLevel(NSFloatingWindowLevel)`(PoC 实测;winit always_on_top 已自带 level 3,补丁增量在 collectionBehavior) |
 | 失焦隐藏 | eframe 视口 `focused` → egui 命令 `Visible(false)`(winit orderOut)。实测(non-activating panel):`focused` 语义有效(winit 取 `windowDidBecomeKey/DidResignKey`)。**切 Space 豁免(2026-10-16 定,product §2;Task 14b 落地)**:`NSWorkspaceActiveSpaceDidChangeNotification`(NSWorkspace 通知中心,观察者 Retained 保活)记「序号+单调时刻」;**实测通知多数晚于失焦 265-550ms → 判据锚在失焦时刻**,宽限 `FOCUS_HIDE_GRACE=800ms`(覆盖最坏 +550;500ms 首版曾漏);**点击当帧判定**:`NSEvent.pressedMouseButtons` 查询(免权限)——点击失焦立即隐藏不受宽限影响;ghost 态 150ms 轮询兜底。常量:`SPACE_EXEMPT_WINDOW=500ms`/`GHOST_POLL=150ms` |
 | **显示路径(定案)** | 显示必须走 **native `orderFrontRegardless()` + `makeKeyWindow()`**(主线程直接调用;唤起入口本就在主线程,无跨线程,故无需 DispatchQueue 投递)+ `ctx.request_repaint_of(悬浮条视口)`;**禁用 winit `Visible(true)` 唤起**——PoC-4 实测 eframe 0.37 对不可见窗口的跨线程唤起有 100ms 硬节流(`run.rs` 源码),唤起 132ms 超线;native 路径对外中位 **16.7ms**,且与 NSPanel 五要素(ADR-8)同路 |

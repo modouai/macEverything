@@ -34,6 +34,7 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -394,6 +395,199 @@ struct PaletteState {
     vib: Option<Retained<NSVisualEffectView>>,
     /// 上帧垫窗是否可见(显隐边沿检测:只在翻转时调 orderFront/orderOut)。
     blur_visible: bool,
+    /// 全隐缩窗时保存的三窗 contentSize(Some = 当前处于 1×1 缩窗态)。
+    ///
+    /// 背景:隐藏走 `orderOut` 不销毁,三视口的 GL drawable 池(每窗 1 块
+    /// `IOGPUSurfaceMTL` + 3 块 AppKit 共享 WindowServer)常驻约 78MB。
+    /// `clearDrawable` 实测只能释放部分且数秒后被 AppKit 重建;把**隐藏窗口
+    /// 的 contentSize 缩到 1×1** 可让 WindowServer/GL 真正回收 surface
+    /// (缩窗 + 清 drawable 实测 86.4MB → ≈150KB)。显示前按此处保存的尺寸恢复。
+    shrunk: ShrunkSizes,
+}
+
+/// 缩窗前的 contentSize 快照(主线程;三窗各一份)。
+#[derive(Default, Clone, Copy)]
+struct ShrunkSizes {
+    root: Option<NSSize>,
+    palette: Option<NSSize>,
+    settings: Option<NSSize>,
+}
+
+/// 三个主视口窗口(缩窗/恢复的定向对象)。
+#[derive(Clone, Copy, Debug)]
+enum MainWindow {
+    Root,
+    Palette,
+    Settings,
+}
+
+/// 全隐缩窗定时器代号:显示动作递增即可作废尚未触发的旧定时器。
+static SHRINK_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 全隐后等待多久缩窗(秒;`MCE_SURFACE_SHRINK_SECS` 仅供实机验证调参)。
+const SHRINK_AFTER_SECS: u64 = 30;
+
+/// 缩窗延迟(纯函数,单测钉住):合法环境值优先,否则默认 30s。
+fn shrink_delay_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SHRINK_AFTER_SECS)
+}
+
+/// 定时器代号是否仍然有效(纯函数,单测钉住):显示动作会递增代号作废旧定时器。
+fn shrink_timer_is_current(scheduled: u64, current: u64) -> bool {
+    scheduled == current
+}
+
+/// 安排一次「全隐 N 秒后缩窗」一次性定时器(主队列;重复调用覆盖旧代)。
+///
+/// 必须在主线程调用;全隐期没有帧,定时器是唯一能跑到缩窗逻辑的路径。
+/// 触发时再核对三窗原生 `isVisible()`——期间若有窗口显示,直接跳过
+/// (显示路径已递增 `SHRINK_GEN`,正常情况连这里都到不了)。
+pub fn schedule_surface_shrink() {
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    let gen = SHRINK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let secs = shrink_delay_secs(std::env::var("MCE_SURFACE_SHRINK_SECS").ok().as_deref());
+    let Ok(when) = dispatch2::DispatchTime::try_from(Duration::from_secs(secs)) else {
+        return;
+    };
+    let _ = dispatch2::DispatchQueue::main().after(when, move || {
+        let current = SHRINK_GEN.load(Ordering::SeqCst);
+        if !shrink_timer_is_current(gen, current) {
+            log::info!("全隐缩窗:定时器已作废(gen {gen} != {current},期间有显示动作)");
+            return;
+        }
+        if shrink_hidden_windows() {
+            log::info!("全隐 {secs}s:三视口 contentSize 缩到 1×1(surface 释放)");
+        }
+    });
+}
+
+/// 作废待触发的缩窗定时器(任何显示动作入口调用;不释放已缩窗口的尺寸,
+/// 尺寸恢复由 [`restore_window_size`] 在具体显示路径完成)。
+pub fn cancel_surface_shrink() {
+    SHRINK_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// 三窗均不可见时把 contentSize 缩到 1×1(返回是否有窗口被缩)。
+///
+/// 只在主线程;任一主窗可见则整体跳过。尺寸快照存 [`PaletteState::shrunk`],
+/// 显示前由 [`restore_window_size`] 恢复。AppKit 调用期间**不持** PALETTE 借用
+/// (setContentSize 可触发 winit 同步重入一帧)。
+#[allow(deprecated)] // NSOpenGLContext 自 macOS 10.14 起标记废弃,但 glow/CGL 后端仍用它。
+pub(crate) fn shrink_hidden_windows() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let (root, palette) = PALETTE.with(|cell| {
+        let st = cell.borrow();
+        (st.root.clone(), st.palette.clone())
+    });
+    let (Some(root), Some(palette)) = (root, palette) else {
+        return false; // 视口窗尚未创建:下次隐藏再排定时器
+    };
+    let Some(settings) = find_window_by_title(mtm, Some(&root), &settings_window_titles()) else {
+        return false;
+    };
+    let windows = [
+        (&root, MainWindow::Root, "root"),
+        (&palette, MainWindow::Palette, "palette"),
+        (&settings, MainWindow::Settings, "settings"),
+    ];
+    // 最小化窗口的恢复可能绕过本 app 的显示路径(点 Dock 图标),1×1 尺寸会
+    // 直接呈现在用户面前;全屏窗口的尺寸由系统 Space 管理。两类一律不缩。
+    if windows.iter().any(|(win, _, _)| {
+        win.isVisible()
+            || win.isMiniaturized()
+            || win.styleMask().contains(NSWindowStyleMask::FullScreen)
+    }) {
+        log::info!("全隐缩窗:仍有可见/最小化/全屏主窗口,跳过");
+        return false;
+    }
+    let mut sizes = ShrunkSizes::default();
+    for (win, kind, name) in windows {
+        let before = win
+            .contentView()
+            .map_or_else(|| win.frame().size, |view| view.frame().size);
+        match kind {
+            MainWindow::Root => sizes.root = Some(before),
+            MainWindow::Palette => sizes.palette = Some(before),
+            MainWindow::Settings => sizes.settings = Some(before),
+        }
+        win.setContentSize(NSSize::new(1.0, 1.0));
+        log::info!(
+            "全隐缩窗:{name} {:.0}×{:.0} → 1×1",
+            before.width,
+            before.height
+        );
+    }
+    PALETTE.with(|cell| cell.borrow_mut().shrunk = sizes);
+
+    // 仅缩窗有时仍会留下上一尺寸的 AppKit 后备用 surface(实测 9–19MB 波动);
+    // 再对三窗 drawable 做一次 clearDrawable,并把上下文停到已缩为 1×1 的
+    // root 视图上(ctx.view 保持非 nil,glutin 的 is_view_current 不会 panic;
+    // 当前 drawable 只剩 2×2 像素)。两者合起来实测稳定到 ≈150KB。
+    //
+    // 不做这一步也不会崩,只是释放不彻底;currentContext 取不到(理论不可达:
+    // glutin 让上下文常驻 current)时如实留痕并只保留缩窗效果。
+    match objc2_app_kit::NSOpenGLContext::currentContext() {
+        Some(ctx) => {
+            // 只清「本 app 三个视口」的上下文:currentContext 正常即 eframe 的
+            // glow 上下文;若 view 关联到别的视图(未来接入第二个 GL 组件),跳过清除。
+            let current_view = ctx.view(mtm);
+            let owns = current_view.as_deref().is_none_or(|v| {
+                let vp = v as *const NSView;
+                windows
+                    .iter()
+                    .filter_map(|(win, _, _)| win.contentView())
+                    .any(|own| Retained::as_ptr(&own) == vp)
+            });
+            if !owns {
+                log::warn!("全隐缩窗:当前 GL 上下文不属于三视口,仅缩窗(未清 drawable)");
+                return true;
+            }
+            for (win, _, name) in windows {
+                let Some(view) = win.contentView() else {
+                    continue;
+                };
+                ctx.setView(Some(&view), mtm);
+                ctx.clearDrawable();
+                log::info!("全隐缩窗:{name} drawable cleared");
+            }
+            // 停到 root 的 1×1 视图(show 时 eframe make_current 会重新绑定)。
+            if let Some(view) = root.contentView() {
+                ctx.setView(Some(&view), mtm);
+                log::info!("全隐缩窗:GL 上下文停在 root 1×1 视图");
+            }
+        }
+        None => log::warn!("全隐缩窗:取不到当前 GL 上下文,仅缩窗(未清 drawable)"),
+    }
+    true
+}
+
+/// 显示前恢复某一主窗的 contentSize(未缩过 = no-op;返回是否恢复)。
+fn restore_window_size(win: &NSWindow, kind: MainWindow) -> bool {
+    let saved = PALETTE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        match kind {
+            MainWindow::Root => st.shrunk.root.take(),
+            MainWindow::Palette => st.shrunk.palette.take(),
+            MainWindow::Settings => st.shrunk.settings.take(),
+        }
+    });
+    match saved {
+        Some(size) => {
+            win.setContentSize(size);
+            log::info!(
+                "缩窗恢复:{kind:?} 1×1 → {:.0}×{:.0}",
+                size.width,
+                size.height
+            );
+            true
+        }
+        None => false,
+    }
 }
 
 thread_local! {
@@ -526,6 +720,9 @@ pub fn show_palette(top_inset: f64) -> Result<f64> {
     let win = PALETTE
         .with(|cell| cell.borrow().palette.clone())
         .ok_or_else(|| anyhow!("悬浮条窗口未就绪(视口尚未创建)"))?;
+    // 全隐缩窗态:先作废定时器、恢复 contentSize,再定位( position 读取窗高)。
+    cancel_surface_shrink();
+    restore_window_size(&win, MainWindow::Palette);
     let (anchor, panel_w) = position_palette(&win, mtm, top_inset);
     // 顺序照 PoC-1b `show_and_make_key`:先补 first responder,再 orderFrontRegardless,
     // 最后 makeKeyWindow(定位先于显示,避免可见后跳位)。
@@ -587,6 +784,10 @@ pub fn show_root_window() -> Result<()> {
     let root = PALETTE
         .with(|cell| cell.borrow().root.clone())
         .ok_or_else(|| anyhow!("根窗句柄未记录(attach_root 未执行)"))?;
+    // 全隐缩窗态:先作废定时器并恢复尺寸,再激活/置前(恢复会触发 resize 通知,
+    // 后续 winit/egui 首帧即按正确尺寸布局)。
+    cancel_surface_shrink();
+    restore_window_size(&root, MainWindow::Root);
     let app = NSApplication::sharedApplication(mtm);
     // Dock 图标(Accessory→Regular policy 切换)先于激活/置前:policy 切换会让系统
     // 重算本 app 的窗口归属,放在置前之后实测概率把窗口压回普通层(2026-10-29
@@ -649,6 +850,9 @@ pub fn show_settings_window(center: bool) -> Result<()> {
     let root = PALETTE.with(|cell| cell.borrow().root.clone());
     let win = find_window_by_title(mtm, root.as_deref(), &settings_window_titles())
         .ok_or_else(|| anyhow!("设置窗口未就绪(视口尚未创建)"))?;
+    // 全隐缩窗态:先恢复尺寸再居中/置前(居中按恢复后的 frame 计算)。
+    cancel_surface_shrink();
+    restore_window_size(&win, MainWindow::Settings);
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
     // 最小化态不会因 orderFrontRegardless/makeKeyWindow 自动从 Dock 恢复。
@@ -1139,6 +1343,8 @@ pub fn reanchor() {
 
 /// 退出/销毁前还原窗口类(否则 winit drop → abort;spike 三方对照实证)。
 pub fn revert_class() {
+    // 退出时作废尚未触发的缩窗定时器(避免退出流程里再动窗口尺寸)。
+    cancel_surface_shrink();
     // 重入安全(同 show_palette):状态短借用取出,object_setClass 在借用外。
     let (win, orig, class_before) = PALETTE.with(|cell| {
         let st = cell.borrow();
@@ -2393,5 +2599,24 @@ mod tests {
         )
         .expect("live fetch");
         assert!(!bytes.is_empty());
+    }
+
+    /// 缩窗延迟:默认 30s;合法覆盖生效;非法值回落默认(不 panic、不误缩)。
+    /// 突变钉:把 `unwrap_or(SHRINK_AFTER_SECS)` 改成 `unwrap_or(0)` 首条即红。
+    #[test]
+    fn shrink_delay_defaults_and_overrides() {
+        assert_eq!(super::shrink_delay_secs(None), 30, "默认 30s");
+        assert_eq!(super::shrink_delay_secs(Some("2")), 2, "合法覆盖");
+        assert_eq!(super::shrink_delay_secs(Some("abc")), 30, "非法值回落默认");
+        assert_eq!(super::shrink_delay_secs(Some("")), 30, "空值回落默认");
+    }
+
+    /// 旧代定时器必须被拒绝:显示动作递增代号后,未触发的缩窗不得执行。
+    /// 突变钉:把 `scheduled == current` 改成 `true` 本测试即红。
+    #[test]
+    fn stale_shrink_timer_is_rejected() {
+        assert!(super::shrink_timer_is_current(7, 7), "同代有效");
+        assert!(!super::shrink_timer_is_current(7, 8), "显示后旧代作废");
+        assert!(!super::shrink_timer_is_current(8, 7), "不可能:反序也拒绝");
     }
 }
