@@ -1611,13 +1611,9 @@ fn draw_row(
     let painter = ui.painter();
     painter.rect_filled(cells.rect, egui::CornerRadius::ZERO, bg);
     match icons.icon(ui.ctx(), entry) {
-        Some(id) => {
-            painter.image(
-                id,
-                cells.icon,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        Some(draw) => {
+            // 图集绘制:同一张纹理,UV 定位到该图标的 64×64 单元格。
+            painter.image(draw.texture, cells.icon, draw.uv, egui::Color32::WHITE);
         }
         None => icons::draw_fallback(painter, cells.icon, palette.column_text),
     }

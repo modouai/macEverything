@@ -1,10 +1,17 @@
 //! 结果行系统图标(visual.md §2.4「文件图标走系统真实图标」)。
 //!
+//! ## 纹理形态:单一图集(2026-11-01)
+//!
+//! 所有图标(类型 + 路径)都写进**一张** 64×64 单元格图集([`IconAtlas`]),
+//! 绘制用 UV 定位。原因:实测每张独立图标纹理的驱动侧固定开销约 8.9MB
+//! (64×64 位图仅 16KB),滚动停稳后 30 张可见图标即 ≈227MB;图集把纹理对象
+//! 从「每图标一张」降为「全局一张」(≈8.9MB + 位图 1–4MB)。
+//!
 //! ## 缓存与去重
 //!
 //! - **类型图标**:UI 线程先解析 UTI(`platform::uti_for`,廉价的 UTType 查询),
-//!   纹理、失败记录与在途请求都以 **UTI** 为键——`.jpg/.jpeg/.jpe` 等映射到同一
-//!   UTI 的不同扩展名共享一份纹理与在途请求,不会重复解码 36MB TIFF。
+//!   图集槽位、失败记录与在途请求都以 **UTI** 为键——`.jpg/.jpeg/.jpe` 等映射到同一
+//!   UTI 的不同扩展名共享一份图块与在途请求,不会重复解码 36MB TIFF。
 //! - **APP bundle**(`.app` 目录):图标每个 APP 不同,按**路径**取
 //!   (`NSWorkspace iconForFile:`,自然含用户自定义);缓存与在途去重同「自定义
 //!   图标」通道(路径为键,失败落 `None` 回落 KEY_APP 类型图标 = 通用 APP 图标,
@@ -20,7 +27,7 @@
 //!
 //! 专用工作线程 `mce-icon-loader` 串行执行「资源读取 + `NSImage.TIFFRepresentation`
 //! 数据化 + image 解码 + Lanczos 缩放」,只把 64×64 **预乘** RGBA 回传。UI 线程每帧只做:
-//! drain 响应、限量大上传纹理、解析 UTI——零重活,不阻塞首屏/滚动。
+//! drain 响应、限量写入图集(每次 16KB partial 上传)、解析 UTI——零重活,不阻塞首屏/滚动。
 //!
 //! 依据:NSWorkspace 的图标查询可跨线程(Chromium `chrome/browser/icon_loader_mac.mm`
 //! 即在独立线程调用 `iconForFile:`);worker 只对返回的 NSImage 做数据化,不创建/
@@ -50,9 +57,17 @@ const UPLOAD_BUDGET: usize = 8;
 const RESPONSE_POLL: Duration = Duration::from_millis(16);
 /// 在途请求超时(持续无任何响应):防止 worker 卡死时永久 60fps 轮询。
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
-/// 路径图标缓存上限(含自定义图标;内存规格 tech.md §6.2.3:2048→128 LRU,
-/// 上界 64×64×4×128 ≈ 2MB,对照原 2048 条 ≈ 32MB)。超出按**最久未用**淘汰。
-const MAX_PATH_ICONS: usize = 128;
+/// 路径图标缓存上限(含自定义图标)。按**内存预算**定(2026-11-01 实测):
+/// 图标纹理的驱动侧固定开销约 8.9MB/张(64×64 位图仅 16KB),条目数直接决定
+/// 内存。32 条 ≈ 1.5 屏可见行(实测回退/小范围滚动不重载),超出按 LRU 淘汰。
+/// 图集化后(见 [`IconAtlas`])条目本身不再各占一张纹理,此上限退回「条目数」
+/// 语义,并防止无界增长。
+const MAX_PATH_ICONS: usize = 32;
+/// 图集每边槽数(8 列 × 8 行 = 64 槽起步;满时纵向倍增到 [`ATLAS_MAX_ROWS`])。
+const ATLAS_COLS: usize = 8;
+const ATLAS_INIT_ROWS: usize = 8;
+/// 图集行数上限(32 行 = 256 槽 = 1024×2048 px;再满则淘汰最旧类型图标)。
+const ATLAS_MAX_ROWS: usize = 32;
 /// 滚动抑制的静默阈值:检测到滚动后再保持抑制 150ms,滚动停止且静默期满才
 /// 恢复按需加载(给惯性滚动/连续滚轮留余量,避免「停一下就建一批纹理」)。
 pub(crate) const SCROLL_SETTLE: Duration = Duration::from_millis(150);
@@ -85,16 +100,159 @@ enum IconResponse {
     App { path: String, rgba: Option<Vec<u8>> },
 }
 
+/// 一行图标的绘制句柄:图集纹理 + 该图标在**图集内**的 UV 子矩形。
+///
+/// 图集化动机(2026-11-01 实测):每张独立图标纹理的驱动侧固定开销约 8.9MB
+/// (与 64×64 位图无关),滚动停稳后加载可见行即可堆出 30 张 ≈ 227MB。全部图标
+/// 打进一张图集后,GL 纹理对象从「每图标一张」降为「全局一张」,内存从
+/// N×8.9MB 降为 1×8.9MB + 图集位图(1–4MB)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IconDraw {
+    /// 图集纹理 id(全局唯一,三视口共用)。
+    pub texture: egui::TextureId,
+    /// 图集内的 UV 子矩形。
+    pub uv: egui::Rect,
+}
+
+/// 图标图集:固定 64×64 单元格网格,slot 索引 → (列, 行)。
+///
+/// - 容量:8 列起步 8 行(64 槽),满时**只纵向倍增**到 [`ATLAS_MAX_ROWS`]
+///   (slot 的行列映射不变,已有 UV 无需重算);
+/// - 写入:响应落地时把 64×64 预乘 RGBA 拷进图集,并 `set_partial` 上传该单元格
+///   (16KB/次,与逐图标纹理的整张上传相比可忽略);
+/// - 槽位释放:Lru 淘汰/重置时归还 slot,复用不重建纹理。
+struct IconAtlas {
+    image: egui::ColorImage,
+    handle: egui::TextureHandle,
+    rows: usize,
+    /// 可复用槽(淘汰归还)。
+    free: Vec<usize>,
+    /// 尚未分配过的下一个槽。
+    next: usize,
+}
+
+impl IconAtlas {
+    fn new(ctx: &egui::Context) -> Self {
+        let px = ICON_PX as usize;
+        let size = [px * ATLAS_COLS, px * ATLAS_INIT_ROWS];
+        let image =
+            egui::ColorImage::new(size, vec![egui::Color32::TRANSPARENT; size[0] * size[1]]);
+        let handle = ctx.load_texture("icon-atlas", image.clone(), egui::TextureOptions::LINEAR);
+        Self {
+            image,
+            handle,
+            rows: ATLAS_INIT_ROWS,
+            free: Vec::new(),
+            next: 0,
+        }
+    }
+
+    fn id(&self) -> egui::TextureId {
+        self.handle.id()
+    }
+
+    fn capacity(&self) -> usize {
+        ATLAS_COLS * self.rows
+    }
+
+    fn slot_xy(&self, slot: usize) -> (usize, usize) {
+        let px = ICON_PX as usize;
+        ((slot % ATLAS_COLS) * px, (slot / ATLAS_COLS) * px)
+    }
+
+    fn uv(&self, slot: usize) -> egui::Rect {
+        let (x, y) = self.slot_xy(slot);
+        let px = ICON_PX as f32;
+        let (w, h) = (self.image.size[0] as f32, self.image.size[1] as f32);
+        egui::Rect::from_min_max(
+            egui::pos2(x as f32 / w, y as f32 / h),
+            egui::pos2((x as f32 + px) / w, (y as f32 + px) / h),
+        )
+    }
+
+    /// 分配一个槽:优先复用释放槽,其次未用槽,最后纵向扩容;到上限返回 None。
+    fn alloc(&mut self, ctx: &egui::Context) -> Option<usize> {
+        if let Some(slot) = self.free.pop() {
+            return Some(slot);
+        }
+        if self.next < self.capacity() {
+            let slot = self.next;
+            self.next += 1;
+            return Some(slot);
+        }
+        if !self.grow(ctx) {
+            return None;
+        }
+        let slot = self.next;
+        self.next += 1;
+        Some(slot)
+    }
+
+    /// 纵向倍增(列数不变 → slot 的 (列, 行) 像素位置不变;归一化 UV 由绘制时
+    /// 按当前图集尺寸实时计算,不缓存,故扩容后无需重算已交付的绘制句柄)。
+    fn grow(&mut self, _ctx: &egui::Context) -> bool {
+        if self.rows >= ATLAS_MAX_ROWS {
+            return false;
+        }
+        let px = ICON_PX as usize;
+        let new_rows = (self.rows * 2).min(ATLAS_MAX_ROWS);
+        let size = [px * ATLAS_COLS, px * new_rows];
+        let mut image =
+            egui::ColorImage::new(size, vec![egui::Color32::TRANSPARENT; size[0] * size[1]]);
+        let old_len = self.image.pixels.len();
+        image.pixels[..old_len].copy_from_slice(&self.image.pixels);
+        self.image = image;
+        self.rows = new_rows;
+        self.handle
+            .set(self.image.clone(), egui::TextureOptions::LINEAR);
+        log::debug!("图标图集扩容到 {:?}", self.image.size);
+        true
+    }
+
+    /// 写入一个单元格并上传该 64×64 子区域(16KB partial delta)。
+    ///
+    /// 调用方保证 `rgba.len() == ICON_PX² × 4`(预乘)。
+    fn write(&mut self, slot: usize, rgba: &[u8]) {
+        let px = ICON_PX as usize;
+        let (x, y) = self.slot_xy(slot);
+        let w = self.image.size[0];
+        let mut region = Vec::with_capacity(px * px);
+        for row in 0..px {
+            let src = &rgba[row * px * 4..(row + 1) * px * 4];
+            for col in 0..px {
+                let i = col * 4;
+                let color = egui::Color32::from_rgba_premultiplied(
+                    src[i],
+                    src[i + 1],
+                    src[i + 2],
+                    src[i + 3],
+                );
+                self.image.pixels[(y + row) * w + x + col] = color;
+                region.push(color);
+            }
+        }
+        self.handle.set_partial(
+            [x, y],
+            egui::ColorImage::new([px, px], region),
+            egui::TextureOptions::LINEAR,
+        );
+    }
+}
+
 /// 结果行图标缓存(跨帧保留;单位置一个)。
 pub struct IconCache {
     /// 类型分组键 → UTI 标识符(同扩展名只解析一次 UTI)。
     key_to_uti: HashMap<String, String>,
-    /// UTI 标识符 → 纹理(缓存键 = UTI,不是路径;visual.md §2.4)。
-    type_icons: HashMap<String, egui::TextureHandle>,
+    /// UTI 标识符 → 图集槽位(缓存键 = UTI,不是路径;visual.md §2.4)。
+    type_icons: HashMap<String, usize>,
+    /// 类型图标的插入序(图集槽耗尽时淘汰最旧者).
+    type_order: VecDeque<String>,
     /// 取图失败的类型(UTI):不再重试,直接落兜底。
     failed_types: HashSet<String>,
-    /// 路径 → 自定义图标;`None` = 无自定义或读取失败(均保留到 reset/上限)。
-    path_icons: HashMap<String, Option<egui::TextureHandle>>,
+    /// 路径 → 自定义图标槽位;`None` = 无自定义或读取失败(均保留到 reset/上限)。
+    path_icons: HashMap<String, Option<usize>>,
+    /// 图标图集(懒创建:首个图标落地时建;三视口共用一张纹理)。
+    atlas: Option<IconAtlas>,
     /// 路径 LRU 序(头 = 最久未用,尾 = 最近使用;命中/覆盖即移尾;
     /// 上限淘汰从头取。与 `path_icons` 同步维护)。
     path_order: VecDeque<String>,
@@ -157,8 +315,10 @@ impl IconCache {
         Self {
             key_to_uti: HashMap::new(),
             type_icons: HashMap::new(),
+            type_order: VecDeque::new(),
             failed_types: HashSet::new(),
             path_icons: HashMap::new(),
+            atlas: None,
             path_order: VecDeque::new(),
             pending_types: HashSet::new(),
             pending_paths: HashSet::new(),
@@ -239,7 +399,7 @@ impl IconCache {
     /// APP bundle(`.app` 目录)的图标每个 APP 不同,`NSWorkspace iconForFile:`
     /// 才能给到(自然含用户自定义);未命中/失败时本帧先用类型图标(KEY_APP →
     /// 通用 APP 图标,不是文件夹图标)。
-    pub fn icon(&mut self, ctx: &egui::Context, entry: &HitEntry) -> Option<egui::TextureId> {
+    pub fn icon(&mut self, ctx: &egui::Context, entry: &HitEntry) -> Option<IconDraw> {
         self.icon_at(ctx, entry, Instant::now())
     }
 
@@ -264,15 +424,15 @@ impl IconCache {
         ctx: &egui::Context,
         entry: &HitEntry,
         now: Instant,
-    ) -> Option<egui::TextureId> {
+    ) -> Option<IconDraw> {
         if self.scrolling_at(now) {
             return self.cached_icon(entry);
         }
         if is_app_bundle(&entry.name, entry.is_dir) {
             if self.path_icons.contains_key(&entry.path) {
                 self.touch(&entry.path);
-                if let Some(Some(tex)) = self.path_icons.get(&entry.path) {
-                    return Some(tex.id());
+                if let Some(Some(slot)) = self.path_icons.get(&entry.path) {
+                    return self.draw_slot(*slot);
                 }
                 // 取图失败 → 通用 APP 类型图标兜底
             } else {
@@ -282,14 +442,23 @@ impl IconCache {
         }
         if self.path_icons.contains_key(&entry.path) {
             self.touch(&entry.path);
-            if let Some(Some(tex)) = self.path_icons.get(&entry.path) {
-                return Some(tex.id());
+            if let Some(Some(slot)) = self.path_icons.get(&entry.path) {
+                return self.draw_slot(*slot);
             }
             // 已查无自定义图标 → 类型图标
         } else {
             self.request_path(ctx, &entry.path);
         }
         self.type_icon(ctx, &entry.name, entry.is_dir)
+    }
+
+    /// 槽位 → 绘制句柄(图集必已存在:槽位只由图集写入产生)。
+    fn draw_slot(&self, slot: usize) -> Option<IconDraw> {
+        let atlas = self.atlas.as_ref()?;
+        Some(IconDraw {
+            texture: atlas.id(),
+            uv: atlas.uv(slot),
+        })
     }
 
     /// 测试观测面:在途请求数(路径, 类型)。用于验证调用点确实报告了滚动。
@@ -302,21 +471,22 @@ impl IconCache {
     ///
     /// 命中规则与 [`Self::icon`] 一致,但所有「未命中→请求」的分支都退化为
     /// `None`(调用方画占位);类型图标只查**已解析过**的键。
-    fn cached_icon(&mut self, entry: &HitEntry) -> Option<egui::TextureId> {
+    fn cached_icon(&mut self, entry: &HitEntry) -> Option<IconDraw> {
         if is_app_bundle(&entry.name, entry.is_dir) {
             return self
                 .path_icons
                 .get(&entry.path)
-                .and_then(Option::as_ref)
-                .map(egui::TextureHandle::id);
+                .and_then(|slot| slot.as_ref().and_then(|s| self.draw_slot(*s)));
         }
-        if let Some(Some(tex)) = self.path_icons.get(&entry.path) {
-            return Some(tex.id());
+        if let Some(Some(slot)) = self.path_icons.get(&entry.path) {
+            let slot = *slot;
+            return self.draw_slot(slot);
         }
         // 类型图标:键已解析过才查(滚动期不做 UTType 查询)。
         let key = type_key(&entry.name, entry.is_dir);
         let uti = self.key_to_uti.get(&key)?;
-        self.type_icons.get(uti).map(egui::TextureHandle::id)
+        let uti = uti.clone();
+        self.cached_type(&uti)
     }
 
     /// LRU 记账:命中的路径移到队尾(最近使用)。
@@ -361,12 +531,7 @@ impl IconCache {
     }
 
     /// 类型图标:先解析 UTI,再以 UTI 查纹理/失败/在途;未命中才发请求。
-    fn type_icon(
-        &mut self,
-        ctx: &egui::Context,
-        name: &str,
-        is_dir: bool,
-    ) -> Option<egui::TextureId> {
+    fn type_icon(&mut self, ctx: &egui::Context, name: &str, is_dir: bool) -> Option<IconDraw> {
         let key = type_key(name, is_dir);
         let uti = match self.key_to_uti.get(&key) {
             Some(uti) => uti.clone(),
@@ -399,9 +564,11 @@ impl IconCache {
         None
     }
 
-    /// 已上传纹理的类型图标命中。
-    fn cached_type(&self, uti: &str) -> Option<egui::TextureId> {
-        self.type_icons.get(uti).map(|tex| tex.id())
+    /// 已入图集的类型图标命中。
+    fn cached_type(&self, uti: &str) -> Option<IconDraw> {
+        self.type_icons
+            .get(uti)
+            .and_then(|slot| self.draw_slot(*slot))
     }
 
     /// 发送请求。测试构造(无 worker)只保留在途标记,返回成功由测试注入响应。
@@ -453,15 +620,15 @@ impl IconCache {
         drained
     }
 
-    /// 应用一条 worker 响应:上传纹理,写纹理/失败/无自定义缓存。
+    /// 应用一条 worker 响应:把像素写进图集(partial 上传),落缓存。
     fn apply_response(&mut self, ctx: &egui::Context, resp: IconResponse) {
         match resp {
             IconResponse::Type { uti, rgba } => {
                 self.pending_types.remove(&uti);
-                let name = format!("icon-type:{uti}");
-                match rgba.and_then(|rgba| load_texture(ctx, &name, rgba)) {
-                    Some(tex) => {
-                        self.type_icons.insert(uti, tex);
+                match rgba.and_then(|rgba| self.place_icon(ctx, &rgba)) {
+                    Some(slot) => {
+                        self.type_icons.insert(uti.clone(), slot);
+                        self.type_order.push_back(uti);
                     }
                     None => {
                         self.failed_types.insert(uti);
@@ -470,23 +637,51 @@ impl IconCache {
             }
             IconResponse::Path { path, rgba } => {
                 self.pending_paths.remove(&path);
-                let name = format!("icon-path:{path}");
-                let tex = rgba.and_then(|rgba| load_texture(ctx, &name, rgba));
-                self.store_path_icon(path, tex);
+                let slot = rgba.and_then(|rgba| self.place_icon(ctx, &rgba));
+                self.store_path_icon(path, slot);
             }
             IconResponse::App { path, rgba } => {
                 self.pending_paths.remove(&path);
-                let name = format!("icon-app:{path}");
-                let tex = rgba.and_then(|rgba| load_texture(ctx, &name, rgba));
-                self.store_path_icon(path, tex);
+                let slot = rgba.and_then(|rgba| self.place_icon(ctx, &rgba));
+                self.store_path_icon(path, slot);
+            }
+        }
+    }
+
+    /// 把一份 64×64 预乘 RGBA 放进图集,返回槽位;尺寸不符落败(不 panic)。
+    ///
+    /// 槽位分配顺序:释放槽 → 未用槽 → 纵向扩容;图集到上限(256 槽)时淘汰
+    /// 最旧类型图标腾槽。类型图标是共享资源(同 UTI 全列表复用),淘汰代价低。
+    fn place_icon(&mut self, ctx: &egui::Context, rgba: &[u8]) -> Option<usize> {
+        if rgba.len() != ICON_PX as usize * ICON_PX as usize * 4 {
+            return None;
+        }
+        if self.atlas.is_none() {
+            self.atlas = Some(IconAtlas::new(ctx));
+        }
+        loop {
+            let slot = self.atlas.as_mut().expect("图集已建").alloc(ctx);
+            if let Some(slot) = slot {
+                self.atlas.as_mut().expect("图集已建").write(slot, rgba);
+                return Some(slot);
+            }
+            // 图集满:淘汰最旧类型图标腾槽(无类型可淘汰则放弃)。
+            let victim = self.type_order.pop_front()?;
+            if let Some(old) = self.type_icons.remove(&victim) {
+                self.atlas.as_mut().expect("图集已建").free.push(old);
             }
         }
     }
 
     /// 记录路径图标结果(含「无自定义/失败」),维护 LRU 序并执行上限淘汰。
-    fn store_path_icon(&mut self, path: String, icon: Option<egui::TextureHandle>) {
-        if self.path_icons.insert(path.clone(), icon).is_some() {
-            // 覆盖已有条目(理论不可达:在途去重挡住重复请求)按最近使用收尾。
+    fn store_path_icon(&mut self, path: String, slot: Option<usize>) {
+        if let Some(prev) = self.path_icons.insert(path.clone(), slot) {
+            if prev != slot {
+                // 覆盖已有条目(理论不可达:在途去重挡住重复请求):归还旧槽。
+                if let (Some(old), Some(atlas)) = (prev, self.atlas.as_mut()) {
+                    atlas.free.push(old);
+                }
+            }
             self.touch(&path);
         } else {
             self.path_order.push_back(path);
@@ -494,7 +689,7 @@ impl IconCache {
         self.trim_path_icons();
     }
 
-    /// 路径缓存超上限时按 LRU 淘汰最久未用条目。
+    /// 路径缓存超上限时按 LRU 淘汰最久未用条目(归还图集槽位复用)。
     fn trim_path_icons(&mut self) {
         while self.path_icons.len() > MAX_PATH_ICONS {
             let victim = self.path_order.pop_front().or_else(|| {
@@ -504,7 +699,11 @@ impl IconCache {
             let Some(victim) = victim else {
                 break;
             };
-            self.path_icons.remove(&victim);
+            if let Some(Some(slot)) = self.path_icons.remove(&victim) {
+                if let Some(atlas) = self.atlas.as_mut() {
+                    atlas.free.push(slot);
+                }
+            }
         }
     }
 
@@ -625,25 +824,6 @@ fn worker_loop(
     }
 }
 
-/// 平台层返回**预乘** RGBA(NSImage/ImageIO 的 TIFF 样本即预乘;resize 也在预乘上
-/// 进行)。直接按预乘构造,避免 `from_rgba_unmultiplied` 二次乘 alpha 让半透明
-/// 抗锯齿边缘发黑。
-fn rgba_to_color_image(rgba: &[u8]) -> Option<egui::ColorImage> {
-    if rgba.len() != ICON_PX as usize * ICON_PX as usize * 4 {
-        return None;
-    }
-    Some(egui::ColorImage::from_rgba_premultiplied(
-        [ICON_PX as usize, ICON_PX as usize],
-        rgba,
-    ))
-}
-
-/// 上传 64×64 预乘 RGBA 到 egui 纹理(尺寸不符视为失败,不 panic)。
-fn load_texture(ctx: &egui::Context, name: &str, rgba: Vec<u8>) -> Option<egui::TextureHandle> {
-    let image = rgba_to_color_image(&rgba)?;
-    Some(ctx.load_texture(name.to_owned(), image, egui::TextureOptions::LINEAR))
-}
-
 /// 文件名扩展名(与 `type_key` 同一口径,平台层按它解析 UTI)。
 ///
 /// 语义(单测钉住):取最后一个 `.` 之后、非空的一段;隐藏文件(`.gitignore`)
@@ -705,9 +885,27 @@ mod tests {
         px
     }
 
-    fn texture(ctx: &egui::Context, name: &str) -> egui::TextureHandle {
-        let image = egui::ColorImage::from_rgba_unmultiplied([ICON_PX as usize; 2], &rgba_fill(5));
-        ctx.load_texture(name.to_owned(), image, egui::TextureOptions::LINEAR)
+    /// 测试:把一份纯色图块放进图集,返回其绘制句柄。
+    fn put_icon(cache: &mut IconCache, ctx: &egui::Context, v: u8) -> IconDraw {
+        let slot = cache.place_icon(ctx, &rgba_fill(v)).expect("图集槽位");
+        cache.draw_slot(slot).expect("图集已存在")
+    }
+
+    /// 测试:造一个已缓存的类型图标并返回句柄。
+    fn put_type(cache: &mut IconCache, ctx: &egui::Context, uti: &str, v: u8) -> IconDraw {
+        let rgba = rgba_fill(v);
+        let slot = cache.place_icon(ctx, &rgba).expect("图集槽位");
+        cache.type_icons.insert(uti.to_owned(), slot);
+        cache.type_order.push_back(uti.to_owned());
+        cache.cached_type(uti).expect("类型图标已入图集")
+    }
+
+    /// 测试:造一个已缓存的路径图标并返回句柄。
+    fn put_path(cache: &mut IconCache, ctx: &egui::Context, path: &str, v: u8) -> IconDraw {
+        let rgba = rgba_fill(v);
+        let slot = cache.place_icon(ctx, &rgba).expect("图集槽位");
+        cache.store_path_icon(path.to_owned(), Some(slot));
+        cache.draw_slot(slot).expect("图集已存在")
     }
 
     /// 测试隔离:路径已检查且无自定义图标,避免类型测试顺带挂路径请求。
@@ -837,15 +1035,20 @@ mod tests {
         let mut cache = IconCache::without_worker();
         let entry = hit("cached.jpg");
         mark_path_checked(&mut cache, &entry);
-        let tex = texture(&ctx, "cached-type");
-        let id = tex.id();
         cache
             .key_to_uti
             .insert("ext:jpg".to_owned(), "public.jpeg".to_owned());
-        cache.type_icons.insert("public.jpeg".to_owned(), tex);
+        let draw = put_type(&mut cache, &ctx, "public.jpeg", 5);
 
-        assert_eq!(cache.icon(&ctx, &entry), Some(id), "纹理命中应返回 Some");
-        assert_eq!(cache.cached_type("public.jpeg"), Some(id));
+        assert_eq!(
+            cache.icon(&ctx, &entry).map(|d| (d.texture, d.uv)),
+            Some((draw.texture, draw.uv)),
+            "图集命中应返回 Some"
+        );
+        assert_eq!(
+            cache.cached_type("public.jpeg").map(|d| (d.texture, d.uv)),
+            Some((draw.texture, draw.uv))
+        );
         assert!(cache.pending_types.is_empty());
     }
 
@@ -926,9 +1129,12 @@ mod tests {
             },
         );
         assert!(cache.pending_types.is_empty());
-        let id = cache.icon(&ctx, &entry).expect("响应落地后应命中纹理");
+        let draw = cache.icon(&ctx, &entry).expect("响应落地后应命中图集");
         assert_eq!(cache.type_icons.len(), 1);
-        assert_eq!(cache.cached_type("public.jpeg"), Some(id));
+        assert_eq!(
+            cache.cached_type("public.jpeg").map(|d| (d.texture, d.uv)),
+            Some((draw.texture, draw.uv))
+        );
     }
 
     #[test]
@@ -960,25 +1166,35 @@ mod tests {
                 rgba: Some(rgba_fill(11)),
             },
         );
-        let jpg_id = cache.icon(&ctx, &jpg).expect("jpg 命中共享纹理");
-        let jpeg_id = cache.icon(&ctx, &jpeg).expect("jpeg 命中共享纹理");
-        assert_eq!(jpg_id, jpeg_id);
-        assert_eq!(cache.type_icons.len(), 1, "同 UTI 只存一份纹理");
+        let jpg_draw = cache.icon(&ctx, &jpg).expect("jpg 命中共享图集槽");
+        let jpeg_draw = cache.icon(&ctx, &jpeg).expect("jpeg 命中共享图集槽");
+        assert_eq!(
+            (jpg_draw.texture, jpg_draw.uv),
+            (jpeg_draw.texture, jpeg_draw.uv)
+        );
+        assert_eq!(cache.type_icons.len(), 1, "同 UTI 只存一份图集槽");
     }
 
     #[test]
     fn premultiplied_rgba_is_not_multiplied_twice() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
         let mut rgba = vec![0u8; (ICON_PX * ICON_PX * 4) as usize];
         let px = [64u8, 32, 16, 128];
         rgba[..4].copy_from_slice(&px);
-        let image = rgba_to_color_image(&rgba).expect("尺寸合法");
-        let c = image.pixels[0];
+        let slot = cache.place_icon(&ctx, &rgba).expect("尺寸合法");
+        let atlas = cache.atlas.as_ref().expect("图集已建");
+        let (x, y) = atlas.slot_xy(slot);
+        let c = atlas.image.pixels[y * atlas.image.size[0] + x];
         assert_eq!(
             [c.r(), c.g(), c.b(), c.a()],
             px,
             "预乘样本不得被二次乘 alpha(误用 unmultiplied 会变 [32,16,8,128])"
         );
-        assert!(rgba_to_color_image(&rgba[..3]).is_none(), "尺寸不符应拒绝");
+        assert!(
+            cache.place_icon(&ctx, &rgba[..3]).is_none(),
+            "尺寸不符应拒绝"
+        );
     }
 
     #[test]
@@ -1059,15 +1275,11 @@ mod tests {
         cache
             .key_to_uti
             .insert("ext:txt".to_owned(), "public.plain-text".to_owned());
-        let type_tex = texture(&ctx, "type-precedence");
-        let type_id = type_tex.id();
-        cache
-            .type_icons
-            .insert("public.plain-text".to_owned(), type_tex);
+        let type_draw = put_type(&mut cache, &ctx, "public.plain-text", 7);
 
         assert_eq!(
-            cache.icon(&ctx, &entry),
-            Some(type_id),
+            cache.icon(&ctx, &entry).map(|d| (d.texture, d.uv)),
+            Some((type_draw.texture, type_draw.uv)),
             "自定义图标在途时先用类型图标"
         );
         assert_eq!(cache.pending_paths.len(), 1);
@@ -1083,14 +1295,17 @@ mod tests {
             })
             .unwrap();
         cache.begin_frame(&ctx);
-        let custom_id = cache.path_icons[&entry.path]
-            .as_ref()
-            .expect("自定义图标已落地")
-            .id();
-        assert_ne!(custom_id, type_id);
+        let custom = cache
+            .draw_slot(
+                *cache.path_icons[&entry.path]
+                    .as_ref()
+                    .expect("自定义图标已落地"),
+            )
+            .expect("图集已存在");
+        assert_ne!(custom.uv, type_draw.uv, "自定义与类型图标应是不同槽位");
         assert_eq!(
-            cache.icon(&ctx, &entry),
-            Some(custom_id),
+            cache.icon(&ctx, &entry).map(|d| (d.texture, d.uv)),
+            Some((custom.texture, custom.uv)),
             "自定义图标优先于类型图标"
         );
     }
@@ -1132,7 +1347,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS, "路径缓存上限 128");
+        assert_eq!(cache.path_icons.len(), MAX_PATH_ICONS, "路径缓存上限 32");
         assert!(!cache.path_icons.contains_key("/tmp/mce-icon-test/cap-0"));
         assert!(!cache.path_icons.contains_key("/tmp/mce-icon-test/cap-1"));
 
@@ -1145,7 +1360,7 @@ mod tests {
             },
         );
         assert!(cache.path_icons[custom].is_some(), "自定义图标应保留");
-        let custom_id = cache.path_icons[custom].as_ref().unwrap().id();
+        let custom_slot = *cache.path_icons[custom].as_ref().unwrap();
 
         cache.on_reset();
         assert_eq!(
@@ -1153,7 +1368,7 @@ mod tests {
             1,
             "reset 清掉「无自定义/读取失败」条目"
         );
-        assert_eq!(cache.path_icons[custom].as_ref().unwrap().id(), custom_id);
+        assert_eq!(cache.path_icons[custom].as_ref().unwrap(), &custom_slot);
         assert_eq!(cache.path_order.len(), 1);
     }
 
@@ -1184,21 +1399,23 @@ mod tests {
 
         // ① 类型图标已缓存(键已解析):滚动期照常返回。
         let entry = hit("cached.pdf");
-        let tex = texture(&ctx, "scroll-type");
-        let id = tex.id();
         cache
             .key_to_uti
             .insert("ext:pdf".to_owned(), "com.adobe.pdf".to_owned());
-        cache.type_icons.insert("com.adobe.pdf".to_owned(), tex);
+        let type_draw = put_type(&mut cache, &ctx, "com.adobe.pdf", 6);
         cache.path_icons.insert(entry.path.clone(), None);
-        assert_eq!(cache.icon_at(&ctx, &entry, t), Some(id));
+        assert_eq!(
+            cache.icon_at(&ctx, &entry, t).map(|d| (d.texture, d.uv)),
+            Some((type_draw.texture, type_draw.uv))
+        );
 
         // ② 路径自定义图标已缓存:滚动期照常返回。
         let custom = hit("custom.txt");
-        let ctex = texture(&ctx, "scroll-custom");
-        let cid = ctex.id();
-        cache.path_icons.insert(custom.path.clone(), Some(ctex));
-        assert_eq!(cache.icon_at(&ctx, &custom, t), Some(cid));
+        let custom_draw = put_path(&mut cache, &ctx, &custom.path, 8);
+        assert_eq!(
+            cache.icon_at(&ctx, &custom, t).map(|d| (d.texture, d.uv)),
+            Some((custom_draw.texture, custom_draw.uv))
+        );
 
         // ③ 未解析的类型键:滚动期不做 UTType 解析、不发请求。
         let fresh = hit("fresh.xyz");
@@ -1258,11 +1475,84 @@ mod tests {
         );
     }
 
-    /// 突变钉:容量常量必须是 128(内存规格 tech.md §6.2.3;若有人调回大容量,
-    /// 此测先红,提示去规格处重新定线)。
+    /// 图集核心收益:无论多少图标(类型 + 路径),全部落在**同一张**纹理上,
+    /// UV 各不相同。突变(退回每图标一张纹理)时 texture id 会互不相同,本测红。
+    #[test]
+    fn atlas_packs_all_icons_into_one_texture() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
+        let a = put_type(&mut cache, &ctx, "public.jpeg", 1);
+        let b = put_type(&mut cache, &ctx, "public.png", 2);
+        let c = put_path(&mut cache, &ctx, "/tmp/mce-icon-test/x.app", 3);
+        let d = put_icon(&mut cache, &ctx, 4);
+        assert_eq!(a.texture, b.texture, "不同图标必须共用同一张图集纹理");
+        assert_eq!(a.texture, c.texture);
+        assert_eq!(a.texture, d.texture);
+        let uvs = [a.uv, b.uv, c.uv, d.uv];
+        for i in 0..uvs.len() {
+            for j in (i + 1)..uvs.len() {
+                assert_ne!(uvs[i], uvs[j], "不同图标必须占不同 UV 单元格");
+            }
+            assert!(
+                uvs[i].width() > 0.0 && uvs[i].height() > 0.0,
+                "UV 必须是有效子矩形"
+            );
+        }
+    }
+
+    /// 纵向扩容:超过初始 64 槽后图集行数翻倍,**既有槽位的 UV 保持不变**
+    /// (列数不变 → slot 的行列映射不变),纹理 id 也不变。
+    #[test]
+    fn atlas_grows_vertically_without_moving_existing_uvs() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
+        let first = put_icon(&mut cache, &ctx, 1);
+        let mut last = first;
+        for v in 0..(ATLAS_COLS * ATLAS_INIT_ROWS + 4) {
+            last = put_icon(&mut cache, &ctx, (v % 250) as u8);
+        }
+        let atlas = cache.atlas.as_ref().expect("图集已建");
+        assert!(
+            atlas.rows > ATLAS_INIT_ROWS,
+            "超过初始槽位后应纵向扩容,实际 rows={}",
+            atlas.rows
+        );
+        assert_eq!(first.texture, last.texture, "扩容后仍是同一张纹理");
+        // 归一化 UV 随高度变化(÷h),但换算回像素仍是同一格;绘制时实时计算。
+        let uv = cache.draw_slot(0).unwrap().uv;
+        let (w, h) = (atlas.image.size[0] as f32, atlas.image.size[1] as f32);
+        let px = ICON_PX as f32;
+        assert!((uv.min.x * w).abs() < 0.01 && (uv.min.y * h).abs() < 0.01);
+        assert!((uv.width() * w - px).abs() < 0.01);
+        assert!((uv.height() * h - px).abs() < 0.01);
+    }
+
+    /// 淘汰归还槽位复用:路径缓存超上限淘汰后,新图标应复用释放槽,
+    /// 不无限扩容(图集槽位数受缓存上限约束)。
+    #[test]
+    fn atlas_reuses_slots_freed_by_lru_eviction() {
+        let ctx = egui::Context::default();
+        let mut cache = IconCache::without_worker();
+        for i in 0..(MAX_PATH_ICONS + 1) {
+            let path = format!("/tmp/mce-icon-test/reuse-{i}");
+            let slot = cache.place_icon(&ctx, &rgba_fill(1)).unwrap();
+            cache.store_path_icon(path, Some(slot));
+        }
+        let atlas = cache.atlas.as_ref().unwrap();
+        assert!(
+            atlas.rows == ATLAS_INIT_ROWS,
+            "淘汰释放的槽位应被复用,不应扩容(实际 rows={})",
+            atlas.rows
+        );
+        assert!(atlas.free.is_empty() || atlas.next <= MAX_PATH_ICONS + 1);
+    }
+
+    /// 突变钉:容量常量必须是 32(2026-11-01 按内存预算定:每张独立图标纹理
+    /// 驱动侧固定开销 ~8.9MB;图集化后条目不再各占一张纹理,上限只防无界增长;
+    /// 若有人调回大容量,此测先红,提示去规格处重新定线)。
     #[test]
     fn path_icon_capacity_is_pinned_to_spec() {
-        assert_eq!(MAX_PATH_ICONS, 128);
+        assert_eq!(MAX_PATH_ICONS, 32);
     }
 
     /// LRU 语义:命中把条目移到队尾;淘汰从头取最久未用——最旧但刚被命中的

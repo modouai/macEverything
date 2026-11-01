@@ -1757,6 +1757,28 @@ mod tests {
                 "{family:?} 尾部应为 KR/Symbols Lowest 段,实际 {list:?}"
             );
         }
+        // 按键帽全覆盖钉:键帽文案是**字面量**而非长尾样本,必须在生产同款
+        // 字体链里逐一可渲染(曾因 `↵` U+21B5 在所有内置字体与 SF Pro 中均缺失,
+        // 移除 system_fonts 后状态栏显示 tofu;测试只覆盖 `⏎` 漏掉了它)。
+        // 新增键帽符号时此处自动纳入,不必再靠人工挑样本。
+        ctx.fonts_mut(|f| {
+            let keys: Vec<&str> = crate::ui::palette::footer_groups()
+                .iter()
+                .map(|(_, keys)| *keys)
+                .collect();
+            for keys in keys {
+                for family in [
+                    egui::FontId::proportional(11.0),
+                    egui::FontId::monospace(11.0),
+                ] {
+                    assert!(
+                        f.has_glyphs(&family, keys),
+                        "键帽 {keys:?} 在 {family:?} 下缺字形(检查 BUNDLED_FONTS 覆盖)"
+                    );
+                }
+            }
+        });
+
         // 长尾字形全部命中已装字体(汉字/韩文/假名/符号/数字混排)。
         ctx.fonts_mut(|f| {
             for sample in [

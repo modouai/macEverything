@@ -1708,12 +1708,12 @@ fn action_hint(is_dir: bool) -> &'static str {
 }
 
 /// 页脚四组键位提示（视觉序左→右：打开 / 访达 / 完整窗口 / 隐藏；随语言切换）。
-fn footer_groups() -> [(&'static str, &'static str); 4] {
+pub(crate) fn footer_groups() -> [(&'static str, &'static str); 4] {
     let s = i18n::s();
     [
-        (s.palette_action_open, "↵"),
-        (s.palette_footer_finder, "⌘↵"),
-        (s.palette_footer_full_window, "⌥↵"),
+        (s.palette_action_open, "⏎"),
+        (s.palette_footer_finder, "⌘⏎"),
+        (s.palette_footer_full_window, "⌥⏎"),
         (s.palette_footer_hide, "esc"),
     ]
 }
@@ -1756,7 +1756,7 @@ fn draw_result_row(
     t: &tk::Palette,
     panel_x: f32,
     panel_w: f32,
-    texture: Option<egui::TextureId>,
+    draw: Option<icons::IconDraw>,
 ) -> egui::Response {
     // 占位分配（只为拿滚动区的 y 与点击响应）。
     let (slot, resp) = ui.allocate_exact_size(
@@ -1794,13 +1794,11 @@ fn draw_result_row(
         ),
         egui::vec2(tk::ROW_ICON, tk::ROW_ICON),
     );
-    if let Some(id) = texture {
-        row_ui.painter().image(
-            id,
-            icon_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+    if let Some(draw) = draw {
+        // 图集绘制:同一张纹理,UV 定位到该图标的 64×64 单元格。
+        row_ui
+            .painter()
+            .image(draw.texture, icon_rect, draw.uv, egui::Color32::WHITE);
     } else {
         // 兜底字形两形态共用（16 / 32 按矩形缩放；visual.md §2.4）。
         icons::draw_fallback(row_ui.painter(), icon_rect, t.dir_text);
@@ -1995,9 +1993,9 @@ mod tests {
             assert_eq!(
                 footer_groups(),
                 [
-                    ("打开", "↵"),
-                    ("访达", "⌘↵"),
-                    ("完整窗口", "⌥↵"),
+                    ("打开", "⏎"),
+                    ("访达", "⌘⏎"),
+                    ("完整窗口", "⌥⏎"),
                     ("隐藏", "esc"),
                 ]
             );
@@ -2006,9 +2004,9 @@ mod tests {
             assert_eq!(
                 footer_groups(),
                 [
-                    ("Open", "↵"),
-                    ("Finder", "⌘↵"),
-                    ("Full Window", "⌥↵"),
+                    ("Open", "⏎"),
+                    ("Finder", "⌘⏎"),
+                    ("Full Window", "⌥⏎"),
                     ("Hide", "esc"),
                 ]
             );
