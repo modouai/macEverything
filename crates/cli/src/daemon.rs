@@ -229,6 +229,12 @@ pub struct EngineState {
     perm_denied: Mutex<HashSet<PathBuf>>,
     /// 未知 errno 的连续失败计数(累计 3 次按持久失败入负缓存)。
     diff_fail_counts: Mutex<HashMap<PathBuf, u8>>,
+    /// 账本腐化自愈位:flush_merged 的合并写被腐化哨兵拒绝时置位,消费循环
+    /// 消费后触发降级全量重扫(ADR-5「重扫=最终一致性闸门」——拒绝在腐化
+    /// 账本上合并,但必须自愈而非无限拒绝)。经 flag 而非同步降级的理由:
+    /// flush_merged 持 flush_lock,degrade_and_rescan 尾部 flush 重入自死锁;
+    /// spawn_rescan 需要 Arc,消费循环持有。
+    heal_requested: AtomicBool,
 }
 
 impl EngineState {
@@ -262,6 +268,7 @@ impl EngineState {
             last_rescan: Mutex::new(None),
             perm_denied: Mutex::new(HashSet::new()),
             diff_fail_counts: Mutex::new(HashMap::new()),
+            heal_requested: AtomicBool::new(false),
         }
     }
 
@@ -725,18 +732,26 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
         };
         let epoch = st.overlay.epoch();
         let meta = build_meta(state);
-        let ok = engine::overlay::write_merged_atomic(
+        match engine::overlay::write_merged_atomic(
             st.base.as_view(),
             &st.overlay,
             &meta,
             &paths.index_file(),
-        )
-        .map_err(|e| log::error!("合并落盘失败: {e}"))
-        .is_ok();
-        if ok {
-            Some(epoch)
-        } else {
-            None
+        ) {
+            Ok(_) => Some(epoch),
+            Err(e) => {
+                if engine::overlay::is_ledger_corruption(&e) {
+                    // P0 实测第 N 形态:腐化哨兵 25 连刷使 flush 永不成功、
+                    // Overlay 无限增长(1.40M→2.38M 合成读数)。止损 = 置自愈
+                    // 位,由消费循环触发降级全量重扫(全新 Base 一次清零账本与
+                    // 垃圾条目);期间 dirty/last_flush 不动,重扫接管落盘。
+                    state.heal_requested.store(true, Ordering::SeqCst);
+                    log::error!("合并写遇账本腐化,已置降级重扫自愈位: {e}");
+                } else {
+                    log::error!("合并落盘失败: {e}");
+                }
+                None
+            }
         }
     };
     let Some(epoch) = written else { return };
@@ -1062,6 +1077,13 @@ fn consume_events(
             }
         }
         apply_batch(&state, batcher.drain_ready(), !volume_owned);
+        // 账本腐化自愈:flush_merged 无法同步降级(持 flush_lock 重入),经此位
+        // 移交持 Arc 的消费循环;swap 语义保证并发置位不丢(重扫在途时 spawn
+        // 内部 try_lock 弃权,在途重扫本身即重建)。
+        if state.heal_requested.swap(false, Ordering::SeqCst) {
+            log::warn!("账本腐化自愈:触发降级全量重扫(重扫=最终一致性闸门)");
+            spawn_rescan(&state, &paths);
+        }
         if should_flush(&state) {
             flush(&state, &paths);
         }
@@ -2996,6 +3018,35 @@ mod tests {
             10,
         );
         assert_eq!(out.total, 1, "增量已合并落盘");
+    }
+
+    /// 腐化自愈的对照钉:非腐化 io 错误(磁盘/路径问题,重扫无益)不得置自愈
+    /// 位——is_ledger_corruption 的判定边界(InvalidData + 精确前缀)。
+    /// 突变「判定放宽为一切 InvalidData / 一切错误」→ 对照断言红。
+    #[test]
+    fn flush_merged_non_corruption_error_does_not_request_heal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        let mut map = DirIndexMap::default();
+        let key = dir.path().canonicalize().unwrap();
+        map.insert(&key, 0);
+        *state.holder.write().unwrap() = IndexHolder::Overlaid(Box::new(OverlaidState {
+            base: BaseRef::Heap(idx),
+            overlay: engine::overlay::Overlay::new(),
+        }));
+        *state.dir_map.lock().unwrap() = map;
+        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        // 数据目录不存在:合并写 io NotFound(非腐化)
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("absent"),
+        };
+        flush(&state, &paths);
+        assert!(
+            !state.heal_requested.load(Ordering::SeqCst),
+            "普通 io 错误不得触发降级重扫(重扫无益)"
+        );
     }
 
     /// 合并 flush 后 dir_map 必须随新 Base 重建(P0 回归钉,实测 310MB 膨胀的

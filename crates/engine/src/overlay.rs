@@ -349,7 +349,19 @@ impl Overlay {
     /// 占位(NO_PARENT),旁表 `anchors`/`anchor_base` 记 base↔overlay 对。
     fn ensure_anchor(&mut self, base: &dyn IndexView, b0: u32) -> u32 {
         if let Some(&a) = self.anchors.get(&b0) {
-            return a;
+            // C1 纵深防御的**写侧**对应:级联墓碑后桥键可能残留(深层桥的键清扫
+            // 走 purge_prefix 的路径前缀匹配,在错路径/膨胀 Base 上摘除不对称;
+            // 实机取证:anchored=true 而 live=false,子项挂上后被合并哨兵拒绝)。
+            // 复用墓碑 anchor 会让后续子项挂在死父下——摘键重建。
+            if self
+                .index
+                .entries
+                .get(a as usize)
+                .is_some_and(|e| e.is_live())
+            {
+                return a;
+            }
+            self.unlink_anchor(a);
         }
         let mut parent_anchor = NO_PARENT;
         let mut cur = base.entry(b0).parent;
@@ -737,6 +749,64 @@ pub fn materialize_composite(base: &dyn IndexView, overlay: &Overlay) -> Index {
     out
 }
 
+/// 账本腐化错误的消息前缀（[`is_ledger_corruption`] 的判定依据）。
+pub const LEDGER_CORRUPTION_PREFIX: &str = "Overlay 账本腐化";
+
+/// 是否为账本腐化错误（合并写哨兵拒绝）:腐化 = 结构性不可自愈的账本状态,
+/// 调用方(daemon flush_merged)据此触发降级全量重扫自愈(ADR-5 最终一致性
+/// 闸门)——拒绝在腐化账本上合并,但必须自愈而非无限拒绝。普通 io 错误
+/// (磁盘/权限等)重扫无益,不得混入。
+pub fn is_ledger_corruption(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData
+        && e.to_string().starts_with(LEDGER_CORRUPTION_PREFIX)
+}
+
+impl Overlay {
+    /// 账本四表概要（腐化取证 dump 用，单行紧凑形态）。
+    pub fn ledger_summary(&self) -> String {
+        let live = self.index.entries.iter().filter(|e| e.is_live()).count();
+        format!(
+            "overlaid={} anchors={} anchor_base={} dir_ids={} overlay_entries={} overlay_live={}",
+            self.overlaid.len(),
+            self.anchors.len(),
+            self.anchor_base.len(),
+            self.dir_ids.len(),
+            self.index.entries.len(),
+            live
+        )
+    }
+
+    /// 腐化取证:沿涉事条目的 overlay 父链 dump(每级 live/anchor 身份),上限
+    /// 8 级防环。写 error 日志后由调用方触发降级重扫——快照用于离线归因
+    /// 「第 N 形态」的真实触发序列(线上形态:overlay 父条目未留存 ×25 连刷)。
+    pub fn dump_corrupt_chain(&self, stage: &str, id: u32, parent: u32) -> String {
+        let mut chain = vec![format!("entry {id} parent={parent}")];
+        let mut cur = parent;
+        for _ in 0..8 {
+            match self.index.entries.get(cur as usize) {
+                None => {
+                    chain.push(format!("  -> {cur}: <越界>"));
+                    break;
+                }
+                Some(e) => {
+                    chain.push(format!(
+                        "  -> {cur}: live={} dir={} parent={} anchored={}",
+                        e.is_live(),
+                        e.is_dir(),
+                        e.parent,
+                        self.anchor_base.contains_key(&cur)
+                    ));
+                    if e.parent == NO_PARENT || e.parent == cur {
+                        break;
+                    }
+                    cur = e.parent;
+                }
+            }
+        }
+        format!("[{stage}] {}; {}", chain.join(" ; "), self.ledger_summary())
+    }
+}
+
 /// 条目流直写(T4 flush 形态,tech.md §4.3):「Base + Overlay 顺序遍历」产出
 /// **可见集**条目流交 [`crate::persist::write_stream_atomic`] 边产边写——不经
 /// 全量堆物化（对照 [`materialize_composite`] 的全量 Index + 整文件 buf）。
@@ -749,7 +819,9 @@ pub fn materialize_composite(base: &dyn IndexView, overlay: &Overlay) -> Index {
 ///   物化重建段（`rewrite_dir_path` 预写段与合并链恒等，见其注释）。
 ///
 /// 账本腐化（父未留存/非 anchor 条目无父）在物化路径是 debug 断言，此处在
-/// release 同样响亮拒绝写出（产出损坏索引会让用户无感知全量重扫）。
+/// release 同样响亮拒绝写出（产出损坏索引会让用户无感知全量重扫）:
+/// 拒绝前先 [`Overlay::dump_corrupt_chain`] 取证,调用方据
+/// [`is_ledger_corruption`] 触发降级重扫自愈。
 /// 返回活条目数（persist_final 条目数回报复用）。
 pub fn write_merged_atomic(
     base: &dyn IndexView,
@@ -770,7 +842,7 @@ pub fn write_merged_atomic(
     let corrupted = |why: &str| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Overlay 账本腐化，拒绝合并写出：{why}"),
+            format!("{LEDGER_CORRUPTION_PREFIX}，拒绝合并写出：{why}"),
         )
     };
     // write_stream_atomic 返回值即流统计的活条目数,无需旁路捕获
@@ -813,17 +885,31 @@ pub fn write_merged_atomic(
                 continue;
             }
             let parent = if e.parent == NO_PARENT {
-                return Err(corrupted("非 anchor 条目的 parent 必指向 overlay 内条目"));
+                return Err(corrupted(&overlay.dump_corrupt_chain(
+                    "非 anchor 条目的 parent 必指向 overlay 内条目",
+                    o,
+                    e.parent,
+                )));
             } else if let Some(&b) = overlay.anchor_base.get(&e.parent) {
                 let mapped = base_map[b as usize];
                 if mapped == NO_PARENT {
-                    return Err(corrupted("anchor 的 base 目录未留存"));
+                    return Err(corrupted(&overlay.dump_corrupt_chain(
+                        "anchor 的 base 目录未留存",
+                        o,
+                        e.parent,
+                    )));
                 }
                 mapped // 父为 anchor → 挂其 base 目录
             } else {
                 match merged_of.get(&e.parent) {
                     Some(&p) => p, // 父为纯 overlay 目录 → 用已映射合成号
-                    None => return Err(corrupted("overlay 父条目未留存")),
+                    None => {
+                        return Err(corrupted(&overlay.dump_corrupt_chain(
+                            "overlay 父条目未留存",
+                            o,
+                            e.parent,
+                        )))
+                    }
                 }
             };
             let dir_path = if e.is_dir() {
@@ -1817,6 +1903,108 @@ mod tests {
         ref_walk(&root, &mut reference);
         reference.insert(root.to_string_lossy().into_owned());
         assert_eq!(hit_paths_of(shared.as_ref()), reference, "对拍零差异");
+    }
+
+    /// 账本腐化哨兵钉：「活条目的父是墓碑」形态——f 活、parent 指向已墓碑的
+    /// d，「活父必活」不变量破。合并写必须拒绝(腐化 Err,取证链入消息)而非
+    /// 静默产出孤儿;is_ledger_corruption 恰好区分腐化与普通 io 错误。
+    /// 突变「哨兵改为静默 continue」→ merged_of 缺父号 panic/产出孤儿,此测红。
+    #[test]
+    fn merged_write_rejects_dead_parent_corruption() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+
+        // 手工构造不变量破:d(0) 目录 + f(1, parent=d);位改 d 为墓碑(f 保持活)
+        let d = ov.index.insert("ddir", NO_PARENT, true);
+        let _f = ov.index.insert("f.txt", d, false);
+        ov.index.entries[d as usize].flags |= crate::entry::FLAG_TOMBSTONE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_merged_atomic(
+            &base,
+            &ov,
+            &crate::persist::IndexMeta::default(),
+            &dir.path().join("x.bin"),
+        )
+        .expect_err("腐化账本必须被拒绝");
+        assert!(is_ledger_corruption(&err), "腐化 Err 可判定: {err}");
+        assert!(err.to_string().contains("overlay 父条目未留存"));
+        assert!(
+            err.to_string().contains("live=false"),
+            "取证链应含父链 dump"
+        );
+        // 普通io错误不得误判为腐化
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
+        assert!(!is_ledger_corruption(&io_err));
+        let prefix_err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Overlay 其他错");
+        assert!(!is_ledger_corruption(&prefix_err), "前缀必须精确匹配");
+    }
+
+    /// ensure_anchor 的墓碑残键自愈钉(实机第 N 形态的写侧修复):深层级联墓碑
+    /// 后桥键残留(anchored=true 而 live=false)时,该目录再 diff 不得复用墓碑
+    /// anchor 当父——摘键重建。突变「去掉 is_live 校验直接复用」:root 的
+    /// listing 子项挂到墓碑父下,合并写腐化拒绝(父未留存),此测红。
+    #[test]
+    fn ensure_anchor_rebuilds_tombstoned_stale_bridge() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/inner.txt"), "").unwrap();
+        let base = scan(root);
+
+        // 子先 diff:sub 的桥是顶层占位
+        let mut ov = Overlay::new();
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &root.join("sub"))),
+            &root.join("sub"),
+            &[],
+        )
+        .unwrap();
+        // 模拟深层级联墓碑后的键残留:sub 的 anchor 条目连同其 overlay 子树
+        // 位改为墓碑(级联语义),而 anchors/anchor_base 键不动(键清扫走
+        // purge_prefix 的路径匹配,错路径 Base 上摘除不对称——实机取证形态)
+        let sub_bridge = ov.anchors[&id_of(&base, &root.join("sub"))];
+        ov.index.entries[sub_bridge as usize].flags |= FLAG_TOMBSTONE;
+        for k in ov.index.children_of(sub_bridge) {
+            ov.index.entries[k as usize].flags |= FLAG_TOMBSTONE;
+        }
+        assert!(!ov.is_empty(), "残键形态:键在而条目墓碑");
+
+        // 直 diff 残键目录(ensure_anchor 的直接消费路径;父层挂接路径另被
+        // apply_diff 的 reused live 过滤兜住):必须摘残键重建活 anchor,
+        // sub 的 listing 子项挂活父,合并写成功无腐化。
+        // 突变「ensure_anchor 无条件复用」:inner.txt 挂到墓碑父下 →
+        // 合并写腐化拒绝,本测红。
+        ov.apply_diff(
+            &base,
+            DiffTarget::Base(id_of(&base, &root.join("sub"))),
+            &root.join("sub"),
+            &[],
+        )
+        .unwrap();
+        let rebuilt = ov.anchors[&id_of(&base, &root.join("sub"))];
+        assert_ne!(rebuilt, sub_bridge, "墓碑残键必须摘除重建,不得复用");
+        assert!(
+            ov.index.entries[rebuilt as usize].is_live(),
+            "重建桥为活条目"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let live = write_merged_atomic(
+            &base,
+            &ov,
+            &crate::persist::IndexMeta::default(),
+            &dir.path().join("x.bin"),
+        )
+        .expect("重建后合并写成功(无腐化)");
+        assert!(live > 0);
     }
 
     /// epoch 世代钉：apply_diff / purge_prefix 各推进一代，is_empty 不受世代干扰。
