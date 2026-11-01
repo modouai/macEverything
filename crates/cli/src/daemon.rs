@@ -745,8 +745,19 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
             if swap_base_if_fresh(state, view, epoch) {
                 state.dirty.store(0, Ordering::Relaxed);
                 log::info!("合并 flush 完成,Base 已 remap 为 mmap,Overlay 清零");
+                // P0 回归修复:合并空间的条目号是**全新编号**,dir_map 的值(旧
+                // Base 条目号)随 swap 全部失效——必须随新 Base 重建。否则旧号
+                // 命中新索引里的**无关活条目**(#12 的「越界/死」判活拦不住
+                // 「活而错」),apply_diff 把磁盘 listing 挂到错条目下拼出海量
+                // 错误路径(实测 1.4M→237 万条、index.bin 310MB),added 暴涨
+                // 使 dirty 恒过 30k 阈值,合并 flush 密集背靠背(实测 23 次)
+                // 直至连接饥饿挂起。与冷启动/重扫替换段后的 rebuild 同纪律。
+                // 锁序:此刻无 holder 锁,rebuild 内部取「读锁 → dir_map」,
+                // 与 diff_one 的「写锁 → dir_map」同序,无环。
+                rebuild_dir_map(state);
             } else {
                 log::info!("合并写期间有新增量(世代前移),本轮不替换,下轮重试");
+                defer_stale_merge(state);
             }
             // 节流起点按「尝试过 flush」推进:失败重试不密集化
             *state.last_flush.lock().unwrap() = Instant::now();
@@ -774,6 +785,15 @@ fn swap_base_if_fresh(state: &EngineState, view: Box<SharedView>, expected_epoch
         *h = IndexHolder::Shared(view);
     }
     fresh
+}
+
+/// 陈旧快照(放弃替换)的收尾:盘面已含本批快照增量(写的就是含增量态),
+/// 计入 dirty 的变更视为已落盘——清零让下次落盘等新变更积累(30k/120s)。
+/// 否则 dirty 恒过阈值使全量合并写背靠背密集重试,而写期间的新 diff 又使
+/// 世代前移,自激成风暴(P0 实测 23 次背靠背全量写的放大器之一)。
+fn defer_stale_merge(state: &EngineState) {
+    state.dirty.store(0, Ordering::Relaxed);
+    *state.last_flush.lock().unwrap() = Instant::now();
 }
 
 /// 单一 holder 内容的落盘(Mutable 索引或合成物化产物);失败留痕返回 Err。
@@ -1496,21 +1516,29 @@ fn handle_conn(
     state: &Arc<EngineState>,
     paths: &DaemonPaths,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // 每步 io 带阶段标注:线上的「Invalid argument (os error 22)」无法从错误串
+    // 定位 syscall,阶段化后一次出现即可锁定(read 长度/读体/写响应)。
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("设置读超时")?;
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
+    stream.read_exact(&mut len_buf).context("读取消息长度")?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > protocol::MAX_MSG {
         bail!("消息超限({len} 字节)");
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
+    stream
+        .read_exact(&mut buf)
+        .with_context(|| format!("读取消息体({len} 字节)"))?;
     let req: Request = protocol::decode_request(&buf).context("解码请求失败")?;
     let resp = dispatch(req, state, paths);
     let body = encode_response(resp)?;
-    stream.write_all(&(body.len() as u32).to_le_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
+    stream
+        .write_all(&(body.len() as u32).to_le_bytes())
+        .context("写出响应长度")?;
+    stream.write_all(&body).context("写出响应体")?;
+    stream.flush().context("冲刷响应")?;
     Ok(())
 }
 
@@ -2970,6 +2998,94 @@ mod tests {
         assert_eq!(out.total, 1, "增量已合并落盘");
     }
 
+    /// 合并 flush 后 dir_map 必须随新 Base 重建(P0 回归钉,实测 310MB 膨胀的
+    /// 根因):合并空间的条目号是**全新编号**,swap 成功后 dir_map 残留旧号——
+    /// 旧号在新索引里恰好命中**无关活条目**时,#12 的「越界/死」判活拦不住
+    /// (「活而错」),apply_diff 会把磁盘 listing 挂到错条目下:拼出大量错误
+    /// 唯一路径(实测 1.4M → 237 万条),added 计数暴涨使 dirty 恒过 30k 阈值,
+    /// 合并 flush 密集背靠背(实测 23 次)直至索引膨胀、连接饥饿挂起。
+    /// 突变「swap 成功后不 rebuild_dir_map」本测两段断言红。
+    #[test]
+    fn merged_flush_rebuilds_dir_map_for_new_entry_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        // v1 编号:root=0, gone=1, d=2, x.txt=3(gone 在 d 之前,合并后前移)
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("gone.txt", root, false);
+        let d = idx.insert("d", root, true);
+        idx.insert("x.txt", d, false);
+        let idx_file = data.path().join("index.bin");
+        persist::write_atomic(
+            &persist::EntryLayout::of(&idx),
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write().unwrap() =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        *state.roots.lock().unwrap() = vec![dir.path().to_path_buf()];
+        rebuild_dir_map(&state);
+        // 磁盘树与 v1 索引同构(扫描语义)
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("gone.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("d/x.txt"), b"").unwrap();
+        let d_path = dir.path().join("d").canonicalize().unwrap();
+
+        // 磁盘漂移:删 gone + 加 new.txt → diff(root) → flush 合并。
+        // 合并可见集 = root, d, x.txt, new.txt(gone 被屏蔽不落盘)→
+        // 新编号 root=0, d=1, x.txt=2, new.txt=3 —— d 的条目号 2→1。
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        std::fs::write(dir.path().join("new.txt"), b"").unwrap();
+        assert_eq!(diff_one(&state, dir.path()), 2);
+        let paths = DaemonPaths {
+            data_dir: data.path().to_path_buf(),
+        };
+        flush(&state, &paths);
+        assert!(matches!(
+            &*state.holder.read().unwrap(),
+            IndexHolder::Shared(_)
+        ));
+
+        // 断言 A:dir_map 的 d 值必须等于**新索引**中 d 的条目号(1)。
+        // 索引内路径为字面形态(夹具插入时的 dir.path()),不经 canonicalize
+        let d_literal = dir.path().join("d").to_string_lossy().into_owned();
+        let new_d_id = with_view(&state, |v| {
+            (0..v
+                .entry_segments()
+                .iter()
+                .map(|(_, s)| s.len() as u32)
+                .sum::<u32>())
+                .find(|&i| v.full_path_dyn(i) == d_literal)
+        })
+        .flatten()
+        .expect("新索引应含 d");
+        assert_ne!(new_d_id, 2, "夹具应保证编号前移(d: 2→{new_d_id})");
+        assert_eq!(
+            state.dir_map.lock().unwrap().get(&d_path),
+            Some(new_d_id),
+            "合并 swap 后 dir_map 必须重建(d 值应为新号)",
+        );
+
+        // 断言 B:d 内再漂移,diff 落在正确条目上(不得挂到 2 号 new.txt 下)。
+        std::fs::write(d_path.join("y.txt"), b"").unwrap();
+        assert_eq!(diff_one(&state, &d_path), 1);
+        match run_query(&state, "whole:y.txt", 10, None, false) {
+            Response::Query { entries, total, .. } => {
+                assert_eq!(total, 1);
+                // 索引内路径为字面形态(root 条目名 = 夹具插入时的 dir.path())
+                assert_eq!(
+                    entries[0].path,
+                    dir.path().join("d/y.txt").to_string_lossy(),
+                    "y.txt 必须挂在 d 下(不得挂到错条目拼出错误路径)"
+                );
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+    }
+
     /// epoch 复核行为钉(评审必修 4):flush 的「放读锁 → 取写锁」窗口内插入的
     /// diff 使世代前移 → 陈旧快照的替换必须被拒绝(holder 保留 Overlaid、窗口
     /// 增量查询可见);下轮 flush 重新合并落盘后替换成功且含该增量。
@@ -3035,6 +3151,16 @@ mod tests {
         assert!(
             matches!(&*state.holder.read().unwrap(), IndexHolder::Overlaid(_)),
             "拒绝替换后保留增量态"
+        );
+        // P0 加固钉:放弃替换的收尾必须清 dirty(盘面已含快照增量)——否则
+        // dirty 恒过 30k 阈值使全量合并写背靠背密集重试(实测 23 次风暴的
+        // 放大器)。突变「defer_stale_merge 不清 dirty」此断言红。
+        state.dirty.store(5, Ordering::Relaxed);
+        defer_stale_merge(&state);
+        assert_eq!(
+            state.dirty.load(Ordering::Relaxed),
+            0,
+            "放弃替换收尾清 dirty(防密集重写风暴)"
         );
         match run_query(&state, "whole:c.txt", 10, None, false) {
             Response::Query { total, .. } => {
