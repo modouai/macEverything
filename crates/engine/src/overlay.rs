@@ -762,6 +762,36 @@ pub fn is_ledger_corruption(e: &std::io::Error) -> bool {
 }
 
 impl Overlay {
+    /// 指向「已死/越界 base 条目」的 anchor 数(诊断与自愈用,O(anchors))。
+    pub fn stale_anchor_count(&self, base: &dyn IndexView) -> usize {
+        self.anchors
+            .keys()
+            .filter(|&&b| !base.entry(b).is_live())
+            .count()
+    }
+
+    /// 摘除指向已死 base 的 anchor 及其 overlay 子树(自愈:这类桥已无背书,
+    /// 保留只会让合并写出孤儿条目)。返回摘除数。
+    pub fn sweep_stale_anchors(&mut self, base: &dyn IndexView) -> usize {
+        let dead: Vec<u32> = self
+            .anchors
+            .keys()
+            .copied()
+            .filter(|&b| !base.entry(b).is_live())
+            .collect();
+        for b in &dead {
+            if let Some(a) = self.unlink_anchor_by_base(*b) {
+                self.index.remove(a);
+            }
+            self.overlaid.remove(b);
+            // 纯 overlay 子目录的 dir_ids 键由 overlay_dir_id 的死键自愈兜住
+        }
+        if !dead.is_empty() {
+            touch(self);
+        }
+        dead.len()
+    }
+
     /// 账本四表概要（腐化取证 dump 用，单行紧凑形态）。
     pub fn ledger_summary(&self) -> String {
         let live = self.index.entries.iter().filter(|e| e.is_live()).count();
@@ -859,7 +889,16 @@ pub fn write_merged_atomic(
                 } else {
                     let mapped = base_map[e.parent as usize];
                     if mapped == NO_PARENT {
-                        return Err(corrupted("留存条目的父未留存"));
+                        let p = base.entry(e.parent);
+                        return Err(corrupted(&format!(
+                            "留存条目的父未留存: entry {idx}(live={},dir={}) parent={} (live={}, dir={}, masked={})",
+                            e.is_live(),
+                            e.is_dir(),
+                            e.parent,
+                            p.is_live(),
+                            p.is_dir(),
+                            !view.entry_valid(e.parent),
+                        )));
                     }
                     mapped
                 };
@@ -1944,6 +1983,42 @@ mod tests {
         assert!(!is_ledger_corruption(&io_err));
         let prefix_err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Overlay 其他错");
         assert!(!is_ledger_corruption(&prefix_err), "前缀必须精确匹配");
+    }
+
+    /// 死桥清扫钉(「anchor 的 base 目录未留存」的自愈兜底):base 条目被墓碑
+    /// 后,指向它的 anchor + 其 overlay 子树必须整链摘除,否则合并写出孤儿条目。
+    /// 突变「sweep 不摘 anchor」→ 返回值与 overlay 条目数断言红。
+    #[test]
+    fn sweep_stale_anchors_unlinks_bridges_to_dead_base() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/a.txt"), "").unwrap();
+        let base = scan(root);
+        let root_id = id_of(&base, root);
+        let sub_id = id_of(&base, &root.join("sub"));
+
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(root_id), root, &[])
+            .unwrap();
+        ov.apply_diff(&base, DiffTarget::Base(sub_id), &root.join("sub"), &[])
+            .unwrap();
+        assert!(ov.anchors.contains_key(&sub_id));
+        let sub_bridge = ov.anchors[&sub_id];
+
+        // 模拟 base 侧子树被墓碑(ENOENT 摘除后 purge 漏网),而桥键残留
+        let mut dead_base = base;
+        dead_base.remove(sub_id);
+        assert_eq!(ov.stale_anchor_count(&dead_base), 1, "残桥被识别");
+        let swept = ov.sweep_stale_anchors(&dead_base);
+        assert_eq!(swept, 1, "死桥被摘除");
+        assert!(!ov.anchors.contains_key(&sub_id), "anchors 键清除");
+        assert!(!ov.anchor_base.contains_key(&sub_bridge), "反向桥同步清除");
+        assert!(
+            !ov.index.entries[sub_bridge as usize].is_live(),
+            "死桥子树级联墓碑"
+        );
+        assert_eq!(ov.stale_anchor_count(&dead_base), 0);
     }
 
     /// ensure_anchor 的墓碑残键自愈钉(实机第 N 形态的写侧修复):深层级联墓碑

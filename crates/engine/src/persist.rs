@@ -241,6 +241,25 @@ pub(crate) fn tmp_path_for(path: &Path) -> std::io::Result<std::path::PathBuf> {
     )))
 }
 
+/// 启动清扫:删除数据目录内上次会话残留的索引临时文件(写侧 tmp 与溢写段
+/// `.tmp`/`.tmp.d`/`.tmp.m`/`.tmp.p`)。崩溃/强杀时 rename 前的中断产物,
+/// 与目标同目录;按「`index.bin.` 前缀 + 含 `.tmp`」精确匹配,不误删他物。
+pub fn cleanup_stale_index_tmp(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if n.starts_with("index.bin.")
+            && n.contains(".tmp")
+            && std::fs::remove_file(e.path()).is_ok()
+        {
+            log::info!("清理残留索引临时文件: {n}");
+        }
+    }
+}
+
 // —— 流式写侧(T4 合并 flush,tech.md §4.3) ——
 
 /// 条目流生产者的汇聚端:三段 arena 字节**边产边写**进溢写文件(有界内存),
@@ -1008,6 +1027,34 @@ mod tests {
             path_out.total, 4,
             "路径池拼接正确(docs + a.txt + sub + A.txt)"
         );
+    }
+
+    /// 启动清扫钉:残留的 tmp 与溢写段(tmp.d/.m/.p)被清,目标与无关文件不动。
+    /// 突变「匹配条件放宽(删前缀)」→ 无关文件被误删,断言红;「漏 .tmp.d」
+    /// → 残留断言红。
+    #[test]
+    fn cleanup_stale_index_tmp_removes_only_index_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "index.bin.6280.5840.tmp",
+            "index.bin.6280.5840.tmp.d",
+            "index.bin.6280.5841.tmp.m",
+            "index.bin.6280.5842.tmp.p",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join("index.bin"), b"keep").unwrap();
+        std::fs::write(dir.path().join("daemon.log"), b"keep").unwrap();
+        std::fs::write(dir.path().join("config.tmp"), b"keep-other-tmp").unwrap();
+        cleanup_stale_index_tmp(dir.path());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 3, "只留目标/日志/无关 tmp: {left:?}");
+        assert!(left.contains(&"index.bin".to_string()));
+        assert!(left.contains(&"daemon.log".to_string()));
+        assert!(left.contains(&"config.tmp".to_string()), "无关 tmp 不误删");
     }
 
     /// 流式写的原子性钉:生产者中途失败 → 目标不得产出、溢写文件全清理。

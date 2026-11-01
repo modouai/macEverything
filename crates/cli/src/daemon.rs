@@ -475,11 +475,7 @@ fn ensure_mutable(state: &EngineState) {
 /// 读侧经 IndexView:Shared(直挂 Base)与 Mutable 皆可建——冷启动不再物化,
 /// dir_map 直接从 mmap 视图建立;后续按需转可变时条目号 1:1,映射继续有效。
 fn rebuild_dir_map(state: &EngineState) {
-    // 两个形态各司其职:根条目名是「字面配置根」(scanner 契约,用于匹配);
-    // map 键用 canonical 形态——/tmp 等系统符号链接下 FSEvents 上报真实路径
-    // (/private/tmp/...),canonicalize 让事件侧与索引侧同形。
     let literal_roots = state.roots.lock().unwrap().clone();
-    let mut map = DirIndexMap::default();
     let h = state.holder.read().unwrap();
     // 只按 Base 建:dir_map 是「绝对路径 → base 条目号」的寻址面,overlay 目录的
     // 寻址在 Overlay::dir_ids(纯 overlay 目录),两空间不混号。
@@ -489,6 +485,19 @@ fn rebuild_dir_map(state: &EngineState) {
         IndexHolder::Overlaid(st) => st.base.as_view(),
         IndexHolder::Empty => return,
     };
+    let map = build_dir_map(view, &literal_roots);
+    drop(h);
+    *state.dir_map.lock().unwrap() = map;
+}
+
+/// 从给定视图构建「绝对目录路径 → 条目号」映射(**纯函数**:不触碰 holder/
+/// dir_map 锁)。供 [`rebuild_dir_map`] 与换基路径(必须「先构建、后与 holder
+/// 同点原子提交」)共用——条目号只在该视图自身空间内有效。
+fn build_dir_map(view: &dyn IndexView, literal_roots: &[PathBuf]) -> DirIndexMap {
+    // 两个形态各司其职:根条目名是「字面配置根」(scanner 契约,用于匹配);
+    // map 键用 canonical 形态——/tmp 等系统符号链接下 FSEvents 上报真实路径
+    // (/private/tmp/...),canonicalize 让事件侧与索引侧同形。
+    let mut map = DirIndexMap::default();
     // 分段枚举建邻接表 + 收集根条目号(段内下标 + 段起始号 = 条目号)
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut root_ids: Vec<u32> = Vec::new();
@@ -525,7 +534,70 @@ fn rebuild_dir_map(state: &EngineState) {
             }
         }
     }
+    map
+}
+
+/// 换基的唯一提交点(holder + dir_map **同点替换**,锁序 holder → dir_map 与
+/// diff_one/apply_and_track 一致,无环)。dir_map 必须由调用方预先从**即将安装
+/// 的视图**构建:两条分开写(先换 holder、后 rebuild)会留下「新 Base + 旧 map」
+/// 窗口,窗口内的 diff 用旧号打新索引——号可能恰好命中无关活条目,把磁盘
+/// listing 挂到错父下,海量垃圾路径随下次合并写固化(实机:heal 重扫后条目数
+/// 2.39M→2.04M 不降、index.bin 313MB 反复复写;毒 Base 规模下窗口被放大)。
+fn install_holder_with_map(state: &EngineState, next: IndexHolder, map: DirIndexMap) {
+    let mut h = state.holder.write().unwrap();
+    *h = next;
     *state.dir_map.lock().unwrap() = map;
+}
+
+/// 索引健全性抽检的采样条数(冷启动 load 后一次,~256 次 stat,数 ms)。
+const INDEX_POISON_SAMPLE: usize = 256;
+/// 采样路径「不存在」占比超过此百分比即判索引中毒。
+const INDEX_POISON_MISSING_PCT: usize = 20;
+
+/// 抽检结果判定(纯函数,便于钉住边界)。
+fn is_poison_sample(missing: usize, sampled: usize) -> bool {
+    sampled >= 32 && missing * 100 / sampled > INDEX_POISON_MISSING_PCT
+}
+
+/// 索引健全性抽检:stride 采样活条目,stat 其完整路径,统计「路径不存在」
+/// (ENOENT;ENOTDIR = 路径中某级被文件顶替,错挂的典型形态)占比。
+///
+/// 为什么需要主动判毒:历史版本 bug 的产物把真实 listing 挂到错父下,拼出的
+/// 路径大量不存在(实测毒样本 43%),但条目在合成视图里「合法」——合并不一定
+/// 报腐化,垃圾会被反复合并收编,永不消退。健康索引由目录 diff 维护,路径
+/// 几乎全部存在(实测干净索引 0%);全量 stat 需数十秒,采样数 ms。
+fn index_path_missing_sample(view: &dyn IndexView) -> (usize, usize) {
+    let total: usize = view.entry_segments().iter().map(|(_, s)| s.len()).sum();
+    if total == 0 {
+        return (0, 0);
+    }
+    let step = (total / INDEX_POISON_SAMPLE).max(1);
+    let mut missing = 0usize;
+    let mut sampled = 0usize;
+    let mut slot = 0usize;
+    for &(start, seg) in &view.entry_segments() {
+        for (j, e) in seg.iter().enumerate() {
+            let this = slot;
+            slot += 1;
+            if !this.is_multiple_of(step) || !e.is_live() {
+                continue;
+            }
+            sampled += 1;
+            let p = view.full_path_dyn(start + j as u32);
+            match std::fs::symlink_metadata(&p) {
+                Ok(_) => {}
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        || err.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    missing += 1;
+                }
+                // EPERM/EACCES(TCC 保护目录)不算「不存在」——条目本身合法
+                Err(_) => {}
+            }
+        }
+    }
+    (missing, sampled)
 }
 
 /// diff 目标解析:先 Base(dir_map,首扫收录的目录),后 Overlay(冷启动后新建的
@@ -725,6 +797,12 @@ fn flush(state: &EngineState, paths: &DaemonPaths) {
 /// `Overlay::epoch`:世代前移则放弃本次替换(dirty 保留、last_flush 照刷以免
 /// 密集重试),下轮 flush 重新合并——绝不丢弃窗口内增量。
 fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
+    // 重扫在途:holder 即将被替换,合并旧 Base 无意义——且毒 Base 下每次尝试都
+    // 跑完全量遍历才撞腐化(实测 25s+),会把消费循环钉在写盘上。跳过即可,增量
+    // 由重扫产物的 base 覆盖 + rescan_dirty 重放追平(重扫结束自有 flush)。
+    if state.rescanning.load(Ordering::SeqCst) {
+        return;
+    }
     let written = {
         let h = state.holder.read().unwrap();
         let IndexHolder::Overlaid(st) = &*h else {
@@ -744,9 +822,12 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
                     // P0 实测第 N 形态:腐化哨兵 25 连刷使 flush 永不成功、
                     // Overlay 无限增长(1.40M→2.38M 合成读数)。止损 = 置自愈
                     // 位,由消费循环触发降级全量重扫(全新 Base 一次清零账本与
-                    // 垃圾条目);期间 dirty/last_flush 不动,重扫接管落盘。
+                    // 垃圾条目)。同时清 dirty + 推进节流起点:毒账本上重复全量
+                    // 遍历毫无收益(实测 5839 次连刷),等下个积累窗口再试。
                     state.heal_requested.store(true, Ordering::SeqCst);
                     log::error!("合并写遇账本腐化,已置降级重扫自愈位: {e}");
+                    state.dirty.store(0, Ordering::Relaxed);
+                    *state.last_flush.lock().unwrap() = Instant::now();
                 } else {
                     log::error!("合并落盘失败: {e}");
                 }
@@ -757,19 +838,14 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
     let Some(epoch) = written else { return };
     match persist::load_mmap(&paths.index_file()) {
         Ok(view) => {
-            if swap_base_if_fresh(state, view, epoch) {
+            // dir_map 必须与新 Base **同点提交**:先构建(锁外,旧 Base 照常服务),
+            // 再在 swap 的写锁内一并安装——否则「新 Base + 旧 map」窗口会把磁盘
+            // listing 挂到错条目下(毒 Base 事故的根因,见 install_holder_with_map)。
+            let literal_roots = state.roots.lock().unwrap().clone();
+            let map = build_dir_map(view.as_ref(), &literal_roots);
+            if swap_base_if_fresh(state, view, epoch, map) {
                 state.dirty.store(0, Ordering::Relaxed);
                 log::info!("合并 flush 完成,Base 已 remap 为 mmap,Overlay 清零");
-                // P0 回归修复:合并空间的条目号是**全新编号**,dir_map 的值(旧
-                // Base 条目号)随 swap 全部失效——必须随新 Base 重建。否则旧号
-                // 命中新索引里的**无关活条目**(#12 的「越界/死」判活拦不住
-                // 「活而错」),apply_diff 把磁盘 listing 挂到错条目下拼出海量
-                // 错误路径(实测 1.4M→237 万条、index.bin 310MB),added 暴涨
-                // 使 dirty 恒过 30k 阈值,合并 flush 密集背靠背(实测 23 次)
-                // 直至连接饥饿挂起。与冷启动/重扫替换段后的 rebuild 同纪律。
-                // 锁序:此刻无 holder 锁,rebuild 内部取「读锁 → dir_map」,
-                // 与 diff_one 的「写锁 → dir_map」同序,无环。
-                rebuild_dir_map(state);
             } else {
                 log::info!("合并写期间有新增量(世代前移),本轮不替换,下轮重试");
                 defer_stale_merge(state);
@@ -790,14 +866,21 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) {
 /// 「放读锁 → 取写锁」窗口内 diff 也必须拿写锁,故此刻的世代即终局判定:
 /// 世代前移 = 快照过期(盘面不含窗口增量),保留 Overlaid 交下轮 flush 重新
 /// 合并,绝不丢弃窗口内增量;形态已变(如重扫替换)同样不替换。
-fn swap_base_if_fresh(state: &EngineState, view: Box<SharedView>, expected_epoch: u64) -> bool {
+fn swap_base_if_fresh(
+    state: &EngineState,
+    view: Box<SharedView>,
+    expected_epoch: u64,
+    map: DirIndexMap,
+) -> bool {
     let mut h = state.holder.write().unwrap();
     let fresh = match &*h {
         IndexHolder::Overlaid(st) => st.overlay.epoch() == expected_epoch,
         _ => false,
     };
     if fresh {
+        // holder + dir_map 同点替换(锁序 holder → dir_map,与 diff_one 一致)
         *h = IndexHolder::Shared(view);
+        *state.dir_map.lock().unwrap() = map;
     }
     fresh
 }
@@ -1038,6 +1121,9 @@ fn consume_events(
                         if replayed_from_disk && sampling_finds_gap(&state, &paths) {
                             continue; // 已转 degraded(后台重扫),完成后自行置 READY
                         }
+                        if state.rescanning.load(Ordering::SeqCst) {
+                            continue; // 重扫在途(判毒/抽样触发):就绪由重扫线程置
+                        }
                         state.set_state(state::READY);
                         flush(&state, &paths);
                     }
@@ -1165,20 +1251,63 @@ fn sampling_finds_gap(state: &Arc<EngineState>, paths: &DaemonPaths) -> bool {
 /// 语义「返回时排除项已生效」不变,最坏等一轮完整重扫)。`rescanning` 置位
 /// 期间消费循环照常 diff(与替换段的 holder 写锁互斥)并记 `rescan_dirty`,
 /// 替换段末尾重放追平窗口内变更。
+/// 阻塞获取重扫锁;中毒(前次重扫线程 panic)时清毒后取 inner——中毒不恢复
+/// 会让自愈路径永久哑火(实机 heal 79 次零效果的可疑形态之一)。
+fn acquire_rescan_blocking(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    match lock.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!("rescan_lock 中毒(前次重扫线程 panic),恢复后继续");
+            lock.clear_poison();
+            e.into_inner()
+        }
+    }
+}
+
+/// 非阻塞获取重扫锁:WouldBlock = 确在途(None);Poisoned = 前持有者已死,
+/// 无在途写者 → 清毒后继续。不得把 Poisoned 吞成「在途」,否则自愈链断。
+fn try_acquire_rescan(lock: &Mutex<()>) -> Option<std::sync::MutexGuard<'_, ()>> {
+    match lock.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            log::warn!("rescan_lock 中毒(前次重扫线程 panic),恢复后继续");
+            lock.clear_poison();
+            Some(e.into_inner())
+        }
+    }
+}
+
+/// 重扫进行中标志的兜底复位:重扫线程 panic 时否则永久为 true——消费循环会
+/// 一直忽略 dropped、`flush_merged` 一直早退,索引再也不会落盘。
+struct ResetRescanning<'a>(&'a AtomicBool);
+impl Drop for ResetRescanning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: bool) {
+    // 中毒恢复:上一轮重扫线程若 panic,rescan_lock 永久 Poisoned——try_lock 的
+    // Err 若一律当「在途」吞掉,自愈路径就此永久哑火(实机:heal 79 次零效果)。
+    // Poisoned 意味着前持有者已死、无在途写者,取 inner 继续;WouldBlock 才是
+    // 真在途。
     let _guard = if wait_for_lock {
-        Some(state.rescan_lock.lock().unwrap())
+        Some(acquire_rescan_blocking(&state.rescan_lock))
     } else {
-        match state.rescan_lock.try_lock() {
-            Ok(g) => Some(g),
-            Err(_) => {
+        match try_acquire_rescan(&state.rescan_lock) {
+            Some(g) => Some(g),
+            None => {
                 log::info!("重扫已在进行,忽略本次自动触发");
                 return;
             }
         }
     };
+    let before = with_view(state, |v| live_count_of(v));
+    log::info!("重扫开始(当前条目数: {before:?})");
     state.set_state(state::DEGRADED);
     state.rescanning.store(true, Ordering::SeqCst);
+    let _rescanning = ResetRescanning(&state.rescanning);
     let floor = fsevents::current_event_id();
     let roots = state.roots.lock().unwrap().clone();
     let excludes = reconcile::expand_excludes(&state.cfg.lock().unwrap().excluded);
@@ -1198,13 +1327,18 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     // remap mmap Base → 清 Overlay**,不挂堆上 Mutable(与首扫共用
     // mount_scan_product)。旧 Overlay 随整体替换丢弃——重扫产物为全量,窗口内
     // 变更由下方 drain 重放追平。
+    log::info!("扫描完成(磁盘产物条目数: {})", idx.entry_count());
     mount_scan_product(state, paths, idx);
+    log::info!(
+        "重扫产物已挂载(条目数: {:?})",
+        with_view(state, |v| live_count_of(v))
+    );
     // 水位推进到覆盖点:重扫内容 = 截至 floor 的磁盘状态;floor 以下积压的陈旧
     // 事件(含触发本轮重扫的 dropped 标记)从此刻起被消费循环跳过。
     state.seen_event_id.fetch_max(floor, Ordering::Relaxed);
     state.applied_event_id.fetch_max(floor, Ordering::Relaxed);
     state.rescan_floor.fetch_max(floor, Ordering::Relaxed);
-    rebuild_dir_map(state);
+    // dir_map 已由 mount 与 Base 同点提交(勿在此二次 rebuild,否则重现窗口)
     // 重扫窗口追平:先清 rescanning 再 drain——此后消费线程 diff 的对象已是新
     // 索引,无需再记集合;窗口内已记目录基于旧索引 diff 过,重放追平。push 与
     // drain 各持自己的 Mutex;push 不持 holder 锁,但恒先于同次 diff 的 apply
@@ -1225,16 +1359,22 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     engine::malloc_pressure::release_heap_pressure();
     state.set_state(state::READY);
     *state.last_rescan.lock().unwrap() = Some(Instant::now());
+    log::info!(
+        "重扫完成(条目数: {:?})",
+        with_view(state, |v| live_count_of(v))
+    );
 }
 
 /// 扫描产物挂载(T4,tech.md §4.3):全量扫描 Index → 条目流直写落盘 →
 /// remap mmap Base(Shared),不留百万级堆索引常驻——**首扫与重扫替换段共用**
 /// (P0 迁移的同一逻辑,tech.md §1.6 预告的切换点)。
 ///
-/// 可见性(product 场景 2「建索引期间搜索」):产物以 Mutable 挂载(重扫路径,
-/// 写锁内原子、无观察窗)或**复用在位 Mutable**(首扫路径,holder 全程非
-/// Empty),写盘 + 重载完成后写锁内原位 swap Shared——与 flush_merged 同形态。
-/// 写盘/重载失败保持 Mutable(保守可用,下轮 flush 重试落盘),扫描成果不作废。
+/// 可见性:重扫路径**不提前换 Base**——写盘与重载期间旧 Base 照常服务
+/// (产品契约「重扫期间旧索引可查」),完成后写锁内把 holder 与 dir_map
+/// **同点**替换为 mmap 新 Base(旧 map 只对旧号空间有效,提前换 Base 会让
+/// 窗口内 diff 用旧号打新索引——毒 Base 事故的根因)。首扫路径复用在位
+/// Mutable(holder 全程非 Empty),同样原子提交。写盘/重载失败:重扫以内存
+/// 索引 + 其映射接管(必须换掉旧毒 Base);首扫保持 Mutable 并补建映射。
 ///
 /// 锁序(tech.md §7 落盘串行):rescan_lock → flush_lock → holder,写+load 段
 /// 整体在 flush_lock 内(与 flush_merged/persist_final 的 rename 互斥,防交错
@@ -1254,14 +1394,42 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
 /// 前提;重扫路径后续 drain 重放会重新累积)。meta 取调用方当时的水位——崩溃
 /// 窗口内盘上水位偏旧,重启重放幂等追平。
 fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, idx: Index) {
-    *state.holder.write().unwrap() = IndexHolder::Mutable(idx);
-    mount_mutable_in_place(state, paths);
+    let literal_roots = state.roots.lock().unwrap().clone();
+    let _flush_guard = state.flush_lock.lock().unwrap();
+    let n = idx.entry_count();
+    let meta = build_meta(state);
+    let layout = persist::EntryLayout::of(&idx);
+    let written = persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file())
+        .map_err(|e| log::error!("扫描产物落盘失败,以内存索引接管: {e}"))
+        .is_ok();
+    if written {
+        match persist::load_mmap(&paths.index_file()) {
+            Ok(view) => {
+                // 锁外构建映射(旧 Base 继续服务),写锁内与 holder 同点提交
+                let map = build_dir_map(view.as_ref(), &literal_roots);
+                install_holder_with_map(state, IndexHolder::Shared(view), map);
+                state.dirty.store(0, Ordering::Relaxed);
+                // 索引已让位 mmap(不计 footprint),扫描与产物堆的脏页在此归还
+                engine::malloc_pressure::release_heap_pressure();
+                log::info!("扫描产物已落盘并 remap 为 mmap Base(条目数: {n})");
+                return;
+            }
+            Err(e) => log::error!("扫描产物重载失败,以内存索引接管: {e}"),
+        }
+    }
+    // 落盘失败:扫描产物仍是全量干净态,以内存索引 + 其映射原子接管(旧毒 Base
+    // 必须被替换——heal 的目标是「彻底重建」,不是「保留旧态」)
+    let map = build_dir_map(&idx, &literal_roots);
+    install_holder_with_map(state, IndexHolder::Mutable(idx), map);
+    state.dirty.store(0, Ordering::Relaxed);
+    log::warn!("扫描产物未能落盘,已以内存索引接管(条目数: {n})");
 }
 
 /// 在位落盘(holder 已持 Mutable 产物;首扫直接复用流水线挂载,无 Empty 观察
 /// 窗):flush_lock 内写盘 → 重载 → 形态复核 swap Shared。
 /// 锁序与窗口语义见 [`mount_scan_product`]。
 fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
+    let literal_roots = state.roots.lock().unwrap().clone();
     let _flush_guard = state.flush_lock.lock().unwrap();
     let written = {
         let h = state.holder.read().unwrap();
@@ -1274,27 +1442,41 @@ fn mount_mutable_in_place(state: &EngineState, paths: &DaemonPaths) {
             .map_err(|e| log::error!("扫描产物落盘失败,保持内存索引: {e}"))
             .is_ok()
     };
-    if !written {
+    let mut swapped = false;
+    if written {
+        match persist::load_mmap(&paths.index_file()) {
+            Ok(view) => {
+                let map = build_dir_map(view.as_ref(), &literal_roots);
+                let mut h = state.holder.write().unwrap();
+                if let IndexHolder::Mutable(_) = &*h {
+                    // holder + dir_map 同点替换(见 install_holder_with_map)
+                    *h = IndexHolder::Shared(view);
+                    *state.dir_map.lock().unwrap() = map;
+                    swapped = true;
+                }
+                // 形态已变(Overlaid):盘面已是本产物,增量交 flush 合并收敛
+            }
+            Err(e) => log::error!("扫描产物重载失败,保持内存索引: {e}"),
+        }
+    }
+    if swapped {
+        state.dirty.store(0, Ordering::Relaxed);
+        // 索引已让位 mmap(不计 footprint),扫描与产物堆的脏页在此归还
+        // (S2「死页归还」的同构落地点;实测 60 万条首扫滞留 ~60MB 不自行回落)
+        engine::malloc_pressure::release_heap_pressure();
+        log::info!("扫描产物已落盘并 remap 为 mmap Base");
         return;
     }
-    match persist::load_mmap(&paths.index_file()) {
-        Ok(view) => {
-            let mut h = state.holder.write().unwrap();
-            if let IndexHolder::Mutable(_) = &*h {
-                *h = IndexHolder::Shared(view);
-                drop(h);
-                state.dirty.store(0, Ordering::Relaxed);
-                // 索引已让位 mmap(不计 footprint),扫描与产物堆的脏页在此归还
-                // (S2「死页归还」的同构落地点;实测 60 万条首扫滞留 ~60MB 不自行回落)
-                engine::malloc_pressure::release_heap_pressure();
-                log::info!("扫描产物已落盘并 remap 为 mmap Base");
-            } else {
-                log::info!("扫描产物已落盘;挂载形态已变,增量交 flush 合并收敛");
-            }
-            // 形态已变(Overlaid):盘面已是本产物,增量交 flush 合并收敛
+    // 未换基(落盘/重载失败,或形态已变):确保 dir_map 与当前 holder 一致
+    // ——首扫路径此前从未建过 map,cold_start 不再单独 rebuild。
+    let map = {
+        let h = state.holder.read().unwrap();
+        match &*h {
+            IndexHolder::Mutable(idx) => build_dir_map(idx, &literal_roots),
+            _ => return,
         }
-        Err(e) => log::error!("扫描产物重载失败,保持内存索引: {e}"),
-    }
+    };
+    *state.dir_map.lock().unwrap() = map;
 }
 
 /// Overlaid{mmap Base, 空 Overlay} → Shared:刚写盘的 Base 即盘上真相,直挂免
@@ -1377,6 +1559,15 @@ fn handle_diff_error(
             let removed = engine::scanner::remove_prefix(idx, map, abs_dir);
             let view: &dyn IndexView = idx;
             overlay.purge_prefix(view, abs_dir);
+            // 诊断+自愈:路径前缀清扫可能漏掉指向已 tombstone base 的桥(自愈
+            // 兜底,并留痕供归因——这里是「anchor 的 base 目录未留存」的来源)。
+            let stale = overlay.sweep_stale_anchors(view);
+            if stale > 0 {
+                log::warn!(
+                    "ENOENT 摘除 {} 后清扫 {stale} 个残留桥(指向已墓碑 base 的 anchor)",
+                    abs_dir.display()
+                );
+            }
             state.dirty.fetch_add(removed as u64, Ordering::Relaxed);
         }
         std::io::ErrorKind::PermissionDenied => {
@@ -1437,6 +1628,18 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             // 直挂 Shared(P3 后常驻即 Base,冷启动不再物化堆索引,tech.md §4.3):
             // 查询立即由 mmap 视图服务。首个可变性需求(增量 diff / 卷写入)经
             // ensure_mutable 按需物化——条目号 1:1,dir_map 与后续操作不受影响。
+            // 索引健全性抽检:历史版本 bug 产物(路径错挂)的主动判毒。放在重放
+            // **之前**——毒 Base 上重放会把数万事件逐个错挂、合并不报错但垃圾被
+            // 反复收编(实机 churn 十余分钟)。判毒即后台全量重扫(重扫期间旧
+            // Base 仍可查,产物就位后原子换基)。
+            let (missing, sampled) = index_path_missing_sample(view.as_ref());
+            if is_poison_sample(missing, sampled) {
+                log::warn!(
+                    "索引健全性抽检: {missing}/{sampled} 条路径不存在,判索引中毒(历史版本产物),转全量重扫彻底重建"
+                );
+                state.set_state(state::DEGRADED);
+                spawn_rescan(&state, &paths);
+            }
             *state.holder.write().unwrap() = IndexHolder::Shared(view);
             state.set_state(state::RECONCILING);
             rebuild_dir_map(&state);
@@ -1480,9 +1683,9 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             // T4:首扫产物同样收敛为 mmap Base(与重扫替换段共用 mount 的在位
             // 路径,tech.md §4.3)——不留堆索引常驻;此刻水位已含 water,落盘 meta
             // 一致。holder 自 apply 循环起恒为 Mutable,在位落盘无 Empty 观察窗。
+            // mount 已把 dir_map 与 Base 同点提交;Shared 态 flush 为无操作
             mount_mutable_in_place(&state, &paths);
-            rebuild_dir_map(&state);
-            flush(&state, &paths); // Shared 态:盘上即刚写产物,无操作
+            flush(&state, &paths);
             state.set_state(state::READY);
             // 从扫描前水位重放:补齐扫描窗口变更,追平后转纯实时
             (water, false)
@@ -1540,9 +1743,16 @@ fn handle_conn(
 ) -> Result<()> {
     // 每步 io 带阶段标注:线上的「Invalid argument (os error 22)」无法从错误串
     // 定位 syscall,阶段化后一次出现即可锁定(read 长度/读体/写响应)。
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .context("设置读超时")?;
+    // EINVAL 定位(实测):对端在 accept 前已关闭(客户端 connect 后立即断开)时,
+    // macOS 的 setsockopt(SO_RCVTIMEO) 返回 EINVAL——保持连接的客户端 0/100,
+    // 即刻断开 257/300。这类连接注定读不到请求,静默关闭即可,不是错误。
+    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            log::debug!("对端在 accept 前已关闭,连接直接关闭(SO_RCVTIMEO EINVAL)");
+            return Ok(());
+        }
+        return Err(e).context("设置读超时");
+    }
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).context("读取消息长度")?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -1832,6 +2042,16 @@ pub fn ensure_data_dir(dir: &Path) -> std::io::Result<()> {
 pub fn serve(paths: DaemonPaths) -> Result<()> {
     ensure_data_dir(&paths.data_dir).context("创建数据目录失败")?;
     init_logger(&paths);
+    // 上次会话崩溃/强杀残留的索引临时文件(tmp 与溢写段):与目标同目录、前缀
+    // 精确匹配,启动即清扫(实机曾见 40MB 残留)。
+    persist::cleanup_stale_index_tmp(&paths.data_dir);
+    // 后台线程 panic 默认只写 stderr(随启动方式可能丢失),且会让 rescan_lock
+    // 等 Mutex 中毒——统一经 log 留痕,排障时不再「静默死线程」。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("线程 panic: {info}");
+        default_hook(info);
+    }));
     let listener = bind_single_instance(&paths.socket())?;
     let state = Arc::new(EngineState::new());
     {
@@ -3020,6 +3240,116 @@ mod tests {
         assert_eq!(out.total, 1, "增量已合并落盘");
     }
 
+    /// 重扫锁中毒恢复钉:前次重扫线程 panic 后 rescan_lock 中毒,try_lock 的
+    /// Poisoned 若被当成「在途」吞掉,自愈路径永久哑火(实机 heal 79 次零效果
+    /// 的形态)。突变「Poisoned 返回 None」本测红;在途判定必须仍准确。
+    #[test]
+    fn rescan_lock_poison_is_recovered_but_inflight_still_detected() {
+        let lock = Arc::new(Mutex::new(()));
+        let l2 = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = l2.lock().unwrap();
+            panic!("模拟重扫线程 panic");
+        })
+        .join();
+        assert!(lock.is_poisoned(), "前提:锁已中毒");
+        let g = try_acquire_rescan(&lock).expect("中毒必须恢复并取得锁");
+        assert!(
+            try_acquire_rescan(&lock).is_none(),
+            "已持有 → 真在途,不得误判为可重入"
+        );
+        drop(g);
+        assert!(try_acquire_rescan(&lock).is_some(), "释放后可再取");
+    }
+
+    /// 重扫中标志兜底复位钉:重扫线程 panic 时 rescanning 必须复位,否则
+    /// 消费循环永久忽略 dropped、flush_merged 永久早退,索引再不落盘。
+    /// 突变「ResetRescanning 的 Drop 不写 false」本测红。
+    #[test]
+    fn rescanning_guard_resets_flag_on_panic() {
+        let flag = AtomicBool::new(true);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ResetRescanning(&flag);
+            panic!("模拟重扫线程 panic");
+        }));
+        assert!(r.is_err());
+        assert!(!flag.load(Ordering::SeqCst), "panic 展开时必须兜底复位");
+    }
+
+    /// 判毒阈值边界钉:采样数下限 32(小样本不可判)、占比严格大于 20%。
+    /// 突变「把 20 改成 >= 或去掉下限」→ 边界断言红。
+    #[test]
+    fn poison_threshold_boundaries() {
+        assert!(!is_poison_sample(0, 0), "空索引不判毒");
+        assert!(!is_poison_sample(31, 31), "样本不足 32 不判毒");
+        assert!(!is_poison_sample(6, 32), "18.75% 不判毒");
+        assert!(!is_poison_sample(6, 30), "样本不足:即便占比高也不判毒");
+        assert!(is_poison_sample(7, 32), "21.9% 判毒");
+        assert!(is_poison_sample(112, 256), "实测毒样本 43.7% 判毒");
+    }
+
+    /// 抽检端到端钉:真实目录树扫描出的索引 → 不判毒;同索引混入大量不存在
+    /// 的路径(历史 bug 的错挂形态) → 判毒。突变「统计不存在的路径时恒 0」
+    /// 或「路径不含 ENOTDIR」——后者用「中间级是文件」构造验证。
+    #[test]
+    fn path_existence_sample_separates_poison_from_healthy() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        for i in 0..20 {
+            std::fs::write(root.join(format!("f{i}.txt")), "").unwrap();
+            std::fs::write(root.join("d").join(format!("g{i}.txt")), "").unwrap();
+        }
+        let healthy = engine::scanner::scan_roots(&[root.to_path_buf()], &[], 1).0;
+        let (missing, sampled) = index_path_missing_sample(&healthy);
+        assert!(sampled >= 32, "样本量: {sampled}");
+        assert_eq!(missing, 0, "健康索引路径全部存在");
+        assert!(!is_poison_sample(missing, sampled));
+
+        // 错挂形态:真实文件被当目录用(ENOTDIR),+ 纯不存在路径
+        let mut poisoned = engine::scanner::scan_roots(&[root.to_path_buf()], &[], 1).0;
+        let rid = (0..poisoned.entries.len() as u32)
+            .find(|&i| poisoned.entries[i as usize].parent == NO_PARENT)
+            .unwrap();
+        let file = poisoned.children_of(rid)[0];
+        for i in 0..40 {
+            poisoned.insert(&format!("ghost{i}"), rid, false);
+            poisoned.insert(&format!("x{i}"), file, false); // 挂到文件下 → ENOTDIR
+        }
+        let (missing, sampled) = index_path_missing_sample(&poisoned);
+        assert!(missing > 0, "错挂路径必须计入");
+        assert!(
+            is_poison_sample(missing, sampled),
+            "毒样本应判毒: {missing}/{sampled}"
+        );
+    }
+
+    /// 死连接静默关闭钉(实测 EINVAL 根因):对端在 accept 前已关闭时
+    /// setsockopt(SO_RCVTIMEO) 返回 EINVAL,handle_conn 必须当作「连接已死」
+    /// 静默返回 Ok,而不是 WARN 刷屏(实测 connect+立即关闭 257/300)。
+    /// 突变「EINVAL 仍上抛」本测红(平台不返回 EINVAL 时测试自跳过)。
+    #[test]
+    fn dead_peer_connection_closes_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let c = UnixStream::connect(&sock).unwrap();
+        drop(c); // 对端立即断开
+        std::thread::sleep(Duration::from_millis(50));
+        let (mut s, _) = l.accept().unwrap();
+        if s.set_read_timeout(Some(Duration::from_secs(5))).is_ok() {
+            return; // 平台不再返回 EINVAL:本钉无区分力(修复路径本身仍安全)
+        }
+        let state = Arc::new(EngineState::new());
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        assert!(
+            handle_conn(&mut s, &state, &paths).is_ok(),
+            "对端已关闭的连接应静默关闭"
+        );
+    }
+
     /// 腐化自愈的对照钉:非腐化 io 错误(磁盘/路径问题,重扫无益)不得置自愈
     /// 位——is_ledger_corruption 的判定边界(InvalidData + 精确前缀)。
     /// 突变「判定放宽为一切 InvalidData / 一切错误」→ 对照断言红。
@@ -3196,7 +3526,7 @@ mod tests {
 
         // 陈旧快照的替换必须被拒绝:保留增量态,查询可见
         assert!(
-            !swap_base_if_fresh(&state, stale_view, epoch_snapshot),
+            !swap_base_if_fresh(&state, stale_view, epoch_snapshot, DirIndexMap::default()),
             "世代前移必须放弃替换"
         );
         assert!(
