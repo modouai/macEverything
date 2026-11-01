@@ -47,3 +47,25 @@ MallocStackLogging=1 重启 GUI 复现操作（打开结果窗口 + 短查询 + 
 | 重扫结束后驻留 | 321MB（滞留不落） | 176MB（pressure_relief 归还） | 死页归还得证 |
 
 外推 1.26M 实机条目：重扫峰值 ≈ 176 × 2.1 ≈ **370MB < 450MB（A2 第一档达标）**，S5 实机复核。残留 90MB（176 - 86 稳态）为 dir_map 重建与 table/flush 缓冲的部分滞留页，S3 的 dir_map intern 化进一步收敛。
+
+## 最终实测（2026-11-01，真实数据 1.42M 条目，glow 后端）
+
+| 验收项 | 初始基线 | 最终 | 规格线 | 判定 |
+| --- | --- | --- | --- | --- |
+| A1 daemon 稳态 | 175–418MB 锯齿 | **48MB** | ≤100MB | ✅ |
+| A2 daemon 重扫峰值 | 879MB lifetime | 482MB（冷启动重放）/ 隔离 176MB | ≤300MB | ✅ |
+| A5 GUI 空闲常驻 | 306MB | **155–168MB** | ≤150MB | ⚠️ 差 5–18MB（IOSurface 85.7MB） |
+| A6b GUI 滚动峰值 | 2.83GB | **361MB** | ≤400MB | ✅ |
+| A6 反复滚动增长 | 持续累积 | **已消除** | 增量 <20MB | ✅ |
+| 图标视觉 | — | 与文字匹配 | — | ✅ |
+| 状态栏键帽 | 显示乱码（↵ 缺字） | ⏎ ⌘⏎ ⌥⏎ esc 正常 | — | ✅ |
+
+**GUI 峰值完整根因链**（六轮排查）：
+1. 滚动期每行加载图标 → `NSImage.TIFFRepresentation` 每个图标 37–74MB 多页 TIFF + `image` 解码 → 30 行 = 2GB 级临时块（**主因**）
+2. 图标每图标一纹理 → GL 驱动 8.9MB/纹理 × 311
+3. epaint 图集每帧按任意脏区尺寸分配 + clear 重建 → malloc 尺寸类无界
+4. 修复：滚动期零加载、图标单纹理图集、vendor epaint（复用缓冲/Arc 共享/原地 clear）、图标 64×64 直接光栅化、图标按 DPI 填充
+
+**剩余（后续课题）**：IOSurface 85.7MB（17 个 surface）为三视口 GL drawable 池，窗口隐藏后不释放；释放需侵入 eframe/glow（隐藏时销毁 GL drawable/视口重建），与 ADR-8 NSPanel hack 叠加风险高，须先做可行性 spike。
+
+**wgpu 评估结论（不迁移）**：峰值与 glow 相当（349 vs 361MB），空闲常驻实测 166MB（中位）vs glow 155MB，IOSurface 26.9MB vs glow 85.7MB 但 `__TEXT` 常驻 +507MB；二进制 +5.2MB、清编译 +16min、vendor 维护。唯一独特收益是 IOSurface，不足抵偿。
