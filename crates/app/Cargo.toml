@@ -14,13 +14,17 @@ protocol = { path = "../protocol" }
 # session 直接复用 engine::query::SortKey(ADR-7:app 经 client 承载层依赖 engine 已许可;
 # Rust 2018+ 依赖非传递可见,故显式声明)。
 engine = { path = "../engine" }
-# 0.37 一律带 system_fonts:仅 default_fonts 时中文渲染为方框(PoC-1 实测,
-# 见 docs/specs/v2-ui/poc-results.md「与 plan 示意的接线差异」#3)。
+# system_fonts 不带(A6b 裁决,2026-11-01):fontique 回退单次查询固定枚举开销
+# 191-194MB,与命中字体无关;真实文件名长尾不可控,任何一次触发即击穿内存
+# 验收(实测峰值 2.4GB,线 400MB)。未知字形按 MissingGlyphPolicy::Tofu 显示,
+# 汉字/韩文/符号由内置 OFL 字体覆盖(ui/mod.rs BUNDLED_FONTS)。
+# 旧注释「0.37 一律带 system_fonts:仅 default_fonts 时中文渲染为方框」已作废
+# ——当时无内置 CJK 字体,如今方框只出现在覆盖集外的真生僻字形上,属预期。
 # clipboard(2026-10-16 修「输入框无法粘贴」):default-features=false 会一并关掉
 # egui-winit/clipboard,剪贴板集成(arboard)随之缺席——egui-winit 的 handle_key_event
 # 只在 clipboard_shortcuts 下把 ⌘V 译成 Event::Paste,而 Clipboard::get 无 arboard 时
 # 只读进程内兜底串(恒空,空串不再 push 事件),⌘V/⌘C/⌘X 三键全哑。
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts", "clipboard"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 objc2 = "0.6"
 # NSResponder/NSAppearance:ui/theme.rs 经 NSApplication.effectiveAppearance 读系统外观
 # (sharedApplication 挂在 NSResponder feature 下、外观 API 挂在 NSAppearance 下;
@@ -147,6 +151,3 @@ tray-icon = { version = "0.26.1", default-features = false }
 [dev-dependencies]
 # 设置持久化单测用独立临时目录(与 engine/client/cli 同版本)。
 tempfile = "3"
-# CJK 字体注入的 footprint 对比采样(#[ignore] 测试):复现 eframe 同款
-# fontique 系统回退慢路径(tech.md §6.2.1 归因);生产路径不直接依赖它。
-egui_system_font_provider = "0.37"

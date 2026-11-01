@@ -238,7 +238,7 @@ struct Overlay {
 
 ### 6.2 阶段一（确定性手段，目标 ≤ 150MB）
 
-1. **消灭 CJK 字体回退慢路径（峰值主修复，S0.3 归因定案）**：注入覆盖 CJK 的字体源使中文 galley 布局直接命中，`egui_system_font_provider`/fontique 的 fallback（`Family::resolve_slow` → `Query::matches` 191MB×3 + `load_blob` 苹方 ttc 整块载入 76MB×2，实测复现 peak 4.3GB）只在极生僻字形时偶发。实现取向：egui `FontInsert` 注入 CJK 覆盖字体（字形全集，~10MB 一次性内存）置于 Proportional/Monospace 高优先级；拉丁仍 SF Pro/SF Mono。`system_fonts` feature 的保留与否随实现评估（去掉则 fontique 不参与，需确认默认字体面覆盖）。
+1. **消灭字体回退慢路径（峰值主修复；T5 落地后经 A6b 实测二次收敛，2026-11-01 定案）**：最终形态 = `system_fonts` feature **整体移除**（fontique 不再存在于任何构建，Cargo.lock 零引用）+ 内置 OFL 覆盖链注入。覆盖链（每 family，`FontInsert` + `from_static` 零拷贝）：SF Pro/SF Mono（拉丁）→ Noto Sans SC（汉字 20,976 + 假名）→ egui 默认字体 → Noto Sans KR（韩文 11,172）→ Noto Sans Symbols/2（符号 3,506，⌥⌘ 类）；KR/Symbols 排 chain 尾部，不改变现有任何字形的来源。**T5 初版「只注入 SC、provider 兜极生僻字形偶发」的假设被 A6b 推翻**：fontique 单次查询是固定枚举开销（MSL 实测 194MB/次，与命中字体无关），真实文件名长尾不可控，纯数字查询 + 滚动即复现（峰值 2.4GB）。移除后未知字形按 `MissingGlyphPolicy::Tofu`（egui 默认）显示——纯显示退化，搜索/复制/排序不受影响；彩色 emoji 退为 egui 内置黑白 NotoEmoji。行为回归钉（单测）：覆盖链字形零 provider 询问、真无字形字符（U+2A6B2）tofu 布局不塌且**若**有 provider 必被询问（sentinel 突变对）；`ui()` 留痕 `discovered_fonts` 应恒空，非空即 provider 回归。
 2. **死页归还**：viewport 空闲（无输入、无滚动）60s 后 `malloc_zone_pressure_relief`（`platform/mac.rs` unsafe 区）；对 `Malloc Large (empty)` 死页（峰值时实测 3GB/362 块滞留）。
 3. **图标缓存治理**：现状已是 worker 回传 64×64 预乘 RGBA + 路径缓存上限 2048 条 FIFO 淘汰（`ui/icons.rs:54` `MAX_PATH_ICONS`），上界 64×64×4×2048 ≈ 32MB（与实测 CG Image 18MB 同量级）。治理：上限 2048 → 小上限（128）LRU + 确认缓存淘汰路径上 egui 纹理 handle 与 CG Image 的显式释放；预期 -15MB 以上。
 4. **字形图集上限**：`max_texture_side` 8192→4096（单块重烘 256MB→64MB 上限），封顶保险（归因证实峰值主因不是图集，此项降级为防扩散）。
@@ -252,7 +252,11 @@ struct Overlay {
 - **IOSurface 归属（常驻态 85.8MB/28 个，结果窗口关闭也不释放）**：2160×1254 BGRA 10.4MB×3 = 结果窗口 drawable 三缓冲（IOGPUSurfaceMTL + AppKit 镜像）；1400×492 2.7MB×4 = 悬浮条；1240×1200 5.8MB×2 = 第三视口。滚动时 `NSIOSurfacePool nextUnusedSurface` 增配 18.8MB 块。处置：视口关闭显式释放 surface（egui viewport 生命周期钩子；drawable 池行为随实现调查）——预期常驻 -55MB。
 - **CG Image**：8–18MB（图标，随查询内容浮动），§6.2.3 治理已覆盖。
 
-**剩余探索项**：视口 surface 释放（上述）；CoreText 栅格化缓存驻留限制；每帧分配审计（style 克隆热点）。修复项落地后按数据决定是否继续冲 ≤ 100MB 或回评审定线。
+**A6b 复测裁决（2026-11-01，T5 修复后）**：同款操作（纯数字查询 + 滚动）峰值 **2.4GB**、空闲期 447→729MB 不降。MSL 再归因：① 4×194MB mmap = fontique 回退**再次**触发（`resolve_slow` → `Query::matches` → `load_blob`，栈与首归因同源）——查询是纯数字，触发行的文件名含注入字体集外的字形；**查询内容与命中字体均无关，194MB 是 fontique 查询的固定枚举开销**，真实长尾不可控，任何一次触发即击穿 A6b。裁决：推翻「极生僻字形偶发」假设，`system_fonts` 整体移除（最终形态见 §6.2.1）。② 次级贡献：40×8MB + 32×2MB glTexImage2D/IOGPUResourceCreate ≈ 390MB——egui 图集在滚动中持续引入新字形、反复重烘上传（图集逐出机制），**先记录**：缓解候选 = 覆盖链扩容减少新字形引入、图集周期性重建，阶段二按数据处置。
+
+移除后实测（2026-11-01）：headless 采样（harness 同长尾行集 2000 行）峰值 **6MB**（对照侧 `MCE_NO_CJK_FONT=1` 5MB；fontique 不在依赖图）；真 GUI 空闲 A/B：内置字体注入与否 footprint 持平（202 vs 203MB，字体字节为 clean file-backed 页，自身 ≈1MB）；空闲构成 IOSurface 90MB/46 块 + Malloc Small 死页 58MB（`malloc_zone_pressure_relief` 只折叠大块，Small 段滞留）——均为阶段二（视口 surface 释放、堆治理细化）范围。
+
+**剩余探索项**：视口 surface 释放（上述）；CoreText 栅格化缓存驻留限制；图集重烘节流（上述②）；每帧分配审计（style 克隆热点）。修复项落地后按数据决定是否继续冲 ≤ 100MB 或回评审定线。
 
 ### 6.4 阶段二出口条件
 
