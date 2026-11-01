@@ -20,9 +20,20 @@ pub fn release_heap_pressure() {
         fn malloc_default_zone() -> *mut c_void;
         fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
     }
-    let relieved = unsafe { malloc_zone_pressure_relief(malloc_default_zone(), 0) };
-    if relieved > 0 {
-        log::debug!("malloc pressure relief 归还 {} KB", relieved / 1024);
+    // 迭代折叠:单次调用只处理当时可见的空闲段,Small zone 的碎片化段
+    // 需要多轮才能收敛(实测单次后仍有 70MB+ 小对象死页)。最多 8 轮,
+    // 返回 0 即收敛;每轮开销与剩余空闲段数成正比,收敛后近乎零成本。
+    let zone = unsafe { malloc_default_zone() };
+    let mut total = 0usize;
+    for _ in 0..8 {
+        let n = unsafe { malloc_zone_pressure_relief(zone, 0) };
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    if total > 0 {
+        log::debug!("malloc pressure relief 归还 {} KB", total / 1024);
     }
 }
 
