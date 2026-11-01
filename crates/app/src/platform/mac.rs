@@ -1731,6 +1731,10 @@ pub fn app_icon_rgba(path: &str) -> Option<Vec<u8>> {
 ///
 /// 位图格式:8bit/通道、4 采样、alpha 在后、非 planar、deviceRGB、默认
 /// bitmapFormat(预乘)——正是图标图集要求的预乘 RGBA 内存序。
+///
+/// 尺寸取 64×64:行内最大绘制矩形是悬浮条 `ROW_ICON = 32pt`,2x 下 = 64px
+/// (1:1);完整窗口 `ROW_ICON = 16pt` → 32px(2x 过采样)。128px 对当前 UI
+/// 属过度采样,且会让图集单元/内存翻四倍,故不采用。
 fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
     let px = ICON_PX as NSInteger;
     let bytes_per_row = px * 4;
@@ -1765,10 +1769,15 @@ fn image_rgba(icon: &NSImage) -> Option<Vec<u8>> {
     let gc = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
     let previous = NSGraphicsContext::currentContext();
     NSGraphicsContext::setCurrentContext(Some(&gc));
-    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(px as f64, px as f64));
+    // 源矩形必须是图像的**完整逻辑边界**(点),目标矩形才是 64×64 像素位图;
+    // 两者都传目标矩形会从源图坐标里裁一块 64×64(图像往往只有 32pt),
+    // AppKit 按实际内容绘制 → 图标只占单元格约一半,视觉变小。
+    let size = icon.size();
+    let source = NSRect::new(NSPoint::new(0.0, 0.0), size);
+    let dest = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(px as f64, px as f64));
     icon.drawInRect_fromRect_operation_fraction(
-        rect,
-        rect,
+        dest,
+        source,
         NSCompositingOperation::SourceOver,
         1.0,
     );
@@ -2237,6 +2246,27 @@ mod tests {
         }
     }
 
+    /// 不透明像素的包围盒占比(宽, 高):图标内容必须基本填满 64×64 单元格。
+    /// 旧实现把源矩形也传成目标矩形,AppKit 按 32pt 原尺寸绘制 → 占比约 0.47,
+    /// 行内图标视觉减半;本钉捕获这类回归。
+    fn opaque_bbox(rgba: &[u8], px: usize) -> (f32, f32) {
+        let (mut minx, mut miny, mut maxx, mut maxy) = (px, px, 0usize, 0usize);
+        for y in 0..px {
+            for x in 0..px {
+                if rgba[(y * px + x) * 4 + 3] > 8 {
+                    minx = minx.min(x);
+                    miny = miny.min(y);
+                    maxx = maxx.max(x + 1);
+                    maxy = maxy.max(y + 1);
+                }
+            }
+        }
+        (
+            (maxx - minx) as f32 / px as f32,
+            (maxy - miny) as f32 / px as f32,
+        )
+    }
+
     /// 图标解码钉:直接画进 64×64 位图(不走 TIFFRepresentation)。
     /// 旧路径在本机每个图标产生 37–74MB 的临时分配,实测 1000 条真实结果、
     /// 不滚动、仅加载可见行图标时峰值 845MB;直接光栅化后同场景 216MB。
@@ -2256,6 +2286,11 @@ mod tests {
             }
         }
         assert!(visible > 64 * 64 / 10, "应有可见像素,实际 {visible}");
+        let (w, h) = opaque_bbox(&rgba, 64);
+        assert!(
+            w >= 0.75 && h >= 0.6,
+            "图标内容应基本填满单元格(回归:源/目标矩形混用导致缩到一半),实际 {w:.2}x{h:.2}"
+        );
     }
 
     /// APP 图标(16bit float 多页表示)也必须能直接画出可见像素;
@@ -2269,6 +2304,11 @@ mod tests {
         assert!(
             visible > 64 * 64 / 10,
             "APP 图标应有可见像素,实际 {visible}"
+        );
+        let (w, h) = opaque_bbox(&rgba, 64);
+        assert!(
+            w >= 0.65 && h >= 0.65,
+            "APP 图标内容应基本填满单元格,实际 {w:.2}x{h:.2}"
         );
     }
 
@@ -2301,6 +2341,15 @@ mod tests {
     #[expect(clippy::print_stderr)]
     fn ignored_icon_decode_footprint() {
         let before = lifetime_peak_mb();
+        for path in [
+            "/System/Applications/Utilities/Terminal.app",
+            "/System/Applications/Calculator.app",
+            "/System/Applications/Safari.app",
+        ] {
+            if std::path::Path::new(path).exists() {
+                let _ = super::app_icon_rgba(path);
+            }
+        }
         for uti in [
             "public.folder",
             "public.plain-text",
