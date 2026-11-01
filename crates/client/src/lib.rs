@@ -42,6 +42,11 @@ impl DaemonPaths {
     pub fn log_file(&self) -> PathBuf {
         self.data_dir.join("daemon.log")
     }
+    /// 用户主动 `stop` 的意图标记(CLI stop 成功后写入,CLI start 清除)。
+    /// GUI 存活监控据此区分「崩溃退出」与「用户主动停止」,不把后者拉起。
+    pub fn stop_intent_file(&self) -> PathBuf {
+        self.data_dir.join("daemon.stop-intent")
+    }
 }
 
 /// 连接 daemon;连不上返回 None(调用方据此走离线降级)。

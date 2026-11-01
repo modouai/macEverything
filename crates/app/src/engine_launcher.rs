@@ -61,10 +61,17 @@ struct LivenessTracker {
 }
 
 impl LivenessTracker {
-    /// 返回本轮是否应拉起。`expected=false`(离线/用户停止)或 `suspended`
-    /// (手动重启窗口)一律清零且不触发。
-    fn observe(&mut self, connectable: bool, expected: bool, suspended: bool) -> bool {
-        if connectable || !expected || suspended {
+    /// 返回本轮是否应拉起。`expected=false`(离线/用户停止)、`suspended`
+    /// (手动重启窗口)或 `stop_intent`(用户显式 CLI stop 的标记)一律清零
+    /// 且不触发。
+    fn observe(
+        &mut self,
+        connectable: bool,
+        expected: bool,
+        suspended: bool,
+        stop_intent: bool,
+    ) -> bool {
+        if connectable || !expected || suspended || stop_intent {
             self.failures = 0;
             return false;
         }
@@ -88,24 +95,30 @@ where
         .name("daemon-health".to_owned())
         .spawn(move || {
             let mut tracker = LivenessTracker::default();
+            let mut last_stop_intent = false;
             loop {
                 std::thread::sleep(MONITOR_INTERVAL);
                 let connectable = client::connect(&paths).is_some();
                 let expected = expected_running();
                 let suspended = MONITOR_SUSPENDED.load(Ordering::SeqCst);
-                if connectable {
-                    tracker.reset();
-                    continue;
+                // CLI stop 成功后的意图标记:用户主动停止不是崩溃,不拉起。
+                // 标记在 CLI start 时清除,届时监控自动恢复。
+                let stop_intent = paths.stop_intent_file().exists();
+                if stop_intent != last_stop_intent {
+                    if stop_intent {
+                        log::info!("检测到用户主动 stop 标记,存活监控暂停自动拉起");
+                    } else {
+                        log::info!("stop 标记已清除,存活监控恢复");
+                    }
+                    last_stop_intent = stop_intent;
                 }
-                if !expected || suspended {
-                    tracker.reset();
-                    continue;
-                }
-                if !tracker.observe(false, expected, suspended) {
-                    log::warn!(
-                        "daemon 存活探测失败({}/{MONITOR_FAIL_THRESHOLD}),继续观察",
-                        tracker.failures
-                    );
+                if !tracker.observe(connectable, expected, suspended, stop_intent) {
+                    if !connectable && expected && !suspended && !stop_intent {
+                        log::warn!(
+                            "daemon 存活探测失败({}/{MONITOR_FAIL_THRESHOLD}),继续观察",
+                            tracker.failures
+                        );
+                    }
                     continue;
                 }
                 // 进入拉起前再复核暂停闸:用户可能恰在探测后发起手动重启。
@@ -324,13 +337,19 @@ mod tests {
     #[test]
     fn liveness_tracker_restarts_only_after_consecutive_failures() {
         let mut t = LivenessTracker::default();
-        assert!(!t.observe(false, true, false), "第 1 次不可连:仅观察");
-        assert!(t.observe(false, true, false), "第 2 次不可连:触发拉起");
+        assert!(
+            !t.observe(false, true, false, false),
+            "第 1 次不可连:仅观察"
+        );
+        assert!(
+            t.observe(false, true, false, false),
+            "第 2 次不可连:触发拉起"
+        );
         t.reset();
-        assert!(!t.observe(false, true, false));
-        assert!(!t.observe(true, true, false), "可连即清零");
-        assert!(!t.observe(false, true, false), "清零后重新从 1 计数");
-        assert!(t.observe(false, true, false));
+        assert!(!t.observe(false, true, false, false));
+        assert!(!t.observe(true, true, false, false), "可连即清零");
+        assert!(!t.observe(false, true, false, false), "清零后重新从 1 计数");
+        assert!(t.observe(false, true, false, false));
     }
 
     /// 离线态 / 用户主动 stop / 手动重启窗口:探测失败也不得拉起,且计数清零
@@ -338,11 +357,31 @@ mod tests {
     #[test]
     fn liveness_tracker_respects_expected_and_suspend() {
         let mut t = LivenessTracker::default();
-        assert!(!t.observe(false, false, false), "离线态(期望不运行):不拉起");
-        assert!(!t.observe(false, false, false));
-        assert!(!t.observe(false, true, true), "手动重启窗口:不拉起");
-        assert!(!t.observe(false, true, false), "恢复后重新从 1 计数");
-        assert!(t.observe(false, true, false), "期望运行 + 连续 2 次才触发");
+        assert!(
+            !t.observe(false, false, false, false),
+            "离线态(期望不运行):不拉起"
+        );
+        assert!(!t.observe(false, false, false, false));
+        assert!(!t.observe(false, true, true, false), "手动重启窗口:不拉起");
+        assert!(!t.observe(false, true, false, false), "恢复后重新从 1 计数");
+        assert!(
+            t.observe(false, true, false, false),
+            "期望运行 + 连续 2 次才触发"
+        );
+    }
+
+    /// CLI stop 意图标记:用户主动停止后监控不得拉起(即使期望位仍为真)。
+    /// 突变「忽略 stop_intent」→ 第二次断言红。
+    #[test]
+    fn liveness_tracker_respects_user_stop_intent() {
+        let mut t = LivenessTracker::default();
+        assert!(!t.observe(false, true, false, true), "stop 意图:不拉起");
+        assert!(
+            !t.observe(false, true, false, true),
+            "stop 意图期间计数清零"
+        );
+        assert!(!t.observe(false, true, false, false), "标记清除后从 1 计数");
+        assert!(t.observe(false, true, false, false), "恢复后连续 2 次触发");
     }
 
     #[test]

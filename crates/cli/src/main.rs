@@ -117,6 +117,13 @@ fn start(paths: &client::DaemonPaths) -> Result<(), CliError> {
         message: format!("数据目录不可用({}): {e}", paths.data_dir.display()),
         json: false,
     })?;
+    // 新一次启动 = 用户重新期望运行:清掉上次主动 stop 的意图标记,让 GUI
+    // 存活监控恢复「崩溃才拉起」语义(标记仅在 CLI stop 成功后写入)。
+    match std::fs::remove_file(paths.stop_intent_file()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("清除 stop 意图标记失败: {e}"),
+    }
     if std::env::var_os("MCE_FOREGROUND").is_some() {
         return daemon::serve(paths.clone()).map_err(runtime);
     }
@@ -131,6 +138,11 @@ fn run() -> Result<(), CliError> {
         Command::Start => start(&paths),
         Command::Stop => {
             let n = client::stop(&paths).map_err(runtime)?;
+            // 用户主动停止:落一个意图标记,GUI 存活监控看到后不再自动拉起。
+            // 只在实际 stop 成功后写;失败(如 daemon 未运行)不改变期望态。
+            if let Err(e) = std::fs::write(paths.stop_intent_file(), b"user stop\n") {
+                eprintln!("写入 stop 意图标记失败: {e}");
+            }
             println!("已停止,最终条目数 {n}");
             Ok(())
         }
