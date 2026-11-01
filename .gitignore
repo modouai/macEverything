@@ -13,3 +13,6 @@ target/
 
 # Twikoo 评论后端已废弃，整体不入库（磁盘文件保留，可从历史取回）
 /infra/
+
+# cargo vendor 标记(本地补丁目录,不随仓库分发)
+vendor/epaint/.cargo-ok

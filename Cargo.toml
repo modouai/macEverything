@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/engine", "crates/protocol", "crates/client", "crates/cli", "crates/app"]
-exclude = ["scripts/spike-readdir", "scripts/poc/poc1_window", "scripts/poc/poc1b_nspanel", "scripts/poc/poc2_hotkey", "scripts/poc/poc3_nsmenu", "scripts/poc/poc4_idle", "scripts/poc/poc6_height_resize", "scripts/poc/poc7_vibrancy", "scripts/poc/poc8_quicklook"]
+exclude = ["vendor/epaint", "scripts/spike-readdir", "scripts/poc/poc1_window", "scripts/poc/poc1b_nspanel", "scripts/poc/poc2_hotkey", "scripts/poc/poc3_nsmenu", "scripts/poc/poc4_idle", "scripts/poc/poc6_height_resize", "scripts/poc/poc7_vibrancy", "scripts/poc/poc8_quicklook"]
 
 [workspace.package]
 version = "2.5.0"
@@ -21,3 +21,10 @@ log = "0.4"
 fsevent-sys = "4"
 core-foundation-sys = "0.8"
 libc = "0.2"
+
+# 本地补丁:epaint 的字体图集增量上传按脏区任意尺寸分配,macOS malloc 按尺寸类
+# 缓存 VM 段 → 滚动时 Malloc Large (empty) 随高度种类无界累积(峰值 1.9–2.8GB)。
+# 补丁把增量区域量化到 2 的幂(见 vendor/epaint/src/texture_atlas.rs 的 MCE 标记)。
+# **升级 egui/epaint 版本时必须重新同步此补丁**(vendor 目录以 0.37.0 为基线)。
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }

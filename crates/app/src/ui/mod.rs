@@ -2018,6 +2018,71 @@ mod tests {
         );
     }
 
+    /// 本地补丁钉(vendor/epaint 的 MCE 标记):字体图集**部分增量**必须量化到
+    /// 2 的幂尺寸。原因:每帧增量按脏区任意尺寸分配 ColorImage,macOS malloc 按
+    /// 尺寸类缓存 VM 段 → 滚动时尺寸类无界、Malloc Large (empty) 持续累积
+    /// (实测 71 块 × 4–10MB、峰值 1.9–2.8GB)。量化把尺寸类压回十几个。
+    /// 突变(去掉补丁 / 上游升级覆盖 vendor)→ 尺寸不再为 2 的幂,本测红。
+    #[test]
+    fn epaint_partial_delta_is_size_quantized() {
+        use egui::epaint::{ImageData, TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 256], TextOptions::default());
+        let _ = atlas.take_delta(); // 清掉初始 EVERYTHING
+        let ((_x, _y), region) = atlas.allocate((7, 30));
+        for px in region.pixels.iter_mut() {
+            *px = egui::Color32::from_rgb(1, 2, 3);
+        }
+        let delta = atlas.take_delta().expect("脏区应产生增量");
+        let [w, h] = delta.image.size();
+        assert!(
+            w.is_power_of_two() && h.is_power_of_two(),
+            "增量尺寸应量化到 2 的幂,实际 {w}x{h}"
+        );
+        assert!(w >= 7 && h >= 30, "量化不得裁掉脏区({w}x{h} < 7x30)");
+        let pos = delta.pos.expect("部分增量应带 pos");
+        assert!(
+            pos[0] + w <= 4096 && pos[1] + h <= 256,
+            "量化后应仍在图集内"
+        );
+        // 多传区域必须取自图集现有像素(只多传,不改变内容)。
+        let ImageData::Color(img) = &delta.image;
+        let atlas_img = atlas.image();
+        let aw = atlas_img.width();
+        for yy in 0..h {
+            for xx in 0..w {
+                let a = atlas_img.pixels[(pos[1] + yy) * aw + pos[0] + xx];
+                let b = img.pixels[yy * w + xx];
+                assert_eq!(
+                    (a.r(), a.g(), a.b(), a.a()),
+                    (b.r(), b.g(), b.b(), b.a()),
+                    "增量像素应与图集一致 @({xx},{yy})"
+                );
+            }
+        }
+    }
+
+    /// 本地补丁钉:不同脏区高度只产生**有界**的尺寸类(量化到 2 的幂),
+    /// 这是「Malloc Large (empty) 不再随滚动线性累积」的机制保证。
+    #[test]
+    fn epaint_delta_size_classes_are_bounded() {
+        use egui::epaint::{TextOptions, TextureAtlas};
+        let mut atlas = TextureAtlas::new([4096, 2048], TextOptions::default());
+        let _ = atlas.take_delta();
+        let mut classes = std::collections::BTreeSet::new();
+        for h in 1..=40usize {
+            let _ = atlas.allocate((7, h));
+            if let Some(delta) = atlas.take_delta() {
+                classes.insert(delta.image.size());
+            }
+        }
+        assert!(!classes.is_empty(), "应产生增量(否则测试失去意义)");
+        assert!(
+            classes.len() <= 16,
+            "增量尺寸类应有界(≤16),实际 {} 个: {classes:?}",
+            classes.len()
+        );
+    }
+
     /// 字号基准纯函数：1.0 / 1.15 两档，测试不改全局倍率。
     #[test]
     fn base_text_sizes_follow_scale() {
