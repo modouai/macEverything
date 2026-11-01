@@ -69,3 +69,27 @@ MallocStackLogging=1 重启 GUI 复现操作（打开结果窗口 + 短查询 + 
 **剩余（后续课题）**：IOSurface 85.7MB（17 个 surface）为三视口 GL drawable 池，窗口隐藏后不释放；释放需侵入 eframe/glow（隐藏时销毁 GL drawable/视口重建），与 ADR-8 NSPanel hack 叠加风险高，须先做可行性 spike。
 
 **wgpu 评估结论（不迁移）**：峰值与 glow 相当（349 vs 361MB），空闲常驻实测 166MB（中位）vs glow 155MB，IOSurface 26.9MB vs glow 85.7MB 但 `__TEXT` 常驻 +507MB；二进制 +5.2MB、清编译 +16min、vendor 维护。唯一独特收益是 IOSurface，不足抵偿。
+
+## 最终验收（2026-11-01 晚，真实数据 1.36M 条目，2.6.0）
+
+| 验收项 | 初始 | 最终 | 规格 | 判定 |
+| --- | --- | --- | --- | --- |
+| A1 daemon 稳态 | 175–418MB 锯齿 | **40.9MB** | ≤100MB | ✅ |
+| A2 daemon 峰值 | 879MB | 185MB | ≤300MB | ✅ |
+| A6b GUI 滚动峰值 | 2.83GB | **361MB** | ≤400MB | ✅ |
+| A5 GUI 空闲 | 306MB | 155MB | ≤150MB | ⚠️（IOSurface 85MB，后续课题） |
+| A7 查询 | P99 9.2ms | P99 7.9ms | 无回退 | ✅ |
+| 滚动增长 | 持续累积 | 已消除 | — | ✅ |
+| 锁中毒静默失效 | 消费线程死、进程活 | fail-fast + GUI 自动重启（实测 9.7–10.5s） | — | ✅ |
+
+### 最后两轮的关键发现
+
+1. **macOS 27 的 `malloc_zone_pressure_relief` 对大块空段返回 0、完全无效**（此前所有「归还死页」尝试失败的根因）。有效手段是 `MADV_FREE_REUSABLE` 打标后再释放/复用 + 缓冲复用；`release_heap_pressure` 保留但仅对部分场景有效。
+2. daemon 内存大头归因：dir_map（40MB/15.8 万小对象）→ 开放寻址表 + 路径 arena（20MB/约 1k 节点）；合并 flush 的 StreamWriter 中间 Vec → 溢写文件（峰值 46MB → MB 级）；ENOENT 删除物化整份 Base（150MB 瞬时）→ 祖先 listing diff；Overlay 无上限 → 15 万条目/32MB 规模闸。
+3. GUI 峰值最终根因是**图标 TIFF 解码**（37–74MB/图标）；epaint 图集 churn 为第二因；两者均修。
+
+### 后续项（已登记）
+
+- IOSurface 85.7MB（隐藏视口 GL surface 不释放，需 eframe/glow 内部 spike）
+- daemon.rs 按状态机阶段拆分（3703 行 / 103 函数）
+- S5 backlog 六项（重放期 flush 窗口、溢写残留清扫、dirty 临界段、ensure_anchor 祖先校验、heal 冷却口径、崩溃残留清扫）

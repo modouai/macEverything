@@ -244,6 +244,18 @@ struct Overlay {
 4. **字形图集上限**：`max_texture_side` 8192→4096（单块重烘 256MB→64MB 上限），封顶保险（归因证实峰值主因不是图集，此项降级为防扩散）。
 5. **堆粗查**：`heap` 定位活跃堆中的明显异常块，易修则修。
 
+### 6.2.6 最终结论：GUI 峰值根因与修复（2026-11-01 收口）
+
+完整根因链（六轮排查，按贡献排序）：
+1. **图标 TIFF 解码**（主因）：`NSImage.TIFFRepresentation` 每个图标 37–74MB 多页 TIFF（APP 图标 1024×1024 16bit float）+ `image` 解码 → 一屏 30 个 = 2GB 级临时块；「反复滚动持续增长」即此。修复：`NSImage.drawInRect` 直接光栅化到 64×64（16KB），`fromRect` 必须传图像完整逻辑边界。
+2. **图标每图一纹理**：GL 驱动 8.9MB/纹理 × 滚动行数。修复：滚动期零加载（150ms 静默后只加载可见行）+ 全部图标打包单纹理图集（UV 绘制）。
+3. **epaint 图集 churn**：`take_delta` 每帧按任意脏区尺寸分配 ColorImage（malloc 尺寸类无界）+ clear 重建（整图深拷贝）。修复（vendor epaint）：尺寸 2 的幂量化、上传缓冲复用池、full delta Arc 共享、clear 原地保留尺寸。
+4. `max_texture_side` 视口间 None/Some 交替 → epaint 每 pass 清图集重排（clamp 统一 Some）。
+
+**未采用**：wgpu 后端（常驻实测 166MB 中位 vs glow 155MB，峰值相当，二进制 +5.2MB/编译 +16min；唯一优势 IOSurface 归零，不足抵偿）。
+
+**遗留**：IOSurface 85.7MB（三视口 GL drawable 池，隐藏不释放）→ 后续课题，需 eframe/glow 内部 spike。
+
 ### 6.3 阶段二（归因驱动，目标 ≤ 100MB；S0.3 归因结论已回填）
 
 **归因结论（2026-10-30，MallocStackLogging 复现实测）**：
