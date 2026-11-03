@@ -244,11 +244,7 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
 
 /// 扫描主体;返回 `Some(已应用条目数)` = 扫描批次全部完成(可重放窗口 diff +
 /// 落盘),`None` = 中止(卷消失/世代漂移/推迟,调用方不重放)。
-fn scan_volume_body(
-    state: &Arc<EngineState>,
-    paths: &DaemonPaths,
-    vol: &Path,
-) -> Option<usize> {
+fn scan_volume_body(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) -> Option<usize> {
     // 本轮扫描的世代快照:任一卸载(含本轮自己的中止路径)推进世代即失效,
     // 批间校验不过直接放弃,不与新一轮扫描交错应用。
     let my_epoch = state.volume_scan_epoch.load(Ordering::Relaxed);
@@ -337,11 +333,7 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
 /// I6:清除计入 dirty 并**主动 flush**——本路径把 Shared 按需物化为 Mutable,
 /// 不落盘则既留下堆索引常驻(插拔一次抵消内存优化),盘面也仍是脏卷条目。
 /// flush 写完会收敛回 mmap Shared 并回收堆。
-pub fn purge_unmounted(
-    state: &Arc<EngineState>,
-    paths: &DaemonPaths,
-    desired: &HashSet<PathBuf>,
-) {
+pub fn purge_unmounted(state: &Arc<EngineState>, paths: &DaemonPaths, desired: &HashSet<PathBuf>) {
     let stale: HashSet<PathBuf> = state
         .dir_map
         .lock_fail_fast("dir_map")
