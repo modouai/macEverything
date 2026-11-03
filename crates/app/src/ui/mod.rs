@@ -80,6 +80,9 @@ pub mod settings;
 pub mod settings_layout;
 pub mod settings_tokens;
 pub mod settings_view;
+/// TEMP SPIKE(不提交):字形图集释放的实机验证驱动。
+#[cfg(target_os = "macos")]
+mod spike;
 pub mod theme;
 pub mod tokens;
 pub mod window_tokens;
@@ -644,6 +647,8 @@ impl App {
         // 切 Space(尤其进他人全屏)后主动唤醒悬浮条重绘并恢复层级:
         // 否则窗口可能停在一帧空白内容,点一下才恢复(2026-10-18 实机反馈)。
         platform::install_space_repaint(cc.egui_ctx.clone());
+        // 全隐缩窗后清字形图集要请求重绘帧(见 platform/mac.rs release_glyph_atlas)。
+        platform::install_surface_reclaim(cc.egui_ctx.clone());
         let hotkey_snapshot = hotkey.snapshot();
         let hotkey_note = hotkey.note().cloned();
         // 自动检查更新（默认开启）：先记账再移动 settings_file。
@@ -1265,6 +1270,9 @@ impl eframe::App for App {
             );
         }
 
+        #[cfg(target_os = "macos")]
+        spike::tick(self, ctx);
+
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
@@ -1429,7 +1437,12 @@ impl eframe::App for App {
 
         // 主视口:完整结果窗口(Task 17;product §2;右键菜单 Task 18 需 Frame 取窗)。
         // 图标缓存与悬浮条共用一份(UTI 纹理跨视口复用;勿开第二个 worker)。
-        {
+        //
+        // 根窗隐藏时不绘制:eframe 在 macOS 上把 `ViewportInfo.visible()` 报成 None,
+        // 任何一帧都会跑完整 UI pass——隐藏期绘制不仅白耗 CPU,还会让已清空的
+        // 字形图集重新长出来(全隐缩窗后的回收帧必须保持空 pass)。原生 isVisible
+        // 为准(None = 未接平台,保留绘制)。
+        if platform::root_visible() != Some(false) {
             let mut s = self.shared();
             let Shared {
                 palette, results, ..
@@ -1486,6 +1499,13 @@ impl eframe::App for App {
 /// 悬浮条视口的绘制回调(deferred:自己的 pass 内运行,含 tick/主题/动作落地)。
 fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
+    #[cfg(target_os = "macos")]
+    spike::note_palette_drawn();
+    // 隐藏期不绘制(理由同根视口:eframe 会跑隐藏视口的 pass,绘制会让
+    // 回收帧重新长字形图集)。原生 isVisible 为准;None = 平台未接,保留绘制。
+    if platform::palette_visible() == Some(false) {
+        return;
+    }
     // 空闲判定采样(悬浮条视口输入;常驻交互频繁,空闲口径见 idle 模块注释)。
     idle::note_viewport_activity(&ctx);
     let now = Instant::now();
@@ -2392,5 +2412,74 @@ mod tests {
             vec![HotkeyFrameEvent::CloseCancel],
             "无命令也须消费关闭取消"
         );
+    }
+
+    /// 全隐释放 GPU 纹理:字形图集必须能缩回最小高度,并让下一帧带整图增量
+    /// (渲染端据此 `glTexImage2D` 重建成小纹理),之后还能重新增长。
+    ///
+    /// 突变钉:注释掉 `FontsView::clear_glyph_atlas` 里的 `reset_to_min_size`
+    /// (或让 `TextureAtlas::reset_to_min_size` 直接返回),`after[1] == 32`
+    /// 断言即红——防止「只清内容不缩尺寸」让 GPU 纹理继续常驻。
+    #[test]
+    fn glyph_atlas_reset_shrinks_image_and_emits_full_delta() {
+        let ctx = egui::Context::default();
+        let run = |ctx: &egui::Context| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+        };
+        let mut out = run(&ctx);
+        out.textures_delta.clear();
+        let ascii: String = (0x20u8..0x7F).map(char::from).collect();
+        // 同一批字符 × 40 个字号 = 40 组独立字形键,足以让图集高度越过 32。
+        let grow = |ctx: &egui::Context| {
+            ctx.fonts_mut(|f| {
+                for i in 0..40 {
+                    let size = 14.0 + i as f32;
+                    let _ = f.layout_no_wrap(
+                        ascii.clone(),
+                        egui::FontId::proportional(size),
+                        egui::Color32::WHITE,
+                    );
+                }
+                f.font_image_size()
+            })
+        };
+        let before = grow(&ctx);
+        assert!(
+            before[1] > 32,
+            "测试前提:多字号布局必须让图集高度增长,实际 {before:?}"
+        );
+        let mut out = run(&ctx);
+        out.textures_delta.clear();
+
+        ctx.fonts_mut(|f| f.clear_glyph_atlas());
+        let after = ctx.fonts(|f| f.font_image_size());
+        assert_eq!(after[1], 32, "清空后高度必须缩回最小值(否则 GPU 纹理不缩)");
+        assert!(after[0] >= 1024, "宽度保持 max_texture_side");
+
+        let mut out = run(&ctx);
+        let font_delta = out
+            .textures_delta
+            .set
+            .get(&egui::TextureId::default())
+            .and_then(|deltas| deltas.last())
+            .expect("清空后的下一帧必须带字形图集增量");
+        assert!(
+            font_delta.pos.is_none(),
+            "必须是整图增量(局部增量不会重建纹理尺寸)"
+        );
+        assert_eq!(font_delta.image.size(), after, "增量尺寸 = 缩小后的图集");
+        out.textures_delta.clear();
+
+        let regrown = grow(&ctx);
+        assert!(regrown[1] > 32, "显示期重新布局必须能再次增长图集");
     }
 }

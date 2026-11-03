@@ -31,6 +31,11 @@ pub(super) struct GalleyCache {
 }
 
 impl GalleyCache {
+    /// MCE: 丢弃全部缓存布局(图集被重置后 UV 全部作废)。
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
     fn layout_internal(
         &mut self,
         fonts: &mut FontsImpl,

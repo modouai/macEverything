@@ -424,6 +424,43 @@ enum MainWindow {
 /// 全隐缩窗定时器代号:显示动作递增即可作废尚未触发的旧定时器。
 static SHRINK_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// 缩窗后清字形图集要用到的 egui Context(App::new 安装一次)。
+static RECLAIM_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
+
+/// 安装字形图集回收用的 Context(主线程,App::new 调用一次)。
+pub fn install_surface_reclaim(ctx: egui::Context) {
+    let mut slot = match RECLAIM_CTX.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(ctx);
+}
+
+/// 清空 egui 字形图集并请求一帧,让渲染端把 32MB 的 GPU 纹理重建成最小尺寸。
+///
+/// 必须在主线程且不在 egui pass 内(本函数由缩窗定时器的主队列块调用)。
+/// 隐藏视口在 `App::ui`/视口回调里会被跳过绘制,因此这一帧不会产生新字形,
+/// `take_delta` 只会带上缩小后的整图,`glTexImage2D` 随之释放旧纹理。
+fn release_glyph_atlas() -> bool {
+    let ctx = match RECLAIM_CTX.lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let Some(ctx) = ctx else {
+        log::warn!("全隐缩窗:回收 Context 未安装,跳过字形图集释放");
+        return false;
+    };
+    let [before_w, before_h] = ctx.fonts(|f| f.font_image_size());
+    // fonts_mut 会清空图集、缩回最小尺寸,并让下一次 begin_pass 清空所有 galley 缓存。
+    ctx.fonts_mut(|f| f.clear_glyph_atlas());
+    let [after_w, after_h] = ctx.fonts(|f| f.font_image_size());
+    ctx.request_repaint();
+    log::info!(
+        "全隐缩窗:字形图集 {before_w}×{before_h} → {after_w}×{after_h},已请求重绘帧(释放 GPU 纹理)"
+    );
+    true
+}
+
 /// 全隐后等待多久缩窗(秒;`MCE_SURFACE_SHRINK_SECS` 仅供实机验证调参)。
 const SHRINK_AFTER_SECS: u64 = 30;
 
@@ -563,6 +600,9 @@ pub(crate) fn shrink_hidden_windows() -> bool {
         }
         None => log::warn!("全隐缩窗:取不到当前 GL 上下文,仅缩窗(未清 drawable)"),
     }
+    // 字形图集(4096×2048×4 ≈ 32MB)占 IOAccelerator 大头:缩窗/清 drawable 后
+    // 再清图集并请求一帧,让 GPU 纹理重建成最小尺寸(4096×32)。
+    let _ = release_glyph_atlas();
     true
 }
 

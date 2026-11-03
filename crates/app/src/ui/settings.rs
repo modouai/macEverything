@@ -989,6 +989,11 @@ impl SettingsData {
 /// 设置视口 pass（deferred 回调）。
 pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
+    // 隐藏期不绘制(理由同根视口:eframe 会跑隐藏视口的 pass,绘制会让全隐
+    // 缩窗后的回收帧重新长字形图集)。原生 isVisible 为准;None = 平台未接。
+    if crate::platform::settings_visible() == Some(false) {
+        return;
+    }
     // 空闲判定采样(设置视口输入;三视口共用同一口径,见 ui/idle.rs)。
     crate::ui::idle::note_viewport_activity(&ctx);
     let now = Instant::now();

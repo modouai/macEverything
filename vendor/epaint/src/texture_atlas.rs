@@ -147,6 +147,19 @@ impl TextureAtlas {
         self.add_initial_glyphs();
     }
 
+    /// MCE: 丢弃整图内容并缩回**初始最小尺寸**(宽 = max_texture_side,高 32)。
+    ///
+    /// 与 [`Self::clear`] 的区别:clear 保尺寸/保缓冲(适合图集将满时的原地重来);
+    /// 本方法把 `ColorImage` 真正换成小图,下一次 `take_delta` 是整图增量,
+    /// 渲染端据此 `glTexImage2D` 重分配到小尺寸——用于**全隐时释放 GPU 纹理**
+    /// (egui 字形图集 4096×2048×4 ≈ 32MB,占 IOAccelerator 大头)。
+    /// 调用方必须同时让所有 galley 缓存失效(UV 全部作废;见 `FontsView::clear_glyph_atlas`)。
+    pub fn reset_to_min_size(&mut self) {
+        let options = self.options;
+        let width = options.max_texture_side.min(16 * 1024);
+        *self = Self::new([width, 32], options);
+    }
+
     /// 白像素(纯色绘制用)+ 一组预栅格化圆盘;`new` 与 `clear` 共用。
     fn add_initial_glyphs(&mut self) {
         // Make the top left pixel fully white for `WHITE_UV`, i.e. painting something with solid color:

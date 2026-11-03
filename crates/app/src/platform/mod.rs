@@ -399,6 +399,18 @@ pub fn sync_blur(visible: bool, corner_radius: f64, top_inset: f64, visible_pane
     let _ = (visible, corner_radius, top_inset, visible_panel_h);
 }
 
+/// 安装字形图集回收用的 Context(主线程;App::new 调用一次)。非 macOS:no-op。
+pub fn install_surface_reclaim(ctx: eframe::egui::Context) {
+    #[cfg(target_os = "macos")]
+    {
+        mac::install_surface_reclaim(ctx);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx;
+    }
+}
+
 /// 安排「三窗全隐 N 秒后缩窗释放 surface」一次性定时器(主线程;重复调用覆盖)。
 /// 非 macOS:no-op。
 pub fn schedule_surface_shrink() {

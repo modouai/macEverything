@@ -259,6 +259,16 @@ impl GlyphAtlas {
         self.raster_glyphs.clear();
     }
 
+    /// MCE: 忘记全部字形并缩回最小图集(全隐时释放 GPU 纹理用)。
+    ///
+    /// 与 [`Self::clear`] 的区别:本方法把图集图像缩回 32 高,下一次 `take_delta`
+    /// 的整图增量会让渲染端重建一块小纹理;调用方必须先让所有 galley 缓存失效。
+    pub fn reset_to_min_size(&mut self) {
+        self.atlas.reset_to_min_size();
+        self.outline_glyphs.clear();
+        self.raster_glyphs.clear();
+    }
+
     /// Forget what the [`GlyphRasterizer`]s produced, e.g. because they were replaced.
     pub fn clear_raster_glyphs(&mut self) {
         self.raster_glyphs.clear();

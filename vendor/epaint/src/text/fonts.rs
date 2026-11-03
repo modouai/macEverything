@@ -175,9 +175,13 @@ impl Fonts {
     /// This function will react to changes in [`TextOptions`],
     /// as well as notice when the font atlas is getting full, and handle that.
     pub fn begin_pass(&mut self, options: TextOptions, viewport_key: ViewportKey) {
+        // MCE: 图集被主动重置(全隐释纹理)后,所有视口的 galley 缓存都指向旧 UV。
+        let atlas_cleared = self.fonts.take_atlas_cleared();
         if self.fonts.options() != &options {
             self.fonts.set_options(options);
             self.galley_caches.clear(); // Galleys point into the old atlas.
+        } else if atlas_cleared {
+            self.galley_caches.clear(); // Galleys point into the reset atlas.
         } else if 0.8 < self.fonts.glyphs.fill_ratio() {
             // The parsed faces are still fine; only the bitmaps need to go.
             self.fonts.glyphs.clear();
@@ -343,6 +347,19 @@ impl FontsView<'_> {
         self.fonts.glyphs.atlas().image().clone()
     }
 
+    /// MCE: 立即丢弃字形图集并把图像缩回最小尺寸(全隐时释放 GPU 纹理)。
+    ///
+    /// 下一次 [`Fonts::font_image_delta`] 会是整图增量,渲染端据此
+    /// `glTexImage2D` 重建一块小纹理;所有 galley 缓存(旧 UV)在下一次
+    /// [`Fonts::begin_pass`] 统一清空,当前视口缓存立即失效。
+    /// 之后按需重新栅格化/上传,显示路径无需显式恢复。
+    pub fn clear_glyph_atlas(&mut self) {
+        self.fonts.glyphs.reset_to_min_size();
+        self.fonts.atlas_cleared = true;
+        self.galley_cache.clear();
+        *self.used_since_begin_pass = false;
+    }
+
     /// Current size of the font image.
     /// Pass this to [`crate::Tessellator`].
     pub fn font_image_size(&self) -> [usize; 2] {
@@ -484,6 +501,9 @@ impl FontsView<'_> {
 pub(crate) struct FontsImpl {
     definitions: Arc<FontDefinitions>,
     glyphs: GlyphAtlas,
+    /// MCE: 图集被主动重置过(全隐释放 GPU 纹理)。下一次 pass 必须清空所有
+    /// galley 缓存——它们持有旧图集的 UV。
+    atlas_cleared: bool,
     faces: FaceStore,
 
     /// Indexed by [`FamilyKey`].
@@ -512,6 +532,7 @@ impl FontsImpl {
         let mut slf = Self {
             definitions: Arc::new(definitions),
             glyphs: GlyphAtlas::new(options),
+            atlas_cleared: false,
             faces: FaceStore::new(options),
             families: Default::default(),
             family_keys: Default::default(),
@@ -551,6 +572,12 @@ impl FontsImpl {
         crate::texture_atlas::MCE_SET_OPTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.faces.set_options(options);
         self.glyphs = GlyphAtlas::new(options);
+        self.atlas_cleared = false;
+    }
+
+    /// 取走「图集已重置」标记(由 [`Fonts::begin_pass`] 消费并清缓存)。
+    fn take_atlas_cleared(&mut self) -> bool {
+        core::mem::take(&mut self.atlas_cleared)
     }
 
     /// Also use this glyph rasterizer.
