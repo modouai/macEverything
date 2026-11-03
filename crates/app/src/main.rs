@@ -130,25 +130,16 @@ fn main() -> anyhow::Result<()> {
             // 全局热键(Task 15):主线程 + NSApplication 就绪后注册(macOS 要求),
             // 起事件泵线程;失败不中断启动(降级为悬浮条提示 + 日志)。
             // settings.toml 中的自定义键优先,注册失败回落默认并留提示(Task H2)。
-            let spike = std::env::var_os("MCE_SPIKE").is_some();
-            let hotkey = if spike {
-                hotkey::disabled()
-            } else {
-                hotkey::install(&cc.egui_ctx, &settings)
-            };
+            let hotkey = hotkey::install(&cc.egui_ctx, &settings);
             // 菜单栏托盘(Task 16):本闭包在 winit 首个 resumed(StartCause::Init)
             // 之下运行 —— tray-icon 文档要求的「事件循环已在跑、不是刚创建」最早时机;
             // 菜单/图标构建须主线程(mac 实现取 MainThreadMarker)。失败不中断启动:
             // 悬浮条/热键/完整窗口仍在,仅托盘入口缺失(日志留痕,tray.rs 模块注释)。
-            let tray = if spike {
-                None
-            } else {
-                match tray::install(&cc.egui_ctx, paths.clone()) {
-                    Ok(runtime) => Some(runtime),
-                    Err(err) => {
-                        log::error!("菜单栏托盘不可用:{err:#}");
-                        None
-                    }
+            let tray = match tray::install(&cc.egui_ctx, paths.clone()) {
+                Ok(runtime) => Some(runtime),
+                Err(err) => {
+                    log::error!("菜单栏托盘不可用:{err:#}");
+                    None
                 }
             };
             Ok(Box::new(ui::App::new(

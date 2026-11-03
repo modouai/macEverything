@@ -80,9 +80,6 @@ pub mod settings;
 pub mod settings_layout;
 pub mod settings_tokens;
 pub mod settings_view;
-/// TEMP SPIKE(不提交):字形图集释放的实机验证驱动。
-#[cfg(target_os = "macos")]
-mod spike;
 pub mod theme;
 pub mod tokens;
 pub mod window_tokens;
@@ -1270,9 +1267,6 @@ impl eframe::App for App {
             );
         }
 
-        #[cfg(target_os = "macos")]
-        spike::tick(self, ctx);
-
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
@@ -1499,8 +1493,6 @@ impl eframe::App for App {
 /// 悬浮条视口的绘制回调(deferred:自己的 pass 内运行,含 tick/主题/动作落地)。
 fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
-    #[cfg(target_os = "macos")]
-    spike::note_palette_drawn();
     // 隐藏期不绘制(理由同根视口:eframe 会跑隐藏视口的 pass,绘制会让
     // 回收帧重新长字形图集)。原生 isVisible 为准;None = 平台未接,保留绘制。
     if platform::palette_visible() == Some(false) {

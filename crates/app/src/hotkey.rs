@@ -1055,18 +1055,6 @@ fn plan_reset_suspended<R: KeyRegistrar>(
 ///
 /// `file` 提供启动偏好:两槽 Some → 优先注册自定义键,失败回落默认并留提示;
 /// None → 保持旧默认行为(候选降级链 / ⌥⇧F)。
-/// TEMP SPIKE(不提交):不注册热键的运行时,避免与生产实例抢键。
-pub fn disabled() -> HotkeyRuntime {
-    HotkeyRuntime {
-        manager: None,
-        active: Arc::new(Mutex::new(ActiveKeys::default())),
-        snapshot: HotkeySnapshot::from_active(ActiveKeys::default(), note_for(None), None),
-        suspended: None,
-        on_action: Arc::new(OnceLock::new()),
-        deferred: Arc::new(Mutex::new(VecDeque::new())),
-    }
-}
-
 pub fn install(ctx: &egui::Context, file: &SettingsFile) -> HotkeyRuntime {
     let on_action: Arc<OnceLock<DispatchFn>> = Arc::new(OnceLock::new());
     let deferred: Arc<Mutex<VecDeque<Action>>> = Arc::new(Mutex::new(VecDeque::new()));
