@@ -93,3 +93,19 @@ MallocStackLogging=1 重启 GUI 复现操作（打开结果窗口 + 短查询 + 
 - IOSurface 85.7MB（隐藏视口 GL surface 不释放，需 eframe/glow 内部 spike）
 - daemon.rs 按状态机阶段拆分（3703 行 / 103 函数）
 - S5 backlog 六项（重放期 flush 窗口、溢写残留清扫、dirty 临界段、ensure_anchor 祖先校验、heal 冷却口径、崩溃残留清扫）
+
+## 隐藏态优化（2026-11-03，用户重点诉求）
+
+用户要求：无任何 UI 展示时的常驻内存进一步压缩（当时 235MB）。
+
+| 阶段 | 隐藏态 footprint | IOSurface | IOAccelerator |
+| --- | --- | --- | --- |
+| 初始 | 235MB | 77.9MB | — |
+| 隐藏视口 surface 释放 | 152.8MB | **0.4–21MB** | 33.9MB |
+| + 全隐清空字形图集 | **110.2MB** | 20.8MB | **6MB** |
+
+**机制（两处，均实测）**：
+1. eframe 0.37 在 macOS 上 `ViewportInfo.visible()` 恒为 `None` → 每帧都会重绘隐藏视口，因此 surface 释放必须在帧后经主队列定时器执行：三窗全隐 30s 后 `contentSize → 1×1` + `clearDrawable`（GL 上下文停到已缩小的视图避免 glutin panic）；显示路径先恢复尺寸再 orderFront，代号递增作废旧定时器。`clearDrawable` 单独不可用（AppKit 3–7s 内重建），`CALayer.contents=nil` 无效（层是 `_NSOpenGLViewBackingLayer`），销毁视口会崩溃。
+2. 图集清空：vendor epaint 新增 `clear_glyph_atlas()`，全隐定时器内清空并请求一帧，让 GPU 纹理重建成 4096×32；隐藏视口跳过绘制，防止 reclaim 帧重新长图集。
+
+**回归验证**：唤醒 17–21ms（红线 <100ms）、毛玻璃/透明/三视口渲染/NSPanel 五要素全部正常（用户人眼确认）；多轮隐藏-显示无异常。
