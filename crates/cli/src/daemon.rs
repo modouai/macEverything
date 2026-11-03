@@ -4504,4 +4504,463 @@ mod tests {
             "落地 Shared 清 dirty"
         );
     }
+
+    // ---------- C1:卷全量扫描闸门 ----------
+
+    /// 扫描闸门语义钉(C1):卷扫描期间该卷前缀内的 diff 只登记不应用——否则
+    /// 卷流消费线程先 diff 会把目录收进 Overlay(holder 转 Overlaid),扫描随后
+    /// 插入的深层 Base 条目因「最近 overlaid 祖先非 anchor」被合并写丢弃。
+    /// 扫描结束后释放闸门并按登记目录重放,窗口变更不丢。
+    /// 突变「diff_one 去掉闸门登记」→ 第一步 diff 即返回 1 且 holder 转 Overlaid,
+    /// 两条断言必红。
+    #[test]
+    fn volume_scan_gate_defers_diffs_until_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mounted_state(dir.path());
+        let vol = dir.path().canonicalize().unwrap();
+        let token = begin_volume_scan(&state, &vol);
+
+        std::fs::write(dir.path().join("new.txt"), b"").unwrap();
+        assert_eq!(diff_one(&state, dir.path()), 0, "闸门期间 diff 不得应用");
+        assert!(
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Mutable(_)
+            ),
+            "闸门期间不得转 Overlaid(否则扫描深层条目会被 overlaid 祖先屏蔽)"
+        );
+
+        let pending = end_volume_scan(&state, token);
+        assert_eq!(pending.len(), 1, "被闸住的目录应登记");
+        assert_eq!(diff_one(&state, &pending[0]), 1, "释放闸门后重放生效");
+        match run_query(&state, "whole:new.txt", 10, None, false) {
+            Response::Query { total, .. } => assert_eq!(total, 1, "重放后新文件可见"),
+            other => panic!("意外响应: {other:?}"),
+        }
+
+        // 旧 token 不得清新扫描的闸门/偷走其 pending
+        let t2 = begin_volume_scan(&state, &vol);
+        let _ = end_volume_scan(&state, token);
+        assert!(
+            state.volume_scan_gate.lock_recover().owner.is_some(),
+            "旧扫描收尾不得清掉新扫描的闸门"
+        );
+        let _ = end_volume_scan(&state, t2);
+    }
+
+    /// C1 + I6 集成钉:卷扫描把深层条目直写 Base,完成后落盘并收敛回 mmap
+    /// Shared(堆索引回收);卷内所有层级(含深层文件)完整可查。
+    /// 突变「scan 不 end gate / 不重放」由闸门单测覆盖;本测钉扫描结果完整性与
+    /// 收敛形态(旧实现 flush 只写盘不换 Shared → 第一条断言红)。
+    #[test]
+    fn scan_volume_into_indexes_deep_tree_and_converges_shared() {
+        let t = tempfile::tempdir().unwrap();
+        let vol = t.path().join("vol");
+        std::fs::create_dir_all(vol.join("a/b")).unwrap();
+        std::fs::write(vol.join("a/b/c.txt"), b"").unwrap();
+        std::fs::write(vol.join("top.txt"), b"").unwrap();
+        let data = t.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let paths = DaemonPaths { data_dir: data };
+        let state = Arc::new(EngineState::new());
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(Index::new());
+        *state.roots.lock_recover() = vec![vol.clone()];
+
+        volumes::scan_volume_into(&state, &paths, &vol);
+
+        assert!(
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Shared(_)
+            ),
+            "I6:卷扫描落盘后必须收敛为 mmap Shared(回收堆索引)"
+        );
+        let disk = persist::load_mmap(&paths.index_file()).unwrap();
+        for name in ["a", "b", "c.txt", "top.txt"] {
+            let out = engine::query::execute(
+                disk.as_ref(),
+                &engine::query::parse(&format!("whole:{name}")).unwrap(),
+                10,
+            );
+            assert_eq!(out.total, 1, "卷内 {name} 必须已落盘(深层条目不得被截断)");
+        }
+        assert!(
+            state
+                .dir_map
+                .lock_fail_fast("dir_map")
+                .contains_key(&vol.canonicalize().unwrap()),
+            "收敛后 dir_map 必须与新 Base 同点重建(卷根可寻址)"
+        );
+    }
+
+    // ---------- C2:compact 与 dir_map 同点提交 ----------
+
+    /// C2 窗口钉:compact 重排条目号后,dir_map 必须在**同一 holder 写锁临界区**
+    /// 内重建并安装。测试持 dir_map 锁迫使 compact 线程停在提交点:
+    /// - 新实现:线程持 holder 写锁等待 dir_map → `try_read` 一直失败;
+    /// - 旧实现(compact 放锁 → rebuild 再装 map):holder 已释放,`try_read` 成功。
+    ///
+    /// 突变「放锁后 rebuild」→ 100ms 后的 try_read 断言红。
+    #[test]
+    fn compact_commits_dir_map_under_holder_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("d")).unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("d", root, true);
+        let gone = idx.insert("gone.txt", root, false);
+        idx.remove(gone); // 墓碑 1/3 > 20%:触发整理
+        assert!(idx.needs_compaction(), "夹具应满足整理阈值");
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
+        state
+            .dir_map
+            .lock_fail_fast("dir_map")
+            .insert(Path::new("/stale/compacted/key"), 999);
+
+        let dir_map_guard = state.dir_map.lock_fail_fast("dir_map");
+        let st = state.clone();
+        let handle = std::thread::spawn(move || maybe_compact(&st));
+        let mut entered = false;
+        for _ in 0..500 {
+            if state.holder.try_read().is_err() {
+                entered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(entered, "maybe_compact 应取得 holder 写锁");
+        // compact(微秒级)早已完成;若实现先放 holder 再去等 dir_map,此刻可读。
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            state.holder.try_read().is_err(),
+            "dir_map 提交前不得释放 holder 写锁(C2 窗口:旧 map 打新 Base)"
+        );
+        drop(dir_map_guard);
+        handle.join().unwrap();
+
+        let map = state.dir_map.lock_fail_fast("dir_map");
+        let root_key = dir.path().canonicalize().unwrap();
+        assert!(
+            map.get(&root_key).is_some(),
+            "整理后 dir_map 必须与新 Base 同点重建"
+        );
+        assert!(map.get(&root_key.join("d")).is_some(), "目录子键应重建");
+        assert!(
+            map.get(Path::new("/stale/compacted/key")).is_none(),
+            "陈旧键应随整表重建消失"
+        );
+        drop(map);
+        let h = state.holder.read_fail_fast("holder");
+        let IndexHolder::Mutable(idx) = &*h else {
+            panic!("整理后仍应为 Mutable");
+        };
+        assert_eq!(idx.entries.iter().filter(|e| e.is_live()).count(), 2);
+    }
+
+    /// C2:陈旧 map 键指向**活文件**时,不得按目录做 diff(apply_and_track 的
+    /// 判活必须含 is_dir)。旧实现只判 is_live → 文件被当目录,listing 挂到文件
+    /// 名下并污染 Overlay。突变「去掉 is_dir」→ diff 返回 1、holder 转 Overlaid,
+    /// 本测两条断言红。
+    #[test]
+    fn stale_dir_map_key_pointing_to_live_file_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("realdir")).unwrap();
+        std::fs::write(dir.path().join("realdir/new.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"").unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("realdir", root, true);
+        let f = idx.insert("f.txt", root, false);
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        let root_key = dir.path().canonicalize().unwrap();
+        let real_key = root_key.join("realdir");
+        let mut map = DirIndexMap::default();
+        map.insert(&root_key, root);
+        map.insert(&real_key, f); // 陈旧/错位:目录键指向活文件
+        *state.dir_map.lock_fail_fast("dir_map") = map;
+
+        assert_eq!(
+            diff_one(&state, &real_key),
+            0,
+            "指向文件的键不得按目录 diff"
+        );
+        assert!(
+            !state
+                .dir_map
+                .lock_fail_fast("dir_map")
+                .contains_key(&real_key),
+            "错位键应被清出"
+        );
+        // diff 入口会先把 Shared/Mutable 转 Overlaid(形态转换与目标无关),
+        // 但错位键必须**不产生任何增量**——Overlay 账本与条目均空。
+        let h = state.holder.read_fail_fast("holder");
+        match &*h {
+            IndexHolder::Overlaid(st) => {
+                assert!(st.overlay.is_empty(), "不得为错位键建 Overlay");
+            }
+            IndexHolder::Mutable(_) => {}
+            _ => panic!("diff 后应为 Mutable 或 Overlaid"),
+        }
+    }
+
+    /// C2:mask_deleted_via_parent 对 resolve_target 给出的 Base 号必须复用同一
+    /// 套判活(越界/非目录)。旧实现直接 apply_diff → `entry(999)` 越界 panic。
+    /// 突变「去掉校验」→ 本测 panic 红。
+    #[test]
+    fn mask_deleted_via_parent_ignores_out_of_range_base_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("d", root, true);
+        let base = BaseRef::Heap(idx);
+        let root_key = dir.path().canonicalize().unwrap();
+        let d_key = root_key.join("d");
+        let mut map = DirIndexMap::default();
+        map.insert(&root_key, root);
+        map.insert(&d_key, 999); // 换基窗口残留的越界号
+        let mut overlay = engine::overlay::Overlay::new();
+
+        let gone = d_key.join("deleted.txt");
+        let out = mask_deleted_via_parent(&state, &base, &mut overlay, &mut map, &gone, &[]);
+        assert!(out.is_some(), "应上溯到有效祖先完成屏蔽,而不是 panic");
+        assert_ne!(map.get(&d_key), Some(999), "陈旧越界键不得保留");
+    }
+
+    // ---------- C3:扫描产物水位 ----------
+
+    /// C3:扫描产物落盘 meta 的水位必须取**扫描开始时的 floor**,而不是扫描
+    /// 期间被消费线程推进的 applied——否则崩溃重启从超前水位重放,跳过窗口事件。
+    /// 突变「mount_scan_product 用 build_meta(当前 applied)」→ 断言 500≠100 红。
+    #[test]
+    fn mount_scan_product_writes_scan_floor_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        // 模拟:扫描期间消费线程把 applied 推到 500,但产物只覆盖 floor=100。
+        state.applied_event_id.store(500, Ordering::Relaxed);
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
+        let mut idx = Index::new();
+        idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        let paths = DaemonPaths {
+            data_dir: data.path().to_path_buf(),
+        };
+
+        mount_scan_product(&state, &paths, idx, 100);
+
+        let disk = persist::load_mmap(&paths.index_file()).unwrap();
+        assert_eq!(
+            disk.meta.last_event_id, 100,
+            "扫描产物水位必须取 floor(崩溃窗口多重放,绝不漏事件)"
+        );
+        assert!(matches!(
+            &*state.holder.read_fail_fast("holder"),
+            IndexHolder::Shared(_)
+        ));
+    }
+
+    /// C3:Stop 落盘必须与重扫串行(rescan_lock → flush_lock)。重扫在途时
+    /// persist_final 不得抢先写盘;突变「Stop 不取 rescan_lock」→ Stop 立即完成,
+    /// 第一条断言红。
+    #[test]
+    fn stop_waits_for_inflight_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let rescan = state.rescan_lock.lock().unwrap();
+        let st = state.clone();
+        let p = paths.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let resp = dispatch(
+                Request::Stop {
+                    v: protocol::PROTOCOL_VERSION,
+                },
+                &st,
+                &p,
+            );
+            let _ = tx.send(resp);
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(150)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "重扫在途时 Stop 落盘必须等待(否则写入超前水位)"
+        );
+        drop(rescan);
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("释放重扫锁后 Stop 应完成");
+        assert!(matches!(resp, Response::Stop { ok: true, .. }));
+        handle.join().unwrap();
+    }
+
+    // ---------- I6:Mutable → Shared 收敛 ----------
+
+    /// I6:Mutable 落盘后必须 remap 回 Shared——否则插拔一次卷就把整份 Base
+    /// 永久钉在堆上。突变「只有写盘、不换 Shared」→ 第一条断言红。
+    #[test]
+    fn mutable_flush_converges_to_shared_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        idx.insert("a.txt", root, false);
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
+        state.dirty.store(1, Ordering::Relaxed);
+        let paths = DaemonPaths {
+            data_dir: data.path().to_path_buf(),
+        };
+
+        flush(&state, &paths);
+
+        assert!(
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Shared(_)
+            ),
+            "I6:Mutable 落盘后必须收敛 Shared(堆索引回收)"
+        );
+        assert_eq!(state.dirty.load(Ordering::Relaxed), 0);
+        assert!(
+            state
+                .dir_map
+                .lock_fail_fast("dir_map")
+                .contains_key(&dir.path().canonicalize().unwrap()),
+            "收敛时 dir_map 必须与新 Base 同点安装"
+        );
+        let disk = persist::load_mmap(&paths.index_file()).unwrap();
+        let out = engine::query::execute(
+            disk.as_ref(),
+            &engine::query::parse("whole:a.txt").unwrap(),
+            10,
+        );
+        assert_eq!(out.total, 1, "落盘内容完整");
+    }
+
+    /// I6:启动清除路径必须计 dirty + flush:否则 Shared→Mutable 物化后不写盘,
+    /// 堆索引常驻且盘面残留未挂载卷条目。
+    /// 突变「purge 不清 dirty/不 flush」→ holder 仍 Mutable、盘面仍含卷前缀,红。
+    #[test]
+    fn purge_unmounted_flushes_and_converges() {
+        let data = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        let root = idx.insert("/Volumes/MceTestUnmounted", NO_PARENT, true);
+        idx.insert("deep.txt", root, false);
+        let idx_file = data.path().join("index.bin");
+        persist::write_atomic(
+            &persist::EntryLayout::of(&idx),
+            idx.entries.iter(),
+            &persist::IndexMeta::default(),
+            &idx_file,
+        )
+        .unwrap();
+        *state.holder.write_fail_fast("holder") =
+            IndexHolder::Shared(persist::load_mmap(&idx_file).unwrap());
+        state
+            .dir_map
+            .lock_fail_fast("dir_map")
+            .insert(Path::new("/Volumes/MceTestUnmounted"), root);
+        let paths = DaemonPaths {
+            data_dir: data.path().to_path_buf(),
+        };
+
+        volumes::purge_unmounted(&state, &paths, &HashSet::new());
+
+        assert!(
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Shared(_)
+            ),
+            "启动清除后应收敛 Shared(回收物化堆索引)"
+        );
+        let disk = persist::load_mmap(&paths.index_file()).unwrap();
+        let out = engine::query::execute(
+            disk.as_ref(),
+            &engine::query::parse("MceTestUnmounted").unwrap(),
+            10,
+        );
+        assert_eq!(out.total, 0, "盘面不得残留未挂载卷条目");
+    }
+
+    // ---------- I4:落盘失败退避 ----------
+
+    /// I4:落盘失败必须推进节流并计入失败次数(指数退避);否则 dirty 恒 ≥ 阈值
+    /// 时消费循环每 150ms 重试全量遍历 + 写盘。
+    /// 突变「失败分支不推进 last_flush / 不累计失败」→ 首轮失败后 should_flush
+    /// 仍为 true,本测红。
+    #[test]
+    fn failed_merged_flush_backs_off_instead_of_tight_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        *state.holder.write_fail_fast("holder") = IndexHolder::Overlaid(Box::new(OverlaidState {
+            base: BaseRef::Heap(idx),
+            overlay: engine::overlay::Overlay::new(),
+        }));
+        // 数据目录不存在:合并写 io NotFound(非腐化)
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("absent"),
+        };
+        state.dirty.store(FLUSH_DIRTY_LIMIT, Ordering::Relaxed);
+
+        assert!(should_flush(&state), "dirty 达阈值应触发首轮 flush");
+        flush(&state, &paths);
+        assert_eq!(
+            state.flush_failures.load(Ordering::Relaxed),
+            1,
+            "失败次数应累计"
+        );
+        assert!(!should_flush(&state), "写失败后必须退避,不得紧循环重试");
+
+        // 退避窗口(5s)过后允许重试
+        *state.last_flush.lock_recover() = Instant::now() - Duration::from_secs(6);
+        assert!(should_flush(&state), "退避窗口过后应重试");
+        flush(&state, &paths);
+        assert_eq!(state.flush_failures.load(Ordering::Relaxed), 2);
+        // 连续失败退避翻倍(10s):6s 仍等待,11s 重试
+        *state.last_flush.lock_recover() = Instant::now() - Duration::from_secs(6);
+        assert!(!should_flush(&state), "连续失败退避应翻倍");
+        *state.last_flush.lock_recover() = Instant::now() - Duration::from_secs(11);
+        assert!(should_flush(&state));
+    }
+
+    /// I4:Mutable 写失败同样必须退避(旧实现只打日志,last_flush/dirty 均不动)。
+    #[test]
+    fn failed_mutable_flush_backs_off_instead_of_tight_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let mut idx = Index::new();
+        idx.insert(dir.path().to_string_lossy().as_ref(), NO_PARENT, true);
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        *state.roots.lock_recover() = vec![dir.path().to_path_buf()];
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("absent"),
+        };
+        state.dirty.store(FLUSH_DIRTY_LIMIT, Ordering::Relaxed);
+
+        assert!(should_flush(&state));
+        flush(&state, &paths);
+        assert!(
+            matches!(
+                &*state.holder.read_fail_fast("holder"),
+                IndexHolder::Mutable(_)
+            ),
+            "写失败保持 Mutable(内存即真相)"
+        );
+        assert_eq!(state.flush_failures.load(Ordering::Relaxed), 1);
+        assert!(!should_flush(&state), "Mutable 写失败同样必须退避");
+    }
 }
