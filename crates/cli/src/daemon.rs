@@ -170,6 +170,13 @@ pub const REPLAY_DOWNTIME_THRESHOLD_SECS: u64 = 48 * 3600;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(120);
 /// 落盘节流:累计变更超过此条数 → 立即触发快照(放宽理由同上)。
 const FLUSH_DIRTY_LIMIT: u64 = 30_000;
+/// 落盘失败后的重试退避基值(I4):连续失败按 5s、10s、20s…… 指数退避,上限
+/// `FLUSH_INTERVAL`。没有它时 `dirty >= FLUSH_DIRTY_LIMIT` 会在 150ms 消费
+/// 循环里每轮都命中(写失败的 dirty 不清零)→ 全量遍历 + 写盘尝试打满 CPU/IO
+/// (数据目录 ENOSPC/只读的实测形态)。
+const FLUSH_RETRY_BASE: Duration = Duration::from_secs(5);
+/// 退避指数的封顶位移(5s << 5 = 160s,再被 FLUSH_INTERVAL 截断)。
+const FLUSH_RETRY_MAX_SHIFT: u32 = 5;
 /// Overlay 规模上限:条目数或三段 arena 字节超限即触发合并(即便变更计数未到
 /// 阈值)。目录 diff 会把整份 listing 收进 Overlay,大目录/事件风暴下条目数可
 /// 远超 dirty 计数;无上限时单次增量可长到百万级(堆峰值与 flush 后死页都随之
@@ -337,6 +344,9 @@ pub struct EngineState {
     stopping: AtomicBool,
     dirty: AtomicU64,
     last_flush: Mutex<Instant>,
+    /// 连续落盘失败次数(I4):`should_flush` 据此做指数退避,防写失败时
+    /// 「dirty ≥ 阈值 → 每 150ms 全量遍历 + 写盘」紧循环。成功清零。
+    flush_failures: AtomicU32,
     /// 落盘串行锁:stop 落盘与消费线程退出落盘/节流落盘互斥(曾实测并发
     /// write_atomic 交错损坏索引;tmp 名唯一化之外的语义级双保险)。
     flush_lock: Mutex<()>,
@@ -390,12 +400,64 @@ pub struct EngineState {
     /// 直接复用——重放/事件风暴期长出的百万级 arena 不再每次 flush 释放成
     /// 不可折叠死页。
     spare_overlay: Mutex<Option<engine::overlay::Overlay>>,
+    /// 卷全量扫描闸门(C1,见 [`VolumeScanGate`])。
+    volume_scan_gate: Mutex<VolumeScanGate>,
 }
 
 #[derive(Default)]
 struct MergeScratch {
     base_remap: Vec<u32>,
     new_dirs: Vec<(u32, Vec<u8>)>,
+}
+
+/// 卷全量扫描闸门(C1)。卷扫描线程把卷内条目**直写 Base**;若同窗口内卷流
+/// 消费线程把同卷目录 diff 进 Overlay(`overlaid.insert(V)`),扫描随后插入的
+/// 深层 Base 条目父链上最近 overlaid 祖先是 V 且非 anchor → 查询/合并写按
+/// 「被屏蔽陈旧 Base」丢弃,卷被截断为一级子项且不可自愈。
+///
+/// 闸门语义:扫描期间该卷前缀内的 diff 只登记(事件只是提示),扫描结束后
+/// 按「重读磁盘」逐目录重放——既不丢窗口变更,也不与扫描写 Base 交错。
+#[derive(Default)]
+struct VolumeScanGate {
+    /// 正在全量扫描的卷根(canonical 形态)。
+    owner: Option<PathBuf>,
+    /// 本次扫描的世代号:旧扫描收尾不得误清新扫描的闸/偷走其 pending。
+    token: u64,
+    /// 闸门期间被挡下的目录(canonical),扫描结束后重放 diff。
+    pending: HashSet<PathBuf>,
+}
+
+/// 进入卷扫描闸门,返回本次 token。卷扫描由监听线程串行执行,正常不重入;
+/// 上一轮若异常残留 owner,以新 token 直接接管(旧 end 因 token 不符不再动闸)。
+fn begin_volume_scan(state: &EngineState, vol: &Path) -> u64 {
+    let mut g = state.volume_scan_gate.lock_recover();
+    g.token = g.token.wrapping_add(1);
+    g.owner = Some(vol.to_path_buf());
+    g.pending.clear();
+    g.token
+}
+
+/// 退出卷扫描闸门:token 相符才释放 owner 并交出 pending;被新扫描接管时
+/// 返回空(那批目录属于新扫描的窗口,不得由旧线程重放)。
+fn end_volume_scan(state: &EngineState, token: u64) -> Vec<PathBuf> {
+    let mut g = state.volume_scan_gate.lock_recover();
+    if g.token != token {
+        return Vec::new();
+    }
+    g.owner = None;
+    g.pending.drain().collect()
+}
+
+/// 扫描闸门下 diff 的登记:目录位于当前扫描卷前缀内 → 只记录并返回 true。
+fn gate_volume_diff(state: &EngineState, dir: &Path) -> bool {
+    let mut g = state.volume_scan_gate.lock_recover();
+    match &g.owner {
+        Some(owner) if dir.starts_with(owner) => {
+            g.pending.insert(dir.to_path_buf());
+            true
+        }
+        _ => false,
+    }
 }
 
 impl EngineState {
@@ -414,6 +476,7 @@ impl EngineState {
             stopping: AtomicBool::new(false),
             dirty: AtomicU64::new(0),
             last_flush: Mutex::new(Instant::now()),
+            flush_failures: AtomicU32::new(0),
             flush_lock: Mutex::new(()),
             dir_map: Mutex::new(DirIndexMap::default()),
             roots: Mutex::new(vec![]),
@@ -432,6 +495,7 @@ impl EngineState {
             heal_requested: AtomicBool::new(false),
             merge_scratch: Mutex::new(MergeScratch::default()),
             spare_overlay: Mutex::new(None),
+            volume_scan_gate: Mutex::new(VolumeScanGate::default()),
         }
     }
 
@@ -649,7 +713,10 @@ fn rebuild_dir_map(state: &EngineState) {
         IndexHolder::Empty => return,
     };
     let map = build_dir_map(view, &literal_roots);
-    drop(h);
+    // holder 读锁**仍持着**时安装 map(C2 窗口 2):换基(重扫替换/compact)必须
+    // 先拿 holder 写锁,故旧视图的 map 绝无可能在「新 Base 已安装」之后才落到
+    // dir_map——否则会以旧号覆盖新 map。锁序 holder(读) → dir_map,与
+    // diff/换基的 holder(写) → dir_map 同序,无环。
     *state.dir_map.lock_fail_fast("dir_map") = map;
 }
 
@@ -796,6 +863,18 @@ fn resolve_target(
         .map(engine::overlay::DiffTarget::OverlayDir)
 }
 
+/// dir_map 给出的 base 条目号在当前 Base 中仍是**活目录**?(C2:换基/整理后的
+/// 陈旧 map 窗口里,旧号可能越界或指向无关的活条目。所有 Base 目标的判活必须
+/// 走本函数——直接 `entry()` 下标越界即 panic,指向文件则会把 listing 挂到文件下。)
+fn base_dir_target_live(view: &dyn IndexView, d0: u32) -> bool {
+    view.entry_segments().iter().any(|&(s, seg)| {
+        d0 >= s
+            && seg
+                .get((d0 - s) as usize)
+                .is_some_and(|e| e.is_live() && e.is_dir())
+    })
+}
+
 /// 对单个绝对目录执行 diff(写侧入 Overlay,tech.md §4.2)并维护 dir_map。
 /// 锁序:holder(write) → dir_map。返回该目录本次的变更条数(added + removed),
 /// 供抽样对拍判定用(计数口径 = 真实漂移:overlay 旧子项集 vs listing;首 diff
@@ -813,15 +892,11 @@ fn apply_and_track(
     };
     if let engine::overlay::DiffTarget::Base(d0) = target {
         // 「新索引 + 旧 map」竞态窗口(替换段 swap 与 rebuild_dir_map 之间,遗留
-        // #12):map 残留的条目号对新索引可能**越界**。get+is_live 判活
-        // (scanner.rs 同一模式):越界/已死键一律清映射短路,绝不按死号下标。
-        // 突变「回退 entry(d0) 直下标」由 stale_dir_map_key 测试钉死。
-        let live =
-            base.as_view().entry_segments().iter().any(|&(s, seg)| {
-                d0 >= s && seg.get((d0 - s) as usize).is_some_and(|e| e.is_live())
-            });
-        if !live {
-            map.remove(abs_dir); // 目录已删(子树墓碑)或键失配:清映射,不做 diff
+        // #12):map 残留的条目号对新索引可能**越界**。段内 get + is_live + is_dir
+        // 判活(scanner.rs 同一模式):越界/已死/非目录键一律清映射短路,绝不按
+        // 死号下标。突变「回退 entry(d0) 直下标」/「去掉 is_dir」由 C2 测试钉死。
+        if !base_dir_target_live(base.as_view(), d0) {
+            map.remove(abs_dir); // 目录已删(子树墓碑)、键失配或指向文件:清映射
             return 0;
         }
     }
@@ -860,6 +935,13 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
     let base = abs_dir
         .canonicalize()
         .unwrap_or_else(|_| abs_dir.to_path_buf());
+    // 卷扫描闸门(C1):该卷全量扫描期间,卷前缀内的 diff 只登记、不应用。
+    // 扫描线程直写 Base;并发的 Overlay 收录会让扫描插入的深层 Base 条目
+    // 因「最近 overlaid 祖先非 anchor」被合并 flush 静默丢弃(卷截断)。
+    // 扫描结束后由 scan_volume_into 统一重放(重读磁盘,幂等)。
+    if gate_volume_diff(state, &base) {
+        return 0;
+    }
     // 持久失败负缓存:短路(含补链路径)。EPERM 目录保留索引条目但不再重试。
     // 重启清零——用户补授权限后重启即自动重新索引。
     if state.perm_denied.lock_recover().contains(&base) {
@@ -925,10 +1007,19 @@ fn diff_one(state: &EngineState, abs_dir: &Path) -> u32 {
 }
 
 fn build_meta(state: &EngineState) -> IndexMeta {
+    build_meta_at(state, state.applied_event_id.load(Ordering::Relaxed))
+}
+
+/// 以**显式水位**构建落盘 meta(C3)。常规 flush 取当前 applied;扫描产物挂载
+/// 必须取扫描开始时的 floor——扫描期间消费线程仍会把 id>floor 的事件 diff 进
+/// 旧 Base 并推进 applied,但产物内容不含这些变更。若把当前 applied 写进新盘面,
+/// 落盘+安装后、rescan_dirty 重放完成前崩溃/Stop,重启会从超前水位重放而跳过
+/// 这些事件 → 索引永久缺条目。
+fn build_meta_at(state: &EngineState, watermark: u64) -> IndexMeta {
     let cfg = state.cfg.lock_recover().clone();
     IndexMeta {
         built_at: state.built_at.load(Ordering::Relaxed),
-        last_event_id: state.applied_event_id.load(Ordering::Relaxed),
+        last_event_id: watermark,
         scan_roots: state
             .roots
             .lock_recover()
@@ -944,40 +1035,105 @@ fn build_meta(state: &EngineState) -> IndexMeta {
 }
 
 /// 快照落盘(原子替换,flush_lock 串行化);失败留痕不中断。
-/// Shared 态(dirty == 0,无本会话增量)无需重写:盘上索引即当前状态。
-/// Overlaid 态(T4 正式形态):合并流式直写 + remap 换 Base + 清 Overlay,
-/// 见 [`flush_merged`]。
+/// Shared 态(盘面即真相)无需重写;Mutable 态写盘后**收敛回 mmap Shared**
+/// (I6:堆索引只是卷扫描/首扫的临时载体,不回收会长期驻留 ~100MB 级);
+/// Overlaid 态(T4 正式形态)走合并流式写 + remap 换 Base,见 [`flush_merged`]。
+///
+/// I4:任何一次尝试之后都推进 `last_flush`;写失败额外累计 `flush_failures`,
+/// 由 [`should_flush`] 做指数退避——否则 dirty 恒 ≥ 阈值时消费循环每 150ms
+/// 触发一次全量遍历 + 写盘,数据目录 ENOSPC/只读下会打满 CPU/IO。
 fn flush(state: &EngineState, paths: &DaemonPaths) {
     // 落盘串行域只覆盖写盘/换基;压力归还在锁释放后执行——8 轮
     // malloc_zone_pressure_relief 不需要与其它落盘路径互斥,持锁跑会无谓拉长
     // flush 串行段(消费循环的落盘节流、stop 落盘都在等这把锁)。
     let relieve = {
         let _guard = state.flush_lock.lock_fail_fast("flush_lock");
-        // Overlaid 分流:合并写需要「放读锁 → 取写锁」的锁形态,单独走 flush_merged
-        if matches!(
-            &*state.holder.read_fail_fast("holder"),
-            IndexHolder::Overlaid(_)
-        ) {
-            flush_merged(state, paths)
-        } else {
+        // 先按当前形态选路;形态只可能被并发 diff 从 Mutable/Shared 转成
+        // Overlaid,各分支都在自己的写锁内复核并安全降级。
+        let form = {
             let h = state.holder.read_fail_fast("holder");
-            let mut dirty_now = false;
             match &*h {
-                IndexHolder::Mutable(idx) => {
-                    dirty_now = write_holder_index(idx, state, paths).is_ok();
-                }
-                IndexHolder::Shared(_) | IndexHolder::Empty => {}
-                IndexHolder::Overlaid(_) => {} // 上方已分流
+                IndexHolder::Overlaid(_) => FlushForm::Overlaid,
+                IndexHolder::Mutable(_) => FlushForm::Mutable,
+                IndexHolder::Shared(_) | IndexHolder::Empty => FlushForm::Settled,
             }
-            if dirty_now {
-                state.dirty.store(0, Ordering::Relaxed);
+        };
+        match form {
+            // 合并写需要「放读锁 → 取写锁」的锁形态,单独走 flush_merged
+            FlushForm::Overlaid => flush_merged(state, paths),
+            FlushForm::Mutable => {
+                let converged = flush_mutable_converge(state, paths);
                 *state.last_flush.lock_recover() = Instant::now();
+                converged
             }
-            false
+            FlushForm::Settled => {
+                // 盘面即真相:滞留 dirty 只能是记账残留。持 holder 读锁清零——
+                // diff/卷扫描的 dirty 增量都在 holder 写锁内,不会与本临界区
+                // 交错,清掉的必是「已落盘」计数。I4 前提:否则 Shared 态
+                // dirty 恒真会让 should_flush 每轮空转。
+                let h = state.holder.read_fail_fast("holder");
+                state.dirty.store(0, Ordering::Relaxed);
+                state.flush_failures.store(0, Ordering::Relaxed);
+                *state.last_flush.lock_recover() = Instant::now();
+                drop(h);
+                false
+            }
         }
     };
     if relieve {
         engine::malloc_pressure::release_heap_pressure();
+    }
+}
+
+/// [`flush`] 的形态选路(写锁内复核前的快照)。
+#[derive(Clone, Copy)]
+enum FlushForm {
+    Overlaid,
+    Mutable,
+    Settled,
+}
+
+/// Mutable(Base 堆索引)的落盘 + 收敛(I6)。返回是否实际完成「写盘 → remap →
+/// 换 Shared」(调用方据此归还堆压力)。
+///
+/// 全程持 holder **写锁**:Mutable 的在位写者(卷扫描批次/compact)同样要 holder
+/// 写锁,写盘快照与 swap 之间不可能插入内容变更——否则 swap 会丢掉写入之后
+/// 新应用的批次。代价是写盘期间查询短暂阻塞;Mutable 只在卷挂载/卸载与首扫
+/// staging 等低频路径出现,可接受。
+fn flush_mutable_converge(state: &EngineState, paths: &DaemonPaths) -> bool {
+    let literal_roots = state.roots.lock_recover().clone();
+    let mut h = state.holder.write_fail_fast("holder");
+    let IndexHolder::Mutable(idx) = &*h else {
+        // 形态已变(并发 diff 转 Overlaid):未写盘,增量交合并写;不算失败。
+        return false;
+    };
+    let meta = build_meta(state);
+    let layout = persist::EntryLayout::of(idx);
+    if let Err(e) = persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file()) {
+        log::error!("落盘失败: {e}");
+        // I4:失败退避(持写锁递增,不与 diff/扫描的 dirty 增量交错)。
+        state.flush_failures.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    match persist::load_mmap(&paths.index_file()) {
+        Ok(view) => {
+            let map = build_dir_map(view.as_ref(), &literal_roots);
+            // holder + dir_map 同点替换(见 install_holder_with_map 注)。
+            let old = std::mem::replace(&mut *h, IndexHolder::Shared(view));
+            if let IndexHolder::Mutable(mut old_idx) = old {
+                old_idx.reset();
+                old_idx.release_pages();
+            }
+            *state.dir_map.lock_fail_fast("dir_map") = map;
+            state.dirty.store(0, Ordering::Relaxed);
+            state.flush_failures.store(0, Ordering::Relaxed);
+            true
+        }
+        Err(e) => {
+            log::error!("落盘产物重载失败(保持内存索引,退避后重试): {e}");
+            state.flush_failures.fetch_add(1, Ordering::Relaxed);
+            false
+        }
     }
 }
 
@@ -1028,9 +1184,14 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
                     state.heal_requested.store(true, Ordering::SeqCst);
                     log::error!("合并写遇账本腐化,已置降级重扫自愈位: {e}");
                     state.dirty.store(0, Ordering::Relaxed);
+                    state.flush_failures.fetch_add(1, Ordering::Relaxed);
                     *state.last_flush.lock_recover() = Instant::now();
                 } else {
                     log::error!("合并落盘失败: {e}");
+                    // I4:失败也推进节流起点并累计失败次数——否则 dirty 恒 ≥
+                    // 阈值时每个 150ms 轮次都会重新触发全量遍历 + 写盘。
+                    state.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *state.last_flush.lock_recover() = Instant::now();
                 }
                 None
             }
@@ -1058,8 +1219,9 @@ fn flush_merged(state: &EngineState, paths: &DaemonPaths) -> bool {
         }
         Err(e) => {
             log::error!("合并产物重载失败(保留增量态,下轮重试): {e}");
-            // 节流起点照推进:dirty 已超批量阈值时,失败重试不得退化为
-            // 消费循环逐轮密集全量重写
+            // 节流起点照推进 + 失败退避(I4):dirty 已超批量阈值时,失败重试
+            // 不得退化为消费循环逐轮密集全量重写。
+            state.flush_failures.fetch_add(1, Ordering::Relaxed);
             *state.last_flush.lock_recover() = Instant::now();
         }
     }
@@ -1104,6 +1266,7 @@ fn swap_base_if_fresh(
             }
         }
         let old = std::mem::replace(&mut *h, IndexHolder::Shared(view));
+        state.flush_failures.store(0, Ordering::Relaxed);
         // 回收旧 Overlay:清空保容量 + 空页标可回收,供下次增量复用。重放/
         // 事件风暴期 overlay 可涨到数十万条目,直接 drop 会让 macOS 滞留
         // 大块脏页(实测单次换基 ~100MB 级)。
@@ -1128,24 +1291,8 @@ fn swap_base_if_fresh(
 /// 世代前移,自激成风暴(P0 实测 23 次背靠背全量写的放大器之一)。
 fn defer_stale_merge(state: &EngineState) {
     state.dirty.store(0, Ordering::Relaxed);
+    state.flush_failures.store(0, Ordering::Relaxed);
     *state.last_flush.lock_recover() = Instant::now();
-}
-
-/// 单一 holder 内容的落盘(Mutable 索引或合成物化产物);失败留痕返回 Err。
-fn write_holder_index(
-    idx: &Index,
-    state: &EngineState,
-    paths: &DaemonPaths,
-) -> std::io::Result<()> {
-    let meta = build_meta(state);
-    let layout = persist::EntryLayout::of(idx);
-    match persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file()) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            log::error!("落盘失败: {e}");
-            Err(e)
-        }
-    }
 }
 
 /// 最终落盘(stop 路径):持 flush_lock 串行化;返回 (落盘成功, 条目数)。
@@ -1224,12 +1371,30 @@ fn status_entry_count(state: &EngineState) -> u32 {
     }
 }
 
+/// 连续失败的重试退避(I4):5s、10s、20s、40s、80s、120s(封顶正常间隔)。
+fn flush_retry_backoff(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let shift = failures.saturating_sub(1).min(FLUSH_RETRY_MAX_SHIFT);
+    FLUSH_RETRY_BASE
+        .saturating_mul(1u32 << shift)
+        .min(FLUSH_INTERVAL)
+}
+
 fn should_flush(state: &EngineState) -> bool {
     let dirty = state.dirty.load(Ordering::Relaxed);
     if dirty == 0 {
         return false;
     }
-    if dirty >= FLUSH_DIRTY_LIMIT || state.last_flush.lock_recover().elapsed() >= FLUSH_INTERVAL {
+    let last = *state.last_flush.lock_recover();
+    // I4:落盘连续失败时,阈值(dirty ≥ 30k)与 Overlay 规模闸都必须让位于
+    // 退避窗口——否则写失败不清 dirty,消费循环每 150ms 重试一次全量遍历。
+    let failures = state.flush_failures.load(Ordering::Relaxed);
+    if failures > 0 && last.elapsed() < flush_retry_backoff(failures) {
+        return false;
+    }
+    if dirty >= FLUSH_DIRTY_LIMIT || last.elapsed() >= FLUSH_INTERVAL {
         return true;
     }
     // 规模闸:变更计数不高但 Overlay 已长大(整份 listing 收录的目录多)时,
@@ -1295,36 +1460,49 @@ fn apply_batch(
 /// overlaid/dir_ids 锚定的 base 条目号会全部失效;延迟到 T4 flush 合并
 /// (清 Overlay)后再整理。
 fn maybe_compact(state: &EngineState) {
-    let (before, after) = {
-        let mut h = state.holder.write_fail_fast("holder");
-        match &mut *h {
-            IndexHolder::Mutable(idx) => {
-                if !idx.needs_compaction() {
-                    return;
-                }
-                let before = idx.entries.len();
-                idx.compact();
-                (before, idx.entries.len())
+    let literal_roots = state.roots.lock_recover().clone();
+    // compact 与 dir_map 重建**同一 holder 写锁临界区**(C2):compact 全量重排
+    // base 条目号后旧 map 立即失效;若放锁再 rebuild,窗口内的并发 diff 会用旧号
+    // 打新索引(号可能恰中无关活条目 → 错挂 + Overlay 污染),且 rebuild 可能在
+    // 重扫换基之后用旧视图 map 覆盖新 map。build_dir_map 是纯函数,直接在锁内
+    // 对已整理视图构建并同点安装(锁序 holder → dir_map,与 diff 一致)。
+    let mut h = state.holder.write_fail_fast("holder");
+    let (before, after) = match &mut *h {
+        IndexHolder::Mutable(idx) => {
+            if !idx.needs_compaction() {
+                return;
             }
-            IndexHolder::Overlaid(st) => {
-                if !st.overlay.is_empty() {
-                    return; // Overlay 活跃:整理会重排 base 条目号,账本失效
-                }
-                let BaseRef::Heap(idx) = &mut st.base else {
-                    return; // Mmap base 只读,无墓碑增长形态
-                };
-                if !idx.needs_compaction() {
-                    return;
-                }
-                let before = idx.entries.len();
-                idx.compact();
-                (before, idx.entries.len())
-            }
-            _ => return,
+            let before = idx.entries.len();
+            idx.compact();
+            (before, idx.entries.len())
         }
+        IndexHolder::Overlaid(st) => {
+            if !st.overlay.is_empty() {
+                return; // Overlay 活跃:整理会重排 base 条目号,账本失效
+            }
+            let BaseRef::Heap(idx) = &mut st.base else {
+                return; // Mmap base 只读,无墓碑增长形态
+            };
+            if !idx.needs_compaction() {
+                return;
+            }
+            let before = idx.entries.len();
+            idx.compact();
+            (before, idx.entries.len())
+        }
+        _ => return,
     };
+    {
+        let view: &dyn IndexView = match &*h {
+            IndexHolder::Mutable(idx) => idx,
+            IndexHolder::Overlaid(st) => st.base.as_view(),
+            _ => unreachable!("上方分支已限定 Mutable/Overlaid"),
+        };
+        let map = build_dir_map(view, &literal_roots);
+        *state.dir_map.lock_fail_fast("dir_map") = map;
+    }
+    drop(h);
     log::info!("索引整理:条目 {before} → {after},回收墓碑与 arena 孤儿字节");
-    rebuild_dir_map(state);
     engine::malloc_pressure::release_heap_pressure();
 }
 
@@ -1597,7 +1775,9 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
     // mount_scan_product)。旧 Overlay 随整体替换丢弃——重扫产物为全量,窗口内
     // 变更由下方 drain 重放追平。
     log::info!("扫描完成(磁盘产物条目数: {})", idx.entry_count());
-    mount_scan_product(state, paths, idx);
+    // 落盘水位 = floor(C3):产物只承诺覆盖扫描开始时刻的磁盘状态;窗口内
+    // id>floor 的变更由下方 rescan_dirty 重放补入,但崩溃窗口不能依赖它。
+    mount_scan_product(state, paths, idx, floor);
     log::info!(
         "重扫产物已挂载(条目数: {:?})",
         with_view(state, |v| live_count_of(v))
@@ -1660,13 +1840,15 @@ fn degrade_and_rescan(state: &EngineState, paths: &DaemonPaths, wait_for_lock: b
 ///   读锁段内无法运行。
 ///
 /// swap 落地 Shared 即清 dirty:盘面 = 内存真相(flush 的「Shared 态 dirty==0」
-/// 前提;重扫路径后续 drain 重放会重新累积)。meta 取调用方当时的水位——崩溃
-/// 窗口内盘上水位偏旧,重启重放幂等追平。
-fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, mut idx: Index) {
+/// 前提;重扫路径后续 drain 重放会重新累积)。meta 的落盘水位取**扫描开始时的
+/// floor**(C3):扫描期间消费线程仍可能把 id>floor 的事件 diff 进旧 Base 并推进
+/// applied,但产物内容不含它们——写当前 applied 会让重启跳过这些事件。取 floor
+/// 只会多重放(幂等),绝不漏。
+fn mount_scan_product(state: &EngineState, paths: &DaemonPaths, mut idx: Index, watermark: u64) {
     let literal_roots = state.roots.lock_recover().clone();
     let _flush_guard = state.flush_lock.lock_fail_fast("flush_lock");
     let n = idx.entry_count();
-    let meta = build_meta(state);
+    let meta = build_meta_at(state, watermark);
     let layout = persist::EntryLayout::of(&idx);
     let written = persist::write_atomic(&layout, idx.entries.iter(), &meta, &paths.index_file())
         .map_err(|e| log::error!("扫描产物落盘失败,以内存索引接管: {e}"))
@@ -1840,6 +2022,16 @@ fn mask_deleted_via_parent(
         let Some(target) = resolve_target(map, overlay, &cur) else {
             continue; // 该级未索引(如刚被删的中间目录):继续向上
         };
+        // C2:resolve_target 只查 dir_map,不做判活——陈旧 map 窗口下 Base 号可能
+        // 越界/指向非目录,apply_diff 内部 entry()/children_of() 会直接 panic。
+        // 与 apply_and_track 复用同一判活校验;失配按键失效处理(清键,继续上溯,
+        // 由更高层 listing 的一次屏蔽兜底)。
+        if let engine::overlay::DiffTarget::Base(d0) = target {
+            if !base_dir_target_live(view, d0) {
+                map.remove(&cur);
+                continue;
+            }
+        }
         match overlay.apply_diff(view, target, &cur, excludes) {
             Ok(stats) => {
                 let mut changed = stats.added + stats.removed;
@@ -1986,7 +2178,7 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
             // 启动清除:上次会话的卷前缀中,本次未挂载(或已停用)的移除——
             // 落盘索引不重扫,脏卷条目无自然消亡机制,必须在建流/就绪前清掉。
             // (有待清卷时内部按需转可变;无卷变更则保持 Shared 常驻。)
-            volumes::purge_unmounted(&state, &desired_set);
+            volumes::purge_unmounted(&state, &paths, &desired_set);
             (last_id, true)
         }
         Err(e) => {
@@ -2078,11 +2270,18 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
     Ok(())
 }
 
+/// 处理一条连接。返回值语义:
+/// - `Ok(true)`:本条连接处理的是 **Stop**(调用方负责退出进程);
+/// - `Ok(false)`:其他请求,或对端在发请求前断开/超时(静默关闭);
+/// - `Err`:真正的处理失败(仅非 Stop 路径;Stop 的响应写失败只留痕,仍须退出)。
+///
+/// Stop 的响应写失败也不能阻止退出:最终落盘已完成,若进程继续挂着
+/// (stopping 已置位),CLI 收不到应答、socket 已删,daemon 会变成僵尸。
 fn handle_conn(
     stream: &mut UnixStream,
     state: &Arc<EngineState>,
     paths: &DaemonPaths,
-) -> Result<()> {
+) -> Result<bool> {
     // 每步 io 带阶段标注:线上的「Invalid argument (os error 22)」无法从错误串
     // 定位 syscall,阶段化后一次出现即可锁定(read 长度/读体/写响应)。
     // EINVAL 定位(实测):对端在 accept 前已关闭(客户端 connect 后立即断开)时,
@@ -2091,29 +2290,84 @@ fn handle_conn(
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
         if e.kind() == std::io::ErrorKind::InvalidInput {
             log::debug!("对端在 accept 前已关闭,连接直接关闭(SO_RCVTIMEO EINVAL)");
-            return Ok(());
+            return Ok(false);
         }
         return Err(e).context("设置读超时");
     }
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).context("读取消息长度")?;
+    match stream.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if peer_gone(&e) => {
+            // 健康探测/客户端在请求前断开或读超时:不是 daemon 故障。
+            // 以 WARN 记录曾实测约 1.7 万行/天(5s 探测 × 全天)。
+            log::debug!("连接在请求前关闭/超时({:?}),静默关闭", e.kind());
+            return Ok(false);
+        }
+        Err(e) => return Err(e).context("读取消息长度"),
+    }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > protocol::MAX_MSG {
         bail!("消息超限({len} 字节)");
     }
     let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
-        .with_context(|| format!("读取消息体({len} 字节)"))?;
+    match stream.read_exact(&mut buf) {
+        Ok(()) => {}
+        Err(e) if peer_gone(&e) => {
+            log::debug!("连接在读消息体时关闭/超时({:?}),静默关闭", e.kind());
+            return Ok(false);
+        }
+        Err(e) => return Err(e).with_context(|| format!("读取消息体({len} 字节)")),
+    }
     let req: Request = protocol::decode_request(&buf).context("解码请求失败")?;
+    let is_stop = matches!(&req, Request::Stop { .. });
     let resp = dispatch(req, state, paths);
-    let body = encode_response(resp)?;
-    stream
-        .write_all(&(body.len() as u32).to_le_bytes())
-        .context("写出响应长度")?;
-    stream.write_all(&body).context("写出响应体")?;
-    stream.flush().context("冲刷响应")?;
-    Ok(())
+    let body = match encode_response(resp) {
+        Ok(body) => body,
+        Err(e) if is_stop => {
+            // serde 编码小响应不会失败;真失败也不能让进程卡在 stopping 态。
+            log::error!("Stop 响应编码失败(落盘已完成,仍退出): {e}");
+            return Ok(true);
+        }
+        Err(e) => return Err(e).context("编码响应失败"),
+    };
+    let wrote = (|| -> Result<()> {
+        stream
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .context("写出响应长度")?;
+        stream.write_all(&body).context("写出响应体")?;
+        stream.flush().context("冲刷响应")?;
+        Ok(())
+    })();
+    if is_stop {
+        if let Err(e) = wrote {
+            log::warn!("Stop 响应写出失败(落盘已完成,仍退出): {e:#}");
+        }
+        return Ok(true);
+    }
+    wrote?;
+    Ok(false)
+}
+
+/// 连接线程的退出权限(纯函数,单测钉住 I1):**只有处理了 Stop 的连接**可以
+/// 退出进程。`_stopping` 故意不参与判定——旧实现按全局状态判断,任意探测/查询
+/// 连接恰逢 Stop 就会 `exit(0)`,截断 Stop 线程正在做的 `persist_final`
+/// (大索引数百 ms)并吞掉 Stop 应答。保留该参数以便测试复现旧判据。
+fn should_exit_process(handled_stop: bool, _stopping: bool) -> bool {
+    handled_stop
+}
+
+/// 对端在请求完成前断开/超时(EOF、reset、SO_RCVTIMEO 到期):属于连接事件,
+/// 不是 daemon 处理失败,不应刷 WARN。
+fn peer_gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+    )
 }
 
 /// 响应写侧体积预算:client 读侧拒绝超过 MAX_MSG 的响应,1000 条深路径结果
@@ -2181,8 +2435,16 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             }
         }
+        // 存活探测:立即回,不触碰索引(Status 的 entry_count 是 O(条目数))。
+        Request::Ping { .. } => Response::Pong,
         Request::Stop { .. } => {
             state.stopping.store(true, Ordering::SeqCst);
+            // C3:Stop 落盘与重扫串行(rescan_lock → flush_lock,与
+            // degrade_and_rescan 同序)。重扫在途时,新 Base 已按 floor 落盘但
+            // 窗口事件尚在 rescan_dirty 待重放 / 待合并;此刻 persist_final 可能
+            // 把「扫描产物 + 超前 applied 水位」写进盘面(或反之),留下重启后
+            // 无法自愈的缺口。等一整轮重扫(含重放与最终 flush)结束再落盘。
+            let _rescan = acquire_rescan_blocking(&state.rescan_lock);
             // 最终落盘完成后才响应(契约:响应即落盘已保证);落盘失败如实 ok=false
             let (ok, n) = persist_final(state, paths);
             let _ = std::fs::remove_file(paths.socket());
@@ -2408,21 +2670,22 @@ pub fn serve(paths: DaemonPaths) -> Result<()> {
             }
         });
     }
+    // 不在 stopping 时 break:Stop 的最终落盘在连接线程里同步进行,主循环若因
+    // 探测连接恰好到达而 break → serve 返回 → 进程退出会截断 persist_final
+    // (索引落盘丢失、Stop 应答写不出去)。退出统一由**处理 Stop 的线程**在
+    // 响应完成后执行;探测/查询线程即使与 Stop 并发也绝无退出权限。
     for stream in listener.incoming() {
-        if state.stopping.load(Ordering::SeqCst) {
-            break;
-        }
         let Ok(mut stream) = stream else { continue };
         let st = state.clone();
         let p = paths.clone();
-        spawn_guarded("conn", move || {
-            if let Err(e) = handle_conn(&mut stream, &st, &p) {
-                log::warn!("连接处理失败: {e:#}");
+        spawn_guarded("conn", move || match handle_conn(&mut stream, &st, &p) {
+            Ok(handled_stop) => {
+                let stopping = st.stopping.load(Ordering::SeqCst);
+                if should_exit_process(handled_stop, stopping) {
+                    std::process::exit(0);
+                }
             }
-            // stop 已响应:落盘保证已达成,退出进程(accept 循环随之结束)
-            if st.stopping.load(Ordering::SeqCst) {
-                std::process::exit(0);
-            }
+            Err(e) => log::warn!("连接处理失败: {e:#}"),
         });
     }
     Ok(())
@@ -3823,6 +4086,134 @@ mod tests {
             is_poison_sample(missing, sampled),
             "毒样本应判毒: {missing}/{sampled}"
         );
+    }
+
+    /// 存活探测:dispatch(Ping) 必须立即回 Pong,且不置 stopping(只有 Stop 能)。
+    #[test]
+    fn ping_dispatches_to_pong_without_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let resp = dispatch(
+            Request::Ping {
+                v: protocol::PROTOCOL_VERSION,
+            },
+            &state,
+            &paths,
+        );
+        assert_eq!(resp, Response::Pong);
+        assert!(
+            !state.stopping.load(Ordering::SeqCst),
+            "Ping 不得改变停机状态"
+        );
+    }
+
+    /// 退出权限只属于**处理了 Stop 的连接**,与全局 stopping 无关。
+    /// 突变:改回 `_stopping`(旧实现)→ `(false, true)` 断言红——这正是
+    /// 「探测连接撞 stopping 提前 exit、截断 persist_final」的根因。
+    #[test]
+    fn exit_permission_belongs_to_stop_connection_not_stopping_flag() {
+        assert!(should_exit_process(true, true));
+        assert!(should_exit_process(true, false));
+        assert!(
+            !should_exit_process(false, true),
+            "探测/查询连接不得因 stopping 已置位而退出进程"
+        );
+        assert!(!should_exit_process(false, false));
+    }
+
+    /// 对端在请求前 EOF:静默关闭(Ok(false)),不上抛 WARN 级错误。
+    /// 突变「EOF 仍上抛」→ 本测拿到 Err 即红。
+    #[test]
+    fn peer_eof_before_request_closes_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("eof.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let c = UnixStream::connect(&sock).unwrap();
+        let (mut s, _) = l.accept().unwrap();
+        // 只关写端(保持连接存活到 accept 之后,避免走 SO_RCVTIMEO EINVAL 分支)
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let state = Arc::new(EngineState::new());
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let handled = handle_conn(&mut s, &state, &paths).expect("EOF 应静默关闭");
+        assert!(!handled, "非 Stop 连接不得获得退出权限");
+    }
+
+    /// 退出权限只属于 Stop:**同一实现**对 Ping 返回 false、对 Stop 返回 true。
+    /// 这是「探测连接撞 stopping 导致提前 exit」的结构性修复钉:旧实现按
+    /// `state.stopping` 判定,任意并发连接到点即退出;新实现按请求类型判定。
+    /// 突变「按 stopping 判定 / Stop 返回 false」→ 本测红。
+    #[test]
+    fn only_stop_connection_requests_process_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(EngineState::new());
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        // ① Ping:Ok(false) + 线上 Pong
+        {
+            let sock = dir.path().join("ping.sock");
+            let l = UnixListener::bind(&sock).unwrap();
+            let mut c = UnixStream::connect(&sock).unwrap();
+            let (mut s, _) = l.accept().unwrap();
+            c.write_all(
+                &protocol::encode(&Request::Ping {
+                    v: protocol::PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            c.flush().unwrap();
+            let handled = handle_conn(&mut s, &state, &paths).unwrap();
+            assert!(!handled, "Ping 连接不得请求退出");
+            let mut len = [0u8; 4];
+            c.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            c.read_exact(&mut body).unwrap();
+            assert_eq!(
+                protocol::decode_response(&body).unwrap(),
+                Response::Pong,
+                "Ping 必须收到 Pong"
+            );
+        }
+
+        // ② Stop:Ok(true) + Stop 应答 + stopping 置位(由 serve 负责随后 exit)
+        {
+            let sock = dir.path().join("stop.sock");
+            let l = UnixListener::bind(&sock).unwrap();
+            let mut c = UnixStream::connect(&sock).unwrap();
+            let (mut s, _) = l.accept().unwrap();
+            c.write_all(
+                &protocol::encode(&Request::Stop {
+                    v: protocol::PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            c.flush().unwrap();
+            let handled = handle_conn(&mut s, &state, &paths).unwrap();
+            assert!(handled, "Stop 连接必须请求退出(落盘与应答已完成)");
+            assert!(state.stopping.load(Ordering::SeqCst));
+            let mut len = [0u8; 4];
+            c.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            c.read_exact(&mut body).unwrap();
+            match protocol::decode_response(&body).unwrap() {
+                Response::Stop {
+                    ok,
+                    final_entry_count,
+                } => {
+                    assert!(ok, "Empty 态落盘应为成功");
+                    assert_eq!(final_entry_count, 0);
+                }
+                other => panic!("意外响应: {other:?}"),
+            }
+        }
     }
 
     /// 死连接静默关闭钉(实测 EINVAL 根因):对端在 accept 前已关闭时

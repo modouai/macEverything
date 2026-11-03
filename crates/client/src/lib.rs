@@ -81,6 +81,33 @@ pub fn expect_ok(resp: Response) -> Result<Response> {
     }
 }
 
+/// 存活探测读超时:daemon 只回一个空 Pong,2s 足够;`connect` 的 30s 是给
+/// 查询大响应用的,探测不适用(卡死的 daemon 不该让监控线程睡 30s)。
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 最小存活探测:连接 → Ping → 期待 Pong。任何失败(连不上/超时/旧 daemon
+/// 不识别 Ping 而断连/非 Pong 应答)→ false。
+///
+/// 必须发真实请求,不能 connect 后立即断开:后者会让 daemon 每轮记一条
+/// 「连接处理失败」WARN(5s 一轮 ≈ 1.7 万行/天),而且探测连接若恰逢 Stop
+/// 落盘,旧实现的「任意连接线程结束即 exit」会截断 `persist_final`。
+/// daemon 侧同样只允许 Stop 所在线程退出进程(见 cli/daemon.rs `serve`)。
+pub fn ping(paths: &DaemonPaths) -> bool {
+    let Some(mut s) = connect(paths) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(PING_TIMEOUT));
+    matches!(
+        call(
+            &mut s,
+            &Request::Ping {
+                v: protocol::PROTOCOL_VERSION
+            }
+        ),
+        Ok(Response::Pong)
+    )
+}
+
 // —— 按需 stat 读取(daemon 在线查询与离线查询共用同一实现) ——
 
 /// 读单个路径的 (size, mtime, is_dir);不存在或不可读返回 (None, None, false)。
@@ -587,6 +614,27 @@ mod tests {
                 _handle: handle,
             },
         )
+    }
+
+    /// 存活探测:daemon 回 Pong → true;无 daemon → false(不 panic、不阻塞)。
+    #[test]
+    fn ping_true_on_pong_and_false_without_daemon() {
+        let (paths, _h) = stub_daemon(br#"{"msg":"pong"}"#);
+        assert!(ping(&paths), "Pong 应答应判定为在线");
+
+        let dir = tempfile::tempdir().unwrap();
+        let absent = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        assert!(!ping(&absent), "socket 不存在应判定为不可连");
+    }
+
+    /// Error 应答(如旧 daemon 版本不匹配)不是 Pong:探测须判 false,
+    /// 不能把「连上了但答错」当成健康。
+    #[test]
+    fn ping_false_on_error_response() {
+        let (paths, _h) = stub_daemon(br#"{"msg":"error","code":"version","message":"bad"}"#);
+        assert!(!ping(&paths));
     }
 
     /// 方向回显须原样读响应:真实 daemon 对 mtime + 协议 desc 位 true 回显

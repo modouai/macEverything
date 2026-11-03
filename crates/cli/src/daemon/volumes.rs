@@ -209,11 +209,46 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
     scan_volume_into(state, paths, vol);
 }
 
-/// 卷根种子 + 全量扫入索引(批间检查卷仍在)→ flush。
+/// 卷根种子 + 全量扫入索引(批间检查卷仍在)→ 重放扫描窗口 diff → flush。
 ///
 /// **前缀清除前置**:上次会话/上次挂载可能残留该卷条目,直接 seed+apply 会与
 /// 残留重复(每文件双条目);先清后扫,确定性收敛。运行期挂载与启动补扫共用。
+///
+/// **C1 扫描闸门**:扫描把条目直写 Base,而卷流消费线程同窗口内可能对同卷
+/// 目录做 diff。若它先把目录收进 Overlay(`overlaid.insert(V)`),扫描随后插入的
+/// 深层 Base 条目父链上最近 overlaid 祖先是 V 且非 anchor → 查询/合并写把它们
+/// 当「被屏蔽陈旧 Base」静默丢弃,卷被截断为一级子项(不可自愈)。闸门在
+/// `remove_prefix` 之前开启,扫描期间卷前缀内的 diff 只登记;扫描完成后先释放
+/// 闸门、再逐目录重放(重读磁盘,幂等),最后落盘。
 pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
+    let vol_canon = vol.canonicalize().unwrap_or_else(|_| vol.to_path_buf());
+    let token = super::begin_volume_scan(state, &vol_canon);
+    let applied = scan_volume_body(state, paths, vol);
+    // 先释放闸门再重放:重放 diff 走正常路径(持 holder 写锁)。token 被新扫描
+    // 接管时 pending 归新扫描(返回空),旧线程不得重放/不得清闸。
+    let pending = super::end_volume_scan(state, token);
+    let Some(applied) = applied else {
+        return; // 中止(拔盘/世代漂移):清除已由 unmount 或新一轮扫描接管
+    };
+    // 扫描窗口内被闸住的目录:事件只是提示,重读磁盘逐目录补 diff。
+    // 首个 diff 会把 Mutable 扫描产物转 Overlaid,最终 flush 合并落盘。
+    for dir in pending {
+        super::diff_one(state, &dir);
+    }
+    flush(state, paths);
+    log::info!(
+        "卷索引完成: {} 条目 {applied} 条(窗口重放后已落盘)",
+        vol.display(),
+    );
+}
+
+/// 扫描主体;返回 `Some(已应用条目数)` = 扫描批次全部完成(可重放窗口 diff +
+/// 落盘),`None` = 中止(卷消失/世代漂移/推迟,调用方不重放)。
+fn scan_volume_body(
+    state: &Arc<EngineState>,
+    paths: &DaemonPaths,
+    vol: &Path,
+) -> Option<usize> {
     // 本轮扫描的世代快照:任一卸载(含本轮自己的中止路径)推进世代即失效,
     // 批间校验不过直接放弃,不与新一轮扫描交错应用。
     let my_epoch = state.volume_scan_epoch.load(Ordering::Relaxed);
@@ -224,7 +259,7 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
         let mut map = state.dir_map.lock_fail_fast("dir_map");
         let Some(idx) = mutable_base_slot(&mut h) else {
             log::warn!("卷扫描推迟(主索引非可变态),下轮重试: {}", vol.display());
-            return;
+            return None;
         };
         engine::scanner::remove_prefix(idx, &mut map, vol);
         // 前缀清除先行:Overlay 账本同步作废(残留 anchor 会让陈旧子树在合成视图复活)。
@@ -249,11 +284,11 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
         if !vol.exists() {
             log::warn!("卷扫描中消失,中止: {}", vol.display());
             unmount_volume(state, paths, vol);
-            return;
+            return None;
         }
         if state.volume_scan_epoch.load(Ordering::Relaxed) != my_epoch {
             log::info!("卷扫描世代漂移,放弃本轮残余批次: {}", vol.display());
-            return;
+            return None;
         }
         let mut h = state.holder.write_fail_fast("holder");
         if let Some(idx) = mutable_base_slot(&mut h) {
@@ -264,12 +299,7 @@ pub fn scan_volume_into(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Pat
         }
     }
     state.io_errors.fetch_add(gaps.io_errors, Ordering::Relaxed);
-    flush(state, paths);
-    log::info!(
-        "卷索引完成: {} 条目 {applied} 条(io_errors {})",
-        vol.display(),
-        gaps.io_errors
-    );
+    Some(applied)
 }
 
 /// 卸载/停用:停卷流 → 前缀清除 → roots 移除 → flush。幂等。
@@ -303,7 +333,15 @@ fn unmount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
 /// 启动清除:cold_start 加载落盘索引后调用——索引里残留「上次会话挂载、
 /// 本次未挂载(或已停用)」的卷前缀,不清理则脏条目永久污染搜索结果
 /// (落盘索引路径不重扫,无任何机制自然移除它们)。
-pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
+///
+/// I6:清除计入 dirty 并**主动 flush**——本路径把 Shared 按需物化为 Mutable,
+/// 不落盘则既留下堆索引常驻(插拔一次抵消内存优化),盘面也仍是脏卷条目。
+/// flush 写完会收敛回 mmap Shared 并回收堆。
+pub fn purge_unmounted(
+    state: &Arc<EngineState>,
+    paths: &DaemonPaths,
+    desired: &HashSet<PathBuf>,
+) {
     let stale: HashSet<PathBuf> = state
         .dir_map
         .lock_fail_fast("dir_map")
@@ -311,10 +349,12 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
         .filter_map(volume_root_of)
         .filter(|v| !desired.contains(v))
         .collect();
-    // 有待清卷才物化:无卷变更的冷启动保持 Shared 常驻(零堆索引),不清白付
-    if !stale.is_empty() {
-        ensure_mutable(state);
+    if stale.is_empty() {
+        return; // 无卷变更的冷启动保持 Shared 常驻(零堆索引),不清白付
     }
+    // 有待清卷才物化
+    ensure_mutable(state);
+    let mut removed_total = 0u32;
     for vol in stale {
         let removed = {
             let mut h = state.holder.write_fail_fast("holder");
@@ -327,8 +367,15 @@ pub fn purge_unmounted(state: &Arc<EngineState>, desired: &HashSet<PathBuf>) {
             purge_overlay_after_prefix_removal(&mut h, &vol);
             removed
         };
+        removed_total += removed;
         if removed > 0 {
             log::info!("启动清除未挂载卷前缀: {} 条目 {removed} 条", vol.display());
         }
     }
+    state
+        .dirty
+        .fetch_add(removed_total as u64, Ordering::Relaxed);
+    // 即便 removed_total == 0(陈旧键指向已清条目),也要 flush:Mutable 态物化
+    // 已发生,需写盘 + 收敛回 Shared 才能回收堆索引。
+    flush(state, paths);
 }

@@ -399,6 +399,22 @@ pub fn sync_blur(visible: bool, corner_radius: f64, top_inset: f64, visible_pane
     let _ = (visible, corner_radius, top_inset, visible_panel_h);
 }
 
+/// I3 回归钉的测试计数(生产不启用):`send_palette_hide` 必须调用本函数。
+#[cfg(test)]
+pub(crate) static HIDE_BLUR_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 立即隐藏毛玻璃垫窗(不依赖绘制帧)。隐藏态 `draw_palette` 在可见性守卫处
+/// 直接 return,末尾的 `sync_blur(false)` 不会执行;只发 `Visible(false)` 命令
+/// 会让垫窗的磨砂矩形残留在屏上。这里只对本 app 自建的垫窗 `orderOut`
+/// (不是 winit 管理的窗口),不会触发同步重入帧,可从帧内(持 Shared 锁)调用。
+pub fn hide_blur() {
+    #[cfg(test)]
+    HIDE_BLUR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    mac::sync_blur(false, 0.0, 0.0, 0.0);
+}
+
 /// 安装字形图集回收用的 Context(主线程;App::new 调用一次)。非 macOS:no-op。
 pub fn install_surface_reclaim(ctx: eframe::egui::Context) {
     #[cfg(target_os = "macos")]

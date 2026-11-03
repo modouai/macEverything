@@ -369,6 +369,9 @@ fn hide_palette_state(s: &mut Shared) {
 /// 下发悬浮条隐藏命令(egui 命令 → winit `orderOut`;视口与窗口保留,不销毁)。
 /// 只入 egui 队列、无 AppKit 调用 → 可在外层持锁时调用。
 fn send_palette_hide(ctx: &egui::Context, reason: &str) {
+    // 垫窗立即收起(I3):隐藏态 draw_palette 在可见性守卫处 return,末尾的
+    // `sync_blur(false)` 不会执行;只发命令会让磨砂矩形残留在屏上。
+    platform::hide_blur();
     ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
     // 三窗全隐后缩窗释放 GL surface(定时器触发时再核对真实可见性)。
     platform::schedule_surface_shrink();
@@ -2246,6 +2249,27 @@ mod tests {
                 "基准 {base} × 1.15，实际 {got}"
             );
         }
+    }
+
+    /// I3 回归钉:隐藏悬浮条必须**立即**收起毛玻璃垫窗。隐藏态 `draw_palette`
+    /// 在可见性守卫处直接 return,末尾的 `sync_blur(false)` 永不执行;只发
+    /// `Visible(false)` 命令会让磨砂矩形残留在屏上。
+    /// 突变:删掉 `send_palette_hide` 里的 `platform::hide_blur()` → 本测红。
+    #[test]
+    fn send_palette_hide_immediately_hides_blur_layer() {
+        use std::sync::atomic::Ordering;
+        let before = platform::HIDE_BLUR_CALLS.load(Ordering::Relaxed);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            send_palette_hide(ui.ctx(), "test");
+        });
+        // run_ui 的纹理增量必须显式取走(epaint 对未处理增量 drop 会 panic)。
+        out.textures_delta.clear();
+        let after = platform::HIDE_BLUR_CALLS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "隐藏悬浮条必须先收起垫窗(hide_blur 未被调用)"
+        );
     }
 
     /// ⌘W = 根窗隐藏（与红点关闭同语义）；裸 W 不触发。

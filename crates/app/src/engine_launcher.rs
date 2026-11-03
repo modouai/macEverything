@@ -20,9 +20,34 @@ use crate::i18n;
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// daemon 存活监控:低频连接探测,连续 2 次不可连才判定退出(单次抖动不拉起)。
+/// daemon 存活监控:可见期探测间隔。连续 2 次不可连才判定退出(单次抖动不拉起)。
 const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
+/// 三窗全隐期探测间隔:界面不活跃,崩溃晚 30s 发现无感;减少唤醒与 daemon 连接。
+const HIDDEN_MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 const MONITOR_FAIL_THRESHOLD: u32 = 2;
+
+/// GUI 当前是否「三窗全隐」。平台层在显隐边沿更新(mac.rs):
+/// 缩窗定时器确认三窗全隐 → true;任何显示路径(`cancel_surface_shrink`)→ false。
+/// 启动即三窗全隐(产品形态),故默认 true。
+static UI_HIDDEN: AtomicBool = AtomicBool::new(true);
+
+/// 平台层写入全隐状态(主线程;原子写,无锁)。
+pub(crate) fn set_ui_hidden(hidden: bool) {
+    UI_HIDDEN.store(hidden, Ordering::Relaxed);
+}
+
+fn ui_hidden() -> bool {
+    UI_HIDDEN.load(Ordering::Relaxed)
+}
+
+/// 当前探测间隔(纯函数,单测钉住):全隐 30s,可见 5s。
+fn monitor_interval(hidden: bool) -> Duration {
+    if hidden {
+        HIDDEN_MONITOR_INTERVAL
+    } else {
+        MONITOR_INTERVAL
+    }
+}
 
 /// GUI 是否「期望 daemon 运行」。启动拉起成功 / 托盘手动拉起成功后置 true;
 /// 用户主动停止(手动重启的 stop 段)或启动时就是离线态则保持 false —— 离线
@@ -84,9 +109,13 @@ impl LivenessTracker {
     }
 }
 
-/// 启动 daemon 存活监控线程(每 5s 探测 socket)。判定退出 → `ensure_engine`
-/// 拉起;成功后调用 `on_restarted`(主线程外的 UI 清离线提示/重查入口,由
-/// 调用方自行切回 UI 锁)。
+/// 启动 daemon 存活监控线程(可见期每 5s、全隐期每 30s 发一次 Ping 探测)。
+/// 判定退出 → `ensure_engine` 拉起;成功后调用 `on_restarted`(主线程外的 UI
+/// 清离线提示/重查入口,由调用方自行切回 UI 锁)。
+///
+/// 探测必须用 [`client::ping`](真实 Ping/Pong 请求)而不是 connect 后立即断开:
+/// 后者在 daemon 侧表现为「读了 0 字节就 EOF」,曾以 WARN 刷屏(5s × 全天 ≈
+/// 1.7 万行),且探测连接与 Stop 并发时有截断停机落盘的风险。
 pub fn spawn_health_monitor<F>(paths: client::DaemonPaths, on_restarted: F)
 where
     F: Fn() + Send + 'static,
@@ -97,8 +126,10 @@ where
             let mut tracker = LivenessTracker::default();
             let mut last_stop_intent = false;
             loop {
-                std::thread::sleep(MONITOR_INTERVAL);
-                let connectable = client::connect(&paths).is_some();
+                // 每轮重新取间隔:全隐/可见切换在下一轮生效(最迟一个周期)。
+                let interval = monitor_interval(ui_hidden());
+                std::thread::sleep(interval);
+                let connectable = client::ping(&paths);
                 let expected = expected_running();
                 let suspended = MONITOR_SUSPENDED.load(Ordering::SeqCst);
                 // CLI stop 成功后的意图标记:用户主动停止不是崩溃,不拉起。
@@ -382,6 +413,13 @@ mod tests {
         );
         assert!(!t.observe(false, true, false, false), "标记清除后从 1 计数");
         assert!(t.observe(false, true, false, false), "恢复后连续 2 次触发");
+    }
+
+    /// 探测间隔:可见期 5s、全隐期退避到 30s。突变「恒 5s / 恒 30s」即红。
+    #[test]
+    fn monitor_interval_backs_off_when_all_hidden() {
+        assert_eq!(monitor_interval(false), Duration::from_secs(5));
+        assert_eq!(monitor_interval(true), Duration::from_secs(30));
     }
 
     #[test]

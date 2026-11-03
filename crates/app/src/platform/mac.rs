@@ -406,11 +406,53 @@ struct PaletteState {
 }
 
 /// 缩窗前的 contentSize 快照(主线程;三窗各一份)。
-#[derive(Default, Clone, Copy)]
+///
+/// 不变式:`Some(size)` = 该窗口当前处于 1×1 缩窗态,显示前须恢复为 `size`。
+/// 因此**已缩过的窗口不得重新捕获**——重新捕获时读到的是 1×1,会覆盖原始尺寸
+/// (C1:用户报告的「完整窗口打不开」根因)。
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
 struct ShrunkSizes {
     root: Option<NSSize>,
     palette: Option<NSSize>,
     settings: Option<NSSize>,
+}
+
+impl ShrunkSizes {
+    fn slot(&self, kind: MainWindow) -> Option<NSSize> {
+        match kind {
+            MainWindow::Root => self.root,
+            MainWindow::Palette => self.palette,
+            MainWindow::Settings => self.settings,
+        }
+    }
+
+    fn set(&mut self, kind: MainWindow, size: Option<NSSize>) {
+        match kind {
+            MainWindow::Root => self.root = size,
+            MainWindow::Palette => self.palette = size,
+            MainWindow::Settings => self.settings = size,
+        }
+    }
+
+    fn take(&mut self, kind: MainWindow) -> Option<NSSize> {
+        let saved = self.slot(kind);
+        self.set(kind, None);
+        saved
+    }
+}
+
+/// 为窗口登记缩前尺寸(纯函数,单测钉住 C1)。已有快照 = 该窗口仍处于 1×1,
+/// 保留首次值并返回 `false`(调用方不得再缩/重新捕获);返回 `true` 才表示
+/// 本次应执行缩窗。
+///
+/// 刻意逐项合并而非整体赋值:第二次全隐缩窗时 root/settings 仍在 1×1,
+/// 整体覆盖会把它们的「原始尺寸」写成 1×1。
+fn record_shrink_slot(saved: &mut ShrunkSizes, kind: MainWindow, observed: NSSize) -> bool {
+    if saved.slot(kind).is_some() {
+        return false;
+    }
+    saved.set(kind, Some(observed));
+    true
 }
 
 /// 三个主视口窗口(缩窗/恢复的定向对象)。
@@ -505,13 +547,23 @@ pub fn schedule_surface_shrink() {
 /// 尺寸恢复由 [`restore_window_size`] 在具体显示路径完成)。
 pub fn cancel_surface_shrink() {
     SHRINK_GEN.fetch_add(1, Ordering::SeqCst);
+    // 任何显示路径都会走到这里:退出「三窗全隐」,健康探测恢复 5s 间隔。
+    crate::engine_launcher::set_ui_hidden(false);
 }
 
-/// 三窗均不可见时把 contentSize 缩到 1×1(返回是否有窗口被缩)。
+/// 三窗均不可见时把 contentSize 缩到 1×1(返回本次是否有窗口被新缩)。
 ///
 /// 只在主线程;任一主窗可见则整体跳过。尺寸快照存 [`PaletteState::shrunk`],
 /// 显示前由 [`restore_window_size`] 恢复。AppKit 调用期间**不持** PALETTE 借用
 /// (setContentSize 可触发 winit 同步重入一帧)。
+///
+/// **逐窗口合并**(C1):已保存过快照的窗口仍是 1×1,直接跳过——绝不能重新
+/// 捕获后整体覆盖(第二次缩窗会把 root/settings 的原始尺寸写成 1×1,完整
+/// 窗口/设置从此恢复成 1×1 不可用)。
+///
+/// **重入安全**(I2):每个窗口「先登记尺寸 → 缩 → 立刻回读三窗可见性」。
+/// `setContentSize` 可能被 winit 同步派发成一帧,重入帧若执行显示路径并
+/// orderFront,就回滚本窗口并放弃本轮,避免把刚显示的窗口继续缩成 1×1。
 #[allow(deprecated)] // NSOpenGLContext 自 macOS 10.14 起标记废弃,但 glow/CGL 后端仍用它。
 pub(crate) fn shrink_hidden_windows() -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -540,17 +592,27 @@ pub(crate) fn shrink_hidden_windows() -> bool {
             || win.styleMask().contains(NSWindowStyleMask::FullScreen)
     }) {
         log::info!("全隐缩窗:仍有可见/最小化/全屏主窗口,跳过");
+        crate::engine_launcher::set_ui_hidden(false);
         return false;
     }
-    let mut sizes = ShrunkSizes::default();
+    // 三窗全隐已确认:健康探测退避到 30s(见 engine_launcher::monitor_interval)。
+    crate::engine_launcher::set_ui_hidden(true);
+
+    let mut kept = false;
     for (win, kind, name) in windows {
         let before = win
             .contentView()
             .map_or_else(|| win.frame().size, |view| view.frame().size);
-        match kind {
-            MainWindow::Root => sizes.root = Some(before),
-            MainWindow::Palette => sizes.palette = Some(before),
-            MainWindow::Settings => sizes.settings = Some(before),
+        // 先登记再缩:重入帧里的显示路径必须能读到原始尺寸。
+        let should_shrink =
+            PALETTE.with(|cell| record_shrink_slot(&mut cell.borrow_mut().shrunk, kind, before));
+        if !should_shrink {
+            log::debug!(
+                "全隐缩窗:{name} 已处于缩窗态(保留首次快照 {:.0}×{:.0}),跳过",
+                before.width,
+                before.height
+            );
+            continue;
         }
         win.setContentSize(NSSize::new(1.0, 1.0));
         log::info!(
@@ -558,8 +620,20 @@ pub(crate) fn shrink_hidden_windows() -> bool {
             before.width,
             before.height
         );
+        // AppKit 调用后复核:期间有窗口被显示(重入帧)→ 回滚本窗口并放弃。
+        if let Some((_, _, visible_name)) = windows.iter().find(|(w, _, _)| w.isVisible()) {
+            log::warn!("全隐缩窗:{visible_name} 在缩窗期间变为可见,回滚 {name} 并放弃本轮");
+            win.setContentSize(before);
+            PALETTE.with(|cell| cell.borrow_mut().shrunk.set(kind, None));
+            crate::engine_launcher::set_ui_hidden(false);
+            return kept;
+        }
+        kept = true;
     }
-    PALETTE.with(|cell| cell.borrow_mut().shrunk = sizes);
+    if !kept {
+        // 三窗早已全部缩过:无需重复清 drawable/图集。
+        return false;
+    }
 
     // 仅缩窗有时仍会留下上一尺寸的 AppKit 后备用 surface(实测 9–19MB 波动);
     // 再对三窗 drawable 做一次 clearDrawable,并把上下文停到已缩为 1×1 的
@@ -608,14 +682,7 @@ pub(crate) fn shrink_hidden_windows() -> bool {
 
 /// 显示前恢复某一主窗的 contentSize(未缩过 = no-op;返回是否恢复)。
 fn restore_window_size(win: &NSWindow, kind: MainWindow) -> bool {
-    let saved = PALETTE.with(|cell| {
-        let mut st = cell.borrow_mut();
-        match kind {
-            MainWindow::Root => st.shrunk.root.take(),
-            MainWindow::Palette => st.shrunk.palette.take(),
-            MainWindow::Settings => st.shrunk.settings.take(),
-        }
-    });
+    let saved = PALETTE.with(|cell| cell.borrow_mut().shrunk.take(kind));
     match saved {
         Some(size) => {
             win.setContentSize(size);
@@ -2658,5 +2725,83 @@ mod tests {
         assert!(super::shrink_timer_is_current(7, 7), "同代有效");
         assert!(!super::shrink_timer_is_current(7, 8), "显示后旧代作废");
         assert!(!super::shrink_timer_is_current(8, 7), "不可能:反序也拒绝");
+    }
+
+    /// 模拟一次缩窗轮次(只做纯状态部分):返回每个窗口本轮是否应缩。
+    fn shrink_round(saved: &mut ShrunkSizes, live: [NSSize; 3]) -> [bool; 3] {
+        let kinds = [MainWindow::Root, MainWindow::Palette, MainWindow::Settings];
+        let mut out = [false; 3];
+        for (i, kind) in kinds.into_iter().enumerate() {
+            out[i] = record_shrink_slot(saved, kind, live[i]);
+        }
+        out
+    }
+
+    /// C1 回归钉:三窗缩窗 → 只打开悬浮条(其快照被 take)→ 再次全隐缩窗。
+    /// 第二次观测到的 root/settings 是 1×1,但**不得覆盖**首次快照;之后打开
+    /// 完整窗口必须恢复原始尺寸(而不是 1×1)。
+    ///
+    /// 突变:把 [`record_shrink_slot`] 改回「无条件记录/整体覆盖」→ 第二次
+    /// 轮次返回全 true 且 `saved.root` 变成 1×1,本测红。
+    #[test]
+    fn second_shrink_keeps_original_root_size_after_partial_restore() {
+        let root = NSSize::new(1200.0, 800.0);
+        let palette = NSSize::new(700.0, 500.0);
+        let settings = NSSize::new(620.0, 600.0);
+        let one = NSSize::new(1.0, 1.0);
+
+        let mut saved = ShrunkSizes::default();
+        assert_eq!(
+            shrink_round(&mut saved, [root, palette, settings]),
+            [true, true, true],
+            "首次全隐:三窗都应缩并记录原始尺寸"
+        );
+
+        // 用户只打开悬浮条:显示路径 take 掉 palette 快照并恢复原尺寸;
+        // root/settings 保持 1×1,快照原样保留。
+        assert_eq!(saved.take(MainWindow::Palette), Some(palette));
+        assert_eq!(saved.root, Some(root));
+        assert_eq!(saved.settings, Some(settings));
+
+        // 悬浮条再隐藏,30s 后第二次缩窗:root/settings 实际读到 1×1。
+        let shrunk = shrink_round(&mut saved, [one, palette, one]);
+        assert_eq!(
+            shrunk,
+            [false, true, false],
+            "已缩窗口不得重复缩窗/重新捕获"
+        );
+        assert_eq!(saved.root, Some(root), "root 原始尺寸不得被 1×1 覆盖");
+        assert_eq!(saved.settings, Some(settings), "settings 同上");
+        assert_eq!(
+            saved.palette,
+            Some(palette),
+            "palette 应重新捕获恢复后的尺寸"
+        );
+
+        // 打开完整窗口:必须恢复原始尺寸(C1 用户可见症状的最终断言)。
+        assert_eq!(saved.take(MainWindow::Root), Some(root));
+        assert_eq!(saved.root, None, "take 后快照清空(当前不再处于缩窗态)");
+    }
+
+    /// 连续两次全隐(期间无任何窗口打开):第二次观测到 1×1,但快照一条都
+    /// 不得改写。突变「整体覆盖」→ 第二次任一 true 或快照变 1×1,本测红。
+    #[test]
+    fn repeated_full_shrink_never_overwrites_saved_entries() {
+        let first = [
+            NSSize::new(1200.0, 800.0),
+            NSSize::new(700.0, 500.0),
+            NSSize::new(620.0, 600.0),
+        ];
+        let one = NSSize::new(1.0, 1.0);
+        let mut saved = ShrunkSizes::default();
+        assert!(shrink_round(&mut saved, first).iter().all(|v| *v));
+        assert!(
+            !shrink_round(&mut saved, [one; 3]).iter().any(|v| *v),
+            "已缩窗口不应再次缩"
+        );
+        assert_eq!(
+            [saved.root, saved.palette, saved.settings],
+            [Some(first[0]), Some(first[1]), Some(first[2])]
+        );
     }
 }

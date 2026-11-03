@@ -32,6 +32,12 @@ pub enum Request {
     Status {
         v: u32,
     },
+    /// 最小存活探测(健康监控):只证明 daemon 在线且能处理请求。
+    /// 刻意不用 Status——`status_entry_count` 是 O(条目数),每 5s 探测一次
+    /// 百万级索引会形成可观的周期开销。
+    Ping {
+        v: u32,
+    },
     Stop {
         v: u32,
     },
@@ -71,6 +77,7 @@ impl Request {
         match self {
             Request::Query { v, .. }
             | Request::Status { v }
+            | Request::Ping { v }
             | Request::Stop { v }
             | Request::ExcludeAdd { v, .. }
             | Request::ExcludeRemove { v, .. }
@@ -119,6 +126,8 @@ pub enum Response {
         ok: bool,
         final_entry_count: u32,
     },
+    /// Ping 应答(存活探测;无载荷;daemon 立即返回)。
+    Pong,
     Exclude {
         ok: bool,
         excluded: Vec<String>,
@@ -394,6 +403,28 @@ mod tests {
         assert!(validate::exclude_path("/abs/x").is_ok());
     }
 
+    /// Ping/Pong 往返:存活探测的最小消息;线上 tag 固定,且请求携带协议版本
+    /// (旧 daemon 不认识该 tag 会解码失败断连,新客户端按不可连处理)。
+    #[test]
+    fn ping_pong_roundtrip() {
+        let r = Request::Ping {
+            v: PROTOCOL_VERSION,
+        };
+        let bytes = encode(&r).unwrap();
+        assert_eq!(decode_request(&bytes[4..]).unwrap(), r);
+        assert_eq!(r.version(), PROTOCOL_VERSION);
+        assert!(serde_json::to_string(&r)
+            .unwrap()
+            .contains(r#""msg":"ping""#));
+
+        let p = Response::Pong;
+        let bytes = encode(&p).unwrap();
+        assert_eq!(decode_response(&bytes[4..]).unwrap(), p);
+        assert!(serde_json::to_string(&p)
+            .unwrap()
+            .contains(r#""msg":"pong""#));
+    }
+
     /// E5:恢复默认是纯版本化无参请求;线上 tag 固定为 `exclude_reset`,往返无损。
     /// 卷偏好消息往返 + 线上 tag 形态(external-volumes)。
     #[test]
@@ -443,6 +474,9 @@ mod tests {
         // 契约:每请求都携带版本字段(serde tag 保证变体可辨)
         let cases = [
             Request::Status {
+                v: PROTOCOL_VERSION,
+            },
+            Request::Ping {
                 v: PROTOCOL_VERSION,
             },
             Request::Stop {
