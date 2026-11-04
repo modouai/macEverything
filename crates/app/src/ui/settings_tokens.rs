@@ -51,8 +51,7 @@ pub struct SettingsPalette {
     pub divider: egui::Color32,
     /// 控件底（分段容器 / 下拉字段等未选中态的共用底色）。
     pub control_fill: egui::Color32,
-    /// 控件文字（规格对账；语言项禁用态改用次要色，启用态文案留给后续版本）。
-    #[allow(dead_code)]
+    /// 控件文字（下拉字段文字/箭头、次级按钮文字）。
     pub control_text: egui::Color32,
     /// 字号分段：选中段底。
     pub segment_selected_fill: egui::Color32,

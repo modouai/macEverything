@@ -2481,8 +2481,8 @@ pub fn open_accessibility_settings() {
 // 剪贴板纯文本(navigator 策略 B 的 save/set/restore;M0 探针先行使用)
 //
 // NSPasteboard 一般建议主线程使用,但 generalPasteboard 的读写在现代 macOS 上
-// 允许任意线程(AppKit 未强制 main-thread check);探针实验线程直接调用属
-// M0 取证可接受范围,Task 11 产品化时再收敛调用线程契约。
+// 允许任意线程(AppKit 未强制 main-thread check);当前 navigator 后台线程
+// 直接调用,调用线程契约未收敛(遗留项)。
 
 /// 读剪贴板纯文本(None = 无文本/非文本)。
 pub fn clipboard_text() -> Option<String> {
@@ -2505,8 +2505,8 @@ pub fn clipboard_set_text(s: &str) -> bool {
 }
 
 /// 恢复(写回 save 的文本;None = 原本无文本 → clearContents 清空)。
-/// 近似语义:None 路径会连带清掉剪贴板里的非文本项——M0 取证可接受,
-/// Task 11 产品化时改多类型快照(pasteboard types 全量保存/回写)。
+/// 当前快照仅纯文本:None 路径会连带清掉剪贴板里的非文本项;多类型快照
+/// (pasteboard types 全量保存/回写)为独立遗留项。
 pub fn clipboard_restore(saved: Option<&str>) -> bool {
     match saved {
         Some(t) => clipboard_set_text(t),
