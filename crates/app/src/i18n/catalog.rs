@@ -82,6 +82,9 @@ catalog! {
     panel_assist_need_auth: "需授权" / "Needs Permission",
     panel_assist_grant: "去授权…" / "Grant Permission…",
     tray_panel_assist_auth: "保存面板助手待授权…" / "Save-Panel Assist Needs Permission…",
+    // 保存面板目录助手浮层
+    overlay_hint: "输入目录名…" / "Type a directory name…",
+    overlay_clipboard_hint: "路径已复制，按 ⌘⇧G 后 ⌘V 粘贴" / "Path copied — press ⌘⇧G then ⌘V",
     update_open_failed: "无法打开下载页" / "Couldn't open the download page",
     update_status_idle: "尚未检查" / "Not checked yet",
     update_status_checking: "正在检查…" / "Checking…",

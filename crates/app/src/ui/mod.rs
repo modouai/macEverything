@@ -74,6 +74,7 @@ pub mod icons;
 pub mod idle;
 pub mod mascot;
 pub mod menu_actions;
+pub mod overlay;
 pub mod overlay_layout;
 pub mod palette;
 pub mod results;
@@ -575,6 +576,19 @@ fn palette_builder() -> egui::ViewportBuilder {
         .with_always_on_top()
 }
 
+/// 保存面板目录助手浮层视口 builder(常量;尺寸固定,定位由平台层原生摆位)。
+/// 无装饰、不透明内容自绘、启动隐藏;`always_on_top` 与平台层 NSPanel level 双保险。
+fn overlay_builder() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title(platform::OVERLAY_TITLE)
+        .with_inner_size([overlay::OVERLAY_W, overlay::OVERLAY_H])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_has_shadow(false)
+        .with_visible(false)
+        .with_always_on_top()
+}
+
 pub struct App {
     /// 二次启动唤起通道(app.sock 监听线程 → 主线程;main 接线)。
     incoming: Receiver<Incoming>,
@@ -588,6 +602,9 @@ pub struct App {
     root_hide_issued: bool,
     /// 纠偏回读已留痕一次(原生 `isVisible()` 核对;见 `logic`)。
     root_hide_verified: bool,
+    /// 临时调试开关(`MCE_OVERLAY_DEBUG=1`):首帧打开浮层并定位一次,
+    /// 让浮层可编译可达(clippy 无死代码)。Task 14 事件接线后移除。
+    overlay_debug_pending: bool,
     /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 已接)。
     quitting: bool,
     /// 全局热键运行时(Task 15/21):manager 保活 + 事件泵;命中走主队列直调
@@ -615,6 +632,8 @@ pub struct Shared {
     pub update: update::UpdateState,
     /// 悬浮条可见标志(真源;排帧门禁与按钮态都读它)。
     pub palette_visible: bool,
+    /// 保存面板目录助手浮层(事件接线在 Task 14;本任务只有 debug 显示路径)。
+    pub overlay: overlay::OverlayState,
 }
 
 impl App {
@@ -675,6 +694,7 @@ impl App {
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
             update: update::UpdateState::new(),
             palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
+            overlay: overlay::OverlayState::new(cc.egui_ctx.clone(), paths.clone()),
         }));
         if auto_update {
             spawn_update_check(&shared, &cc.egui_ctx);
@@ -749,6 +769,8 @@ impl App {
             attach_attempts: 0,
             root_hide_issued: false,
             root_hide_verified: false,
+            // 临时调试开关(Task 14 移除):启动后打开浮层一次并定位。
+            overlay_debug_pending: std::env::var("MCE_OVERLAY_DEBUG").as_deref() == Ok("1"),
             quitting: false,
             hotkey,
             tray,
@@ -1306,6 +1328,33 @@ impl eframe::App for App {
         // 状态不落后到下次显示;空闲无 pending 时不产生任何帧,不破隐藏零帧。
         self.shared().results.tick(Instant::now());
 
+        // 保存面板助手浮层:查询会话推进(与悬浮条同一工作线程模式)。
+        // 浮层可见时其 pass 也会驱动 poll(根视口被遮挡、logic 不跑时的兜底)。
+        self.shared().overlay.poll(Instant::now());
+
+        // 临时调试开关(Task 14 移除):首帧打开浮层并定位一次。视口窗由 eframe 在
+        // 注册 pass 末尾创建,首帧未就绪时等下一帧;成功即清除标志。
+        if self.overlay_debug_pending {
+            {
+                let mut s = self.shared();
+                if !s.overlay.visible {
+                    s.overlay.open();
+                }
+            }
+            match platform::overlay_show([100.0, 200.0, 600.0, 400.0]) {
+                Ok(()) => {
+                    self.overlay_debug_pending = false;
+                    // orderFront 后补一帧本视口 pass,确保窗内内容立即上屏。
+                    ctx.request_repaint_of(overlay::overlay_viewport_id());
+                    log::info!("MCE_OVERLAY_DEBUG:浮层已显示(临时调试开关,Task 14 移除)");
+                }
+                Err(err) => {
+                    log::info!("MCE_OVERLAY_DEBUG:浮层窗口未就绪,下帧重试:{err}");
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         // 完整窗口尺寸持久化(visual.md §1.2):可见期跟踪,400ms 限频合并写盘。
         self.persist_window_size(ctx, Instant::now());
 
@@ -1377,6 +1426,10 @@ impl eframe::App for App {
         // 视口窗由 eframe 在注册 pass 末尾创建:首帧找不到属正常,下帧重试(有上限)。
         if let Err(err) = platform::ensure_patched() {
             log::warn!("悬浮条平台补丁失败: {err}");
+        }
+        // 浮层窗同款补丁(视口创建后首见即换类;隐藏期 reassert 为 no-op)。
+        if let Err(err) = platform::ensure_overlay_patched() {
+            log::warn!("浮层平台补丁失败: {err}");
         }
         if !platform::attached() && self.attach_attempts < PATCH_ATTACH_ATTEMPTS {
             self.attach_attempts += 1;
@@ -1481,6 +1534,15 @@ impl eframe::App for App {
             settings::viewport_id(),
             settings::builder(),
             move |ui, _class| settings::draw(ui, &shared),
+        );
+
+        // 保存面板目录助手浮层第四视口:常驻注册(deferred;隐藏不销毁)。
+        // 显示/隐藏与定位由平台层原生完成(Task 14 接线);本回调只负责绘制。
+        let shared = Arc::clone(&self.shared);
+        ctx.show_viewport_deferred(
+            overlay::overlay_viewport_id(),
+            overlay_builder(),
+            move |ui, _class| draw_overlay(ui, &shared),
         );
     }
 
@@ -1588,6 +1650,25 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         palette::MASCOT_STRIP as f64,
         s.palette.visible_panel_h() as f64,
     );
+}
+
+/// 浮层视口绘制回调(deferred:自己的 pass 内运行)。
+///
+/// 锁纪律同 `draw_palette`:短锁取 `Shared` 后在本回调内绘制(无原生调用);
+/// 隐藏期直接返回,保持全隐缩窗后的回收帧为空 pass(不重新长字形图集)。
+fn draw_overlay(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
+    let ctx = ui.ctx().clone();
+    let mut s = lock_shared(shared);
+    if !s.overlay.visible {
+        return;
+    }
+    idle::note_viewport_activity(&ctx);
+    // 查询会话驱动:根视口被完全遮挡、`logic` 不跑时仍由此推进(与悬浮条同因)。
+    s.overlay.poll(Instant::now());
+    // 浮层不透明纯色底(不做毛玻璃);内容留白由 CentralPanel 默认内边距提供。
+    egui::CentralPanel::default().show(ui, |ui| {
+        overlay::show_overlay(ui, &mut s.overlay);
+    });
 }
 
 #[cfg(test)]

@@ -15,7 +15,6 @@
 /// `screen` 原点(x/y)为 NaN 时 `f64::clamp` 会 panic;`panel`/`overlay` 尺寸
 /// 为 NaN 则结果按 NaN 静默传播。调用方须保证有限值——detector 的
 /// `valid_panel_frame` 已拦截 AX 读数。
-#[allow(dead_code)] // Task 13 浮层接线后移除
 pub fn overlay_frame(
     panel: [f64; 4],
     screen: [f64; 4],

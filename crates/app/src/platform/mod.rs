@@ -47,6 +47,9 @@ pub enum NavigateOutcome {
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
 
+/// 保存面板目录助手浮层窗口标题(同上:builder 与平台层定位两处必须一致)。
+pub const OVERLAY_TITLE: &str = "overlay";
+
 /// 设置窗可接受的两种原生标题(查找时同时匹配,避免切换瞬间竞态)。
 ///
 /// 标题随语言切换(视口标题取 `i18n::s().settings_title`);语言切换后旧窗口
@@ -334,6 +337,18 @@ pub fn ensure_patched() -> anyhow::Result<()> {
     }
 }
 
+/// 每帧核对浮层窗补丁(与悬浮条同法;视口窗未创建时 no-op,下帧再试)。
+pub fn ensure_overlay_patched() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::ensure_overlay_patched()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 /// 唤起悬浮条:原生定位 + `orderFrontRegardless` + `makeKeyWindow`(不激活 app)。
 /// 返回实际面板宽(按鼠标所在屏回填;调用方据此同步 UI 布局宽)。
 ///
@@ -348,6 +363,35 @@ pub fn show_palette(top_inset: f64) -> anyhow::Result<f64> {
     {
         let _ = top_inset;
         Err(anyhow::anyhow!("非 macOS:悬浮条原生唤起不可用"))
+    }
+}
+
+/// 唤起保存面板目录助手浮层(原生定位 + 置前 + 成 key;不激活 app)。
+///
+/// `ax_frame` = 检测器上报的保存面板 frame,AX 屏幕坐标(左上原点、y 向下)。
+/// 平台层负责换算 AppKit 坐标、按面板中心所在屏定位。
+pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_show(ax_frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ax_frame;
+        Err(anyhow::anyhow!("非 macOS:浮层原生唤起不可用"))
+    }
+}
+
+/// 隐藏浮层(`orderOut`,不销毁窗口)。
+#[allow(dead_code)] // Task 14 接线层调用(本任务仅 debug 显示路径)。
+pub fn overlay_hide() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_hide()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
     }
 }
 
