@@ -31,6 +31,10 @@ pub struct QueryPlan {
     pub path_terms: Vec<Pattern>,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// 仅目录(保存面板助手):候选层过滤非目录,total 同口径。
+    /// parse 恒 false,调用方(engine 外的 daemon/client)按协议位显式置位,
+    /// 不进解析语法(与 case:/whole: 的整轮开关不同源,是调用方级过滤)。
+    pub dir_only: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -77,6 +81,7 @@ pub fn parse(query: &str) -> Result<QueryPlan, ParseError> {
         path_terms: Vec::new(),
         case_sensitive,
         whole_word,
+        dir_only: false,
     };
     for word in words {
         match word {
@@ -209,6 +214,11 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
         .flat_map_iter(|&(start, chunk)| {
             (start..).zip(chunk.iter()).filter_map(|(idx, e)| {
                 if !e.is_live() || !view.entry_valid(idx) {
+                    return None;
+                }
+                // dir_only(保存面板助手):候选层滤掉非目录,rows 只剩目录,
+                // total(rows 长度)自然同口径只计目录。
+                if plan.dir_only && !e.is_dir() {
                     return None;
                 }
                 if !plan.path_terms.is_empty() {
@@ -788,6 +798,31 @@ mod match_tests {
         let out = execute(&i, &parse("*").unwrap(), 0);
         assert!(out.hits.is_empty());
         assert_eq!(out.total, 5);
+    }
+
+    /// dir_only = true 时只返回目录;total 同步只计目录(截断前全量口径不变)。
+    /// 突变「execute 去掉 dir_only 过滤」时文件命中回归必红。
+    #[test]
+    fn dir_only_filters_files_and_counts_total() {
+        let i = sample();
+        // "r" 恰命中 projects(目录)与 README.md(文件);Documents/budget/季度报告 无 r
+        let mut plan = parse("r").unwrap();
+        plan.dir_only = true;
+        let out = execute(&i, &plan, 100);
+        assert_eq!(out.total, 1, "只计目录");
+        assert_eq!(i.display_name(out.hits[0]), b"projects");
+        // 默认 plan(false)行为不变:文件照常命中。
+        let all = execute(&i, &parse("r").unwrap(), 100);
+        assert!(all.total > out.total, "缺省不过滤");
+    }
+
+    /// dir_only 与 path: 词组合:候选(命中目录的直接子项)同样被过滤。
+    #[test]
+    fn dir_only_applies_after_path_candidate_filter() {
+        let i = sample();
+        let mut plan = parse("path:documents").unwrap(); // Documents 下两个文件
+        plan.dir_only = true;
+        assert_eq!(execute(&i, &plan, 100).total, 0, "子项全是文件,全被滤掉");
     }
 
     fn names(i: &Index, hits: &[u32]) -> Vec<String> {
