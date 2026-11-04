@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 pub mod ax_ffi;
 #[cfg(target_os = "macos")]
 pub mod cg_events;
+// 保存面板跳转状态机(纯逻辑;Task 11 执行层接线)。
+#[cfg(target_os = "macos")]
+pub mod dialog_navigator;
 #[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
