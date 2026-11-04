@@ -600,16 +600,30 @@ struct NavigateResult {
 
 /// FellBack 结果是否允许重现「路径已复制」提示(纯逻辑)。
 ///
-/// 四个门缺一不可:助手仍启用、浮层未显示(不覆盖用户新面板输入)、结果 pid
-/// 仍是当前归因面板(用户没切到别的保存面板)、面板定位 frame 仍在。
+/// 五个门缺一不可:助手仍启用、浮层未显示(不覆盖用户新面板输入)、结果 pid
+/// 仍是当前归因面板(用户没切到别的保存面板)、面板定位 frame 仍在、该面板
+/// 未被同帧 Esc 屏蔽(迟到结果不得绕过「不打扰」)。
 fn fellback_reopen_allowed(
     enabled: bool,
     overlay_visible: bool,
     active_pid: Option<i32>,
     result_pid: i32,
     has_frame: bool,
+    blocked: bool,
 ) -> bool {
-    enabled && !overlay_visible && active_pid == Some(result_pid) && has_frame
+    enabled && !overlay_visible && active_pid == Some(result_pid) && has_frame && !blocked
+}
+
+/// 一帧浮层处理的唯一顺序真源:用户请求 → 后台结果 → 检测事件。
+///
+/// 生产 `logic` 与单测共用本宏;调换宏内顺序会让「同帧 Closed 不吞请求」
+/// 的测试变红(先 close 会清空请求标志)。
+macro_rules! panel_frame_order {
+    ($request:expr, $navigate:expr, $events:expr) => {{
+        $request;
+        $navigate;
+        $events;
+    }};
 }
 
 /// 浮层请求(绘制层置标志,`logic` 锁内取快照后执行)。
@@ -1056,12 +1070,12 @@ impl App {
                         // 事件自带 pid:宿主切换后单槽归因可能已被其他面板覆盖,
                         // 不能依赖它解除屏蔽。
                         s.dismissals.clear(pid);
-                        // 单槽仅在与被销毁面板一致时清空,避免误清其他归因。
+                        // 单槽与定位 frame 仅在与被销毁面板一致时清空:换绑首扫
+                        // 对无面板 app 发的 Closed 不得误清另一面板的归属。
                         if s.active_panel_pid == Some(pid) {
                             s.active_panel_pid = None;
+                            s.last_panel_frame = None;
                         }
-                        // 面板已不在:定位 frame 失效,防止迟到导航结果重现浮层。
-                        s.last_panel_frame = None;
                     }
                     if let Err(err) = platform::overlay_hide() {
                         log::warn!("浮层隐藏失败(面板关闭 pid={pid}): {err}");
@@ -1081,18 +1095,26 @@ impl App {
                 continue; // Done/Aborted 无事
             }
             // 先取值并释放锁(L8),再做 let-else 判断。
-            let (enabled, visible, active_pid, frame) = {
+            let (enabled, visible, active_pid, frame, blocked) = {
                 let s = self.shared();
                 (
                     s.panel_assist_enabled,
                     s.overlay.visible,
                     s.active_panel_pid,
                     s.last_panel_frame,
+                    s.dismissals.blocked(result.pid),
                 )
             };
-            if !fellback_reopen_allowed(enabled, visible, active_pid, result.pid, frame.is_some()) {
+            if !fellback_reopen_allowed(
+                enabled,
+                visible,
+                active_pid,
+                result.pid,
+                frame.is_some(),
+                blocked,
+            ) {
                 log::debug!(
-                    "丢弃迟到的 FellBack 结果 pid={}: enabled={enabled} visible={visible} active={active_pid:?} frame={}",
+                    "丢弃迟到的 FellBack 结果 pid={}: enabled={enabled} visible={visible} active={active_pid:?} frame={} blocked={blocked}",
                     result.pid,
                     frame.is_some()
                 );
@@ -1629,8 +1651,9 @@ impl eframe::App for App {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
-        // 首次授权检测:用户在系统设置授权后切回 App,设置页/焦点重绘驱动本帧,
-        // 此处发现 false→true 跃迁并自动启用(无需重开开关或重启)。
+        // 首次授权检测:用户在系统设置授权后切回 App,设置 pass 观察到跃迁会
+        // 主动请求 ROOT 重绘;下一次 ROOT logic 帧在这里发现 false→true 并
+        // 自动启用(无需重开开关或重启)。
         self.refresh_panel_assist_trust();
 
         // 保存面板助手:运行期开启时一次性启动 detector(设置切换/授权跃迁只置
@@ -1651,12 +1674,14 @@ impl eframe::App for App {
             }
         }
 
-        // 保存面板助手:先消费用户请求(输入优先),再处理检测事件;顺序不可反——
-        // Closed/HostChanged 的 overlay.close() 会清空同帧的 commit/dismiss 请求。
-        // 后台跳转结果在事件前收口,使同帧 Closed 能关掉刚重现的提示浮层。
-        self.handle_overlay_requests(ctx);
-        self.drain_navigate_results(ctx);
-        self.drain_panel_events(ctx);
+        // 保存面板助手:顺序由 `panel_frame_order!` 单点定义——先消费用户请求
+        // (输入优先),再收后台结果,最后处理检测事件;不可反序(Closed/HostChanged
+        // 的 overlay.close() 会清空同帧 commit/dismiss 请求)。
+        panel_frame_order!(
+            self.handle_overlay_requests(ctx),
+            self.drain_navigate_results(ctx),
+            self.drain_panel_events(ctx)
+        );
 
         // 发现新版本：非阻塞收结果/看门狗；变化时唤醒设置页；托盘条目每帧同步。
         let (phase, changed, settings_open) = {
@@ -2049,28 +2074,62 @@ mod tests {
         )
     }
 
-    /// FellBack 重现四门表:任一不满足都丢弃迟到结果(不覆盖新面板输入)。
-    /// 突变「去掉 active_pid 校验」→ pid 不匹配用例必红。
+    /// FellBack 重现五门表:任一不满足都丢弃迟到结果(不覆盖新面板输入,
+    /// 也不绕过同帧 Esc 的「不打扰」)。
+    /// 突变「去掉 active_pid 校验」→ pid 不匹配用例必红;
+    /// 突变「去掉 blocked 校验」→ blocked 用例必红。
     #[test]
     fn fellback_reopen_requires_all_guards() {
-        assert!(fellback_reopen_allowed(true, false, Some(7), 7, true));
-        assert!(!fellback_reopen_allowed(false, false, Some(7), 7, true));
-        assert!(!fellback_reopen_allowed(true, true, Some(7), 7, true));
+        assert!(fellback_reopen_allowed(
+            true,
+            false,
+            Some(7),
+            7,
+            true,
+            false
+        ));
+        assert!(!fellback_reopen_allowed(
+            false,
+            false,
+            Some(7),
+            7,
+            true,
+            false
+        ));
+        assert!(!fellback_reopen_allowed(
+            true,
+            true,
+            Some(7),
+            7,
+            true,
+            false
+        ));
         assert!(
-            !fellback_reopen_allowed(true, false, Some(7), 8, true),
+            !fellback_reopen_allowed(true, false, Some(7), 8, true, false),
             "结果 pid 已不是当前归因面板"
         );
-        assert!(!fellback_reopen_allowed(true, false, None, 7, true));
-        assert!(!fellback_reopen_allowed(true, false, Some(7), 7, false));
+        assert!(!fellback_reopen_allowed(true, false, None, 7, true, false));
+        assert!(!fellback_reopen_allowed(
+            true,
+            false,
+            Some(7),
+            7,
+            false,
+            false
+        ));
+        assert!(
+            !fellback_reopen_allowed(true, false, Some(7), 7, true, true),
+            "同帧 Esc 屏蔽后不得重现提示"
+        );
     }
 
-    /// 同帧用户请求优先:先 `take_overlay_request` 取快照,随后同帧 `Closed`
-    /// 触发的 `close()` 不会吞掉已取出的请求。
+    /// 同帧用户请求优先(顺序由 `panel_frame_order!` 单点定义):即使同帧
+    /// 检测事件关闭浮层,先取出的请求仍被消费。
     ///
-    /// 突变验证:把生产顺序改回「先 drain_panel_events 后 handle_overlay_requests」
-    /// 时,`close()` 会先清空标记,本测试的取请求步骤得到 None(红)。
+    /// 突变验证:调换宏内 request/events 顺序 → `close()` 先清空标志,
+    /// `request` 为 None,本测试必红。
     #[test]
-    fn user_request_survives_same_frame_closed_event() {
+    fn user_request_consumed_before_same_frame_events() {
         let mut st = test_overlay();
         st.open();
         st.panel_pid = Some(7);
@@ -2084,17 +2143,23 @@ mod tests {
         st.selected = 0;
         st.commit_requested = true;
 
-        // 正确顺序:本帧先消费用户请求。
-        let request = take_overlay_request(&mut st);
-        assert!(
-            matches!(request, Some(OverlayRequest::Commit { pid: 7, .. })),
-            "请求须在事件前取出"
+        let request;
+        panel_frame_order!(
+            {
+                request = take_overlay_request(&mut st);
+            },
+            {},
+            {
+                // 同帧 Closed 事件:关闭浮层并清空请求标志。
+                st.close();
+            }
         );
 
-        // 同帧 Closed 事件随后关闭浮层:标志被清空,但请求快照仍然有效。
-        st.close();
-        assert!(!st.commit_requested, "close 会清请求标志");
-        assert!(request.is_some(), "同帧 Closed 不得吞掉已消费的用户请求");
+        assert!(!st.commit_requested, "事件 close 会清请求标志");
+        assert!(
+            matches!(request, Some(OverlayRequest::Commit { pid: 7, .. })),
+            "同帧事件不得吞掉先消费的请求(顺序调换时此处必红)"
+        );
     }
 
     /// Esc 优先于同帧回车;无 pid/无选中项时关闭但不跳转。

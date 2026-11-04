@@ -260,17 +260,37 @@ extern "C" fn on_signal(_info: *mut std::ffi::c_void) {
     rebind_and_scan(pid);
 }
 
-/// 换绑观察者并首扫;绑定成功但当前 app 没有保存面板时发 `Closed { pid }`。
+/// 焦点窗口扫描结果(三态)。
+///
+/// 只有「成功读到焦点窗口且判定不是保存面板」才是**确认无面板**,允许在换绑
+/// 首扫时发 `Closed`;AX 读取失败/窗口无法定位属于**状态未知**,不得解除屏蔽。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanOutcome {
+    /// 命中保存面板并已发出 `Shown`。
+    Panel,
+    /// 焦点窗口读取成功且 `is_save_panel == false` —— 确认该 app 当前无面板。
+    NoPanel,
+    /// AX 读取失败或面板存在但无法定位 —— 状态未知,不发事件。
+    Unknown,
+}
+
+/// 换绑首扫结果是否应发 `Closed { pid }`(纯逻辑,单测钉住三态收敛)。
+fn should_send_closed_on_rebind(outcome: ScanOutcome) -> bool {
+    outcome == ScanOutcome::NoPanel
+}
+
+/// 换绑观察者并首扫;仅当**确认**当前 app 无保存面板时发 `Closed { pid }`。
 ///
 /// 收敛「面板在别的 app 前台期间关闭」的 Esc 屏蔽泄漏:detector 在非前台 app
 /// 上收不到销毁通知,切回该 app 后这次首扫是唯一确认点——没有面板就按
 /// 「该 app 当前无面板」解除屏蔽(接线层 clear 无屏蔽 pid 为 no-op)。
-/// 命中面板时不发 Closed,保证「切走再切回同一面板仍开着」不会重新弹。
+/// AX 读取失败不确认(否则会误清仍有效面板的屏蔽);命中面板也不发,保证
+/// 「切走再切回同一面板仍开着」不会重新弹。
 fn rebind_and_scan(pid: i32) {
     if !rebind_observer(pid) {
         return;
     }
-    if !scan_focused(pid) {
+    if should_send_closed_on_rebind(scan_focused(pid)) {
         send(PanelEvent::Closed { pid });
     }
 }
@@ -356,42 +376,43 @@ extern "C" fn on_ax_event(
         }
         return;
     }
-    scan_focused(pid);
+    // 同一 app 内的焦点变化:只扫描，不据未命中发 Closed（不做跨 app 收敛）。
+    let _ = scan_focused(pid);
 }
 
-/// 扫描前台 app 的焦点窗口;命中保存面板并发出 `Shown` 时返回 true。
+/// 扫描前台 app 的焦点窗口(三态,见 [`ScanOutcome`])。
 ///
-/// 返回 false 也可能是 AX 读取失败(无法区分「没有面板」与「读不到」),
-/// 故只有换绑首扫路径把 false 当作「该 app 当前无面板」的确认点。
-fn scan_focused(pid: i32) -> bool {
+/// 只有「焦点窗口读取成功且不是保存面板」返回 `NoPanel`;任何 AX 读取失败
+/// 或面板无法定位都返回 `Unknown`,避免把读取故障误判成面板已关闭。
+fn scan_focused(pid: i32) -> ScanOutcome {
     let Some(app) = ax_ffi::app_element(pid) else {
-        return false;
+        return ScanOutcome::Unknown;
     };
     let Some(win) = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW) else {
-        return false;
+        return ScanOutcome::Unknown;
     };
     let snap = snapshot_of_window(&win);
     if !is_save_panel(&snap) {
-        return false;
+        return ScanOutcome::NoPanel;
     }
     let Some((x, y)) = ax_ffi::attr_point(&win, attr::POSITION) else {
-        return false;
+        return ScanOutcome::Unknown;
     };
     let Some((w, h)) = ax_ffi::attr_size(&win, attr::SIZE) else {
-        return false;
+        return ScanOutcome::Unknown;
     };
     // M3:0/负/NaN/∞ 坐标或尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
     // 宁缺毋滥,避免把浮层定位到 (NaN,NaN) 或零尺寸。
     // 注:「尺寸非法时等后续通知重扫」是未验证假设,Task 15 实机确认。
     if !valid_panel_frame(x, y, w, h) {
-        return false;
+        return ScanOutcome::Unknown;
     }
     PANEL_PID.store(pid, Ordering::SeqCst);
     send(PanelEvent::Shown {
         pid,
         frame: [x, y, w, h],
     });
-    true
+    ScanOutcome::Panel
 }
 
 /// 面板 frame 合法性:坐标/宽高必须有限,宽高必须为正(NaN/∞ 与 <=0 均拒绝)。
@@ -483,6 +504,19 @@ mod tests {
     #[test]
     fn floating_window_with_editable_field_currently_matches_pending_m0() {
         assert!(is_save_panel(&snap("AXFloatingWindow", 1, 1)));
+    }
+
+    /// M4 三态收敛:只有「确认无面板」才发 Closed;AX 读取失败(Unknown)
+    /// 不得解除屏蔽,命中面板也不发。
+    /// 突变 `should_send_closed_on_rebind` 改为 `outcome != Panel` → Unknown 用例红。
+    #[test]
+    fn rebind_closed_only_on_confirmed_no_panel() {
+        assert!(!should_send_closed_on_rebind(ScanOutcome::Panel));
+        assert!(should_send_closed_on_rebind(ScanOutcome::NoPanel));
+        assert!(
+            !should_send_closed_on_rebind(ScanOutcome::Unknown),
+            "AX 读取失败不得解除屏蔽"
+        );
     }
 
     /// M2:仅当前台 pid 有效且变化时才换绑;相同 pid 的重复 signal 不得重复换绑/扫描。

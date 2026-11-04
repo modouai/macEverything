@@ -1086,6 +1086,15 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let s = lock_shared(shared);
         SettingsData::from_state(&s.settings, &s.update)
     };
+    // 授权状态跃迁:设置 pass 通常是用户从系统设置授权后返回时最先重绘的入口。
+    // 主动唤醒 ROOT,确保下一次 ROOT logic 帧完成接线重算(根窗可能全隐)。
+    let trust_changed = {
+        let s = lock_shared(shared);
+        s.panel_assist_trusted != data.panel_assist_trusted
+    };
+    if trust_changed {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
     if theme_changed {
         // `set_theme` 只改偏好；显式排一帧让本视口按新主题出图。
         ctx.request_repaint_of(viewport_id());

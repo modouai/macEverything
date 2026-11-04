@@ -2523,30 +2523,6 @@ pub fn probe_start() {
     super::panel_probe::start_probe();
 }
 
-/// 临时实机开关:注册 NSWorkspace 观察者 + 启动 detector,日志打印事件流。
-/// Task 14 正式接线后移除本函数。
-pub fn detector_start_debug() {
-    if !install_app_activate_observer() {
-        log::warn!("detector 未启动:前台应用切换观察者注册失败");
-        return;
-    }
-    let Some(rx) = super::panel_detector::start_detector() else {
-        return;
-    };
-    log::info!("detector 已启动(MCE_PANEL_DETECTOR)");
-    // 临时:事件日志(Task 14 接线后由 UI 消费,此处移除)
-    if let Err(e) = std::thread::Builder::new()
-        .name("panel-detector-log".to_owned())
-        .spawn(move || {
-            for ev in rx {
-                log::info!("[detector] {ev:?}");
-            }
-        })
-    {
-        log::warn!("detector 事件日志线程创建失败:{e}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -88,11 +88,6 @@ fn main() -> anyhow::Result<()> {
         platform::probe_start();
     }
 
-    // 保存面板检测器临时实机开关(Task 14 接线后移除)。
-    if std::env::var("MCE_PANEL_DETECTOR").as_deref() == Ok("1") {
-        platform::detector_start_debug();
-    }
-
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")

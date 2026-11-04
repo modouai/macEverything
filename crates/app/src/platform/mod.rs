@@ -761,15 +761,6 @@ pub fn probe_start() {
     mac::probe_start();
 }
 
-/// 保存面板检测器启动(MCE_PANEL_DETECTOR=1 临时实机开关;Task 14 接线后移除)。
-/// 非 macOS:no-op。
-pub fn detector_start_debug() {
-    #[cfg(target_os = "macos")]
-    {
-        mac::detector_start_debug();
-    }
-}
-
 /// 根窗当前是否为 key window(egui viewport focused 状态补正用;
 /// 非 macOS/未接句柄恒 None)。
 pub fn root_is_key() -> Option<bool> {
