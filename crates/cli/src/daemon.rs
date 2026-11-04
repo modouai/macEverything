@@ -555,7 +555,8 @@ fn desc_echo(key: SortKey, desc: bool) -> Option<bool> {
 /// 排序轮 meta_of 批量并行 stat 在读锁内(耗时随响应如实告知,tech.md 已标注);
 /// 结果行落入缓存 map,组装轮零重查、不触碰锁外 stat 路径。
 /// desc(定案,Task 19b)= 反转自然方向,透传引擎;缺省(旧客户端)等价 false。
-/// dir_only(保存面板助手)= 只返回目录;缺省(旧客户端)等价 false,不过滤。
+/// dir_only(保存面板助手,与 protocol 契约同源)= None/Some(false) 不过滤,
+/// 仅 Some(true) 生效;缺省(旧客户端)为 None,与现状逐位一致。
 fn run_query(
     state: &EngineState,
     q: &str,
@@ -3163,6 +3164,64 @@ mod tests {
                 .find(|e| e.name == "hit_file.txt")
                 .unwrap_or_else(|| panic!("{label} 缺文件命中"));
             assert!(!file_hit.is_dir, "{label}: 文件命中 is_dir 应为 false");
+        }
+    }
+
+    /// dir_only 端到端钉(dispatch → unwrap_or → run_query → plan 置位):
+    /// Some(true) 只回目录且 total 只计目录;None/Some(false) 与现状同义(不过滤)。
+    /// 突变 run_query 的 `plan.dir_only = dir_only` 删除 → Some(true) 分支红;
+    /// 突变 dispatch 的 `unwrap_or(false)` → `unwrap_or(true)` → None/Some(false) 分支红。
+    #[test]
+    fn dispatch_dir_only_returns_directories_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("hit_dir")).unwrap();
+        std::fs::write(dir.path().join("hit_file.txt"), b"x").unwrap();
+        let state = mounted_state(dir.path());
+        {
+            let mut h = state.holder.write_fail_fast("holder");
+            let IndexHolder::Mutable(idx) = &mut *h else {
+                panic!("应为可变索引")
+            };
+            let root = idx
+                .entries
+                .iter()
+                .position(|e| e.parent == NO_PARENT && e.is_dir())
+                .expect("mounted_state 应含根目录条目") as u32;
+            idx.insert("hit_dir", root, true);
+            idx.insert("hit_file.txt", root, false);
+        }
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        for (dir_only, want_total, label) in [
+            (Some(true), 1, "Some(true) 只回目录"),
+            (None, 2, "None 不过滤"),
+            (Some(false), 2, "Some(false) 不过滤"),
+        ] {
+            let resp = dispatch(
+                Request::Query {
+                    v: protocol::PROTOCOL_VERSION,
+                    query: "hit".into(),
+                    limit: 10,
+                    sort: None,
+                    desc: None,
+                    dir_only,
+                },
+                &state,
+                &paths,
+            );
+            let Response::Query { entries, total, .. } = resp else {
+                panic!("{label} 应返回查询响应: {resp:?}")
+            };
+            assert_eq!(total, want_total, "{label}: total 口径");
+            assert_eq!(entries.len(), want_total as usize, "{label}: 条目数");
+            if dir_only == Some(true) {
+                assert!(
+                    entries.iter().all(|e| e.is_dir),
+                    "{label}: 不得回文件: {entries:?}"
+                );
+            }
         }
     }
 

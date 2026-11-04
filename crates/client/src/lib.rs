@@ -256,6 +256,7 @@ pub fn query(
 }
 
 /// 离线查询:直读落盘索引自答(调用方须标注离线并给出索引生成时刻)。
+/// dir_only = 只返回目录;false 不过滤。
 /// 离线路径只做 relevance(无 daemon 侧排序轮 stat 缓存),回显如实为 "relevance":
 /// 调用方请求了列排序时,可比对回显识别「排序未生效」。
 pub fn offline_query(
@@ -648,6 +649,46 @@ mod tests {
         assert!(!ping(&paths));
     }
 
+    /// 桩 daemon 变体:捕获请求体(供线路三态断言)。
+    fn stub_daemon_capturing(
+        body: &[u8],
+    ) -> (
+        DaemonPaths,
+        StubDaemon,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let body = body.to_vec();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).unwrap();
+            let n = u32::from_le_bytes(len) as usize;
+            let mut req = vec![0u8; n];
+            s.read_exact(&mut req).unwrap();
+            *cap.lock().unwrap() = req;
+            let mut out = (body.len() as u32).to_le_bytes().to_vec();
+            out.extend_from_slice(&body);
+            s.write_all(&out).unwrap();
+            s.flush().unwrap();
+        });
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        (
+            paths,
+            StubDaemon {
+                _dir: dir,
+                _handle: handle,
+            },
+            captured,
+        )
+    }
+
     /// 方向回显须原样读响应:真实 daemon 对 mtime + 协议 desc 位 true 回显
     /// 绝对方向 false(mtime 自然降序,desc 位反转后为升序)。桩故意回与请求位
     /// 相反的值——若实现拿请求 desc 冒充回显(而非读响应),此断言必红。
@@ -659,6 +700,32 @@ mod tests {
         let out = query(&paths, "x", 10, Some("mtime"), true, false).unwrap();
         assert_eq!(out.desc_echo, Some(false));
         assert_eq!(out.sort_echo, "mtime");
+    }
+
+    /// dir_only 线路三态钉:true 发送 `"dir_only":true`;false 不发送该键
+    /// (None/Some(false) 引擎同义,省字段让混跑期报文与旧客户端同形)。
+    /// 突变 `then_some(true)` → `then_some(false)` 时 true 分支必红。
+    #[test]
+    fn query_sends_dir_only_only_when_true() {
+        for (dir_only, want_key) in [(true, true), (false, false)] {
+            let (paths, _h, captured) = stub_daemon_capturing(
+                br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"relevance","desc_echo":null}"#,
+            );
+            let out = query(&paths, "x", 10, None, false, dir_only).unwrap();
+            assert!(out.entries.is_empty());
+            let body = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                body.contains(r#""dir_only":true"#),
+                want_key,
+                "dir_only={dir_only} 时请求体: {body}"
+            );
+            if !want_key {
+                assert!(
+                    !body.contains("dir_only"),
+                    "false 不得上线(三态收敛为缺省): {body}"
+                );
+            }
+        }
     }
 
     /// status 失败须保留 daemon 错误码(UI/CLI 按码分流);不得经 expect_ok 丢码。
