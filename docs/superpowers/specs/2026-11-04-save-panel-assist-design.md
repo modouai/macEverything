@@ -73,7 +73,8 @@ NSWorkspace(前台切换) → panel_detector → overlay(浮层窗口) → query
 ⌘⇧G 是唯一不可省的合成键（打开「前往文件夹」无 AX 等价入口）。后续动作双策略：
 
 ```
-策略 A（优先）：⌘⇧G → AX 定位路径输入框 → AXUIElementSetAttributeValue(kAXValue) 直设路径 → AXPress「前往」按钮
+策略 A（优先）：⌘⇧G → AX 定位路径输入框 → AXUIElementSetAttributeValue(kAXValue) 直设路径（读回校验）
+              → 合成 Return 统一提交（与策略 B 同构；「前往」按钮 AXPress 保留为 M0 探针验证点⑥的对照实验）
 策略 B（降级）：⌘⇧G → 剪贴板暂存原内容+写入路径 → 合成 ⌘V → 合成 Return → NSPasteboard API 写回原内容
 ```
 
