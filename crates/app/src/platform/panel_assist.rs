@@ -14,12 +14,15 @@ use std::collections::HashSet;
 /// 关闭/切宿主语义:
 /// - `HostChanged`:前台宿主切换(换绑成功且此前有面板归因)→ 接线层隐藏浮层,
 ///   但**保留 Dismissals**(Esc 屏蔽持续到该面板真正关闭,design §4);
-/// - `Closed { pid }`:面板窗口销毁 → 隐藏浮层并**按 pid 精确解除屏蔽**。
-///   事件携带 pid 而不是让接线层猜:宿主切换后归因可能已被其他面板覆盖,
-///   「A 屏蔽 → 切 B → 切回 A」场景只有 pid 能正确清除 A 的屏蔽。
+/// - `Closed { pid }`:该 app 当前无保存面板 → 隐藏浮层并**按 pid 精确解除屏蔽**。
+///   触发点有两种:① 前台 app 内窗口销毁(AX 销毁通知);② 换绑到该 app 后首扫
+///   未命中——覆盖「面板在别的 app 前台期间关闭,detector 收不到销毁通知」的
+///   屏蔽泄漏路径。事件携带 pid 而不是让接线层猜:宿主切换后归因可能已被其他
+///   面板覆盖,「A 屏蔽 → 切 B → 切回 A」场景只有 pid 能正确清除 A 的屏蔽。
 ///
 /// `Closed` 的宽口径(任意元素销毁即视为关闭)见 [`super::panel_detector`] 的
-/// `on_ax_event` 现场注释。
+/// `on_ax_event` 现场注释;换绑首扫确认见 `rebind_and_scan`。
+/// 两种触发点都幂等:重复 `Closed` 只重复 clear(无屏蔽 pid 为 no-op)。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PanelEvent {
     /// 疑似保存面板出现。frame 为 AX 屏幕坐标 [x, y, w, h]:
@@ -27,7 +30,7 @@ pub enum PanelEvent {
     Shown { pid: i32, frame: [f64; 4] },
     /// 前台宿主切换(换绑成功且此前有面板归因)。接线层应隐藏浮层但保留 Esc 屏蔽。
     HostChanged { previous_pid: i32 },
-    /// 面板窗口销毁(pid = 被销毁面板的宿主)。
+    /// 该 app 当前无保存面板(面板销毁,或绑定后确认不存在;pid = 该 app 宿主)。
     Closed { pid: i32 },
 }
 
@@ -193,6 +196,25 @@ mod tests {
                 "detector_start_needed(enabled={enabled}, running={running})"
             );
         }
+    }
+
+    /// 同一 pid 的 `Closed` 重复到达必须幂等:决策相同,接线层重复 clear 为
+    /// no-op,且不得误清其他 pid 的屏蔽(跨 app 关闭路径会重复确认)。
+    #[test]
+    fn repeated_closed_is_idempotent_and_scoped() {
+        let first = decide(&PanelEvent::Closed { pid: 5 }, true, true, false, true);
+        let second = decide(&PanelEvent::Closed { pid: 5 }, false, false, false, false);
+        assert_eq!(first, Decision::HideAndClear { pid: 5 });
+        assert_eq!(first, second, "重复 Closed 决策不随开关/可见态变化");
+
+        let mut d = Dismissals::default();
+        d.dismiss(5);
+        d.dismiss(6);
+        // 接线层对每个 Closed 各 clear 一次;重复 clear 同一 pid 无害。
+        d.clear(5);
+        d.clear(5);
+        assert!(!d.blocked(5));
+        assert!(d.blocked(6), "不得误清其他 app 的屏蔽");
     }
 
     /// Esc 屏蔽:dismiss 后本面板存续内 blocked,clear(面板关闭)后恢复。

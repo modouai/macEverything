@@ -978,7 +978,6 @@ pub fn ensure_overlay_patched() -> Result<()> {
     Ok(())
 }
 
-/// 浮层视口窗口是否已创建并完成换类(只读;调试首帧重试判定用)。
 /// AX 屏幕坐标(主屏左上原点、y 向下)→ AppKit 屏幕坐标(主屏左下原点、y 向上)。
 /// `primary` = 主屏 frame(菜单栏所在屏;AX 坐标的参照系)。
 fn ax_frame_to_appkit(ax: [f64; 4], primary: NSRect) -> [f64; 4] {

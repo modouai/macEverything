@@ -219,8 +219,7 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>, ready: mpsc::SyncSender<bool>) {
     // 处理启动前已经就位的前台 pid(通知可能早于线程就绪)
     let pid = FRONT_PID.load(Ordering::SeqCst);
     if pid != 0 {
-        let _ = rebind_observer(pid);
-        scan_focused(pid);
+        rebind_and_scan(pid);
     }
     // M1 预检:启动扫描期间接收端已断开时直接走停止路径,不进 runloop。
     if SEND_FAILED.load(Ordering::SeqCst) {
@@ -258,8 +257,22 @@ extern "C" fn on_signal(_info: *mut std::ffi::c_void) {
     if !needs_rebind(bound, pid) {
         return;
     }
-    let _ = rebind_observer(pid);
-    scan_focused(pid);
+    rebind_and_scan(pid);
+}
+
+/// 换绑观察者并首扫;绑定成功但当前 app 没有保存面板时发 `Closed { pid }`。
+///
+/// 收敛「面板在别的 app 前台期间关闭」的 Esc 屏蔽泄漏:detector 在非前台 app
+/// 上收不到销毁通知,切回该 app 后这次首扫是唯一确认点——没有面板就按
+/// 「该 app 当前无面板」解除屏蔽(接线层 clear 无屏蔽 pid 为 no-op)。
+/// 命中面板时不发 Closed,保证「切走再切回同一面板仍开着」不会重新弹。
+fn rebind_and_scan(pid: i32) {
+    if !rebind_observer(pid) {
+        return;
+    }
+    if !scan_focused(pid) {
+        send(PanelEvent::Closed { pid });
+    }
 }
 
 /// 是否需要换绑(bound = 当前 observer 绑定 pid,0 = 未绑定;front = 前台 pid,
@@ -346,34 +359,39 @@ extern "C" fn on_ax_event(
     scan_focused(pid);
 }
 
-fn scan_focused(pid: i32) {
+/// 扫描前台 app 的焦点窗口;命中保存面板并发出 `Shown` 时返回 true。
+///
+/// 返回 false 也可能是 AX 读取失败(无法区分「没有面板」与「读不到」),
+/// 故只有换绑首扫路径把 false 当作「该 app 当前无面板」的确认点。
+fn scan_focused(pid: i32) -> bool {
     let Some(app) = ax_ffi::app_element(pid) else {
-        return;
+        return false;
     };
     let Some(win) = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW) else {
-        return;
+        return false;
     };
     let snap = snapshot_of_window(&win);
     if !is_save_panel(&snap) {
-        return;
+        return false;
     }
     let Some((x, y)) = ax_ffi::attr_point(&win, attr::POSITION) else {
-        return;
+        return false;
     };
     let Some((w, h)) = ax_ffi::attr_size(&win, attr::SIZE) else {
-        return;
+        return false;
     };
     // M3:0/负/NaN/∞ 坐标或尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
     // 宁缺毋滥,避免把浮层定位到 (NaN,NaN) 或零尺寸。
     // 注:「尺寸非法时等后续通知重扫」是未验证假设,Task 15 实机确认。
     if !valid_panel_frame(x, y, w, h) {
-        return;
+        return false;
     }
     PANEL_PID.store(pid, Ordering::SeqCst);
     send(PanelEvent::Shown {
         pid,
         frame: [x, y, w, h],
     });
+    true
 }
 
 /// 面板 frame 合法性:坐标/宽高必须有限,宽高必须为正(NaN/∞ 与 <=0 均拒绝)。

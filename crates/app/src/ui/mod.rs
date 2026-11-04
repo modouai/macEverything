@@ -598,6 +598,20 @@ struct NavigateResult {
     outcome: platform::NavigateOutcome,
 }
 
+/// FellBack 结果是否允许重现「路径已复制」提示(纯逻辑)。
+///
+/// 四个门缺一不可:助手仍启用、浮层未显示(不覆盖用户新面板输入)、结果 pid
+/// 仍是当前归因面板(用户没切到别的保存面板)、面板定位 frame 仍在。
+fn fellback_reopen_allowed(
+    enabled: bool,
+    overlay_visible: bool,
+    active_pid: Option<i32>,
+    result_pid: i32,
+    has_frame: bool,
+) -> bool {
+    enabled && !overlay_visible && active_pid == Some(result_pid) && has_frame
+}
+
 /// 浮层请求(绘制层置标志,`logic` 锁内取快照后执行)。
 #[derive(Debug)]
 enum OverlayRequest {
@@ -722,8 +736,8 @@ pub struct Shared {
     pub dismissals: platform::Dismissals,
     /// 最近一次 Shown 的面板 AX frame(FellBack 重现浮层时重新定位用)。
     pub last_panel_frame: Option<[f64; 4]>,
-    /// 最近一次 Shown 的面板宿主 pid(供重现/诊断归因;屏蔽解除以 `Closed`
-    /// 事件自带的 pid 为准,不依赖本单槽)。
+    /// 最近一次 Shown 的面板宿主 pid(重现归因校验:迟到 FellBack 结果只有与
+    /// 该值一致才允许重开提示;`Closed` 匹配时清空)。
     pub active_panel_pid: Option<i32>,
     /// 运行期开启助手时置位:下一帧尝试启动 detector(一次性,避免每帧调用)。
     pub panel_detector_start_pending: bool,
@@ -1046,6 +1060,8 @@ impl App {
                         if s.active_panel_pid == Some(pid) {
                             s.active_panel_pid = None;
                         }
+                        // 面板已不在:定位 frame 失效,防止迟到导航结果重现浮层。
+                        s.last_panel_frame = None;
                     }
                     if let Err(err) = platform::overlay_hide() {
                         log::warn!("浮层隐藏失败(面板关闭 pid={pid}): {err}");
@@ -1056,15 +1072,34 @@ impl App {
     }
 
     /// 消费后台跳转结果:FellBack 时在面板旁重现浮层并提示路径已复制。
+    ///
+    /// 迟到结果不得污染新状态:仅当助手仍启用、浮层未显示、结果 pid 仍是当前
+    /// 归因面板(用户未切到新面板)且定位 frame 仍在时才重现;否则丢弃。
     fn drain_navigate_results(&mut self, ctx: &egui::Context) {
         while let Ok(result) = self.navigate_rx.try_recv() {
             if result.outcome != platform::NavigateOutcome::FellBackToClipboard {
                 continue; // Done/Aborted 无事
             }
-            // 先校验定位 frame:缺失时不得 open(否则 visible=true 但窗未显示,
-            // 后续 Shown 会被「已显示」门永久吞掉)。
-            let Some(frame) = self.shared().last_panel_frame else {
-                log::warn!("路径已复制,但缺少面板定位 frame,不重现浮层");
+            // 先取值并释放锁(L8),再做 let-else 判断。
+            let (enabled, visible, active_pid, frame) = {
+                let s = self.shared();
+                (
+                    s.panel_assist_enabled,
+                    s.overlay.visible,
+                    s.active_panel_pid,
+                    s.last_panel_frame,
+                )
+            };
+            if !fellback_reopen_allowed(enabled, visible, active_pid, result.pid, frame.is_some()) {
+                log::debug!(
+                    "丢弃迟到的 FellBack 结果 pid={}: enabled={enabled} visible={visible} active={active_pid:?} frame={}",
+                    result.pid,
+                    frame.is_some()
+                );
+                continue;
+            }
+            // 通过校验时 frame 必为 Some(见 `fellback_reopen_allowed`)。
+            let Some(frame) = frame else {
                 continue;
             };
             {
@@ -2012,6 +2047,21 @@ mod tests {
                 data_dir: std::path::PathBuf::new(),
             },
         )
+    }
+
+    /// FellBack 重现四门表:任一不满足都丢弃迟到结果(不覆盖新面板输入)。
+    /// 突变「去掉 active_pid 校验」→ pid 不匹配用例必红。
+    #[test]
+    fn fellback_reopen_requires_all_guards() {
+        assert!(fellback_reopen_allowed(true, false, Some(7), 7, true));
+        assert!(!fellback_reopen_allowed(false, false, Some(7), 7, true));
+        assert!(!fellback_reopen_allowed(true, true, Some(7), 7, true));
+        assert!(
+            !fellback_reopen_allowed(true, false, Some(7), 8, true),
+            "结果 pid 已不是当前归因面板"
+        );
+        assert!(!fellback_reopen_allowed(true, false, None, 7, true));
+        assert!(!fellback_reopen_allowed(true, false, Some(7), 7, false));
     }
 
     /// 同帧用户请求优先:先 `take_overlay_request` 取快照,随后同帧 `Closed`
