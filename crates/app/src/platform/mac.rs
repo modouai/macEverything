@@ -2220,7 +2220,7 @@ unsafe fn handle_fetch_result(
     Ok(data.to_vec())
 }
 
-/// AX 授权查询(ax_ffi 转发;mac.rs 为平台层唯一 unsafe 集中点,故经此转出)。
+/// AX 授权查询(ax_ffi 转发;mac.rs 为平台层 unsafe 集中点,故经此转出)。
 #[allow(dead_code)] // M0 探针/后续任务接线后移除
 pub fn ax_trusted() -> bool {
     super::ax_ffi::is_process_trusted()

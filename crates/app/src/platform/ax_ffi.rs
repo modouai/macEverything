@@ -76,6 +76,7 @@ extern "C" {
     fn AXValueGetValue(value: CFTypeRef, t: i32, out: *mut c_void) -> u8;
     fn CFGetTypeID(cf: CFTypeRef) -> usize;
     fn CFStringGetTypeID() -> usize;
+    fn CFArrayGetTypeID() -> usize;
     fn CFArrayGetCount(arr: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(arr: CFTypeRef, idx: isize) -> *const c_void;
     /// CFBase.h 真实签名返回同一引用;调用点忽略返回值即可。
@@ -101,6 +102,8 @@ pub mod attr {
     pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const POSITION: &str = "AXPosition";
     pub const SIZE: &str = "AXSize";
+    /// 非公开常量(不在公开 HIServices 头),存在性待 M0 实机验证;
+    /// 可编辑性判定以 role + attr_settable(VALUE) 为主路径。
     pub const EDITABLE: &str = "AXEditable";
 }
 
@@ -136,7 +139,9 @@ impl Drop for CFStr {
     }
 }
 
-/// RAII AX 对象(AXUIElement/AXValue/AXObserver 共用形态;Drop → CFRelease)。
+/// RAII AX 对象(AXUIElement/AXValue 等 Copy*/Create* 产出;Drop → CFRelease)。
+/// 不含 AXObserver——见下方 [`AXObserverWrap`](其不 impl Send,类型系统
+/// 阻止跨线程转移误用)。
 pub struct AXRef(*mut c_void);
 
 impl AXRef {
@@ -160,10 +165,29 @@ impl Drop for AXRef {
     }
 }
 
-// SAFETY:CF 对象为堆分配句柄,跨线程转移后调用 AX CF 层 API 合法
-// (AXObserver 除外——它只在 detector 专用线程使用,不做 Send 转移)。
+// SAFETY:CF 对象为堆分配句柄,跨线程转移后调用 AX CF 层 API 合法。
+// AXObserver 不在此列:独立 AXObserverWrap 类型不 impl Send,跨线程转移
+// 由类型系统阻止(observer 的 runloop source 须挂创建线程的 runloop)。
 unsafe impl Send for AXRef {}
 unsafe impl Send for CFStr {}
+
+/// RAII AXObserver(Drop → CFRelease;**不 impl Send**):observer 的
+/// runloop source 必须挂在创建线程的 runloop 上,回调也派发到该线程,
+/// 故禁止 Send 转移——detector 只能在创建 observer 的专用线程上使用。
+pub struct AXObserverWrap(*mut c_void);
+
+impl AXObserverWrap {
+    pub fn raw(&self) -> *mut c_void {
+        self.0
+    }
+}
+
+impl Drop for AXObserverWrap {
+    fn drop(&mut self) {
+        // SAFETY:构造约定 +1 引用归本对象。
+        unsafe { CFRelease(self.0) }
+    }
+}
 
 /// 辅助功能授权状态(首次调用触发 TCC 记录;结果由系统设置控制)。
 pub fn is_process_trusted() -> bool {
@@ -177,25 +201,34 @@ pub fn app_element(pid: i32) -> Option<AXRef> {
     unsafe { AXRef::take(AXUIElementCreateApplication(pid)) }
 }
 
-/// 读属性(返回 RAII CF 对象;失败/不支持 → None)。
+/// 读属性(返回 RAII CF 对象;失败/不支持 → None)。遍历热路径用,错误细节
+/// 不透出;诊断需要区分错误码时用 [`copy_attr_err`]。
 pub fn copy_attr(el: &AXRef, attr: &str) -> Option<AXRef> {
+    copy_attr_err(el, attr).ok()
+}
+
+/// 读属性,错误码透出(probe/detector 诊断用:M0 需区分 CannotComplete
+/// 与 AttributeUnsupported)。
+pub fn copy_attr_err(el: &AXRef, attr: &str) -> Result<AXRef, AXError> {
     let a = CFStr::new(attr);
     let mut out: CFTypeRef = std::ptr::null();
     // SAFETY:out 为本栈帧可写指针;CFStr 生命周期覆盖调用。
     let err = unsafe { AXUIElementCopyAttributeValue(el.raw(), a.raw(), &mut out) };
     if err != AX_ERROR_SUCCESS {
-        return None;
+        return Err(err);
     }
     // SAFETY:成功时 out 为 +1 引用(CFTypeRef 形态 *const,RAII 侧统一
-    // *mut 句柄,仅指针可变性转换,不改变指向)。
-    unsafe { AXRef::take(out as *mut c_void) }
+    // *mut 句柄,仅指针可变性转换,不改变指向)。成功路径 out 非空为 API
+    // 契约,take 不会返回 None。
+    Ok(unsafe { AXRef::take(out as *mut c_void) }.expect("copy_attr_err: 成功路径 out 非空"))
 }
 
-/// 写属性(策略 A 的 AX 直设 value 用)。
-pub fn set_attr(el: &AXRef, attr: &str, value: CFTypeRef) -> Result<(), AXError> {
+/// 写属性(策略 A 的 AX 直设 value 用;模块纪律:对外只暴露安全类型,
+/// 当前仅支持字符串值)。
+pub fn set_attr(el: &AXRef, attr: &str, value: &CFStr) -> Result<(), AXError> {
     let a = CFStr::new(attr);
-    // SAFETY:CFTypeRef 由调用方持有且生命周期覆盖调用;常量属性名合法。
-    let err = unsafe { AXUIElementSetAttributeValue(el.raw(), a.raw(), value) };
+    // SAFETY:value 为调用方借用,生命周期覆盖调用;常量属性名合法。
+    let err = unsafe { AXUIElementSetAttributeValue(el.raw(), a.raw(), value.raw()) };
     if err == AX_ERROR_SUCCESS {
         Ok(())
     } else {
@@ -295,9 +328,12 @@ pub fn children(el: &AXRef) -> Vec<AXRef> {
         return Vec::new();
     };
     let arr = v.raw();
-    // SAFETY:CFArray 与 NSArray toll-free bridged;元素引用归数组所有,
-    // CFRetain 复制后交 AXRef 接管。
+    // SAFETY:先比对 CFTypeID 确认是 CFArray 再遍历(与 value_string 守卫
+    // 模式一致);元素引用归数组所有,CFRetain 复制后交 AXRef 接管。
     unsafe {
+        if CFGetTypeID(arr) != CFArrayGetTypeID() {
+            return Vec::new(); // 非 CFArray(异常形态),按无子处理
+        }
         let n = CFArrayGetCount(arr);
         let mut out = Vec::with_capacity(n as usize);
         for i in 0..n {
@@ -323,20 +359,24 @@ pub fn clone_ref(el: &AXRef) -> AXRef {
 }
 
 /// 创建 AXObserver(回调派发到本调用线程的 runloop;须与 attach 同线程)。
-pub fn observer_create(pid: i32, cb: AXObserverCallback) -> Option<AXRef> {
+/// 返回的 [`AXObserverWrap`] 不 impl Send,只能留在本线程使用。
+pub fn observer_create(pid: i32, cb: AXObserverCallback) -> Option<AXObserverWrap> {
     let mut obs: AXObserverRef = std::ptr::null_mut();
     // SAFETY:obs 出参为本栈帧指针;callback 为无捕获 C 函数指针。
     let err = unsafe { AXObserverCreate(pid, cb, &mut obs) };
     if err != AX_ERROR_SUCCESS {
         return None;
     }
-    // SAFETY:成功时 obs 为 +1 引用。
-    unsafe { AXRef::take(obs) }
+    if obs.is_null() {
+        return None; // 成功路径不应发生(API 契约),防御性兜底
+    }
+    // SAFETY:成功时 obs 为 +1 引用,交 AXObserverWrap 接管。
+    Some(AXObserverWrap(obs))
 }
 
-/// 注册通知(须传与 pid 同源的 element)。
+/// 注册通知(须传与 pid 同源的 element;observer 与 element 同线程使用)。
 pub fn observer_add_notification(
-    obs: &AXRef,
+    obs: &AXObserverWrap,
     el: &AXRef,
     notification: &str,
     refcon: usize,
@@ -353,7 +393,7 @@ pub fn observer_add_notification(
 }
 
 /// observer 的 runloop source 挂到当前线程 runloop(创建线程调用)。
-pub fn attach_observer_to_current_runloop(obs: &AXRef) {
+pub fn attach_observer_to_current_runloop(obs: &AXObserverWrap) {
     // SAFETY:source 归 observer 所有,runloop 只借;mode 常量为全局 CFString。
     unsafe {
         let rl = CFRunLoopGetCurrent();
