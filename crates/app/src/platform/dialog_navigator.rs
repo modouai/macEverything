@@ -296,23 +296,48 @@ fn fill_verdict(readback: Option<&str>, path: &str) -> Obs {
     }
 }
 
+/// 单次读回采样(策略 B):重定位失败与「读到值/读不到值」必须区分——
+/// 前者是输入框消失,后者只是本轮未读到(继续重试)。
+#[derive(Debug)]
+enum ReadbackSample {
+    /// 输入框仍在;内含 AXValue(None = 属性读取失败/非字符串)。
+    Value(Option<String>),
+    /// 重定位失败 = 输入框已消失(用户 Esc / sheet 关闭)。
+    FieldGone,
+}
+
+/// 读回校验结论(策略 B)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readback {
+    /// 读到目标路径。
+    Matched,
+    /// 重试耗尽仍未读到目标路径。
+    Mismatched,
+    /// 输入框消失(重定位失败)。
+    FieldGone,
+}
+
 /// 读回校验(初次 + 最多 `retries` 次重试,每次重试前等 `interval`)。
-/// 抽成闭包驱动便于单测重试次数/时序;实际读取 = AX VALUE。
+/// 每次采样都由闭包**重新定位**输入框:⌘V 可能触发 AX 代理重建,复用首次
+/// 的 AXRef 会让 3 次读回全失败而误判 FellBack。重定位失败立即返回
+/// [`Readback::FieldGone`],由外层映射为 `SheetClosed`。
 fn readback_until_match(
     path: &str,
     retries: u32,
     interval: Duration,
-    mut read: impl FnMut() -> Option<String>,
-) -> bool {
+    mut sample: impl FnMut() -> ReadbackSample,
+) -> Readback {
     for attempt in 0..=retries {
         if attempt > 0 {
             std::thread::sleep(interval);
         }
-        if read().as_deref() == Some(path) {
-            return true;
+        match sample() {
+            ReadbackSample::FieldGone => return Readback::FieldGone,
+            ReadbackSample::Value(v) if v.as_deref() == Some(path) => return Readback::Matched,
+            ReadbackSample::Value(_) => {}
         }
     }
-    false
+    Readback::Mismatched
 }
 
 /// 完整跳转(阻塞;调用方在后台线程执行)。
@@ -336,9 +361,17 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
         let obs = match act {
             Act::SendGoToFolder => {
                 // 先采基线(文件名框等既有输入框),再合成 ⌘⇧G;基线须覆盖整个跳转。
+                // 遗留(Task 15 实机评估):基线谓词的策略细节(采集时机、焦点暂离
+                // 时的判定)以实机取证为准。
                 baseline = baseline_text_fields(pid);
-                // cg_events 的 pid 时效契约:先复核前台,再合成 ⌘⇧G。
-                if !pid_still_front(pid) {
+                if baseline.is_empty() {
+                    // 空基线可能是瞬时 AX 读取失败:此时无法区分 Go-to 框与文件名框,
+                    // 保守中止(宁可不跳转,也不冒误覆盖文件名的风险)。
+                    // 映射为 Timeout → 状态机在 AwaitSheet 上直接 Aborted。
+                    log::warn!("[navigator] 基线为空(可写输入框未采到),保守中止 pid={pid}");
+                    Obs::Timeout
+                } else if !pid_still_front(pid) {
+                    // cg_events 的 pid 时效契约:先复核前台,再合成 ⌘⇧G。
                     Obs::SheetClosed
                 } else {
                     cg_events::post_combo(Some(pid), KEY_G, FLAG_CMD | FLAG_SHIFT);
@@ -364,27 +397,32 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
             Act::PasteViaClipboard => {
                 // M6 契约:无论后续检查如何,先保存原剪贴板(None = 原本无文本)。
                 saved = Some(clipboard_text());
-                match goto_field(pid, &baseline) {
-                    None => Obs::SheetClosed,
-                    Some(field) => {
-                        if !clipboard_set_text(path) {
-                            Obs::StrategyAFailed
-                        } else if !pid_still_front(pid) {
-                            Obs::SheetClosed
-                        } else {
-                            cg_events::post_combo(Some(pid), KEY_V, FLAG_CMD);
-                            let matched = readback_until_match(
-                                path,
-                                PASTE_READBACK_RETRIES,
-                                POLL_STEP,
-                                || ax_ffi::attr_string(&field, attr::VALUE),
-                            );
-                            if matched {
-                                Obs::SheetOpened
-                            } else {
-                                Obs::StrategyAFailed
+                if goto_field(pid, &baseline).is_none() {
+                    Obs::SheetClosed
+                } else if !clipboard_set_text(path) {
+                    // 遗留(Task 15 实机评估):set 失败边角——此时路径并未进剪贴板,
+                    // 但状态机会按策略失败降级/终态处理;实机复核提示文案是否失真。
+                    Obs::StrategyAFailed
+                } else if !pid_still_front(pid) {
+                    Obs::SheetClosed
+                } else {
+                    // 遗留(Task 15 实机评估):策略 A 部分生效后走 B 的 ⌘V 追加风险
+                    // (最坏得到「旧值+路径」文本,不误保存)。
+                    cg_events::post_combo(Some(pid), KEY_V, FLAG_CMD);
+                    // 每次读回重新定位输入框(⌘V 可能触发 AX 代理重建)。
+                    let outcome =
+                        readback_until_match(path, PASTE_READBACK_RETRIES, POLL_STEP, || {
+                            match goto_field(pid, &baseline) {
+                                None => ReadbackSample::FieldGone,
+                                Some(f) => {
+                                    ReadbackSample::Value(ax_ffi::attr_string(&f, attr::VALUE))
+                                }
                             }
-                        }
+                        });
+                    match outcome {
+                        Readback::Matched => Obs::SheetOpened,
+                        Readback::Mismatched => Obs::StrategyAFailed,
+                        Readback::FieldGone => Obs::SheetClosed,
                     }
                 }
             }
@@ -402,11 +440,14 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
                     }
                 }
             }
-            // 防御:状态机契约保证 Restore 只出现在 done=true 的 next 上,
-            // 非 done 路径出现即契约破坏(不可恢复),直接熔断。
-            Act::RestoreClipboard => unreachable!(
-                "RestoreClipboard 只作为 done 收尾动作返回(状态机契约);非 done 路径出现属实现错误"
-            ),
+            // 防御:状态机契约保证 Restore 只出现在 done=true 的 next 上。
+            // 非 done 路径出现即契约破坏——后台线程绝不 panic,记日志后中止。
+            Act::RestoreClipboard => {
+                log::error!(
+                    "[navigator] RestoreClipboard 出现在非 done 动作路径(状态机契约破坏),中止"
+                );
+                return NavigateOutcome::Aborted;
+            }
         };
 
         // 2) 状态机转移。
@@ -414,6 +455,8 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
         if done {
             // M6 契约:先执行收尾动作(Restore),再按终态映射。
             // saved 为 None = 从未保存过 → 不调用恢复,避免误清用户剪贴板。
+            // 遗留(后续单独任务):当前只做纯文本快照;`clipboard_restore(None)`
+            // 走 clearContents 会连带清掉非文本项,需改多类型快照。
             if let Some(Act::RestoreClipboard) = next {
                 if let Some(s) = &saved {
                     let _ = clipboard_restore(s.as_deref());
@@ -702,32 +745,49 @@ mod tests {
     }
 
     /// 读回重试:初次 + 2 次重试内命中即成功(间隔 0 便于单测)。
-    /// 突变「重试次数少 1」→ calls 断言必红。
+    /// 每次采样都重新定位(闭包每次被调用);突变「重试次数少 1」→ calls 必红。
     #[test]
     fn readback_retries_until_match() {
         let mut calls = 0;
-        let ok = readback_until_match("/tmp", 2, Duration::ZERO, || {
+        let r = readback_until_match("/tmp", 2, Duration::ZERO, || {
             calls += 1;
             if calls < 3 {
-                Some("/tmp/old".to_owned())
+                ReadbackSample::Value(Some("/tmp/old".to_owned()))
             } else {
-                Some("/tmp".to_owned())
+                ReadbackSample::Value(Some("/tmp".to_owned()))
             }
         });
-        assert!(ok, "第 3 次读回(初次 + 2 次重试)命中");
+        assert_eq!(r, Readback::Matched, "第 3 次读回(初次 + 2 次重试)命中");
         assert_eq!(calls, 3);
     }
 
-    /// 读回重试耗尽:总共尝试 retries + 1 次后放弃,返回 false。
+    /// 读回重试耗尽:总共尝试 retries + 1 次后放弃,返回 Mismatched。
     #[test]
     fn readback_gives_up_after_retries() {
         let mut calls = 0;
-        let ok = readback_until_match("/tmp", 2, Duration::ZERO, || {
+        let r = readback_until_match("/tmp", 2, Duration::ZERO, || {
             calls += 1;
-            None
+            ReadbackSample::Value(None)
         });
-        assert!(!ok);
+        assert_eq!(r, Readback::Mismatched);
         assert_eq!(calls, 3, "初次 + 2 次重试后放弃");
+    }
+
+    /// 重定位失败(输入框消失)立即返回 FieldGone,不再重试。
+    /// 突变「FieldGone 继续重试」→ calls 断言必红。
+    #[test]
+    fn readback_stops_when_field_gone() {
+        let mut calls = 0;
+        let r = readback_until_match("/tmp", 2, Duration::ZERO, || {
+            calls += 1;
+            if calls == 1 {
+                ReadbackSample::Value(Some("/tmp/old".to_owned()))
+            } else {
+                ReadbackSample::FieldGone
+            }
+        });
+        assert_eq!(r, Readback::FieldGone, "重定位失败即输入框消失");
+        assert_eq!(calls, 2, "发现输入框消失后不再重试");
     }
 
     /// 轮询谓词:成立立即返回 true(不睡);deadline 已过直接 false。
