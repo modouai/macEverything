@@ -27,6 +27,58 @@ pub const OVERLAY_W: f32 = 420.0;
 pub const OVERLAY_H: f32 = 300.0;
 pub const ROW_H: f32 = 26.0;
 
+/// 按键决策涉及的键(纯逻辑用;绘制层从 `egui::Key` 映射)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKey {
+    Enter,
+    Escape,
+    ArrowDown,
+    ArrowUp,
+}
+
+/// 按键决策结果(纯逻辑;IME 组合态下一律 None)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKeyAction {
+    /// 不处理(含 IME 组合/忙、空结果下的回车与方向键)。
+    None,
+    /// 提交当前选中项。
+    Commit,
+    /// 取消/关闭浮层。
+    Dismiss,
+    /// 移动到新选中下标(函数内已 clamp 到 `[0, result_count-1]`)。
+    Select(usize),
+}
+
+/// 浮层按键决策(纯函数;IME 组合态下一律忽略)。
+///
+/// 语义:IME 组合中或本帧有 IME 事件 → None;Enter 且 `result_count > 0` → Commit
+/// (空结果不提交);Escape → Dismiss;↑↓ 在结果非空时移动到 clamp 后的下标。
+pub fn key_action(
+    key: OverlayKey,
+    selected: usize,
+    result_count: usize,
+    ime_composing: bool,
+    ime_busy: bool,
+) -> OverlayKeyAction {
+    // 组合中的预编辑/选字键归输入法;选字回车与 ImeEvent::Commit 同帧到达,
+    // 该帧整帧让位(与悬浮条同款防护)。
+    if ime_composing || ime_busy {
+        return OverlayKeyAction::None;
+    }
+    match key {
+        OverlayKey::Enter if result_count > 0 => OverlayKeyAction::Commit,
+        OverlayKey::Enter => OverlayKeyAction::None,
+        OverlayKey::Escape => OverlayKeyAction::Dismiss,
+        OverlayKey::ArrowDown if result_count > 0 => {
+            OverlayKeyAction::Select(selected.saturating_add(1).min(result_count - 1))
+        }
+        OverlayKey::ArrowUp if result_count > 0 => {
+            OverlayKeyAction::Select(selected.saturating_sub(1))
+        }
+        OverlayKey::ArrowDown | OverlayKey::ArrowUp => OverlayKeyAction::None,
+    }
+}
+
 /// 浮层状态(Shared 持有)。
 pub struct OverlayState {
     pub ctx: egui::Context,
@@ -45,6 +97,10 @@ pub struct OverlayState {
     pub commit_requested: bool,
     #[allow(dead_code)] // Task 14 接线层消费。
     pub dismiss_requested: bool,
+    /// 输入法组合中(候选窗开着):不变更查询,Enter/Esc 归输入法。
+    ime_composing: bool,
+    /// 本帧有 IME 事件(预编辑/提交):选字回车与提交同帧到达,该帧键位归输入法。
+    ime_busy: bool,
     session: Session,
     query_tx: Sender<(u64, Vec<HitEntry>)>,
     query_rx: Receiver<(u64, Vec<HitEntry>)>,
@@ -68,6 +124,8 @@ impl OverlayState {
             clipboard_hint: false,
             commit_requested: false,
             dismiss_requested: false,
+            ime_composing: false,
+            ime_busy: false,
             session: Session::new(DEBOUNCE),
             query_tx,
             query_rx,
@@ -86,6 +144,8 @@ impl OverlayState {
         self.clipboard_hint = false;
         self.commit_requested = false;
         self.dismiss_requested = false;
+        self.ime_composing = false;
+        self.ime_busy = false;
         // 首帧内容:平台层 orderFront 后须有一次本视口的 pass,否则窗内是旧帧/空白。
         self.ctx.request_repaint_of(overlay_viewport_id());
     }
@@ -99,6 +159,8 @@ impl OverlayState {
         self.results.clear();
         self.selected = 0;
         self.clipboard_hint = false;
+        self.ime_composing = false;
+        self.ime_busy = false;
     }
 
     /// 输入变更 → 防抖会话;清空输入立即清结果并作废在途响应。
@@ -160,6 +222,31 @@ impl OverlayState {
     pub fn selected_path(&self) -> Option<String> {
         self.results.get(self.selected).map(|e| e.path.clone())
     }
+
+    /// 输入法组合态跟踪(与悬浮条同款):IME 组合中(候选窗开着)Enter/Esc 属输入法。
+    /// 依据 `Event::Ime`:Preedit 非空 = 组合中;Preedit 空 / Commit = 组合结束。
+    fn track_ime(&mut self, ui: &egui::Ui) {
+        let (composing, busy) = ui.input(|i| {
+            let mut composing = self.ime_composing;
+            let mut busy = false; // 本帧有 IME 事件(预编辑或提交)
+            for ev in &i.events {
+                match ev {
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                        composing = !text.is_empty();
+                        busy = true;
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                        composing = false;
+                        busy = true;
+                    }
+                    _ => {}
+                }
+            }
+            (composing, busy)
+        });
+        self.ime_composing = composing;
+        self.ime_busy = busy;
+    }
 }
 
 /// 绘制(ui/mod.rs 的 show_viewport_deferred 回调调用;短锁取 state 后绘制)。
@@ -169,17 +256,21 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let strings = i18n::s();
     ui.add_space(8.0);
 
+    // IME 组合态须在读取本帧事件前跟踪(选字回车与 Commit 同帧到达,见 track_ime)。
+    st.track_ime(ui);
+
     let input = ui.add(
         egui::TextEdit::singleline(&mut st.input)
             .hint_text(strings.overlay_hint)
             .desired_width(f32::INFINITY),
     );
-    if input.changed() {
+    // 组合中的预编辑文本不触发查询(IME 未上屏;提交帧 composing 已复位,照常查询)。
+    if input.changed() && !st.ime_composing {
         st.on_input(Instant::now());
     }
     input.request_focus();
 
-    // 键盘动作:↑↓ 选中、Enter 提交、Esc 取消(原始按键读取,不受输入框消费影响)。
+    // 键盘动作:IME 组合/忙时整帧让位输入法;其余交给纯函数决策。
     let (up, down, enter, escape) = ui.input(|i| {
         (
             i.key_pressed(egui::Key::ArrowUp),
@@ -188,19 +279,28 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             i.key_pressed(egui::Key::Escape),
         )
     });
-    if !st.results.is_empty() {
-        if down {
-            st.selected = (st.selected + 1).min(st.results.len() - 1);
+    let result_count = st.results.len();
+    for (pressed, key) in [
+        (up, OverlayKey::ArrowUp),
+        (down, OverlayKey::ArrowDown),
+        (enter, OverlayKey::Enter),
+        (escape, OverlayKey::Escape),
+    ] {
+        if !pressed {
+            continue;
         }
-        if up {
-            st.selected = st.selected.saturating_sub(1);
+        match key_action(
+            key,
+            st.selected,
+            result_count,
+            st.ime_composing,
+            st.ime_busy,
+        ) {
+            OverlayKeyAction::None => {}
+            OverlayKeyAction::Commit => st.commit_requested = true,
+            OverlayKeyAction::Dismiss => st.dismiss_requested = true,
+            OverlayKeyAction::Select(index) => st.selected = index,
         }
-        if enter {
-            st.commit_requested = true;
-        }
-    }
-    if escape {
-        st.dismiss_requested = true;
     }
 
     if st.clipboard_hint {
@@ -282,6 +382,75 @@ mod tests {
         )
     }
 
+    fn entry(name: &str, path: &str, is_dir: bool) -> HitEntry {
+        HitEntry {
+            name: name.into(),
+            path: path.into(),
+            size: None,
+            mtime: None,
+            is_dir,
+        }
+    }
+
+    /// 按键决策表:IME 组合/忙整帧让位;空结果不提交/不选中;方向键在函数内 clamp。
+    #[test]
+    fn key_action_table() {
+        const KEYS: [OverlayKey; 4] = [
+            OverlayKey::Enter,
+            OverlayKey::Escape,
+            OverlayKey::ArrowDown,
+            OverlayKey::ArrowUp,
+        ];
+        for key in KEYS {
+            assert_eq!(
+                key_action(key, 0, 3, true, false),
+                OverlayKeyAction::None,
+                "{key:?} 组合中一律忽略"
+            );
+            assert_eq!(
+                key_action(key, 0, 3, false, true),
+                OverlayKeyAction::None,
+                "{key:?} IME 事件帧一律忽略"
+            );
+        }
+        assert_eq!(
+            key_action(OverlayKey::Enter, 0, 0, false, false),
+            OverlayKeyAction::None,
+            "空结果不提交"
+        );
+        assert_eq!(
+            key_action(OverlayKey::Enter, 0, 1, false, false),
+            OverlayKeyAction::Commit
+        );
+        assert_eq!(
+            key_action(OverlayKey::Escape, 0, 0, false, false),
+            OverlayKeyAction::Dismiss
+        );
+        assert_eq!(
+            key_action(OverlayKey::ArrowDown, 0, 3, false, false),
+            OverlayKeyAction::Select(1)
+        );
+        assert_eq!(
+            key_action(OverlayKey::ArrowDown, 2, 3, false, false),
+            OverlayKeyAction::Select(2),
+            "↓到底 clamp 到 count-1"
+        );
+        assert_eq!(
+            key_action(OverlayKey::ArrowUp, 2, 3, false, false),
+            OverlayKeyAction::Select(1)
+        );
+        assert_eq!(
+            key_action(OverlayKey::ArrowUp, 0, 3, false, false),
+            OverlayKeyAction::Select(0),
+            "↑到顶 clamp 0"
+        );
+        assert_eq!(
+            key_action(OverlayKey::ArrowDown, 0, 0, false, false),
+            OverlayKeyAction::None,
+            "空结果不选中"
+        );
+    }
+
     /// 关闭/重新打开必须作废在途响应,并清空输入、结果与提示。
     #[test]
     fn reopen_resets_and_invalidates_inflight() {
@@ -316,10 +485,38 @@ mod tests {
         let before = st.gen;
         st.on_input(Instant::now());
         assert_eq!(st.gen, before, "非空输入不推进代际号");
+        // 先预置非空结果/选中:否则「清空」断言在恒空状态下恒真(假钉)。
+        st.results = vec![entry("a", "/a", true), entry("b", "/b", true)];
+        st.selected = 1;
         st.input.clear();
         st.on_input(Instant::now());
         assert!(st.results.is_empty());
+        assert_eq!(st.selected, 0);
         assert_ne!(st.gen, before, "清空输入须作废在途响应");
+    }
+
+    /// poll 只回填当前代际的响应:过期代际即使后到也不得覆盖当前结果。
+    #[test]
+    fn poll_discards_stale_generation() {
+        let mut st = state();
+        st.open();
+        let current = st.gen;
+        let stale = current.wrapping_sub(1);
+        // 过期代先到:不得回填。
+        st.query_tx
+            .send((stale, vec![entry("old", "/old", false)]))
+            .unwrap();
+        st.poll(Instant::now());
+        assert!(st.results.is_empty(), "过期代结果不得回填");
+        // 当前代随后到:回填并复位选中。
+        st.selected = 2;
+        st.query_tx
+            .send((current, vec![entry("dir", "/dir", true)]))
+            .unwrap();
+        st.poll(Instant::now());
+        assert_eq!(st.results.len(), 1);
+        assert_eq!(st.results[0].path, "/dir");
+        assert_eq!(st.selected, 0, "新结果到达复位选中");
     }
 
     /// 选中路径取当前行;越界/空结果返回 None。
