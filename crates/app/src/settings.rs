@@ -1,8 +1,9 @@
 //! v2.1 设置持久化：数据目录 `settings.toml`。
 //!
-//! 界面偏好（字号、语言、启动时自动检查更新）与两个全局快捷键入此文件；
-//! `check_updates` 默认开启，缺字段按 true 读取（前向兼容）。开机自启的真源是
-//! SMAppService，排除目录的真源是引擎配置，均不写入本文件（design §三）。
+//! 界面偏好（字号、语言、启动时自动检查更新、保存面板目录助手）与两个全局
+//! 快捷键入此文件；`check_updates` 与 `save_panel_assist` 默认开启，缺字段按
+//! true 读取（前向兼容）。开机自启的真源是 SMAppService，排除目录的真源是
+//! 引擎配置，均不写入本文件（design §三）。
 //!
 //! 读取：文件缺失 → 默认值；损坏/读取失败 → 默认值 + `log::warn`，且**不改写**
 //! 原文件（坏文件留待人工或后续版本修复）。写入：同目录 tmp + rename 原子替换，
@@ -310,7 +311,7 @@ mod tests {
         assert_eq!(loaded, f, "显式 false 完整往返");
     }
 
-    /// 保存面板助手默认开启;缺字段读为 true(前向兼容),显式 false 往返保持。
+    /// 保存面板助手默认开启；缺字段读为 true（前向兼容），显式 false 往返保持。
     #[test]
     fn save_panel_assist_defaults_true_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();

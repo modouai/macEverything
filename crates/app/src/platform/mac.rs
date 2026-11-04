@@ -2225,16 +2225,22 @@ pub fn ax_trusted() -> bool {
     super::ax_ffi::is_process_trusted()
 }
 
-/// 打开系统设置的辅助功能授权面板(深链;失败静默——面板未装/链接失效时无害)。
+/// 打开系统设置的辅助功能授权面板(深链;非关键路径——面板未装/链接失效时无害)。
 pub fn open_accessibility_settings() {
     let url = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
     // spawn 即返回;wait 放后台线程收尾(不 join 会留僵尸进程,update.rs open_url 同款)。
-    if let Ok(mut child) = std::process::Command::new("open").arg(url).spawn() {
-        std::thread::spawn(move || {
-            if let Err(err) = child.wait() {
-                log::warn!("等待 open 退出失败: {err}");
-            }
-        });
+    match std::process::Command::new("open").arg(url).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                // 深链失效恰好表现为 open 非零退出(面板未装/链接名变更),须留痕。
+                Ok(st) if !st.success() => {
+                    log::warn!("打开辅助功能设置:open 退出异常({st}):{url}")
+                }
+                Ok(_) => {}
+                Err(err) => log::warn!("等待 open 退出失败: {err}"),
+            });
+        }
+        Err(err) => log::warn!("打开辅助功能设置失败({url}): {err}"),
     }
 }
 

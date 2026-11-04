@@ -335,7 +335,7 @@ impl CliRow {
     }
 }
 
-/// 通用组：六行卡片（字号 / 自启 / 语言 / 两个快捷键 / 命令行工具）。
+/// 通用组：七行卡片（字号 / 自启 / 语言 / 保存面板助手 / 两个快捷键 / 命令行工具）。
 fn draw_general_group(
     ui: &mut egui::Ui,
     full_w: f32,
@@ -516,8 +516,7 @@ fn draw_panel_assist_row(
             egui::vec2(button_w, ADD_BUTTON_H),
         )
     });
-    if let Some(label) = badge {
-        let rect = badge_rect.expect("badge 存在时矩形必已计算");
+    if let (Some(label), Some(rect)) = (badge, badge_rect) {
         draw_text(
             ui,
             rect,

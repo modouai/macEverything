@@ -1204,10 +1204,10 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
         SettingsAction::SetAutoCheck(enabled) => apply_auto_check(shared, ctx, enabled),
         SettingsAction::SetPanelAssist(enabled) => apply_panel_assist(shared, ctx, enabled),
         SettingsAction::OpenPanelAssistAuth => {
-            // 授权面板深链属非关键路径:失败静默(spawn 失败只留痕)。
+            // 授权面板深链属非关键路径:spawn 失败与非零退出由平台层 log 留痕。
+            // 纯外部动作无状态变化,不重绘(OpenWebsite 同例)。
             log::info!("设置页:保存面板助手去授权,打开系统设置");
             platform::open_accessibility_settings();
-            ctx.request_repaint_of(viewport_id());
         }
         SettingsAction::SetVolumesAuto(auto) => {
             let excluded = {
@@ -1657,7 +1657,7 @@ fn apply_panel_assist(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled:
     };
     file.save_panel_assist = enabled;
     let error = store::save(&data_dir, &file).err().map(|err| {
-        log::warn!("保存面板助手 {enabled} 已应用,但设置保存失败: {err:#}");
+        log::warn!("保存面板目录助手 {enabled} 已应用,但设置保存失败: {err:#}");
         SettingsError::SaveFailed
     });
     {
