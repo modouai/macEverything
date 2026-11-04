@@ -293,8 +293,16 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             st.ime_busy,
         ) {
             OverlayKeyAction::None => {}
-            OverlayKeyAction::Commit => st.commit_requested = true,
-            OverlayKeyAction::Dismiss => st.dismiss_requested = true,
+            OverlayKeyAction::Commit => {
+                st.commit_requested = true;
+                // 请求由 ROOT 视口的 App::logic 消费;ROOT 全隐时没有帧,必须主动
+                // 请求一次(可能被节流 ≥100ms,但会执行),否则请求永久挂起。
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            }
+            OverlayKeyAction::Dismiss => {
+                st.dismiss_requested = true;
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            }
             OverlayKeyAction::Select(index) => {
                 if index != st.selected {
                     st.selected = index;
@@ -346,6 +354,8 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     }
     if commit {
         st.commit_requested = true;
+        // 双击提交与键盘提交同因:唤醒 ROOT 的 logic 消费请求(见上)。
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 

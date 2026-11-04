@@ -606,6 +606,38 @@ enum OverlayRequest {
     Commit { pid: i32, path: String },
 }
 
+/// detector 事件桥接:转发到 `App::logic` 并唤醒 ROOT 视口。
+///
+/// 全隐期不排帧(隐藏零帧纪律),detector 的 mpsc 又不持有 egui ctx;若只靠
+/// 帧循环 poll,事件会一直滞留。桥接线程每收到一个事件就请求一次 ROOT 重绘
+/// (隐藏窗可能被节流,但最终会执行),`logic` 随即消费。
+fn bridge_panel_events(
+    rx: Receiver<platform::PanelEvent>,
+    ctx: egui::Context,
+) -> Option<Receiver<platform::PanelEvent>> {
+    let (tx, fwd_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("panel-events".to_owned())
+        .spawn(move || {
+            for ev in rx {
+                if tx.send(ev).is_err() {
+                    break; // 接收端已随 App 退出
+                }
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+        });
+    match spawned {
+        Ok(handle) => {
+            drop(handle); // 分离线程:detector 常驻到进程退出
+            Some(fwd_rx)
+        }
+        Err(err) => {
+            log::error!("保存面板事件桥接线程创建失败:{err}");
+            None
+        }
+    }
+}
+
 pub struct App {
     /// 二次启动唤起通道(app.sock 监听线程 → 主线程;main 接线)。
     incoming: Receiver<Incoming>,
@@ -657,13 +689,15 @@ pub struct Shared {
     pub overlay: overlay::OverlayState,
     /// 助手开关的有效状态(设置开启 **且** 辅助功能已授权;设置切换时更新)。
     pub panel_assist_enabled: bool,
-    /// Esc 屏蔽(本面板存续内不再自动弹;`Closed` 解除)。
+    /// Esc 屏蔽(本面板存续内不再自动弹;`Closed { pid }` 按 pid 精确解除)。
     pub dismissals: platform::Dismissals,
     /// 最近一次 Shown 的面板 AX frame(FellBack 重现浮层时重新定位用)。
     pub last_panel_frame: Option<[f64; 4]>,
-    /// 当前归因面板的 pid(独立于 `overlay.panel_pid`:Esc 关闭浮层后仍需记住
-    /// 该面板,等 `Closed` 解除屏蔽;`overlay.close()` 会清自己的 pid)。
+    /// 最近一次 Shown 的面板宿主 pid(供重现/诊断归因;屏蔽解除以 `Closed`
+    /// 事件自带的 pid 为准,不依赖本单槽)。
     pub active_panel_pid: Option<i32>,
+    /// 运行期开启助手时置位:下一帧尝试启动 detector(一次性,避免每帧调用)。
+    pub panel_detector_start_pending: bool,
 }
 
 impl App {
@@ -731,6 +765,7 @@ impl App {
             dismissals: platform::Dismissals::default(),
             last_panel_frame: None,
             active_panel_pid: None,
+            panel_detector_start_pending: false,
         }));
         if auto_update {
             spawn_update_check(&shared, &cc.egui_ctx);
@@ -803,29 +838,11 @@ impl App {
         // 全隐期没有排帧,收到事件必须主动 request_repaint 唤醒 `logic` 消费。
         let detector_rx = if panel_assist_enabled {
             platform::panel_detector_start().and_then(|rx| {
-                let (tx, fwd_rx) = std::sync::mpsc::channel();
-                let ctx = cc.egui_ctx.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("panel-events".to_owned())
-                    .spawn(move || {
-                        for ev in rx {
-                            if tx.send(ev).is_err() {
-                                break; // 接收端已随 App 退出
-                            }
-                            ctx.request_repaint_of(egui::ViewportId::ROOT);
-                        }
-                    });
-                match spawned {
-                    Ok(handle) => {
-                        drop(handle); // 分离线程:detector 常驻到进程退出
-                        log::info!("保存面板检测器已启动");
-                        Some(fwd_rx)
-                    }
-                    Err(err) => {
-                        log::error!("保存面板事件桥接线程创建失败:{err}");
-                        None
-                    }
+                let bridged = bridge_panel_events(rx, cc.egui_ctx.clone());
+                if bridged.is_some() {
+                    log::info!("保存面板检测器已启动");
                 }
+                bridged
             })
         } else {
             None
@@ -958,20 +975,20 @@ impl App {
                         log::warn!("浮层隐藏失败(宿主切换): {err}");
                     }
                 }
-                platform::Decision::HideAndClear => {
-                    let pid = {
+                platform::Decision::HideAndClear { pid } => {
+                    {
                         let mut s = self.shared();
-                        // Esc 关闭浮层时 `overlay.panel_pid` 已被 close() 清掉,
-                        // 故用独立归因字段取回该面板 pid 再解除屏蔽。
-                        let pid = s.active_panel_pid.take();
                         s.overlay.close();
-                        if let Some(pid) = pid {
-                            s.dismissals.clear(pid); // 面板销毁 → 解除 Esc 屏蔽
+                        // 事件自带 pid:宿主切换后单槽归因可能已被其他面板覆盖,
+                        // 不能依赖它解除屏蔽。
+                        s.dismissals.clear(pid);
+                        // 单槽仅在与被销毁面板一致时清空,避免误清其他归因。
+                        if s.active_panel_pid == Some(pid) {
+                            s.active_panel_pid = None;
                         }
-                        pid
-                    };
+                    }
                     if let Err(err) = platform::overlay_hide() {
-                        log::warn!("浮层隐藏失败(面板关闭 pid={pid:?}): {err}");
+                        log::warn!("浮层隐藏失败(面板关闭 pid={pid}): {err}");
                     }
                 }
             }
@@ -984,25 +1001,25 @@ impl App {
             if result.outcome != platform::NavigateOutcome::FellBackToClipboard {
                 continue; // Done/Aborted 无事
             }
-            let frame = {
+            // 先校验定位 frame:缺失时不得 open(否则 visible=true 但窗未显示,
+            // 后续 Shown 会被「已显示」门永久吞掉)。
+            let Some(frame) = self.shared().last_panel_frame else {
+                log::warn!("路径已复制,但缺少面板定位 frame,不重现浮层");
+                continue;
+            };
+            {
                 let mut s = self.shared();
                 // open() 会复位 pid/提示标志,故先 open 再写入。
                 s.overlay.open();
                 s.overlay.panel_pid = Some(result.pid);
                 s.overlay.clipboard_hint = true;
-                s.last_panel_frame
-            };
-            match frame {
-                Some(frame) => {
-                    if let Err(err) = platform::overlay_show(frame) {
-                        log::warn!("路径已复制,但浮层重现失败 pid={}: {err}", result.pid);
-                        self.shared().overlay.close();
-                        continue;
-                    }
-                    ctx.request_repaint_of(overlay::overlay_viewport_id());
-                }
-                None => log::warn!("路径已复制,但缺少面板定位 frame,无法重现浮层"),
             }
+            if let Err(err) = platform::overlay_show(frame) {
+                log::warn!("路径已复制,但浮层重现失败 pid={}: {err}", result.pid);
+                self.shared().overlay.close();
+                continue;
+            }
+            ctx.request_repaint_of(overlay::overlay_viewport_id());
         }
     }
 
@@ -1534,6 +1551,24 @@ impl eframe::App for App {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
+        // 保存面板助手:运行期开启时一次性启动 detector(设置切换只置 pending,
+        // 不在每帧调用;start_detector 幂等,授权失败会回滚 STARTED 允许重试)。
+        let detector_start_pending = {
+            let mut s = self.shared();
+            std::mem::take(&mut s.panel_detector_start_pending)
+        };
+        if detector_start_pending && self.detector_rx.is_none() {
+            match platform::panel_detector_start() {
+                Some(rx) => {
+                    self.detector_rx = bridge_panel_events(rx, ctx.clone());
+                    if self.detector_rx.is_some() {
+                        log::info!("保存面板检测器已在运行期启动");
+                    }
+                }
+                None => log::info!("保存面板检测器运行期启动失败(未授权或已有实例)"),
+            }
+        }
+
         // 保存面板助手:检测事件 → 浮层显隐;浮层请求 → 关闭/后台跳转;
         // 跳转结果 → FellBack 时重现提示。锁纪律:状态锁内、原生调用锁外。
         self.drain_panel_events(ctx);
@@ -1883,6 +1918,8 @@ fn draw_overlay(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 接线层隐藏(与 palette/settings 的隐藏惯例一致),请求不悬空。
     if ctx.input(|i| i.viewport().close_requested()) {
         s.overlay.dismiss_requested = true;
+        // 请求由 ROOT 的 logic 消费;ROOT 全隐时无帧,须主动唤醒(节流可接受)。
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
     // 查询会话驱动:根视口被完全遮挡、`logic` 不跑时仍由此推进(与悬浮条同因)。
     s.overlay.poll(Instant::now());

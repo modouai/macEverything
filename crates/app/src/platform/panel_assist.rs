@@ -14,7 +14,9 @@ use std::collections::HashSet;
 /// 关闭/切宿主语义:
 /// - `HostChanged`:前台宿主切换(换绑成功且此前有面板归因)→ 接线层隐藏浮层,
 ///   但**保留 Dismissals**(Esc 屏蔽持续到该面板真正关闭,design §4);
-/// - `Closed`:面板窗口销毁 → 隐藏浮层并**解除屏蔽**。
+/// - `Closed { pid }`:面板窗口销毁 → 隐藏浮层并**按 pid 精确解除屏蔽**。
+///   事件携带 pid 而不是让接线层猜:宿主切换后归因可能已被其他面板覆盖,
+///   「A 屏蔽 → 切 B → 切回 A」场景只有 pid 能正确清除 A 的屏蔽。
 ///
 /// `Closed` 的宽口径(任意元素销毁即视为关闭)见 [`super::panel_detector`] 的
 /// `on_ax_event` 现场注释。
@@ -25,8 +27,8 @@ pub enum PanelEvent {
     Shown { pid: i32, frame: [f64; 4] },
     /// 前台宿主切换(换绑成功且此前有面板归因)。接线层应隐藏浮层但保留 Esc 屏蔽。
     HostChanged { previous_pid: i32 },
-    /// 面板窗口销毁。
-    Closed,
+    /// 面板窗口销毁(pid = 被销毁面板的宿主)。
+    Closed { pid: i32 },
 }
 
 /// 接线层对单个事件的决策(纯函数 [`decide`] 的输出)。
@@ -38,8 +40,8 @@ pub enum Decision {
     Show,
     /// 隐藏浮层,但保留 Esc 屏蔽(宿主切换)。
     HideKeepBlock,
-    /// 隐藏浮层并解除对该面板的屏蔽(面板销毁)。
-    HideAndClear,
+    /// 隐藏浮层并解除 `pid` 的 Esc 屏蔽(面板销毁)。
+    HideAndClear { pid: i32 },
 }
 
 /// 事件 → 动作(纯函数;表驱动单测钉住全部分支)。
@@ -63,7 +65,7 @@ pub fn decide(
             }
         }
         PanelEvent::HostChanged { .. } => Decision::HideKeepBlock,
-        PanelEvent::Closed => Decision::HideAndClear,
+        PanelEvent::Closed { pid } => Decision::HideAndClear { pid: *pid },
     }
 }
 
@@ -134,13 +136,14 @@ mod tests {
         );
 
         assert_eq!(
-            decide(&PanelEvent::Closed, true, true, false, true),
-            Decision::HideAndClear,
-            "面板销毁须隐藏并解除屏蔽"
+            decide(&PanelEvent::Closed { pid: 42 }, true, true, false, true),
+            Decision::HideAndClear { pid: 42 },
+            "面板销毁须隐藏并按事件 pid 精确解除屏蔽"
         );
         assert_eq!(
-            decide(&PanelEvent::Closed, false, false, false, false),
-            Decision::HideAndClear
+            decide(&PanelEvent::Closed { pid: 7 }, false, false, false, false),
+            Decision::HideAndClear { pid: 7 },
+            "pid 必须原样透传(宿主切换后归因可能已被其他面板覆盖)"
         );
     }
 

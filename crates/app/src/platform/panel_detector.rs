@@ -336,9 +336,10 @@ extern "C" fn on_ax_event(
     if n == note::UI_ELEMENT_DESTROYED {
         // 宽口径(同探针):app 内任何元素销毁都按面板关闭处理——
         // 产品侧后果仅为 Closed 事件偏早(接线层隐藏浮层),可接受。
+        // 旧归因值随事件交给接线层,用于按 pid 精确解除 Esc 屏蔽。
         let panel = PANEL_PID.swap(0, Ordering::SeqCst);
         if panel != 0 {
-            send(PanelEvent::Closed);
+            send(PanelEvent::Closed { pid: panel });
         }
         return;
     }
