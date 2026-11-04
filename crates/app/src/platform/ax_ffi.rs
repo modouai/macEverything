@@ -80,6 +80,7 @@ extern "C" {
     fn CFArrayGetTypeID() -> usize;
     fn CFArrayGetCount(arr: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(arr: CFTypeRef, idx: isize) -> *const c_void;
+    fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
     /// CFBase.h 真实签名返回同一引用;调用点忽略返回值即可。
     fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
 }
@@ -366,6 +367,12 @@ pub fn clone_ref(el: &AXRef) -> AXRef {
         CFRetain(el.raw());
         AXRef::take(el.raw()).expect("clone_ref: 非空元素")
     }
+}
+
+/// CF 身份判定(AXUIElementRef 代理可能被重建,裸指针比较不可靠;CF 规范做法)。
+pub fn cf_equal(a: &AXRef, b: &AXRef) -> bool {
+    // SAFETY:两参数均为存活 +1 引用,只读比较。
+    unsafe { CFEqual(a.raw(), b.raw()) != 0 }
 }
 
 /// 创建 AXObserver(回调派发到本调用线程的 runloop;须与 attach 同线程)。

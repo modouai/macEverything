@@ -61,7 +61,10 @@ fn runloop_thread() {
     };
     ax_ffi::attach_observer_to_current_runloop(&obs);
     OBSERVER.with(|c| *c.borrow_mut() = Some(obs));
-    install_poll_timer();
+    if !install_poll_timer() {
+        log::error!("[probe] 轮询 timer 安装失败,探针线程退出(无轮询即失效)");
+        return;
+    }
     log::info!("[probe] 运行:前台切换/面板窗口/跳转实验将写日志");
     ax_ffi::run_current_runloop();
 }
@@ -102,7 +105,9 @@ extern "C" fn poll_callout(_ctx: *mut std::ffi::c_void) {
 }
 
 /// 安装 500ms 轮询 timer(常驻,随进程存活;context 零值 = 无 info)。
-fn install_poll_timer() {
+/// 返回 false = 创建失败(调用方结束探针线程——无轮询即失效,继续跑 runloop
+/// 只剩无事件源的 observer,无意义)。
+fn install_poll_timer() -> bool {
     // SAFETY:context 为本函数栈上零值结构,timer 创建后归 runloop 所有;
     // CFRunLoopAddTimer 后 runloop 另持自身引用,本调用方持有的 +1 不再释放
     // 属有意常驻(timer 随进程存活,探针无拆卸路径)。
@@ -124,12 +129,13 @@ fn install_poll_timer() {
             &mut ctx,
         );
         if t.is_null() {
-            log::error!("[probe] CFRunLoopTimerCreate 失败,探针线程退出(无轮询即失效)");
-            return;
+            log::error!("[probe] CFRunLoopTimerCreate 失败");
+            return false;
         }
         CFRunLoopAddTimer(ax_ffi::current_runloop_raw(), t, ax_ffi::default_mode_raw());
         let _ = t;
     }
+    true
 }
 
 /// 轮询:前台 pid 变化 → 重建 observer 换绑 + 立即扫一遍现有窗口。
@@ -294,10 +300,10 @@ fn writable_text_field(el: &AXRef) -> bool {
         && ax_ffi::attr_settable(el, attr::VALUE)
 }
 
-/// ⌘⇧G 前已存在的可写文本框指针集(新元素判定基线;AXRef::raw 即 CF 引用身份,
-/// 同一存活元素的代理引用按 HIServices 惯例稳定;不等不必然异元素——代理可能
-/// 重建——但相等是强肯定,探针取证以不假报为先)。
-fn writable_field_ptrs(pid: i32) -> Vec<*mut std::ffi::c_void> {
+/// ⌘⇧G 前已存在的可写文本框(clone_ref 保活,作 CFEqual 身份判定基线)。
+/// AXUIElementCopyAttributeValue 每次可返回同一底层元素的新代理实例,裸 CF
+/// 指针不等 ≠ 异元素——基线成员比对必须走 CFEqual(见 [`locate_goto_field`])。
+fn baseline_text_fields(pid: i32) -> Vec<AXRef> {
     let Some(app) = ax_ffi::app_element(pid) else {
         return Vec::new();
     };
@@ -305,16 +311,14 @@ fn writable_field_ptrs(pid: i32) -> Vec<*mut std::ffi::c_void> {
         return Vec::new();
     };
     collect(&win, 0, &writable_text_field)
-        .iter()
-        .map(|e| e.raw())
-        .collect()
 }
 
 /// Go-to 输入框定位(验证点⑤)带证据复核:
 /// 首选 = app 当前焦点元素(`AXFocusedElement`)本身满足谓词且为 ⌘⇧G 后新增
 /// (sheet 打开时焦点即其输入框);回退 = 全树谓词搜索,但命中还须与焦点元素
 /// 同一且新增——防 ⌘⇧G 未生效时误中文件名框(覆盖用户文件名 + 假报⑤)。
-fn locate_goto_field(pid: i32, pre_fields: &[*mut std::ffi::c_void]) -> Locate {
+/// 身份判定一律 CFEqual:代理重建下裸指针比较会漏判,CF 规范比较仍正确。
+fn locate_goto_field(pid: i32, pre_fields: &[AXRef]) -> Locate {
     let Some(app) = ax_ffi::app_element(pid) else {
         return Locate::None;
     };
@@ -324,7 +328,7 @@ fn locate_goto_field(pid: i32, pre_fields: &[*mut std::ffi::c_void]) -> Locate {
         .and_then(|fe| ax_ffi::attr_string(fe, attr::ROLE));
     // 首选:焦点元素即 Go-to 框。
     if let Some(fe) = focused.as_ref() {
-        if writable_text_field(fe) && !pre_fields.contains(&fe.raw()) {
+        if writable_text_field(fe) && !pre_fields.iter().any(|p| ax_ffi::cf_equal(p, fe)) {
             return Locate::Found(ax_ffi::clone_ref(fe));
         }
     }
@@ -339,8 +343,9 @@ fn locate_goto_field(pid: i32, pre_fields: &[*mut std::ffi::c_void]) -> Locate {
             _ => Locate::None,
         };
     };
-    let same_as_focus = focused.is_some_and(|fe| fe.raw() == cand.raw());
-    if same_as_focus && !pre_fields.contains(&cand.raw()) {
+    let same_as_focus = focused.is_some_and(|fe| ax_ffi::cf_equal(&fe, &cand));
+    let is_new = !pre_fields.iter().any(|p| ax_ffi::cf_equal(p, &cand));
+    if same_as_focus && is_new {
         Locate::Found(cand)
     } else {
         Locate::FocusedStale(focused_role.unwrap_or_else(|| "<未知焦点>".to_owned()))
@@ -353,8 +358,8 @@ fn run_jump_experiment(pid: i32) {
         log::warn!("[probe] 前台已切换,中止实验 pid={pid}");
         return;
     }
-    // ⌘⇧G 前基线(见 writable_field_ptrs):防误中文件名框的旧元素集合。
-    let pre_fields = writable_field_ptrs(pid);
+    // ⌘⇧G 前基线(见 baseline_text_fields):防误中文件名框的旧元素集合。
+    let pre_fields = baseline_text_fields(pid);
     log::info!("[probe] === 策略 A:⌘⇧G → AX 直设 value → AXPress 前往 ===");
     cg_events::post_combo(Some(pid), KEY_G, FLAG_CMD | FLAG_SHIFT);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
