@@ -13,13 +13,21 @@ use super::ax_ffi::{self, attr, note, AXObserverWrap, AXRef};
 ///
 /// 重复语义:`Shown` 可能因多个通知(AXWindowCreated + AXFocusedWindowChanged +
 /// on_signal 预扫)对同一面板重复发出;去重责任在接线层(浮层已显示则忽略),
-/// detector 不做状态去重。`Closed` 的宽口径(任意元素销毁即视为关闭)见
-/// [`on_ax_event`] 现场注释。
+/// detector 不做状态去重。
+///
+/// 关闭/切宿主语义:
+/// - `HostChanged`:前台宿主切换(换绑成功且此前有面板归因)→ 接线层隐藏浮层,
+///   但**保留 Dismissals**(Esc 屏蔽持续到该面板真正关闭,design §4);
+/// - `Closed`:面板窗口销毁 → 隐藏浮层并**解除屏蔽**。
+///
+/// `Closed` 的宽口径(任意元素销毁即视为关闭)见 [`on_ax_event`] 现场注释。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PanelEvent {
     /// 疑似保存面板出现。frame 为 AX 屏幕坐标 [x, y, w, h]:
     /// 原点在主屏左上角、y 向下(与 AppKit 左下原点相反——浮层定位换算在平台层做)。
     Shown { pid: i32, frame: [f64; 4] },
+    /// 前台宿主切换(换绑成功且此前有面板归因)。接线层应隐藏浮层但保留 Esc 屏蔽。
+    HostChanged { previous_pid: i32 },
     /// 面板窗口销毁。
     Closed,
 }
@@ -157,7 +165,7 @@ thread_local! {
 /// 启动 detector(幂等;第二次调用返回 None)。返回事件接收端。
 ///
 /// 启动握手:spawn 后在 `sync_channel(1)` 上等待 detector 线程完成全部初始化
-/// (最长 5s);线程失败/超时 → None,不交出半死 receiver。
+/// (最长 1s);线程失败/超时 → None,不交出半死 receiver。
 ///
 /// 停止契约:detector 常驻,不支持真正停止——设置关闭由接线层忽略事件即可
 /// (detector 仅通知驱动、无轮询,空转成本可忽略)。若将来需要 stop,必须先
@@ -186,14 +194,20 @@ pub fn start_detector() -> Option<mpsc::Receiver<PanelEvent>> {
             return None;
         }
     }
-    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+    match ready_rx.recv_timeout(Duration::from_secs(1)) {
         Ok(true) => Some(rx),
         // 线程已 fail_init(复位 STARTED + 清原子),此处不再重复复位。
         Ok(false) => None,
-        Err(_) => {
-            // 超时:线程可能仍在初始化,STARTED 保持 true 防重复实例;rx 丢弃后
-            // 线程首次投递事件会触发 send 自停(M1)。
-            log::error!("detector 初始化超时(5s)");
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // 线程在握手前意外退出(未走 fail_init):复位闸门允许重试。
+            log::error!("detector 初始化线程提前退出");
+            STARTED.store(false, Ordering::SeqCst);
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // 仅超时保留 STARTED 闸门(防双实例);rx 丢弃后线程首次投递事件
+            // 会触发 send 自停(M1)。
+            log::error!("detector 初始化超时(1s)");
             None
         }
     }
@@ -242,19 +256,28 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>, ready: mpsc::SyncSender<bool>) {
     // SOURCE 保活到 detector 线程结束。
     SIGNAL_SRC.store(signal_raw, Ordering::SeqCst);
     DETECTOR_RL.store(runloop_raw, Ordering::SeqCst);
+    // 握手先于前台 app 的 AX 扫描:不绑定目标 app 的 AX 响应性;启动扫描产生的
+    // 事件照常进入 channel。
+    let _ = ready.send(true);
     // 处理启动前已经就位的前台 pid(通知可能早于线程就绪)
     let pid = FRONT_PID.load(Ordering::SeqCst);
     if pid != 0 {
         let _ = rebind_observer(pid);
         scan_focused(pid);
     }
-    // 全部初始化完成、即将进 runloop:通知 start_detector 握手成功。
-    let _ = ready.send(true);
+    // M1 预检:启动扫描期间接收端已断开时直接走停止路径,不进 runloop。
+    if SEND_FAILED.load(Ordering::SeqCst) {
+        shutdown_forever();
+    }
     log::info!("detector: 运行");
     ax_ffi::run_current_runloop();
-    // 唯一正常退出路径:事件接收端断开 → send 主动 stop。已发布 raw 可能已被
-    // 主线程加载,故不回收对象、也不结束线程(thread_local 与 runloop 保活到
-    // 进程退出);只清空指针阻止后续 signal。detector 常驻,不支持真正停止。
+    shutdown_forever();
+}
+
+/// 停止路径(不返回):先清空跨线程指针,再进入无 panic 的 park 循环——线程与
+/// 已发布 CF 对象保活到进程退出。已发布 raw 可能已被主线程加载,故不回收对象、
+/// 也不结束线程;清指针之后的日志即使 panic,也不会留下对外可见的悬垂指针。
+fn shutdown_forever() -> ! {
     SIGNAL_SRC.store(std::ptr::null_mut(), Ordering::SeqCst);
     DETECTOR_RL.store(std::ptr::null_mut(), Ordering::SeqCst);
     log::info!("detector: runloop 已停止(接收端断开),对象保活至进程退出");
@@ -299,14 +322,22 @@ fn rebind_observer(pid: i32) -> bool {
         log::warn!("detector: observer 创建失败 pid={pid}");
         return false;
     };
+    let mut registered = 0usize;
     for n in [
         note::WINDOW_CREATED,
         note::FOCUSED_WINDOW_CHANGED,
         note::UI_ELEMENT_DESTROYED,
     ] {
-        if let Err(e) = ax_ffi::observer_add_notification(&obs, &el, n, pid as usize) {
-            log::debug!("detector: 通知注册失败 pid={pid} {n} err={e}");
+        match ax_ffi::observer_add_notification(&obs, &el, n, pid as usize) {
+            Ok(()) => registered += 1,
+            Err(e) => log::debug!("detector: 通知注册失败 pid={pid} {n} err={e}"),
         }
+    }
+    // 三类通知全部被拒(隐藏 AX 树)时新 observer 无意义:不换绑、保留旧绑定,
+    // 允许下次前台切换重试(至少一条成功才置 BOUND_PID)。
+    if registered == 0 {
+        log::warn!("detector: 三类通知全部注册失败 pid={pid},保留旧绑定等待重试");
+        return false;
     }
     ax_ffi::attach_observer_to_current_runloop(&obs);
     OBSERVER.with(|c| {
@@ -319,9 +350,15 @@ fn rebind_observer(pid: i32) -> bool {
         *c.borrow_mut() = Some(obs);
     });
     BOUND_PID.with(|c| c.set(pid));
-    // M4:换绑即前台 app 变化,清空面板归因(不发 Closed——接线层靠新事件
-    // 自然收敛;旧 app 的 Closed 已无意义)。
-    PANEL_PID.store(0, Ordering::SeqCst);
+    // M4 契约:换绑即前台宿主变化。此前若有面板归因,先发 HostChanged 让接线层
+    // 隐藏浮层但保留 Dismissals(Esc 屏蔽持续到该面板真正关闭,design §4);
+    // 不发 Closed,随后清空归因。
+    let previous = PANEL_PID.swap(0, Ordering::SeqCst);
+    if previous != 0 {
+        send(PanelEvent::HostChanged {
+            previous_pid: previous,
+        });
+    }
     true
 }
 
@@ -368,9 +405,10 @@ fn scan_focused(pid: i32) {
     let Some((w, h)) = ax_ffi::attr_size(&win, attr::SIZE) else {
         return;
     };
-    // M3:0/负/NaN/∞ 尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
-    // 宁缺毋滥——等后续通知重扫,避免把浮层定位到 (0,0) 或零尺寸。
-    if !valid_panel_size(w, h) {
+    // M3:0/负/NaN/∞ 坐标或尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
+    // 宁缺毋滥,避免把浮层定位到 (NaN,NaN) 或零尺寸。
+    // 注:「尺寸非法时等后续通知重扫」是未验证假设,Task 15 实机确认。
+    if !valid_panel_frame(x, y, w, h) {
         return;
     }
     PANEL_PID.store(pid, Ordering::SeqCst);
@@ -380,9 +418,9 @@ fn scan_focused(pid: i32) {
     });
 }
 
-/// 面板尺寸合法性:宽高必须为正有限值(NaN/∞ 与 <=0 均拒绝)。
-fn valid_panel_size(w: f64, h: f64) -> bool {
-    w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
+/// 面板 frame 合法性:坐标/宽高必须有限,宽高必须为正(NaN/∞ 与 <=0 均拒绝)。
+fn valid_panel_frame(x: f64, y: f64, w: f64, h: f64) -> bool {
+    x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
 }
 
 fn send(ev: PanelEvent) {
@@ -502,14 +540,19 @@ mod tests {
         assert!(needs_rebind(42, 7), "前台变化换绑");
     }
 
-    /// M3:0/负/NaN/∞ 尺寸不可作为合法 frame(宁缺毋滥,等后续通知重扫)。
+    /// M3:坐标/尺寸为 NaN/∞,或宽高 <=0 时不可作为合法 frame
+    /// (宁缺毋滥;「等后续通知重扫」待 Task 15 实机确认)。
     #[test]
-    fn invalid_panel_size_rejected() {
-        assert!(valid_panel_size(640.0, 480.0));
-        assert!(!valid_panel_size(0.0, 480.0));
-        assert!(!valid_panel_size(640.0, 0.0));
-        assert!(!valid_panel_size(-1.0, 480.0));
-        assert!(!valid_panel_size(f64::NAN, 480.0));
-        assert!(!valid_panel_size(f64::INFINITY, 480.0));
+    fn invalid_panel_frame_rejected() {
+        assert!(valid_panel_frame(100.0, 80.0, 640.0, 480.0));
+        // x/y 非法
+        assert!(!valid_panel_frame(f64::NAN, 80.0, 640.0, 480.0));
+        assert!(!valid_panel_frame(100.0, f64::INFINITY, 640.0, 480.0));
+        // 宽高非正/非有限
+        assert!(!valid_panel_frame(100.0, 80.0, 0.0, 480.0));
+        assert!(!valid_panel_frame(100.0, 80.0, 640.0, 0.0));
+        assert!(!valid_panel_frame(100.0, 80.0, -1.0, 480.0));
+        assert!(!valid_panel_frame(100.0, 80.0, f64::NAN, 480.0));
+        assert!(!valid_panel_frame(100.0, 80.0, f64::INFINITY, 480.0));
     }
 }
