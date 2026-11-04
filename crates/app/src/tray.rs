@@ -2,7 +2,8 @@
 //!
 //! 形态:菜单栏常驻图标(代码生成 RGBA,免 asset 文件);**左键** = 唤起/隐藏悬浮条
 //! (切换语义);**右键** = 菜单[引擎状态(§7 表六态)/⚠ N 个目录未收录(有缺口才挂)/
-//! ── / 打开搜索 / 打开完整窗口 / ── / 开机自启(勾选)/ 设置… / 检查更新… / ── / 退出]。
+//! ── / 打开搜索 / 打开完整窗口 / ── / 开机自启(勾选)/ 保存面板助手待授权…(开关开
+//! 且未授权才挂,点击跳系统设置)/ 设置… / 检查更新… / ── / 退出]。
 //! 结构与 `settings-visual.md` §4.2 一致;「设置…」打开 v2.1 设置窗口(与齿轮同路径)。
 //! 状态项在「未运行」时可点击拉起引擎;状态项与缺口项随引擎快照动态刷新。
 //!
@@ -59,6 +60,8 @@ mod ids {
     pub const OPEN_SEARCH: &str = "open-search";
     pub const OPEN_WINDOW: &str = "open-window";
     pub const AUTOSTART: &str = "autostart";
+    /// 保存面板助手待授权项(开关开且未授权才挂;点击 → 系统设置辅助功能面板)。
+    pub const PANEL_ASSIST: &str = "panel-assist-auth";
     pub const SETTINGS: &str = "settings";
     pub const CHECK_UPDATE: &str = "check-update";
     pub const QUIT: &str = "quit";
@@ -89,6 +92,9 @@ pub enum TrayMsg {
     /// 菜单「开机自启」(Task 20:真实注册态;muda 已按点击翻转勾选,成败由
     /// `ui::drain_tray` 经 `autostart::apply_user_choice` 校准)。
     ToggleAutostart,
+    /// 菜单「保存面板助手待授权…」:打开系统设置辅助功能面板(design §3.2;
+    /// 仅 log,不弹窗)。
+    PanelAssistAuth,
     /// 菜单「设置…」:打开设置窗口(v2.1;与完整窗口齿轮同一开窗路径)。
     OpenSettings,
     /// 「检查更新…」/「有新版本…」:由 UI 按当前阶段决定检查或打开下载页。
@@ -142,6 +148,7 @@ fn dispatch(menu_id: &MenuId) -> Option<TrayMsg> {
         ids::OPEN_SEARCH => TrayMsg::TogglePalette,
         ids::OPEN_WINDOW => TrayMsg::OpenResults,
         ids::AUTOSTART => TrayMsg::ToggleAutostart,
+        ids::PANEL_ASSIST => TrayMsg::PanelAssistAuth,
         ids::SETTINGS => TrayMsg::OpenSettings,
         ids::CHECK_UPDATE => TrayMsg::UpdateAction,
         ids::QUIT => TrayMsg::Quit,
@@ -166,6 +173,9 @@ pub struct TrayRuntime {
     /// 「开机自启」勾选项(勾选态 = 真实注册态;Task 20 起,操作成败在
     /// `ui::drain_tray` 里校准——muda 只按点击翻转,不反映注册结果)。
     autostart: CheckMenuItem,
+    /// 「保存面板助手待授权…」条件项(启动时按「开关开且未授权」定案;
+    /// None = 已授权或功能关闭,不挂)。
+    panel_assist: Option<MenuItem>,
     /// 「设置…」静态项(语言切换后 `relabel` 原地改写文案)。
     settings: MenuItem,
     /// 「检查更新…」动态项。
@@ -213,6 +223,9 @@ impl TrayRuntime {
         self.open_search.set_text(s.tray_open_search);
         self.open_window.set_text(s.tray_open_window);
         self.autostart.set_text(s.tray_autostart);
+        if let Some(item) = &self.panel_assist {
+            item.set_text(s.tray_panel_assist_auth);
+        }
         self.settings.set_text(s.tray_settings);
         self.quit.set_text(s.tray_quit);
         self.state_item.set_text(state_label(&self.applied.state));
@@ -313,6 +326,10 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         None,
     );
     let settings = MenuItem::with_id(ids::SETTINGS, s.tray_settings, true, None);
+    // 保存面板助手待授权项(启动时定案,条件 = 开关开且未授权;design §3.2 只给
+    // 菜单入口,不弹窗)。插入在「设置…」之前(缺口项同款 index 插入法)。
+    let panel_assist_pending = crate::settings::load(&paths.data_dir).save_panel_assist
+        && !crate::platform::panel_assist_trusted();
     let update_item = MenuItem::with_id(ids::CHECK_UPDATE, s.tray_check_update, true, None);
     let quit = MenuItem::with_id(ids::QUIT, s.tray_quit, true, None);
     let sep1 = PredefinedMenuItem::separator();
@@ -333,6 +350,19 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         &quit,
     ])
     .map_err(|e| anyhow::anyhow!("托盘菜单构建失败: {e}"))?;
+    let panel_assist = if panel_assist_pending {
+        let item = MenuItem::with_id(ids::PANEL_ASSIST, s.tray_panel_assist_auth, true, None);
+        // index 6 = 「设置…」当前位置:插到它前面,仍在「自启+设置+更新」组内。
+        if let Err(err) = menu.insert(&item, 6) {
+            log::warn!("托盘保存面板助手待授权项挂载失败: {err}");
+            None
+        } else {
+            log::info!("托盘保存面板助手待授权项挂载(设置页/托盘均可跳系统设置)");
+            Some(item)
+        }
+    } else {
+        None
+    };
 
     let tray = TrayIconBuilder::new()
         .with_icon(icon(ICON_SIZE)?)
@@ -369,6 +399,7 @@ pub fn install(ctx: &egui::Context, paths: DaemonPaths) -> anyhow::Result<TrayRu
         open_window,
         gaps_item: None,
         autostart,
+        panel_assist,
         settings,
         update_item,
         applied_update: UpdatePhase::Idle,
@@ -672,6 +703,7 @@ mod tests {
             (ids::OPEN_SEARCH, TrayMsg::TogglePalette),
             (ids::OPEN_WINDOW, TrayMsg::OpenResults),
             (ids::AUTOSTART, TrayMsg::ToggleAutostart),
+            (ids::PANEL_ASSIST, TrayMsg::PanelAssistAuth),
             (ids::SETTINGS, TrayMsg::OpenSettings),
             (ids::CHECK_UPDATE, TrayMsg::UpdateAction),
             (ids::QUIT, TrayMsg::Quit),

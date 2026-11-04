@@ -595,7 +595,6 @@ pub fn attached() -> bool {
 }
 
 /// 辅助功能授权状态(保存面板助手;macOS)。
-#[allow(dead_code)] // M0 探针/后续任务接线后移除
 pub fn panel_assist_trusted() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -605,6 +604,16 @@ pub fn panel_assist_trusted() -> bool {
     {
         false
     }
+}
+
+/// 打开系统设置 → 隐私与安全性 → 辅助功能(保存面板助手授权入口)。
+pub fn open_accessibility_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        mac::open_accessibility_settings()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {}
 }
 
 /// 读剪贴板纯文本(None = 无文本/非文本)。navigator 策略 B 的 save。

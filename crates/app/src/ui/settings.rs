@@ -382,6 +382,8 @@ pub struct SettingsState {
     pub(crate) language_error: Option<LanguageError>,
     /// 关于分组内联错误（自动检查开关保存失败 / 打开下载页失败）。
     pub(crate) update_error: Option<UpdateError>,
+    /// 保存面板助手开关保存失败的内联错误（已应用的开关不因保存失败回退）。
+    pub(crate) panel_assist_error: Option<SettingsError>,
     /// 语言切换后待 App 刷新的托盘文案标记。
     pub(crate) tray_relabel_pending: bool,
     /// 排除目录（daemon 响应为唯一真源；首次成功 list 响应前为引擎默认种子，
@@ -451,6 +453,7 @@ impl SettingsState {
             font_error: None,
             language_error: None,
             update_error: None,
+            panel_assist_error: None,
             tray_relabel_pending: false,
             excluded: engine::config::default_config().excluded,
             exclude_busy: false,
@@ -889,6 +892,12 @@ impl SettingsState {
         }
     }
 
+    /// 保存面板助手开关落地（纯状态）：保存失败也保留用户选择，仅显示内联错误。
+    pub(crate) fn set_panel_assist_result(&mut self, enabled: bool, error: Option<SettingsError>) {
+        self.file.save_panel_assist = enabled;
+        self.panel_assist_error = error;
+    }
+
     /// 关于分组一次性错误（打开下载页失败）。
     pub(crate) fn set_update_error(&mut self, error: Option<UpdateError>) {
         self.update_error = error;
@@ -902,11 +911,12 @@ impl SettingsState {
         }
     }
 
-    /// 任一设置保存成功：清掉两类保存失败内联错误，避免旧错误跨设置常驻。
+    /// 任一设置保存成功：清掉各类保存失败内联错误，避免旧错误跨设置常驻。
     /// 关于组的保存失败也属于设置保存错误；打开下载页失败保留。
     pub(crate) fn clear_save_errors(&mut self) {
         self.font_error = None;
         self.language_error = None;
+        self.panel_assist_error = None;
         self.clear_update_error(UpdateError::SaveFailed);
     }
 
@@ -967,6 +977,9 @@ impl SettingsData {
             exclude_busy_list: state.exclude_busy_list,
             exclude_error: state.exclude_error.clone(),
             check_updates: state.file.check_updates,
+            panel_assist: state.file.save_panel_assist,
+            panel_assist_trusted: crate::platform::panel_assist_trusted(),
+            panel_assist_error: state.panel_assist_error.clone(),
             update: update.phase().clone(),
             update_error: state.update_error,
             volumes: state.volumes.clone(),
@@ -1189,6 +1202,13 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             ctx.request_repaint_of(viewport_id());
         }
         SettingsAction::SetAutoCheck(enabled) => apply_auto_check(shared, ctx, enabled),
+        SettingsAction::SetPanelAssist(enabled) => apply_panel_assist(shared, ctx, enabled),
+        SettingsAction::OpenPanelAssistAuth => {
+            // 授权面板深链属非关键路径:失败静默(spawn 失败只留痕)。
+            log::info!("设置页:保存面板助手去授权,打开系统设置");
+            platform::open_accessibility_settings();
+            ctx.request_repaint_of(viewport_id());
+        }
         SettingsAction::SetVolumesAuto(auto) => {
             let excluded = {
                 let s = lock_shared(shared);
@@ -1625,6 +1645,33 @@ fn apply_auto_check(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: b
     ctx.request_repaint_of(viewport_id());
 }
 
+/// 保存面板助手开关：立即落共享态并写盘；失败仅内联留痕，不回退开关。
+///
+/// 仿 `apply_auto_check`：共享锁只取快照/落地，`store::save` 在锁外；
+/// 授权状态（徽标/按钮）每帧经 [`SettingsData::from_state`] 实时读取，
+/// 授权完成后回到设置页即自动消失。
+fn apply_panel_assist(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bool) {
+    let (mut file, data_dir) = {
+        let s = lock_shared(shared);
+        (s.settings.file.clone(), s.settings.data_dir.clone())
+    };
+    file.save_panel_assist = enabled;
+    let error = store::save(&data_dir, &file).err().map(|err| {
+        log::warn!("保存面板助手 {enabled} 已应用,但设置保存失败: {err:#}");
+        SettingsError::SaveFailed
+    });
+    {
+        let mut s = lock_shared(shared);
+        let saved = error.is_none();
+        s.settings.set_panel_assist_result(enabled, error);
+        if saved {
+            s.settings.clear_save_errors();
+        }
+    }
+    log::info!("保存面板目录助手 → {enabled}");
+    ctx.request_repaint_of(viewport_id());
+}
+
 /// 打开官网下载页：失败在关于分组内联显示，并写日志。
 fn apply_update_page(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
     let error = match crate::update::open_download_page() {
@@ -1831,6 +1878,7 @@ mod tests {
         assert!(state.autostart_error.is_none());
         assert!(state.font_error.is_none());
         assert!(state.language_error.is_none());
+        assert!(state.panel_assist_error.is_none());
         assert!(!state.tray_relabel_pending);
         assert_eq!(state.excluded, engine::config::default_config().excluded);
         assert!(!state.exclude_busy);
@@ -3182,6 +3230,7 @@ mod tests {
         state.exclude_busy = true;
         state.exclude_busy_list = true;
         state.exclude_error = Some(ExcludeError::Daemon("daemon 未在运行".into()));
+        state.panel_assist_error = Some(SettingsError::SaveFailed);
 
         let update = crate::update::UpdateState::new();
         let data = SettingsData::from_state(&state, &update);
@@ -3210,6 +3259,7 @@ mod tests {
             data.exclude_error,
             Some(ExcludeError::Daemon("daemon 未在运行".into()))
         );
+        assert_eq!(data.panel_assist_error, Some(SettingsError::SaveFailed));
     }
 
     /// 语言落地：更新设置快照 + 错误；切换清一次性快捷键错误并挂起托盘刷新。
@@ -3248,18 +3298,21 @@ mod tests {
         assert!(state.language_error.is_none(), "保存成功须清错误");
     }
 
-    /// 成功保存清两类旧错误；失败只落各自类型（不误清另一项）。
+    /// 成功保存清各类旧错误；失败只落各自类型（不误清另一项）。
     #[test]
-    fn save_success_clears_both_errors_and_failure_sets_only_its_own() {
+    fn save_success_clears_save_errors_and_failure_sets_only_its_own() {
         let mut state = test_state();
         state.set_font_size_result(FontSize::Large, Some(SettingsError::SaveFailed));
         state.set_language_result(LanguageSetting::En, Some(LanguageError::SaveFailed));
+        state.set_panel_assist_result(false, Some(SettingsError::SaveFailed));
         assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
         assert_eq!(state.language_error, Some(LanguageError::SaveFailed));
+        assert_eq!(state.panel_assist_error, Some(SettingsError::SaveFailed));
 
         state.clear_save_errors();
         assert!(state.font_error.is_none());
         assert!(state.language_error.is_none());
+        assert!(state.panel_assist_error.is_none());
 
         state.set_font_size_result(FontSize::Small, Some(SettingsError::SaveFailed));
         assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
@@ -3267,10 +3320,27 @@ mod tests {
             state.language_error.is_none(),
             "字号保存失败不得影响语言错误"
         );
+        assert!(
+            state.panel_assist_error.is_none(),
+            "字号保存失败不得影响保存面板助手错误"
+        );
 
         state.set_language_result(LanguageSetting::ZhHans, Some(LanguageError::SaveFailed));
         assert_eq!(state.font_error, Some(SettingsError::SaveFailed));
         assert_eq!(state.language_error, Some(LanguageError::SaveFailed));
+    }
+
+    /// 保存面板助手开关落地：更新 file 字段 + 内联错误；成功清错误。
+    #[test]
+    fn panel_assist_result_updates_file_and_error() {
+        let mut state = test_state();
+        state.set_panel_assist_result(false, Some(SettingsError::SaveFailed));
+        assert!(!state.file.save_panel_assist);
+        assert_eq!(state.panel_assist_error, Some(SettingsError::SaveFailed));
+
+        state.set_panel_assist_result(true, None);
+        assert!(state.file.save_panel_assist);
+        assert_eq!(state.panel_assist_error, None, "保存成功须清错误");
     }
 
     /// 纯编排：解析语言 + 写入快照 + 保存；不触碰全局语言。

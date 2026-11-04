@@ -2221,9 +2221,21 @@ unsafe fn handle_fetch_result(
 }
 
 /// AX 授权查询(ax_ffi 转发;mac.rs 为平台层 unsafe 集中点,故经此转出)。
-#[allow(dead_code)] // M0 探针/后续任务接线后移除
 pub fn ax_trusted() -> bool {
     super::ax_ffi::is_process_trusted()
+}
+
+/// 打开系统设置的辅助功能授权面板(深链;失败静默——面板未装/链接失效时无害)。
+pub fn open_accessibility_settings() {
+    let url = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+    // spawn 即返回;wait 放后台线程收尾(不 join 会留僵尸进程,update.rs open_url 同款)。
+    if let Ok(mut child) = std::process::Command::new("open").arg(url).spawn() {
+        std::thread::spawn(move || {
+            if let Err(err) = child.wait() {
+                log::warn!("等待 open 退出失败: {err}");
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

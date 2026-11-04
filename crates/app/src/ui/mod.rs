@@ -653,6 +653,11 @@ impl App {
         let hotkey_note = hotkey.note().cloned();
         // 自动检查更新（默认开启）：先记账再移动 settings_file。
         let auto_update = settings_file.check_updates;
+        // 保存面板助手:开关开且未授权 → 提示一次(仅 log + 托盘项,不弹窗;
+        // design §3.2;托盘菜单项由 tray::install 在本调用前按同一条件挂载)。
+        if settings_file.save_panel_assist && !crate::platform::panel_assist_trusted() {
+            log::info!("保存面板助手待授权:设置页或托盘菜单可跳转系统设置");
+        }
         let shared = Arc::new(Mutex::new(Shared {
             palette: palette::PaletteState::new(
                 cc.egui_ctx.clone(),
@@ -849,6 +854,12 @@ impl App {
                     // 设置窗口(v2.1 Task 1):与完整窗口齿轮同一开窗路径。
                     log::info!("托盘:打开设置");
                     open_settings(&self.shared, ctx);
+                }
+                TrayMsg::PanelAssistAuth => {
+                    // 待授权项(design §3.2):深链系统设置辅助功能面板;
+                    // 失败静默(面板未装/链接失效时无害)。
+                    log::info!("托盘:保存面板助手去授权,打开系统设置");
+                    platform::open_accessibility_settings();
                 }
                 TrayMsg::UpdateAction => {
                     let phase = { self.shared().update.phase().clone() };

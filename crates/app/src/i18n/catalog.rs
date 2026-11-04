@@ -76,6 +76,12 @@ catalog! {
     row_version: "版本" / "Version",
     row_website_link: "官网" / "Website",
     row_auto_check: "启动时自动检查更新" / "Check for Updates at Launch",
+    // 保存面板目录助手(设置行 + 授权引导 + 托盘待授权项)
+    row_panel_assist: "保存面板目录助手" / "Save-Panel Directory Assist",
+    row_panel_assist_desc: "在其他应用保存或打开文件时，浮出目录搜索并自动跳转" / "Search a directory and jump the save/open panel to it",
+    panel_assist_need_auth: "需授权" / "Needs Permission",
+    panel_assist_grant: "去授权…" / "Grant Permission…",
+    tray_panel_assist_auth: "保存面板助手待授权…" / "Save-Panel Assist Needs Permission…",
     update_open_failed: "无法打开下载页" / "Couldn't open the download page",
     update_status_idle: "尚未检查" / "Not checked yet",
     update_status_checking: "正在检查…" / "Checking…",
