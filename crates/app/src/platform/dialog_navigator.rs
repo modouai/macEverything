@@ -1,9 +1,11 @@
 //! 跳转状态机(纯逻辑,design §3.4)及其平台执行层(Task 11)。
 //! 步骤由「观测事件」驱动转移,产出「动作」;执行层把每个动作落实到
-//! AX 直设/合成键/剪贴板,并在每次合成键前自检输入框存在(消失则回报
-//! [`Obs::SheetClosed`])。状态机部分不碰平台 API(单测全覆盖);执行层
-//! 的判定逻辑抽为纯函数(`fill_verdict`/`readback_until_match`/`wait_until`)
-//! 单独测试。
+//! AX 直设/合成键/剪贴板。Go-to 框判定用「基线 + 焦点」双重复核
+//! ([`is_goto_candidate`]/[`in_baseline`]);除 ⌘⇧G(此时尚无输入框)外,
+//! 合成键前均自检 Go-to 框存在(消失则回报 [`Obs::SheetClosed`])。
+//! 状态机部分不碰平台 API(单测全覆盖);执行层判定逻辑抽为纯函数
+//! (`is_goto_candidate`/`in_baseline`/`fill_verdict`/`readback_until_match`/
+//! `wait_until`/`outcome_of`)单独测试。
 
 use std::time::{Duration, Instant};
 
@@ -202,14 +204,30 @@ fn in_baseline<T>(candidate: &T, baseline: &[T], eq: impl Fn(&T, &T) -> bool) ->
     baseline.iter().any(|b| eq(b, candidate))
 }
 
-/// 当前 Go-to 输入框(与探针 `locate_goto_field` 同构;共享化留待 Task 15 收口)。
+/// 当前 Go-to 输入框。
 ///
-/// 双重复核:候选须(1)不在 ⌘⇧G 前基线中,(2)与当前 `AXFocusedElement`
-/// 经 CFEqual 同一。输入框消失 / ⌘⇧G 未生效 / 焦点未转到新框 → None。
+/// 快路径:取 `AXFocusedWindow` → 读窗口级 `AXFocusedElement` → 直接判
+/// 「可写 且 非基线」(该元素本身就是焦点,三条件中的 `focused` 恒真)。
+/// 每次判定只 2~3 次 AX IPC,避免深度 6 整树遍历在 50ms 轮询下的冗余开销。
+/// 回退(防御):个别应用不暴露窗口级 `AXFocusedElement` 时才整树搜索,
+/// 并要求「可写 + 非基线 + 与应用级焦点 CFEqual」三条件。
+///
+/// 注:探针 `locate_goto_field` 另有「焦点优先快路径 + FocusedStale 诊断」,
+/// 执行层刻意不同构(不产出诊断);共享化留待 Task 15 收口。
 fn goto_field(pid: i32, baseline: &[AXRef]) -> Option<AXRef> {
     let app = ax_ffi::app_element(pid)?;
-    let focused = ax_ffi::copy_attr(&app, attr::FOCUSED_ELEMENT);
     let win = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW)?;
+    if let Some(focused) = ax_ffi::copy_attr(&win, attr::FOCUSED_ELEMENT) {
+        // 焦点元素即候选:只需「可写 + 非基线」,focused 恒真。
+        return is_goto_candidate(
+            writable_text_field(&focused),
+            in_baseline(&focused, baseline, ax_ffi::cf_equal),
+            true,
+        )
+        .then(|| ax_ffi::clone_ref(&focused));
+    }
+    // 防御回退:窗口级焦点读不到时整树搜索(应用级焦点做同一性复核)。
+    let focused = ax_ffi::copy_attr(&app, attr::FOCUSED_ELEMENT);
     search_field(&win, 0, &|el| {
         is_goto_candidate(
             writable_text_field(el),
@@ -340,38 +358,50 @@ fn readback_until_match(
     Readback::Mismatched
 }
 
+/// 终态 → (对外结果, 是否恢复剪贴板)。
+///
+/// 恢复判据 ≡ 状态机的 `RestoreClipboard` 契约:策略 B 参与过(`has_saved`)
+/// 且终态为 Done/Aborted;`FellBack` 保留路径在剪贴板,不恢复。
+/// 非终态意外进入(契约破坏)按中止处理,已保存则仍恢复。
+fn outcome_of(step: Step, has_saved: bool) -> (NavigateOutcome, bool) {
+    match step {
+        Step::Done => (NavigateOutcome::Done, has_saved),
+        Step::FellBack => (NavigateOutcome::FellBackToClipboard, false),
+        _ => (NavigateOutcome::Aborted, has_saved),
+    }
+}
+
 /// 完整跳转(阻塞;调用方在后台线程执行)。
 ///
 /// 执行循环严格按状态机契约:先执行动作得到观测,再 `on(obs)` 转移;
-/// `done = true` 时若带 [`Act::RestoreClipboard`] 先恢复剪贴板,再按终态映射。
+/// `done = true` 时先按 [`outcome_of`] 执行剪贴板收尾,再返回终态。
 /// `saved`:None = 从未保存;Some(None) = 保存时无文本;Some(Some(t)) = 原文。
 ///
-/// `baseline` 在发 ⌘⇧G 前采集并在整个跳转生命周期保活:后续每一步的
-/// 「输入框仍在」自检都用「非基线 + 焦点一致」谓词,防把文件名框当成 Go-to 框。
+/// `baseline` 在 `m.start()` 后、首个动作执行前采集并在整个跳转生命周期保活:
+/// 后续每一步的「输入框仍在」自检都用「非基线 + 焦点一致」谓词,
+/// 防把文件名框当成 Go-to 框。
 pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
     let mut m = NavMachine::new();
     let mut saved: Option<Option<String>> = None;
-    // ⌘⇧G 前基线(None/空 = 当时没有可写输入框)。
-    let mut baseline: Vec<AXRef> = Vec::new();
     let Some(mut act) = m.start() else {
         return NavigateOutcome::Aborted;
     };
+    // ⌘⇧G 前基线(首个动作执行前采集,整个跳转生命周期保活)。
+    // 遗留(Task 15 实机评估):基线谓词的策略细节(采集时机、焦点暂离)
+    // 以实机取证为准。
+    let baseline = baseline_text_fields(pid);
+    if baseline.is_empty() {
+        // 空基线可能是瞬时 AX 读取失败:此时无法区分 Go-to 框与文件名框,
+        // 保守中止(宁可不跳转,也不冒误覆盖文件名的风险)。
+        log::warn!("[navigator] 基线为空(可写输入框未采到),保守中止 pid={pid}");
+        return NavigateOutcome::Aborted;
+    }
     loop {
         // 1) 执行动作 → 观测。Restore 只作为 done 收尾动作执行(见 loop 末尾)。
         let obs = match act {
             Act::SendGoToFolder => {
-                // 先采基线(文件名框等既有输入框),再合成 ⌘⇧G;基线须覆盖整个跳转。
-                // 遗留(Task 15 实机评估):基线谓词的策略细节(采集时机、焦点暂离
-                // 时的判定)以实机取证为准。
-                baseline = baseline_text_fields(pid);
-                if baseline.is_empty() {
-                    // 空基线可能是瞬时 AX 读取失败:此时无法区分 Go-to 框与文件名框,
-                    // 保守中止(宁可不跳转,也不冒误覆盖文件名的风险)。
-                    // 映射为 Timeout → 状态机在 AwaitSheet 上直接 Aborted。
-                    log::warn!("[navigator] 基线为空(可写输入框未采到),保守中止 pid={pid}");
-                    Obs::Timeout
-                } else if !pid_still_front(pid) {
-                    // cg_events 的 pid 时效契约:先复核前台,再合成 ⌘⇧G。
+                // cg_events 的 pid 时效契约:先复核前台,再合成 ⌘⇧G。
+                if !pid_still_front(pid) {
                     Obs::SheetClosed
                 } else {
                     cg_events::post_combo(Some(pid), KEY_G, FLAG_CMD | FLAG_SHIFT);
@@ -396,7 +426,10 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
             },
             Act::PasteViaClipboard => {
                 // M6 契约:无论后续检查如何,先保存原剪贴板(None = 原本无文本)。
-                saved = Some(clipboard_text());
+                // 仅在首次参与时拍摄,防未来 Confirm 降级 B 路径覆盖原始快照。
+                if saved.is_none() {
+                    saved = Some(clipboard_text());
+                }
                 if goto_field(pid, &baseline).is_none() {
                     Obs::SheetClosed
                 } else if !clipboard_set_text(path) {
@@ -454,22 +487,27 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
         let (next, done) = m.on(obs);
         if done {
             // M6 契约:先执行收尾动作(Restore),再按终态映射。
-            // saved 为 None = 从未保存过 → 不调用恢复,避免误清用户剪贴板。
+            // outcome_of 的恢复判据 ≡ 状态机 RestoreClipboard 契约
+            // (Done/Aborted 且策略 B 参与);saved 为 None = 从未保存过 → 不恢复,
+            // 避免误清用户剪贴板。
             // 遗留(后续单独任务):当前只做纯文本快照;`clipboard_restore(None)`
             // 走 clearContents 会连带清掉非文本项,需改多类型快照。
-            if let Some(Act::RestoreClipboard) = next {
+            let (outcome, restore) = outcome_of(m.step(), saved.is_some());
+            if restore {
                 if let Some(s) = &saved {
-                    let _ = clipboard_restore(s.as_deref());
+                    if !clipboard_restore(s.as_deref()) {
+                        log::warn!("[navigator] 剪贴板恢复失败");
+                    }
                 }
             }
-            return match m.step() {
-                Step::Done => NavigateOutcome::Done,
-                Step::FellBack => NavigateOutcome::FellBackToClipboard,
-                _ => NavigateOutcome::Aborted,
-            };
+            return outcome;
         }
         let Some(a) = next else {
             // 无动作且未 done:状态机保证不会走到(防御兜底,防死循环)。
+            log::error!(
+                "[navigator] 状态机在非终态返回无动作(契约破坏),中止 step={:?}",
+                m.step()
+            );
             return NavigateOutcome::Aborted;
         };
         act = a;
@@ -801,5 +839,41 @@ mod tests {
             !wait_until(Instant::now() - Duration::from_millis(1), || true),
             "deadline 已过不得再执行谓词"
         );
+    }
+
+    /// 终态映射:恢复仅在 Done/Aborted 且策略 B 参与(has_saved)时;
+    /// FellBack 保留路径在剪贴板,绝不恢复;非终态防御映射为 Aborted。
+    /// 突变「FellBack 也恢复」或「Done 忽略 has_saved」→ 对应断言必红。
+    #[test]
+    fn outcome_of_maps_terminal_and_restore() {
+        assert_eq!(
+            outcome_of(Step::Done, true),
+            (NavigateOutcome::Done, true),
+            "成功且策略 B 参与 → 恢复"
+        );
+        assert_eq!(
+            outcome_of(Step::Done, false),
+            (NavigateOutcome::Done, false),
+            "策略 A 成功不碰剪贴板"
+        );
+        assert_eq!(
+            outcome_of(Step::FellBack, true),
+            (NavigateOutcome::FellBackToClipboard, false),
+            "路径保留在剪贴板,不恢复"
+        );
+        assert_eq!(
+            outcome_of(Step::Aborted, true),
+            (NavigateOutcome::Aborted, true),
+            "中止时恢复已保存的剪贴板"
+        );
+        assert_eq!(
+            outcome_of(Step::Aborted, false),
+            (NavigateOutcome::Aborted, false)
+        );
+        // 防御:非终态意外进入 → Aborted(不 panic);已保存则仍恢复。
+        for step in [Step::Idle, Step::AwaitSheet, Step::Fill, Step::Confirm] {
+            assert_eq!(outcome_of(step, false), (NavigateOutcome::Aborted, false));
+            assert_eq!(outcome_of(step, true), (NavigateOutcome::Aborted, true));
+        }
     }
 }
