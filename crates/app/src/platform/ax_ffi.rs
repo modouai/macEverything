@@ -42,6 +42,7 @@ extern "C" {
     fn CFRelease(cf: CFTypeRef);
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, src: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, src: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
     fn CFRunLoopSourceCreate(
@@ -422,6 +423,20 @@ pub fn attach_observer_to_current_runloop(obs: &AXObserverWrap) {
     unsafe {
         let rl = CFRunLoopGetCurrent();
         CFRunLoopAddSource(
+            rl,
+            AXObserverGetRunLoopSource(obs.raw()),
+            kCFRunLoopDefaultMode,
+        );
+    }
+}
+
+/// observer 的 runloop source 从当前线程 runloop 拆下(换绑时先拆再 CFRelease;
+/// 否则旧 source 仍挂在 runloop 上,释放后归属未定义)。当前线程调用。
+pub fn detach_observer_from_current_runloop(obs: &AXObserverWrap) {
+    // SAFETY:source 归 observer 所有,runloop 只借;mode 为全局常量。
+    unsafe {
+        let rl = CFRunLoopGetCurrent();
+        CFRunLoopRemoveSource(
             rl,
             AXObserverGetRunLoopSource(obs.raw()),
             kCFRunLoopDefaultMode,

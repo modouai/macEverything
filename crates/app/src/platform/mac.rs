@@ -354,6 +354,8 @@ fn make_space_observer(mtm: MainThreadMarker) -> Retained<SpaceObserver> {
 }
 
 // 前台应用切换观察者(NSWorkspace 通知 → 保存面板 detector 换绑)。
+// 说明:实现用 DidActivate 而非计划字面的 WillActivate——回调里直读
+// frontmostApplication 更准确,勿「修正」为 WillActivate。
 define_class!(
     // SAFETY(define_class 的 unsafe 契约):超类 NSObject 无子类化约束;
     // 无新增实例变量(ivars 缺省 `()`);方法签名与 AppKit 一致(单参 NSNotification);无 Drop。
@@ -383,13 +385,14 @@ thread_local! {
 }
 
 /// 注册前台应用切换观察者(主线程;幂等——observer 由 thread_local 保活)。
-pub fn install_app_activate_observer() {
+/// 返回 true = 已注册(含此前已注册);false = 非主线程或注册失败。
+pub fn install_app_activate_observer() -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         log::warn!("install_app_activate_observer 非主线程调用");
-        return;
+        return false;
     };
     if APP_ACTIVATE_OBSERVER.with(|c| c.borrow().is_some()) {
-        return;
+        return true;
     }
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
     let obs = AppActivateObserver::alloc(mtm).set_ivars(());
@@ -410,6 +413,7 @@ pub fn install_app_activate_observer() {
         super::panel_detector::notify_frontmost(app.processIdentifier());
     }
     log::info!("前台应用切换观察者已注册");
+    true
 }
 
 /// 漂移计数(与 PoC-1 续同口径:每帧核对,漂移即重施并留痕)。
@@ -2351,19 +2355,25 @@ pub fn probe_start() {
 /// 临时实机开关:注册 NSWorkspace 观察者 + 启动 detector,日志打印事件流。
 /// Task 14 正式接线后移除本函数。
 pub fn detector_start_debug() {
-    install_app_activate_observer();
+    if !install_app_activate_observer() {
+        log::warn!("detector 未启动:前台应用切换观察者注册失败");
+        return;
+    }
     let Some(rx) = super::panel_detector::start_detector() else {
         return;
     };
     log::info!("detector 已启动(MCE_PANEL_DETECTOR)");
     // 临时:事件日志(Task 14 接线后由 UI 消费,此处移除)
-    let _ = std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("panel-detector-log".to_owned())
         .spawn(move || {
             for ev in rx {
                 log::info!("[detector] {ev:?}");
             }
-        });
+        })
+    {
+        log::warn!("detector 事件日志线程创建失败:{e}");
+    }
 }
 
 #[cfg(test)]

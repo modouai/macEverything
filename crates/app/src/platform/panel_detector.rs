@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use super::ax_ffi::{self, attr, note, AXObserverWrap, AXRef};
 
@@ -136,16 +137,15 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static SIGNAL_SRC: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// detector 线程 runloop raw(主线程 CFRunLoopWakeUp 目标)。
 static DETECTOR_RL: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// 事件接收端断开的一次性标志(避免每个事件重复 warn/stop)。
+static SEND_FAILED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// 当前 observer(仅 detector 线程使用;AXObserverWrap 无 Send)。
     static OBSERVER: std::cell::RefCell<Option<AXObserverWrap>> =
         const { std::cell::RefCell::new(None) };
-    /// 退役 observer 保活池:重建时不 CFRelease 旧 observer(其 runloop source
-    /// 可能仍挂在 runloop 上,释放后 source 归属未定义)。生命周期量级 = 前台
-    /// 切换次数,同探针策略。
-    static RETIRED: std::cell::RefCell<Vec<AXObserverWrap>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// 当前 observer 绑定的前台 pid(0 = 未绑定;M2 去抖,detector 线程独占)。
+    static BOUND_PID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// 事件发送端(接收端由接线层持有)。
     static TX: std::cell::RefCell<Option<mpsc::Sender<PanelEvent>>> =
         const { std::cell::RefCell::new(None) };
@@ -155,6 +155,14 @@ thread_local! {
 }
 
 /// 启动 detector(幂等;第二次调用返回 None)。返回事件接收端。
+///
+/// 启动握手:spawn 后在 `sync_channel(1)` 上等待 detector 线程完成全部初始化
+/// (最长 5s);线程失败/超时 → None,不交出半死 receiver。
+///
+/// 停止契约:detector 常驻,不支持真正停止——设置关闭由接线层忽略事件即可
+/// (detector 仅通知驱动、无轮询,空转成本可忽略)。若将来需要 stop,必须先
+/// `CFRunLoopStop` 再清空 `SIGNAL_SRC`/`DETECTOR_RL`;反序会让主线程
+/// `CFRunLoopWakeUp` 命中已释放 runloop。
 pub fn start_detector() -> Option<mpsc::Receiver<PanelEvent>> {
     if STARTED.swap(true, Ordering::SeqCst) {
         return None;
@@ -165,24 +173,37 @@ pub fn start_detector() -> Option<mpsc::Receiver<PanelEvent>> {
         return None;
     }
     let (tx, rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<bool>(1);
     let spawned = std::thread::Builder::new()
         .name("panel-detector".to_owned())
-        .spawn(move || runloop_thread(tx));
+        .spawn(move || runloop_thread(tx, ready_tx));
     match spawned {
         // JoinHandle 立即 drop = 分离线程(runloop 常驻到进程退出)。
-        Ok(h) => {
-            drop(h);
-            Some(rx)
-        }
+        Ok(h) => drop(h),
         Err(e) => {
             log::error!("detector 线程创建失败:{e}");
             STARTED.store(false, Ordering::SeqCst);
+            return None;
+        }
+    }
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(true) => Some(rx),
+        // 线程已 fail_init(复位 STARTED + 清原子),此处不再重复复位。
+        Ok(false) => None,
+        Err(_) => {
+            // 超时:线程可能仍在初始化,STARTED 保持 true 防重复实例;rx 丢弃后
+            // 线程首次投递事件会触发 send 自停(M1)。
+            log::error!("detector 初始化超时(5s)");
             None
         }
     }
 }
 
 /// 主线程调用(NSWorkspace 通知回调):前台 pid 写原子 + 唤醒 detector 线程换绑。
+///
+/// 承重不变量:必须先写 `FRONT_PID` 再读发布指针。若本次 signal 因指针尚未发布
+/// 被跳过,detector 发布完成后的启动扫描必然能看到该 pid;两处 `SeqCst` 不得
+/// 调换或降级(否则前台切换可能丢失)。
 pub fn notify_frontmost(pid: i32) {
     FRONT_PID.store(pid, Ordering::SeqCst);
     // SAFETY:两个指针均为 detector 线程写入的进程生命周期 CF 对象 raw;
@@ -193,18 +214,20 @@ pub fn notify_frontmost(pid: i32) {
     );
 }
 
-fn runloop_thread(tx: mpsc::Sender<PanelEvent>) {
+fn runloop_thread(tx: mpsc::Sender<PanelEvent>, ready: mpsc::SyncSender<bool>) {
     TX.with(|c| *c.borrow_mut() = Some(tx));
     // 信号源(perform 在 detector 线程派发 → rebind 满足 AXObserver 同线程约束)
     let Some(src) = ax_ffi::signal_source_create(on_signal) else {
         log::error!("detector: 信号源创建失败,线程退出");
         fail_init();
+        let _ = ready.send(false);
         return;
     };
     // observer 占位(创建成功前不 attach;失败时信号源随局部变量释放)
     let Some(obs) = ax_ffi::observer_create(0, on_ax_event) else {
         log::error!("detector: AXObserverCreate 失败(权限?),线程退出");
         fail_init();
+        let _ = ready.send(false);
         return;
     };
     // 全部 fallible 初始化完成后,再挂 runloop 并发布跨线程指针。
@@ -222,11 +245,22 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>) {
     // 处理启动前已经就位的前台 pid(通知可能早于线程就绪)
     let pid = FRONT_PID.load(Ordering::SeqCst);
     if pid != 0 {
-        rebind_observer(pid);
+        let _ = rebind_observer(pid);
         scan_focused(pid);
     }
+    // 全部初始化完成、即将进 runloop:通知 start_detector 握手成功。
+    let _ = ready.send(true);
     log::info!("detector: 运行");
     ax_ffi::run_current_runloop();
+    // 唯一正常退出路径:事件接收端断开 → send 主动 stop。已发布 raw 可能已被
+    // 主线程加载,故不回收对象、也不结束线程(thread_local 与 runloop 保活到
+    // 进程退出);只清空指针阻止后续 signal。detector 常驻,不支持真正停止。
+    SIGNAL_SRC.store(std::ptr::null_mut(), Ordering::SeqCst);
+    DETECTOR_RL.store(std::ptr::null_mut(), Ordering::SeqCst);
+    log::info!("detector: runloop 已停止(接收端断开),对象保活至进程退出");
+    loop {
+        std::thread::park();
+    }
 }
 
 /// 初始化失败兜底:显式清空跨线程指针(防发布前遗留悬垂 raw)+ 回滚启动闸
@@ -240,39 +274,55 @@ fn fail_init() {
 /// 信号源 perform(detector 线程):前台 pid 变更 → 换绑 + 立即扫一遍。
 extern "C" fn on_signal(_info: *mut std::ffi::c_void) {
     let pid = FRONT_PID.load(Ordering::SeqCst);
-    if pid == 0 {
+    let bound = BOUND_PID.with(|c| c.get());
+    if !needs_rebind(bound, pid) {
         return;
     }
-    rebind_observer(pid);
+    let _ = rebind_observer(pid);
     scan_focused(pid);
 }
 
-/// 重建 observer 并注册三类通知(本线程;同探针形态,失败不致命)。
-fn rebind_observer(pid: i32) {
+/// 是否需要换绑(bound = 当前 observer 绑定 pid,0 = 未绑定;front = 前台 pid,
+/// 0 = 未知)。前台未变时既不换绑也不扫描(M2:去抖重复 signal)。
+fn needs_rebind(bound: i32, front: i32) -> bool {
+    front != 0 && bound != front
+}
+
+/// 重建 observer 并注册三类通知(本线程;refcon = pid 用于回调归因校验)。
+/// 返回 false = 失败(调用方可重试);成功时更新绑定点并清空面板归因。
+fn rebind_observer(pid: i32) -> bool {
     let Some(el) = ax_ffi::app_element(pid) else {
         log::warn!("detector: app element 创建失败 pid={pid}");
-        return;
+        return false;
     };
     let Some(obs) = ax_ffi::observer_create(pid, on_ax_event) else {
         log::warn!("detector: observer 创建失败 pid={pid}");
-        return;
+        return false;
     };
     for n in [
         note::WINDOW_CREATED,
         note::FOCUSED_WINDOW_CHANGED,
         note::UI_ELEMENT_DESTROYED,
     ] {
-        if let Err(e) = ax_ffi::observer_add_notification(&obs, &el, n, 0) {
+        if let Err(e) = ax_ffi::observer_add_notification(&obs, &el, n, pid as usize) {
             log::debug!("detector: 通知注册失败 pid={pid} {n} err={e}");
         }
     }
     ax_ffi::attach_observer_to_current_runloop(&obs);
     OBSERVER.with(|c| {
         if let Some(old) = c.borrow_mut().take() {
-            RETIRED.with(|r| r.borrow_mut().push(old)); // 保活(同探针:source 归属)
+            // H1:先真拆卸再释放——旧 source 不再挂 runloop,CFRelease 安全;
+            // 不再保留退役池(每轮前台切换都会泄漏 observer + source)。
+            ax_ffi::detach_observer_from_current_runloop(&old);
+            drop(old);
         }
         *c.borrow_mut() = Some(obs);
     });
+    BOUND_PID.with(|c| c.set(pid));
+    // M4:换绑即前台 app 变化,清空面板归因(不发 Closed——接线层靠新事件
+    // 自然收敛;旧 app 的 Closed 已无意义)。
+    PANEL_PID.store(0, Ordering::SeqCst);
+    true
 }
 
 /// AXObserver 回调:销毁 → Closed 事件;其余 → 扫焦点窗口判定。
@@ -280,10 +330,12 @@ extern "C" fn on_ax_event(
     _obs: *mut std::ffi::c_void,
     _el: *mut std::ffi::c_void,
     notification: *const std::ffi::c_void,
-    _refcon: *mut std::ffi::c_void,
+    refcon: *mut std::ffi::c_void,
 ) {
     let pid = FRONT_PID.load(Ordering::SeqCst);
-    if pid == 0 {
+    // 归因兜底(H1):refcon = 注册通知时的 pid。换绑后旧 observer 的残留通知
+    // (理论上已随 detach 消失)不得被误归因到新前台 app。
+    if pid == 0 || refcon as usize as i32 != pid {
         return;
     }
     let n = ax_ffi::cfstring_to_string(notification).unwrap_or_default();
@@ -310,8 +362,17 @@ fn scan_focused(pid: i32) {
     if !is_save_panel(&snap) {
         return;
     }
-    let (x, y) = ax_ffi::attr_point(&win, attr::POSITION).unwrap_or((0.0, 0.0));
-    let (w, h) = ax_ffi::attr_size(&win, attr::SIZE).unwrap_or((0.0, 0.0));
+    let Some((x, y)) = ax_ffi::attr_point(&win, attr::POSITION) else {
+        return;
+    };
+    let Some((w, h)) = ax_ffi::attr_size(&win, attr::SIZE) else {
+        return;
+    };
+    // M3:0/负/NaN/∞ 尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
+    // 宁缺毋滥——等后续通知重扫,避免把浮层定位到 (0,0) 或零尺寸。
+    if !valid_panel_size(w, h) {
+        return;
+    }
     PANEL_PID.store(pid, Ordering::SeqCst);
     send(PanelEvent::Shown {
         pid,
@@ -319,10 +380,19 @@ fn scan_focused(pid: i32) {
     });
 }
 
+/// 面板尺寸合法性:宽高必须为正有限值(NaN/∞ 与 <=0 均拒绝)。
+fn valid_panel_size(w: f64, h: f64) -> bool {
+    w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
+}
+
 fn send(ev: PanelEvent) {
     TX.with(|c| {
         if let Some(tx) = c.borrow().as_ref() {
-            let _ = tx.send(ev);
+            if tx.send(ev).is_err() && !SEND_FAILED.swap(true, Ordering::SeqCst) {
+                log::warn!("事件接收端已断开,detector 停止");
+                // send 在 detector 线程(observer/signal 回调)上执行,可直接停。
+                ax_ffi::stop_current_runloop();
+            }
         }
     });
 }
@@ -421,5 +491,25 @@ mod tests {
         assert!(!d.blocked(2));
         d.clear(2); // 清除未屏蔽 pid 为 no-op
         assert!(d.blocked(1));
+    }
+
+    /// M2:仅当前台 pid 有效且变化时才换绑;相同 pid 的重复 signal 不得重复换绑/扫描。
+    #[test]
+    fn rebind_only_on_front_pid_change() {
+        assert!(!needs_rebind(0, 0), "前台未知不触发");
+        assert!(needs_rebind(0, 42), "首次绑定");
+        assert!(!needs_rebind(42, 42), "前台未变不换绑");
+        assert!(needs_rebind(42, 7), "前台变化换绑");
+    }
+
+    /// M3:0/负/NaN/∞ 尺寸不可作为合法 frame(宁缺毋滥,等后续通知重扫)。
+    #[test]
+    fn invalid_panel_size_rejected() {
+        assert!(valid_panel_size(640.0, 480.0));
+        assert!(!valid_panel_size(0.0, 480.0));
+        assert!(!valid_panel_size(640.0, 0.0));
+        assert!(!valid_panel_size(-1.0, 480.0));
+        assert!(!valid_panel_size(f64::NAN, 480.0));
+        assert!(!valid_panel_size(f64::INFINITY, 480.0));
     }
 }
