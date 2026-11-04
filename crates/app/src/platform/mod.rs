@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
+pub mod ax_ffi;
+#[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
 pub mod mac_quicklook;
@@ -578,6 +580,19 @@ pub fn attached() -> bool {
     #[cfg(target_os = "macos")]
     {
         mac::attached()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 辅助功能授权状态(保存面板助手;macOS)。
+#[allow(dead_code)] // M0 探针/后续任务接线后移除
+pub fn panel_assist_trusted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::ax_trusted()
     }
     #[cfg(not(target_os = "macos"))]
     {
