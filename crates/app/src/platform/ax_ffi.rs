@@ -26,9 +26,9 @@ type CFTypeRef = *const c_void;
 type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 
-/// AXValue 类型枚举(HIServices AXValueType):CGPoint = 1,CGSize = 2。
-const AX_VALUE_POINT_TYPE: usize = 1;
-const AX_VALUE_SIZE_TYPE: usize = 2;
+/// AXValue 类型枚举(HIServices AXValueType,32 位 enum):CGPoint = 1,CGSize = 2。
+const AX_VALUE_POINT_TYPE: i32 = 1;
+const AX_VALUE_SIZE_TYPE: i32 = 2;
 
 /// kCFStringEncodingUTF8。
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -59,7 +59,11 @@ extern "C" {
         attr: CFStringRef,
         val: CFTypeRef,
     ) -> AXError;
-    fn AXUIElementIsAttributeSettable(el: AXUIElementRef, attr: CFStringRef) -> u8;
+    fn AXUIElementIsAttributeSettable(
+        el: AXUIElementRef,
+        attr: CFStringRef,
+        out: *mut u8,
+    ) -> AXError;
     fn AXObserverCreate(pid: i32, callback: AXObserverCallback, out: *mut AXObserverRef)
         -> AXError;
     fn AXObserverAddNotification(
@@ -69,12 +73,13 @@ extern "C" {
         refcon: *mut c_void,
     ) -> AXError;
     fn AXObserverGetRunLoopSource(obs: AXObserverRef) -> CFRunLoopSourceRef;
-    fn AXValueGetValue(value: CFTypeRef, t: usize, out: *mut c_void) -> u8;
+    fn AXValueGetValue(value: CFTypeRef, t: i32, out: *mut c_void) -> u8;
     fn CFGetTypeID(cf: CFTypeRef) -> usize;
     fn CFStringGetTypeID() -> usize;
     fn CFArrayGetCount(arr: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(arr: CFTypeRef, idx: isize) -> *const c_void;
-    fn CFRetain(cf: CFTypeRef);
+    /// CFBase.h 真实签名返回同一引用;调用点忽略返回值即可。
+    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
 }
 
 /// AXObserver 回调(C 函数指针,无环境捕获;状态经 refcon/static 传递)。
@@ -201,8 +206,10 @@ pub fn set_attr(el: &AXRef, attr: &str, value: CFTypeRef) -> Result<(), AXError>
 /// 属性是否可写(可编辑文件名框的判定:role 为 AXTextField 且 value 可写)。
 pub fn attr_settable(el: &AXRef, attr: &str) -> bool {
     let a = CFStr::new(attr);
-    // SAFETY:无指针出参。
-    unsafe { AXUIElementIsAttributeSettable(el.raw(), a.raw()) != 0 }
+    let mut out: u8 = 0;
+    // SAFETY:out 为本栈帧可写 Boolean 出参;CFStr 生命周期覆盖调用。
+    let err = unsafe { AXUIElementIsAttributeSettable(el.raw(), a.raw(), &mut out) };
+    err == AX_ERROR_SUCCESS && out != 0
 }
 
 /// 读字符串属性。
