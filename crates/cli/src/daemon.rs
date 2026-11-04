@@ -555,15 +555,24 @@ fn desc_echo(key: SortKey, desc: bool) -> Option<bool> {
 /// 排序轮 meta_of 批量并行 stat 在读锁内(耗时随响应如实告知,tech.md 已标注);
 /// 结果行落入缓存 map,组装轮零重查、不触碰锁外 stat 路径。
 /// desc(定案,Task 19b)= 反转自然方向,透传引擎;缺省(旧客户端)等价 false。
-fn run_query(state: &EngineState, q: &str, limit: u32, sort: Option<&str>, desc: bool) -> Response {
+/// dir_only(保存面板助手)= 只返回目录;缺省(旧客户端)等价 false,不过滤。
+fn run_query(
+    state: &EngineState,
+    q: &str,
+    limit: u32,
+    sort: Option<&str>,
+    desc: bool,
+    dir_only: bool,
+) -> Response {
     let (key, key_str) = parse_sort_key(sort);
     let desc_echo = desc_echo(key, desc);
-    let Ok(plan) = engine::query::parse(q) else {
+    let Ok(mut plan) = engine::query::parse(q) else {
         return Response::Error {
             code: "parse".into(),
             message: "空查询".into(),
         };
     };
+    plan.dir_only = dir_only;
     // 排序轮 stat 缓存:条目号 → (size, mtime)。meta_of 是 `&dyn Fn`,经 Mutex
     // 取内部可变性写入(不走 FnMut 捕获);响应组装(锁外)按条目号命中优先。
     let cache: Mutex<HashMap<u32, MetaRow>> = Mutex::new(HashMap::new());
@@ -2420,8 +2429,16 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
             limit,
             sort,
             desc,
-            ..
-        } => run_query(state, &query, limit, sort.as_deref(), desc.unwrap_or(false)),
+            dir_only,
+            v: _,
+        } => run_query(
+            state,
+            &query,
+            limit,
+            sort.as_deref(),
+            desc.unwrap_or(false),
+            dir_only.unwrap_or(false),
+        ),
         Request::Status { .. } => {
             let name = *state.state_name.lock_recover();
             let entry_count = status_entry_count(state);
@@ -2839,7 +2856,7 @@ mod tests {
             "Shared 态 rebuild_dir_map 应建立根映射"
         );
         // Shared 态查询直接可服务(冷启动秒开语义)
-        match run_query(&state, "a.txt", 10, None, false) {
+        match run_query(&state, "a.txt", 10, None, false, false) {
             Response::Query { total, .. } => assert_eq!(total, 1, "Shared 态应可查"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -2860,7 +2877,7 @@ mod tests {
             assert!(v.entry(a).is_live() && v.entry(b).is_live());
         });
         // overlay 增量可见、旧路径仍在(仅新增,无删除)
-        match run_query(&state, "c.txt", 10, None, false) {
+        match run_query(&state, "c.txt", 10, None, false, false) {
             Response::Query { total, .. } => assert_eq!(total, 1, "overlay 新增可见"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -3131,7 +3148,7 @@ mod tests {
             (None, "relevance(补 stat miss)"),
             (Some("size"), "size(缓存命中)"),
         ] {
-            let resp = run_query(&state, "hit", 10, sort, false);
+            let resp = run_query(&state, "hit", 10, sort, false, false);
             let Response::Query { entries, .. } = resp else {
                 panic!("{label} 应返回查询响应: {resp:?}");
             };
@@ -3907,7 +3924,7 @@ mod tests {
             "flush 后应为 Shared(remap 完成、Overlay 清零)"
         );
         // 内存查询:增量保留(合并写不得丢更新)
-        match run_query(&state, "whole:new.txt", 10, None, false) {
+        match run_query(&state, "whole:new.txt", 10, None, false, false) {
             Response::Query { total, .. } => assert_eq!(total, 1, "flush 后增量保留"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -4345,7 +4362,7 @@ mod tests {
         // 断言 B:d 内再漂移,diff 落在正确条目上(不得挂到 2 号 new.txt 下)。
         std::fs::write(d_path.join("y.txt"), b"").unwrap();
         assert_eq!(diff_one(&state, &d_path), 1);
-        match run_query(&state, "whole:y.txt", 10, None, false) {
+        match run_query(&state, "whole:y.txt", 10, None, false, false) {
             Response::Query { entries, total, .. } => {
                 assert_eq!(total, 1);
                 // 索引内路径为字面形态(root 条目名 = 夹具插入时的 dir.path())
@@ -4438,7 +4455,7 @@ mod tests {
             0,
             "放弃替换收尾清 dirty(防密集重写风暴)"
         );
-        match run_query(&state, "whole:c.txt", 10, None, false) {
+        match run_query(&state, "whole:c.txt", 10, None, false, false) {
             Response::Query { total, .. } => {
                 assert_eq!(total, 1, "窗口增量不得随陈旧快照替换丢失")
             }
@@ -4454,7 +4471,7 @@ mod tests {
             ),
             "下轮 flush 应替换成功(世代一致)"
         );
-        match run_query(&state, "whole:c.txt", 10, None, false) {
+        match run_query(&state, "whole:c.txt", 10, None, false, false) {
             Response::Query { total, .. } => assert_eq!(total, 1, "下轮合并后增量保留"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -4533,7 +4550,7 @@ mod tests {
         let pending = end_volume_scan(&state, token);
         assert_eq!(pending.len(), 1, "被闸住的目录应登记");
         assert_eq!(diff_one(&state, &pending[0]), 1, "释放闸门后重放生效");
-        match run_query(&state, "whole:new.txt", 10, None, false) {
+        match run_query(&state, "whole:new.txt", 10, None, false, false) {
             Response::Query { total, .. } => assert_eq!(total, 1, "重放后新文件可见"),
             other => panic!("意外响应: {other:?}"),
         }

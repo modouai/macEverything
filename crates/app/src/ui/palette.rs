@@ -1510,7 +1510,7 @@ pub(crate) fn spawn_query_worker(
     let sort = sort_str(fire.sort);
     let desc = fire.desc;
     std::thread::spawn(move || {
-        let payload = match client::query(&paths, &fire.query, limit, sort, desc) {
+        let payload = match client::query(&paths, &fire.query, limit, sort, desc, false) {
             Ok(out) => Payload::Hits {
                 entries: out.entries,
                 total: out.total,

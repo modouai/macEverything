@@ -192,12 +192,14 @@ impl std::error::Error for QueryError {}
 /// sort = 列排序键(name/size/mtime/path);None = relevance(CLI 与 v1 调用方语义)。
 /// desc = 反转该键的自然方向(false = 自然方向,不发该字段——与 19b 前客户端同形);
 /// 引擎在全量命中排序后按方向取前 K,total > K 时为真最大/最小 K 条。
+/// dir_only = 只返回目录(false 不过滤,与缺省同义,不发该字段——旧 daemon 兼容)。
 pub fn query(
     paths: &DaemonPaths,
     q: &str,
     limit: u32,
     sort: Option<&str>,
     desc: bool,
+    dir_only: bool,
 ) -> Result<QueryOutcome, QueryError> {
     let limit = limit.min(RESULT_CAP);
     let no_code = |e: anyhow::Error| QueryError {
@@ -215,7 +217,9 @@ pub fn query(
                 // false 不发送:None 与 false 引擎语义相同(自然方向),
                 // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
                 desc: desc.then_some(true),
-                dir_only: None, // 暂无调用方,恒不发送
+                // false 不发送:None 与 false 引擎语义相同(不过滤),
+                // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
+                dir_only: dir_only.then_some(true),
             },
         )
         .map_err(no_code)?;
@@ -247,17 +251,23 @@ pub fn query(
             }),
         }
     } else {
-        offline_query(paths, q, limit).map_err(no_code)
+        offline_query(paths, q, limit, dir_only).map_err(no_code)
     }
 }
 
 /// 离线查询:直读落盘索引自答(调用方须标注离线并给出索引生成时刻)。
 /// 离线路径只做 relevance(无 daemon 侧排序轮 stat 缓存),回显如实为 "relevance":
 /// 调用方请求了列排序时,可比对回显识别「排序未生效」。
-pub fn offline_query(paths: &DaemonPaths, q: &str, limit: u32) -> Result<QueryOutcome> {
+pub fn offline_query(
+    paths: &DaemonPaths,
+    q: &str,
+    limit: u32,
+    dir_only: bool,
+) -> Result<QueryOutcome> {
     let view = persist::load_mmap(&paths.index_file())
         .map_err(|e| anyhow!("daemon 未运行,且落盘索引不可用({e});先执行 macEverything start"))?;
-    let plan = engine::query::parse(q).map_err(|_| anyhow!("空查询"))?;
+    let mut plan = engine::query::parse(q).map_err(|_| anyhow!("空查询"))?;
+    plan.dir_only = dir_only;
     let out = engine::query::execute(view.as_ref(), &plan, limit as usize);
     let rows: Vec<(String, String)> = out
         .hits
@@ -646,7 +656,7 @@ mod tests {
         let (paths, _h) = stub_daemon(
             br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"mtime","desc_echo":false}"#,
         );
-        let out = query(&paths, "x", 10, Some("mtime"), true).unwrap();
+        let out = query(&paths, "x", 10, Some("mtime"), true, false).unwrap();
         assert_eq!(out.desc_echo, Some(false));
         assert_eq!(out.sort_echo, "mtime");
     }
