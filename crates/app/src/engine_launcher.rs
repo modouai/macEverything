@@ -55,6 +55,8 @@ fn monitor_interval(hidden: bool) -> Duration {
 static EXPECTED_RUNNING: AtomicBool = AtomicBool::new(false);
 /// daemon 最近一次存活探测结果(健康监控每轮写入;浮层接线读缓存后决定是否弹,
 /// 避免在主线程每收到一个 Shown 事件就做一次 2s 超时往返)。
+/// 拉起/重启成功后由 [`ensure_engine`] 立即置 true,消除「重启后全隐期最长 30s
+/// 仍被判离线」的窗口;其余时段最坏陈旧一个探测周期。
 static DAEMON_ONLINE: AtomicBool = AtomicBool::new(false);
 /// 用户主动 stop/重启期间的暂停闸:期间探测失败不计入、不触发拉起。
 static MONITOR_SUSPENDED: AtomicBool = AtomicBool::new(false);
@@ -297,6 +299,7 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
         let skew = match client::daemon_version(paths) {
             Some(v) if v == env!("CARGO_PKG_VERSION") => {
                 log::info!("引擎已在运行,版本匹配({v}),跳过拉起");
+                DAEMON_ONLINE.store(true, Ordering::Relaxed);
                 return Ok(());
             }
             other => other,
@@ -348,6 +351,9 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
     loop {
         if client::connect(paths).is_some() {
             log::info!("引擎已就绪");
+            // 拉起/重启成功后立即刷新在线缓存;否则全隐期健康监控最长 30s 才
+            // 更新,窗口内的保存面板 Shown 会被误判离线而吞掉。
+            DAEMON_ONLINE.store(true, Ordering::Relaxed);
             return Ok(());
         }
         if Instant::now() >= deadline {

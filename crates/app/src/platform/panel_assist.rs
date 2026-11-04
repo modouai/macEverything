@@ -69,6 +69,22 @@ pub fn decide(
     }
 }
 
+/// 有效开关 = 用户设置开启 **且** 辅助功能已授权。
+///
+/// 这是唯一真源:启动、设置切换、运行期授权跃迁都经此重算,避免三处各写
+/// `save && trusted` 而产生偏差。
+pub fn effective_enabled(save_panel_assist: bool, trusted: bool) -> bool {
+    save_panel_assist && trusted
+}
+
+/// 是否需要启动 detector = 有效开关开启 **且** detector 尚未运行。
+///
+/// detector 常驻不可停止,已有接收端时再调用 `start_detector` 只会得到 None;
+/// 此判定供接线层在「首次授权后」决定是否置一次性启动标记。
+pub fn detector_start_needed(enabled: bool, detector_running: bool) -> bool {
+    enabled && !detector_running
+}
+
 /// Esc 屏蔽状态(design §4 不打扰规则:本面板存续内不再自动弹;面板关闭即清除)。
 /// 键 = 宿主 pid(同一 app 同时至多一个模态保存面板)。
 #[derive(Default)]
@@ -145,6 +161,38 @@ mod tests {
             Decision::HideAndClear { pid: 7 },
             "pid 必须原样透传(宿主切换后归因可能已被其他面板覆盖)"
         );
+    }
+
+    /// 有效开关与启动判定表:有效开关 = 设置开启 && 已授权;
+    /// 需要启动 = 有效开关 && detector 未运行。
+    /// 突变「effective_enabled 去掉 trusted」→ 首行 (true,false) 必红;
+    /// 突变「detector_start_needed 去掉 !running」→ (true,true) 必红。
+    #[test]
+    fn effective_enabled_and_start_need_table() {
+        for (save, trusted, want) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                effective_enabled(save, trusted),
+                want,
+                "effective_enabled(save={save}, trusted={trusted})"
+            );
+        }
+        for (enabled, running, want) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert_eq!(
+                detector_start_needed(enabled, running),
+                want,
+                "detector_start_needed(enabled={enabled}, running={running})"
+            );
+        }
     }
 
     /// Esc 屏蔽:dismiss 后本面板存续内 blocked,clear(面板关闭)后恢复。

@@ -1667,7 +1667,8 @@ fn apply_panel_assist(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled:
         let saved = error.is_none();
         // 接线层据此忽略/放行检测事件(detector 常驻,不支持停止)。
         let was_enabled = s.panel_assist_enabled;
-        s.panel_assist_enabled = enabled && trusted;
+        s.panel_assist_trusted = trusted; // 与逻辑帧保持同一观测值
+        s.panel_assist_enabled = platform::panel_assist::effective_enabled(enabled, trusted);
         // 运行期由关到开:置一次性 pending,由 `logic` 尝试启动 detector
         // (授权后用户开启开关即生效,无需重启 App)。关闭不停止 detector。
         if !was_enabled && s.panel_assist_enabled {
