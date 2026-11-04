@@ -9,6 +9,11 @@ use std::sync::mpsc;
 use super::ax_ffi::{self, attr, note, AXObserverWrap, AXRef};
 
 /// 检测事件(UI 接线层每帧 poll;mpsc 单消费)。
+///
+/// 重复语义:`Shown` 可能因多个通知(AXWindowCreated + AXFocusedWindowChanged +
+/// on_signal 预扫)对同一面板重复发出;去重责任在接线层(浮层已显示则忽略),
+/// detector 不做状态去重。`Closed` 的宽口径(任意元素销毁即视为关闭)见
+/// [`on_ax_event`] 现场注释。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PanelEvent {
     /// 疑似保存面板出现。frame 为 AX 屏幕坐标 [x, y, w, h]:
@@ -193,20 +198,27 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>) {
     // 信号源(perform 在 detector 线程派发 → rebind 满足 AXObserver 同线程约束)
     let Some(src) = ax_ffi::signal_source_create(on_signal) else {
         log::error!("detector: 信号源创建失败,线程退出");
+        fail_init();
         return;
     };
-    ax_ffi::attach_signal_source(&src);
-    SIGNAL_SRC.store(src.raw(), Ordering::SeqCst);
-    // RAII 保活
-    SOURCE.with(|c| *c.borrow_mut() = Some(src));
-    // observer 占位 + 挂本线程 runloop
+    // observer 占位(创建成功前不 attach;失败时信号源随局部变量释放)
     let Some(obs) = ax_ffi::observer_create(0, on_ax_event) else {
         log::error!("detector: AXObserverCreate 失败(权限?),线程退出");
+        fail_init();
         return;
     };
+    // 全部 fallible 初始化完成后,再挂 runloop 并发布跨线程指针。
+    ax_ffi::attach_signal_source(&src);
     ax_ffi::attach_observer_to_current_runloop(&obs);
+    let signal_raw = src.raw();
+    let runloop_raw = ax_ffi::current_runloop_raw();
+    // RAII 保活
+    SOURCE.with(|c| *c.borrow_mut() = Some(src));
     OBSERVER.with(|c| *c.borrow_mut() = Some(obs));
-    DETECTOR_RL.store(ax_ffi::current_runloop_raw(), Ordering::SeqCst);
+    // 最后发布:notify_frontmost 在此之前读到 null 即安全跳过;发布后对象由
+    // SOURCE 保活到 detector 线程结束。
+    SIGNAL_SRC.store(signal_raw, Ordering::SeqCst);
+    DETECTOR_RL.store(runloop_raw, Ordering::SeqCst);
     // 处理启动前已经就位的前台 pid(通知可能早于线程就绪)
     let pid = FRONT_PID.load(Ordering::SeqCst);
     if pid != 0 {
@@ -215,6 +227,14 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>) {
     }
     log::info!("detector: 运行");
     ax_ffi::run_current_runloop();
+}
+
+/// 初始化失败兜底:显式清空跨线程指针(防发布前遗留悬垂 raw)+ 回滚启动闸
+/// 允许接线层重试(与线程创建失败路径一致)。
+fn fail_init() {
+    SIGNAL_SRC.store(std::ptr::null_mut(), Ordering::SeqCst);
+    DETECTOR_RL.store(std::ptr::null_mut(), Ordering::SeqCst);
+    STARTED.store(false, Ordering::SeqCst);
 }
 
 /// 信号源 perform(detector 线程):前台 pid 变更 → 换绑 + 立即扫一遍。
