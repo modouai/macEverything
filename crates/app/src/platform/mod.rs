@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 pub mod ax_ffi;
 #[cfg(target_os = "macos")]
+pub mod cg_events;
+#[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
 pub mod mac_quicklook;
