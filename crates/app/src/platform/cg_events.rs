@@ -22,9 +22,10 @@ extern "C" {
 
 /// 事件 tap:kCGHIDEventTap = 0(系统注入层,面板可收)。
 const TAP_HID: u32 = 0;
-/// CGEventFlags 位:Shift = 0x02,Command = 0x10。
-pub const FLAG_SHIFT: u64 = 0x02;
-pub const FLAG_CMD: u64 = 0x10;
+/// CGEventFlags 设备无关位(CGEventTypes.h → IOLLEvent.h NX_*MASK):
+/// Shift = 0x0002_0000,Command = 0x0010_0000(0x02/0x10 是设备依赖位,系统不识别)。
+pub const FLAG_SHIFT: u64 = 0x0002_0000;
+pub const FLAG_CMD: u64 = 0x0010_0000;
 /// HID keycode:kVK_ANSI_G = 0x05,V = 0x09,Return = 0x24。
 pub const KEY_G: u16 = 0x05;
 pub const KEY_V: u16 = 0x09;
