@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 pub mod ax_ffi;
 #[cfg(target_os = "macos")]
 pub mod cg_events;
-// 保存面板跳转状态机(纯逻辑;Task 11 执行层接线)。
+// 保存面板跳转状态机 + 平台执行层(Task 11;执行层动作→AX/合成键/剪贴板)。
 #[cfg(target_os = "macos")]
 pub mod dialog_navigator;
 #[cfg(target_os = "macos")]
@@ -31,6 +31,18 @@ pub mod mac_quicklook;
 pub mod panel_detector;
 #[cfg(target_os = "macos")]
 pub mod panel_probe;
+
+/// 跳转结果(执行层 [`dialog_navigator::NavigateOutcome`] 的唯一真相;
+/// 非 macOS 的同名 stub 只为保持 facade 可编译)。
+#[cfg(target_os = "macos")]
+pub use dialog_navigator::NavigateOutcome;
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigateOutcome {
+    Done,
+    FellBackToClipboard,
+    Aborted,
+}
 
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
@@ -656,6 +668,26 @@ pub fn clipboard_restore(saved: Option<&str>) -> bool {
     {
         let _ = saved;
         true
+    }
+}
+
+/// 把保存面板跳转到指定目录(阻塞;调用方在后台线程执行)。
+///
+/// 状态机驱动策略 A(AX 直设)/策略 B(剪贴板 + ⌘V)降级,收尾恢复剪贴板;
+/// 返回终态供浮层接线层决定后续提示(design §5)。
+/// 非 macOS 恒 `Aborted`(交付面仅 macOS,stub 只为保持 facade 可编译)。
+// Task 14 接线(navigate_panel 的首个生产调用方)后移除本 allow。
+// 在此之前它仍是死代码根:被它引用的执行层/状态机因此一并按「可达」处理。
+#[allow(dead_code)]
+pub fn navigate_panel(pid: i32, path: &str) -> NavigateOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        dialog_navigator::run_navigate(pid, path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, path);
+        NavigateOutcome::Aborted
     }
 }
 
