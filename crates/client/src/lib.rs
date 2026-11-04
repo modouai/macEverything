@@ -215,6 +215,7 @@ pub fn query(
                 // false 不发送:None 与 false 引擎语义相同(自然方向),
                 // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
                 desc: desc.then_some(true),
+                dir_only: None,
             },
         )
         .map_err(no_code)?;
