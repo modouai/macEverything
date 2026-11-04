@@ -101,12 +101,12 @@ pub struct OverlayState {
     ime_composing: bool,
     /// 本帧有 IME 事件(预编辑/提交):选字回车与提交同帧到达,该帧键位归输入法。
     ime_busy: bool,
+    /// 选中项变更后把该行滚入可见区(本帧消费后清零)。
+    scroll_to_selected: bool,
+    /// 查询会话(防抖 + 代际号唯一真相;在途响应以 `Session::accepts` 判定)。
     session: Session,
     query_tx: Sender<(u64, Vec<HitEntry>)>,
     query_rx: Receiver<(u64, Vec<HitEntry>)>,
-    /// 浮层自己的代际号:空输入/关闭/重新打开时递增,作废在途响应
-    /// (Session 的代际号不可读,且清空输入后不会再有新查询可用来抬高它)。
-    gen: u64,
 }
 
 impl OverlayState {
@@ -126,26 +126,27 @@ impl OverlayState {
             dismiss_requested: false,
             ime_composing: false,
             ime_busy: false,
+            scroll_to_selected: false,
             session: Session::new(DEBOUNCE),
             query_tx,
             query_rx,
-            gen: 0,
         }
     }
 
-    /// 打开浮层(清空上一次输入/结果/提示)。
+    /// 打开浮层(清空上一次输入/结果/提示,复位全部瞬态标志)。
     pub fn open(&mut self) {
         self.visible = true;
-        self.gen = self.gen.wrapping_add(1); // 作废上一轮在途响应
-        self.session = Session::new(DEBOUNCE);
+        self.session.reset(); // 推进代际号,作废上一轮在途响应
         self.input.clear();
         self.results.clear();
         self.selected = 0;
         self.clipboard_hint = false;
         self.commit_requested = false;
         self.dismiss_requested = false;
+        self.panel_pid = None;
         self.ime_composing = false;
         self.ime_busy = false;
+        self.scroll_to_selected = false;
         // 首帧内容:平台层 orderFront 后须有一次本视口的 pass,否则窗内是旧帧/空白。
         self.ctx.request_repaint_of(overlay_viewport_id());
     }
@@ -153,21 +154,24 @@ impl OverlayState {
     #[allow(dead_code)] // Task 14 接线层调用(Esc/面板关闭/宿主切换)。
     pub fn close(&mut self) {
         self.visible = false;
-        self.gen = self.gen.wrapping_add(1); // 关闭后在途响应不得回填
-        self.session = Session::new(DEBOUNCE);
+        self.session.reset(); // 关闭后在途响应不得回填
         self.input.clear();
         self.results.clear();
         self.selected = 0;
         self.clipboard_hint = false;
+        self.commit_requested = false;
+        self.dismiss_requested = false;
+        self.panel_pid = None;
         self.ime_composing = false;
         self.ime_busy = false;
+        self.scroll_to_selected = false;
     }
 
     /// 输入变更 → 防抖会话;清空输入立即清结果并作废在途响应。
     pub fn on_input(&mut self, now: Instant) {
         self.session.on_input(&self.input, now);
         if self.input.is_empty() {
-            self.gen = self.gen.wrapping_add(1);
+            // 空词:Session::on_input 已推进代际号(在途旧代不被接受),这里只清展示。
             self.results.clear();
             self.selected = 0;
         } else {
@@ -187,8 +191,8 @@ impl OverlayState {
                 .request_repaint_after_for(delay, overlay_viewport_id());
         }
         if let Some(fire) = self.session.pending_at(now) {
-            self.gen = self.gen.wrapping_add(1);
-            let generation = self.gen;
+            // 代际号由 Session 唯一持有:发起时取 fire.generation,回收时用 accepts 校验。
+            let generation = fire.generation;
             let query = fire.query;
             let paths = self.paths.clone();
             let ctx = self.ctx.clone();
@@ -209,11 +213,13 @@ impl OverlayState {
             });
         }
         while let Ok((generation, entries)) = self.query_rx.try_recv() {
-            if generation != self.gen {
+            // 以 Session 为唯一真相:清空输入/关闭重开/新查询都会推进其代际号。
+            if !self.session.accepts(generation) {
                 continue; // 旧代响应丢弃(慢响应后到不得覆盖新结果)
             }
             self.results = entries;
             self.selected = 0;
+            self.scroll_to_selected = false;
         }
     }
 
@@ -299,7 +305,12 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             OverlayKeyAction::None => {}
             OverlayKeyAction::Commit => st.commit_requested = true,
             OverlayKeyAction::Dismiss => st.dismiss_requested = true,
-            OverlayKeyAction::Select(index) => st.selected = index,
+            OverlayKeyAction::Select(index) => {
+                if index != st.selected {
+                    st.selected = index;
+                    st.scroll_to_selected = true; // 本帧把新选中行滚入可见区
+                }
+            }
         }
     }
 
@@ -326,6 +337,10 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             }
             for (i, entry) in st.results.iter().enumerate() {
                 let response = draw_row(ui, entry, i == st.selected);
+                // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
+                if i == st.selected && st.scroll_to_selected {
+                    ui.scroll_to_rect(response.rect, None);
+                }
                 if response.clicked() {
                     clicked_row = Some(i);
                 }
@@ -335,6 +350,7 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
                 }
             }
         });
+    st.scroll_to_selected = false; // 本帧已消费(点击/查询回填同样不重复滚动)
     if let Some(i) = clicked_row {
         st.selected = i;
     }
@@ -451,48 +467,62 @@ mod tests {
         );
     }
 
-    /// 关闭/重新打开必须作废在途响应,并清空输入、结果与提示。
+    /// 关闭必须作废在途响应,并清空输入、结果、提示与全部瞬态标志。
     #[test]
     fn reopen_resets_and_invalidates_inflight() {
         let mut st = state();
         st.open();
         st.input = "报告".to_owned();
-        let stale_gen = st.gen;
-        st.results = vec![HitEntry {
-            name: "a".into(),
-            path: "/a".into(),
-            size: None,
-            mtime: None,
-            is_dir: true,
-        }];
+        // 产生一个在途代际(验证 close 后作废)。
+        let base = Instant::now();
+        st.session.on_input("报告", base);
+        let inflight = st
+            .session
+            .pending_at(base + DEBOUNCE)
+            .expect("窗口到应发起")
+            .generation;
+        assert!(st.session.accepts(inflight));
+        st.results = vec![entry("a", "/a", true)];
         st.selected = 1;
         st.clipboard_hint = true;
+        st.commit_requested = true;
+        st.dismiss_requested = true;
+        st.panel_pid = Some(123);
         st.close();
         assert!(!st.visible);
         assert!(st.input.is_empty());
         assert!(st.results.is_empty());
         assert_eq!(st.selected, 0);
         assert!(!st.clipboard_hint);
-        assert_ne!(st.gen, stale_gen, "关闭后旧代响应应作废");
+        assert!(!st.commit_requested, "关闭须清提交请求");
+        assert!(!st.dismiss_requested, "关闭须清取消请求");
+        assert_eq!(st.panel_pid, None, "关闭须清面板 pid");
+        assert!(!st.session.accepts(inflight), "关闭后旧代响应应作废");
     }
 
-    /// 清空输入立即清结果并推进代际号(旧响应不得回填)。
+    /// 清空输入立即清结果并推进 Session 代际(旧响应不得回填)。
     #[test]
     fn empty_input_clears_results_and_invalidates() {
         let mut st = state();
         st.open();
+        let base = Instant::now();
         st.input = "报".to_owned();
-        let before = st.gen;
-        st.on_input(Instant::now());
-        assert_eq!(st.gen, before, "非空输入不推进代际号");
+        st.on_input(base);
+        // 发起一次查询取得基线代际(直接驱动会话,不 spawn 线程)。
+        let baseline = st
+            .session
+            .pending_at(base + DEBOUNCE)
+            .expect("窗口到应发起")
+            .generation;
+        assert!(st.session.accepts(baseline), "非空输入不推进代际号");
         // 先预置非空结果/选中:否则「清空」断言在恒空状态下恒真(假钉)。
         st.results = vec![entry("a", "/a", true), entry("b", "/b", true)];
         st.selected = 1;
         st.input.clear();
-        st.on_input(Instant::now());
+        st.on_input(base);
         assert!(st.results.is_empty());
         assert_eq!(st.selected, 0);
-        assert_ne!(st.gen, before, "清空输入须作废在途响应");
+        assert!(!st.session.accepts(baseline), "清空输入须作废在途响应");
     }
 
     /// poll 只回填当前代际的响应:过期代际即使后到也不得覆盖当前结果。
@@ -500,20 +530,33 @@ mod tests {
     fn poll_discards_stale_generation() {
         let mut st = state();
         st.open();
-        let current = st.gen;
-        let stale = current.wrapping_sub(1);
+        // 连发两代查询:第一代在第二代发出后即为过期代。
+        let base = Instant::now();
+        st.session.on_input("a", base);
+        let stale = st
+            .session
+            .pending_at(base + DEBOUNCE)
+            .expect("窗口到应发起")
+            .generation;
+        st.session.on_input("b", base);
+        let current = st
+            .session
+            .pending_at(base + DEBOUNCE)
+            .expect("窗口到应发起")
+            .generation;
+        assert_ne!(stale, current);
         // 过期代先到:不得回填。
         st.query_tx
             .send((stale, vec![entry("old", "/old", false)]))
             .unwrap();
-        st.poll(Instant::now());
+        st.poll(base);
         assert!(st.results.is_empty(), "过期代结果不得回填");
         // 当前代随后到:回填并复位选中。
         st.selected = 2;
         st.query_tx
             .send((current, vec![entry("dir", "/dir", true)]))
             .unwrap();
-        st.poll(Instant::now());
+        st.poll(base);
         assert_eq!(st.results.len(), 1);
         assert_eq!(st.results[0].path, "/dir");
         assert_eq!(st.selected, 0, "新结果到达复位选中");
