@@ -1651,6 +1651,8 @@ fn apply_auto_check(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: b
 /// 授权状态（徽标/按钮）每帧经 [`SettingsData::from_state`] 实时读取，
 /// 授权完成后回到设置页即自动消失。
 fn apply_panel_assist(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled: bool) {
+    // 授权查询是平台调用,锁外做;有效开关 = 设置开启且已授权。
+    let trusted = crate::platform::panel_assist_trusted();
     let (mut file, data_dir) = {
         let s = lock_shared(shared);
         (s.settings.file.clone(), s.settings.data_dir.clone())
@@ -1663,12 +1665,14 @@ fn apply_panel_assist(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled:
     {
         let mut s = lock_shared(shared);
         let saved = error.is_none();
+        // 接线层据此忽略/放行检测事件(detector 常驻,不支持停止)。
+        s.panel_assist_enabled = enabled && trusted;
         s.settings.set_panel_assist_result(enabled, error);
         if saved {
             s.settings.clear_save_errors();
         }
     }
-    log::info!("保存面板目录助手 → {enabled}");
+    log::info!("保存面板目录助手 → {enabled}(已授权 {trusted})");
     ctx.request_repaint_of(viewport_id());
 }
 

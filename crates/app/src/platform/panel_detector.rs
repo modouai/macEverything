@@ -2,56 +2,13 @@
 //! 确认可编辑输入框/按钮组) + 产品事件层(NSWorkspace 前台切换通知驱动,
 //! 专用 runloop 线程换绑 AXObserver,mpsc 输出 [`PanelEvent`])。
 //! 快照结构与 AX 树解耦,纯数据可序列化可测。
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use super::ax_ffi::{self, attr, note, AXObserverWrap, AXRef};
-
-/// 检测事件(UI 接线层每帧 poll;mpsc 单消费)。
-///
-/// 重复语义:`Shown` 可能因多个通知(AXWindowCreated + AXFocusedWindowChanged +
-/// on_signal 预扫)对同一面板重复发出;去重责任在接线层(浮层已显示则忽略),
-/// detector 不做状态去重。
-///
-/// 关闭/切宿主语义:
-/// - `HostChanged`:前台宿主切换(换绑成功且此前有面板归因)→ 接线层隐藏浮层,
-///   但**保留 Dismissals**(Esc 屏蔽持续到该面板真正关闭,design §4);
-/// - `Closed`:面板窗口销毁 → 隐藏浮层并**解除屏蔽**。
-///
-/// `Closed` 的宽口径(任意元素销毁即视为关闭)见 [`on_ax_event`] 现场注释。
-#[derive(Debug, Clone, PartialEq)]
-pub enum PanelEvent {
-    /// 疑似保存面板出现。frame 为 AX 屏幕坐标 [x, y, w, h]:
-    /// 原点在主屏左上角、y 向下(与 AppKit 左下原点相反——浮层定位换算在平台层做)。
-    Shown { pid: i32, frame: [f64; 4] },
-    /// 前台宿主切换(换绑成功且此前有面板归因)。接线层应隐藏浮层但保留 Esc 屏蔽。
-    HostChanged { previous_pid: i32 },
-    /// 面板窗口销毁。
-    Closed,
-}
-
-/// Esc 屏蔽状态(design §4 不打扰规则:本面板存续内不再自动弹;面板关闭即清除)。
-/// 键 = 宿主 pid(同一 app 同时至多一个模态保存面板)。
-#[derive(Default)]
-#[allow(dead_code)] // Task 14 接线层使用(设计 §4 不打扰规则);单测已覆盖。
-pub struct Dismissals {
-    dismissed: HashSet<i32>,
-}
-
-#[allow(dead_code)] // Task 14 接线层使用;单测已覆盖。
-impl Dismissals {
-    pub fn dismiss(&mut self, pid: i32) {
-        self.dismissed.insert(pid);
-    }
-    pub fn blocked(&self, pid: i32) -> bool {
-        self.dismissed.contains(&pid)
-    }
-    pub fn clear(&mut self, pid: i32) {
-        self.dismissed.remove(&pid);
-    }
-}
+// 事件定义在跨平台模块(UI 接线层与单测共用);此处只需导入事件类型。
+use super::panel_assist::PanelEvent;
 
 /// 窗口特征快照(判定输入;与 AX 树解耦,纯数据可序列化可测)。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -507,28 +464,6 @@ mod tests {
     #[test]
     fn floating_window_with_editable_field_currently_matches_pending_m0() {
         assert!(is_save_panel(&snap("AXFloatingWindow", 1, 1)));
-    }
-
-    /// Esc 屏蔽:dismiss 后本面板存续内 blocked,clear(面板关闭)后恢复。
-    #[test]
-    fn dismiss_blocks_until_cleared() {
-        let mut d = Dismissals::default();
-        assert!(!d.blocked(42));
-        d.dismiss(42);
-        assert!(d.blocked(42));
-        d.clear(42);
-        assert!(!d.blocked(42));
-    }
-
-    /// 屏蔽按宿主 pid 隔离:一个 app 的 Esc 不影响其他 app 的保存面板。
-    #[test]
-    fn dismissals_are_per_pid() {
-        let mut d = Dismissals::default();
-        d.dismiss(1);
-        assert!(d.blocked(1));
-        assert!(!d.blocked(2));
-        d.clear(2); // 清除未屏蔽 pid 为 no-op
-        assert!(d.blocked(1));
     }
 
     /// M2:仅当前台 pid 有效且变化时才换绑;相同 pid 的重复 signal 不得重复换绑/扫描。

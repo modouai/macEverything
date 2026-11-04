@@ -90,7 +90,7 @@ pub mod window_tokens;
 
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -199,10 +199,6 @@ impl egui::Plugin for AtlasSideCap {
 /// 首帧接线轮询上限(悬浮条视口窗创建于注册 pass 之后,补丁须下一帧才找得到;
 /// 上限防「窗口永不出现」时无限排帧烧 CPU)。
 const PATCH_ATTACH_ATTEMPTS: u32 = 300;
-
-/// `MCE_OVERLAY_DEBUG` 首帧显示重试上限(浮层视口窗同样创建于注册 pass 之后;
-/// 上限防「窗口永不出现」时无限满速排帧与日志刷屏)。
-const OVERLAY_DEBUG_ATTEMPTS: u32 = 120;
 
 /// 安装 UI 字体:内置覆盖字体(`BUNDLED_FONTS`,Proportional + Monospace
 /// 同表)+ macOS 原生拉丁字体(SF Pro / SF Mono)。
@@ -595,6 +591,21 @@ fn overlay_builder() -> egui::ViewportBuilder {
         .with_always_on_top()
 }
 
+/// 后台跳转结果(工作线程 → `logic`;FellBack 时重现浮层提示已复制)。
+#[derive(Debug, Clone, Copy)]
+struct NavigateResult {
+    pid: i32,
+    outcome: platform::NavigateOutcome,
+}
+
+/// 浮层请求(绘制层置标志,`logic` 锁内取快照后执行)。
+enum OverlayRequest {
+    /// Esc/⌘W:关闭浮层并屏蔽该面板。
+    Dismiss,
+    /// Enter/双击:关闭浮层并后台跳转。
+    Commit { pid: i32, path: String },
+}
+
 pub struct App {
     /// 二次启动唤起通道(app.sock 监听线程 → 主线程;main 接线)。
     incoming: Receiver<Incoming>,
@@ -608,11 +619,13 @@ pub struct App {
     root_hide_issued: bool,
     /// 纠偏回读已留痕一次(原生 `isVisible()` 核对;见 `logic`)。
     root_hide_verified: bool,
-    /// 临时调试开关(`MCE_OVERLAY_DEBUG=1`):首帧打开浮层并定位一次,
-    /// 让浮层可编译可达(clippy 无死代码)。Task 14 事件接线后移除。
-    overlay_debug_pending: bool,
-    /// 调试浮层首帧显示已重试次数(见 `OVERLAY_DEBUG_ATTEMPTS`)。
-    overlay_debug_attempts: u32,
+    /// 保存面板检测事件接收端(`App::new` 按设置启动 detector;全隐期由桥接
+    /// 线程 request_repaint 唤醒 `logic` 消费)。
+    detector_rx: Option<Receiver<platform::PanelEvent>>,
+    /// 后台跳转结果回投(`commit_requested` → 工作线程 → `logic`)。
+    navigate_rx: Receiver<NavigateResult>,
+    /// 跳转结果发送端(每次 commit 克隆给工作线程)。
+    navigate_tx: Sender<NavigateResult>,
     /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 已接)。
     quitting: bool,
     /// 全局热键运行时(Task 15/21):manager 保活 + 事件泵;命中走主队列直调
@@ -640,8 +653,17 @@ pub struct Shared {
     pub update: update::UpdateState,
     /// 悬浮条可见标志(真源;排帧门禁与按钮态都读它)。
     pub palette_visible: bool,
-    /// 保存面板目录助手浮层(事件接线在 Task 14;本任务只有 debug 显示路径)。
+    /// 保存面板目录助手浮层(事件接线见本文件 `drain_panel_events`)。
     pub overlay: overlay::OverlayState,
+    /// 助手开关的有效状态(设置开启 **且** 辅助功能已授权;设置切换时更新)。
+    pub panel_assist_enabled: bool,
+    /// Esc 屏蔽(本面板存续内不再自动弹;`Closed` 解除)。
+    pub dismissals: platform::Dismissals,
+    /// 最近一次 Shown 的面板 AX frame(FellBack 重现浮层时重新定位用)。
+    pub last_panel_frame: Option<[f64; 4]>,
+    /// 当前归因面板的 pid(独立于 `overlay.panel_pid`:Esc 关闭浮层后仍需记住
+    /// 该面板,等 `Closed` 解除屏蔽;`overlay.close()` 会清自己的 pid)。
+    pub active_panel_pid: Option<i32>,
 }
 
 impl App {
@@ -683,7 +705,9 @@ impl App {
         let auto_update = settings_file.check_updates;
         // 保存面板助手:开关开且未授权 → 提示一次(仅 log + 托盘项,不弹窗;
         // design §3.2;托盘菜单项由 tray::install 在本调用前按同一条件挂载)。
-        if settings_file.save_panel_assist && !crate::platform::panel_assist_trusted() {
+        let panel_assist_trusted = crate::platform::panel_assist_trusted();
+        let panel_assist_enabled = settings_file.save_panel_assist && panel_assist_trusted;
+        if settings_file.save_panel_assist && !panel_assist_trusted {
             log::info!("保存面板助手待授权:设置页或托盘菜单可跳转系统设置");
         }
         let shared = Arc::new(Mutex::new(Shared {
@@ -703,6 +727,10 @@ impl App {
             update: update::UpdateState::new(),
             palette_visible: false, // 启动隐藏(产品形态:四窗皆隐,仅菜单栏图标)
             overlay: overlay::OverlayState::new(cc.egui_ctx.clone(), paths.clone()),
+            panel_assist_enabled,
+            dismissals: platform::Dismissals::default(),
+            last_panel_frame: None,
+            active_panel_pid: None,
         }));
         if auto_update {
             spawn_update_check(&shared, &cc.egui_ctx);
@@ -770,6 +798,41 @@ impl App {
             let t = Arc::clone(&dispatch_target);
             move |action| t(action)
         });
+        // 保存面板检测器:设置开启且已授权才启动(常驻不可停止;关闭时由接线层
+        // 忽略事件即可)。detector 的 mpsc 不持有 egui ctx,这里加一层桥接线程:
+        // 全隐期没有排帧,收到事件必须主动 request_repaint 唤醒 `logic` 消费。
+        let detector_rx = if panel_assist_enabled {
+            platform::panel_detector_start().and_then(|rx| {
+                let (tx, fwd_rx) = std::sync::mpsc::channel();
+                let ctx = cc.egui_ctx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("panel-events".to_owned())
+                    .spawn(move || {
+                        for ev in rx {
+                            if tx.send(ev).is_err() {
+                                break; // 接收端已随 App 退出
+                            }
+                            ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        }
+                    });
+                match spawned {
+                    Ok(handle) => {
+                        drop(handle); // 分离线程:detector 常驻到进程退出
+                        log::info!("保存面板检测器已启动");
+                        Some(fwd_rx)
+                    }
+                    Err(err) => {
+                        log::error!("保存面板事件桥接线程创建失败:{err}");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        // 跳转结果通道一次创建、跨提交复用。
+        let (navigate_tx, navigate_rx) = std::sync::mpsc::channel();
+
         Self {
             incoming,
             shared,
@@ -777,9 +840,9 @@ impl App {
             attach_attempts: 0,
             root_hide_issued: false,
             root_hide_verified: false,
-            // 临时调试开关(Task 14 移除):启动后打开浮层一次并定位。
-            overlay_debug_pending: std::env::var("MCE_OVERLAY_DEBUG").as_deref() == Ok("1"),
-            overlay_debug_attempts: 0,
+            detector_rx,
+            navigate_rx,
+            navigate_tx,
             quitting: false,
             hotkey,
             tray,
@@ -840,6 +903,161 @@ impl App {
                 Incoming::ShowPalette => {
                     log::info!("二次启动唤起:显示悬浮条");
                     self.show_palette(ctx);
+                }
+            }
+        }
+    }
+
+    /// 消费保存面板检测事件(每帧;锁内状态读写、原生调用锁外)。
+    ///
+    /// 事件 → 动作由跨平台纯函数 [`platform::panel_assist::decide`] 决定;
+    /// daemon 在线状态读健康监控缓存(`engine_launcher::daemon_online`),
+    /// 不在主线程做 Ping 往返。
+    fn drain_panel_events(&mut self, ctx: &egui::Context) {
+        while let Some(ev) = self.detector_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            let decision = {
+                let s = self.shared();
+                let blocked = match &ev {
+                    platform::PanelEvent::Shown { pid, .. } => s.dismissals.blocked(*pid),
+                    _ => false,
+                };
+                platform::panel_assist::decide(
+                    &ev,
+                    s.panel_assist_enabled,
+                    s.overlay.visible,
+                    blocked,
+                    engine_launcher::daemon_online(),
+                )
+            };
+            match decision {
+                platform::Decision::Ignore => {}
+                platform::Decision::Show => {
+                    let platform::PanelEvent::Shown { pid, frame } = ev else {
+                        continue; // 决策不变量:Show 只来自 Shown
+                    };
+                    {
+                        let mut s = self.shared();
+                        s.last_panel_frame = Some(frame);
+                        s.active_panel_pid = Some(pid); // 归因,供 Closed 解除屏蔽
+                        s.overlay.open(); // 复位上一次输入/结果/瞬态标志
+                        s.overlay.panel_pid = Some(pid); // open() 会清 pid,须在其后写
+                    }
+                    if let Err(err) = platform::overlay_show(frame) {
+                        // 原生唤起失败(窗口未就绪/屏幕查不到):回滚可见态,
+                        // 否则后续 Shown 会被「已显示」门永久吞掉。
+                        log::warn!("浮层显示失败 pid={pid}: {err}");
+                        self.shared().overlay.close();
+                        continue;
+                    }
+                    ctx.request_repaint_of(overlay::overlay_viewport_id());
+                }
+                platform::Decision::HideKeepBlock => {
+                    self.shared().overlay.close();
+                    // 锁外调用(原生 orderOut 可被 winit 同步派发)。
+                    if let Err(err) = platform::overlay_hide() {
+                        log::warn!("浮层隐藏失败(宿主切换): {err}");
+                    }
+                }
+                platform::Decision::HideAndClear => {
+                    let pid = {
+                        let mut s = self.shared();
+                        // Esc 关闭浮层时 `overlay.panel_pid` 已被 close() 清掉,
+                        // 故用独立归因字段取回该面板 pid 再解除屏蔽。
+                        let pid = s.active_panel_pid.take();
+                        s.overlay.close();
+                        if let Some(pid) = pid {
+                            s.dismissals.clear(pid); // 面板销毁 → 解除 Esc 屏蔽
+                        }
+                        pid
+                    };
+                    if let Err(err) = platform::overlay_hide() {
+                        log::warn!("浮层隐藏失败(面板关闭 pid={pid:?}): {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 消费后台跳转结果:FellBack 时在面板旁重现浮层并提示路径已复制。
+    fn drain_navigate_results(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.navigate_rx.try_recv() {
+            if result.outcome != platform::NavigateOutcome::FellBackToClipboard {
+                continue; // Done/Aborted 无事
+            }
+            let frame = {
+                let mut s = self.shared();
+                // open() 会复位 pid/提示标志,故先 open 再写入。
+                s.overlay.open();
+                s.overlay.panel_pid = Some(result.pid);
+                s.overlay.clipboard_hint = true;
+                s.last_panel_frame
+            };
+            match frame {
+                Some(frame) => {
+                    if let Err(err) = platform::overlay_show(frame) {
+                        log::warn!("路径已复制,但浮层重现失败 pid={}: {err}", result.pid);
+                        self.shared().overlay.close();
+                        continue;
+                    }
+                    ctx.request_repaint_of(overlay::overlay_viewport_id());
+                }
+                None => log::warn!("路径已复制,但缺少面板定位 frame,无法重现浮层"),
+            }
+        }
+    }
+
+    /// 消费浮层请求(Esc/⌘W 关闭、Enter/双击提交跳转),一帧至多一个。
+    fn handle_overlay_requests(&mut self, ctx: &egui::Context) {
+        // 锁内只做状态读写;隐藏/线程启动在锁外。
+        let request = {
+            let mut s = self.shared();
+            if s.overlay.dismiss_requested {
+                let pid = s.overlay.panel_pid;
+                s.overlay.close();
+                if let Some(pid) = pid {
+                    s.dismissals.dismiss(pid); // 本面板存续内不再自动弹
+                }
+                Some(OverlayRequest::Dismiss)
+            } else if s.overlay.commit_requested {
+                let pid = s.overlay.panel_pid;
+                let path = s.overlay.selected_path();
+                s.overlay.close();
+                match (pid, path) {
+                    (Some(pid), Some(path)) => Some(OverlayRequest::Commit { pid, path }),
+                    _ => {
+                        // 二者任一缺失:关闭并忽略(无选中项/面板已消失)。
+                        log::warn!("浮层提交缺少面板 pid 或选中路径,忽略");
+                        Some(OverlayRequest::Dismiss)
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        match request {
+            None => {}
+            Some(OverlayRequest::Dismiss) => {
+                if let Err(err) = platform::overlay_hide() {
+                    log::warn!("浮层隐藏失败: {err}");
+                }
+            }
+            Some(OverlayRequest::Commit { pid, path }) => {
+                if let Err(err) = platform::overlay_hide() {
+                    log::warn!("浮层隐藏失败: {err}");
+                }
+                let tx = self.navigate_tx.clone();
+                let ctx = ctx.clone();
+                let log_path = path.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("panel-navigate".to_owned())
+                    .spawn(move || {
+                        let outcome = platform::navigate_panel(pid, &path);
+                        log::info!("保存面板跳转 pid={pid} path={log_path} → {outcome:?}");
+                        let _ = tx.send(NavigateResult { pid, outcome });
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    });
+                if let Err(err) = spawned {
+                    log::error!("保存面板跳转线程创建失败:{err}");
                 }
             }
         }
@@ -1316,6 +1534,12 @@ impl eframe::App for App {
         // 二次启动唤起:每帧收取 app.sock 事件(投递方已 request_repaint 唤醒)
         self.drain_incoming(ctx);
 
+        // 保存面板助手:检测事件 → 浮层显隐;浮层请求 → 关闭/后台跳转;
+        // 跳转结果 → FellBack 时重现提示。锁纪律:状态锁内、原生调用锁外。
+        self.drain_panel_events(ctx);
+        self.drain_navigate_results(ctx);
+        self.handle_overlay_requests(ctx);
+
         // 发现新版本：非阻塞收结果/看门狗；变化时唤醒设置页；托盘条目每帧同步。
         let (phase, changed, settings_open) = {
             let mut s = self.shared();
@@ -1338,43 +1562,12 @@ impl eframe::App for App {
         self.shared().results.tick(Instant::now());
 
         // 保存面板助手浮层:查询会话推进(与悬浮条同一工作线程模式)。
-        // 浮层可见时其 pass 也会驱动 poll(根视口被遮挡、logic 不跑时的兜底)。
-        self.shared().overlay.poll(Instant::now());
-
-        // 临时调试开关(Task 14 移除):首帧打开浮层并定位一次。视口窗由 eframe 在
-        // 注册 pass 末尾创建:窗口尚未创建属可重试(带上限,防满速自旋/日志刷屏);
-        // 窗口已存在仍失败属永久失败,停止重试并只 warn 一次。
-        if self.overlay_debug_pending {
-            {
-                let mut s = self.shared();
-                if !s.overlay.visible {
-                    s.overlay.open();
-                }
-            }
-            if !platform::overlay_window_present() {
-                if self.overlay_debug_attempts < OVERLAY_DEBUG_ATTEMPTS {
-                    self.overlay_debug_attempts += 1;
-                    ctx.request_repaint();
-                } else {
-                    self.overlay_debug_pending = false;
-                    log::warn!(
-                        "MCE_OVERLAY_DEBUG:浮层窗口 {OVERLAY_DEBUG_ATTEMPTS} 帧内未创建,放弃显示"
-                    );
-                }
-            } else {
-                match platform::overlay_show([100.0, 200.0, 600.0, 400.0]) {
-                    Ok(()) => {
-                        self.overlay_debug_pending = false;
-                        // orderFront 后补一帧本视口 pass,确保窗内内容立即上屏。
-                        ctx.request_repaint_of(overlay::overlay_viewport_id());
-                        log::info!("MCE_OVERLAY_DEBUG:浮层已显示(临时调试开关,Task 14 移除)");
-                    }
-                    Err(err) => {
-                        // 窗口已就绪仍唤起失败 = 永久失败:停止重试,只留痕一次。
-                        self.overlay_debug_pending = false;
-                        log::warn!("MCE_OVERLAY_DEBUG:浮层显示失败,不再重试:{err}");
-                    }
-                }
+        // 仅在可见期 poll(审查残留 #5:隐藏期不消费旧 pending);浮层可见时其
+        // pass 也会驱动 poll(根视口被遮挡、logic 不跑时的兜底)。
+        {
+            let mut s = self.shared();
+            if s.overlay.visible {
+                s.overlay.poll(Instant::now());
             }
         }
 

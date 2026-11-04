@@ -26,11 +26,15 @@ pub mod dialog_navigator;
 pub mod mac;
 #[cfg(target_os = "macos")]
 pub mod mac_quicklook;
+/// 保存面板助手的跨平台事件/屏蔽状态与决策纯逻辑(UI 接线层与单测使用)。
+pub mod panel_assist;
 // 保存面板助手(M0 探针 + 检测先行版):与 ax_ffi 同款 cfg,保持模块一致性。
 #[cfg(target_os = "macos")]
 pub mod panel_detector;
 #[cfg(target_os = "macos")]
 pub mod panel_probe;
+
+pub use panel_assist::{Decision, Dismissals, PanelEvent};
 
 /// 跳转结果(执行层 [`dialog_navigator::NavigateOutcome`] 的唯一真相;
 /// 非 macOS 的同名 stub 只为保持 facade 可编译)。
@@ -382,20 +386,7 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
     }
 }
 
-/// 浮层视口窗口是否已创建(调试首帧重试判定:未创建属可重试,已创建仍失败属永久)。
-pub fn overlay_window_present() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        mac::overlay_window_present()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
 /// 隐藏浮层(`orderOut`,不销毁窗口)。
-#[allow(dead_code)] // Task 14 接线层调用(本任务仅 debug 显示路径)。
 pub fn overlay_hide() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -677,6 +668,25 @@ pub fn panel_assist_trusted() -> bool {
     }
 }
 
+/// 启动保存面板检测器(产品路径;主线程调用)。
+///
+/// 先注册 NSWorkspace 前台应用切换观察者(检测器的换绑来源),再启动 detector。
+/// detector 常驻不可停止;返回 None = 权限缺失/初始化失败(调用方按开关重试或忽略)。
+pub fn panel_detector_start() -> Option<std::sync::mpsc::Receiver<PanelEvent>> {
+    #[cfg(target_os = "macos")]
+    {
+        if !mac::install_app_activate_observer() {
+            log::warn!("保存面板检测未启动:前台应用切换观察者注册失败");
+            return None;
+        }
+        panel_detector::start_detector()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// 打开系统设置 → 隐私与安全性 → 辅助功能(保存面板助手授权入口)。
 pub fn open_accessibility_settings() {
     #[cfg(target_os = "macos")]
@@ -732,9 +742,6 @@ pub fn clipboard_restore(saved: Option<&str>) -> bool {
 /// 状态机驱动策略 A(AX 直设)/策略 B(剪贴板 + ⌘V)降级,收尾恢复剪贴板;
 /// 返回终态供浮层接线层决定后续提示(design §5)。
 /// 非 macOS 恒 `Aborted`(交付面仅 macOS,stub 只为保持 facade 可编译)。
-// Task 14 接线(navigate_panel 的首个生产调用方)后移除本 allow。
-// 在此之前它仍是死代码根:被它引用的执行层/状态机因此一并按「可达」处理。
-#[allow(dead_code)]
 pub fn navigate_panel(pid: i32, path: &str) -> NavigateOutcome {
     #[cfg(target_os = "macos")]
     {

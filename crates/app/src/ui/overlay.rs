@@ -92,14 +92,11 @@ pub struct OverlayState {
     pub results: Vec<HitEntry>,
     pub selected: usize,
     /// 最近一次 Shown 的面板 host pid(接线层 commit 时给 navigator 用)。
-    #[allow(dead_code)] // Task 14 接线层写入/读取。
     pub panel_pid: Option<i32>,
     /// navigator 回退出口:路径已复制提示(design §5)。
     pub clipboard_hint: bool,
     /// 接线层请求标志(每帧消费后清零)。
-    #[allow(dead_code)] // Task 14 接线层消费。
     pub commit_requested: bool,
-    #[allow(dead_code)] // Task 14 接线层消费。
     pub dismiss_requested: bool,
     /// 输入法组合中(候选窗开着):不变更查询,Enter/Esc 归输入法。
     ime_composing: bool,
@@ -155,7 +152,6 @@ impl OverlayState {
         self.ctx.request_repaint_of(overlay_viewport_id());
     }
 
-    #[allow(dead_code)] // Task 14 接线层调用(Esc/面板关闭/宿主切换)。
     pub fn close(&mut self) {
         self.visible = false;
         self.session.reset(); // 关闭后在途响应不得回填
@@ -219,7 +215,6 @@ impl OverlayState {
     }
 
     /// 当前选中目录完整路径。
-    #[allow(dead_code)] // Task 14 接线层读取。
     pub fn selected_path(&self) -> Option<String> {
         self.results.get(self.selected).map(|e| e.path.clone())
     }
