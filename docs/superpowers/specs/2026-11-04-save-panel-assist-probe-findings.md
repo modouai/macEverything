@@ -25,6 +25,8 @@
 | 7 | AX API 后台线程调用可行性 | 待实机 | |
 | 8 | 打开面板(open)与保存面板(save)的特征差异 | 待实机 | |
 
+> 备注:AXFloatingWindow 误报验证(Get Info / Inspector 窗口是否被 is_save_panel 命中)。
+
 ## 对 M1 的影响(实机后回填)
 
 - 策略 A/B 默认值 = ？

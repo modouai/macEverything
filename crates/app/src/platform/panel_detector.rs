@@ -14,6 +14,7 @@ pub struct PanelSnapshot {
     /// 子树内 AXButton 数。
     pub buttons: usize,
     /// 子树内文件浏览容器(AXScrollArea/AXSplitGroup)数。
+    /// 当前仅取证字段,不参与 `is_save_panel`;特征表修订时评估是否纳入确认信号。
     pub browsers: usize,
 }
 
@@ -48,15 +49,19 @@ fn count_walk(el: &AXRef, depth: usize, s: &mut PanelSnapshot) {
     }
 }
 
-/// M0 探针粗判:subrole 含 Dialog 即疑似(取证用,宁滥勿缺——漏报比误报更伤取证)。
+/// M0 探针粗判:subrole 含 Dialog 或命中产品快速信号白名单即疑似
+/// (取证用,宁滥勿缺——漏报比误报更伤取证)。白名单形态(尤其 AXFloatingWindow)
+/// 不一定含 Dialog,故此处必须取并集,保证探针能对其 dump 快照并触发实验。
 ///
 /// 与 [`is_save_panel`] 分工:本函数只看快速信号,用于探针决定是否触发实验;
 /// 产品判定必须叠加确认信号(可编辑输入框 + 按钮组),零误报优先。
 pub fn looks_like_panel(s: &PanelSnapshot) -> bool {
-    s.subrole.as_deref().is_some_and(|r| r.contains("Dialog"))
+    s.subrole
+        .as_deref()
+        .is_some_and(|r| r.contains("Dialog") || SUBROLE_QUICK.contains(&r))
 }
 
-/// 快速信号:window subrole 白名单(macOS 实测形态;M0 探针 findings 回填后修订)。
+/// 快速信号:window subrole 白名单(设计推定 subrole 集合;M0 findings 回填后修订)。
 /// 判定为「疑似」而非「确认」——确认必须叠加结构信号。
 /// 注:AXStandardWindow 等普通窗口 subrole 不在列(防误报)。
 const SUBROLE_QUICK: &[&str] = &["AXSystemDialog", "AXDialog", "AXFloatingWindow"];
@@ -109,9 +114,10 @@ mod tests {
         assert!(!is_save_panel(&snap("AXSystemDialog", 1, 0)), "无按钮");
     }
 
-    /// 打开/保存面板都判定为是(设计 §3.2 触发范围:不区分)。
+    /// 标题不参与判定:打开面板标题为「打开」仍判定为是。
+    /// 钉住不得按标题过滤;open/save 的区分不在判定函数职责内(设计 §3.2 触发范围:不区分)。
     #[test]
-    fn open_and_save_panels_both_match() {
+    fn title_not_part_of_judgment_open_title_still_matches() {
         let mut s = snap("AXSystemDialog", 1, 2);
         s.title = Some("打开".into());
         assert!(is_save_panel(&s));
@@ -125,12 +131,29 @@ mod tests {
         assert!(!is_save_panel(&s));
     }
 
-    /// 探针粗判与产品判定的分工钉:粗判只看 subrole(取证宁滥),
-    /// 产品判定必须双信号(零误报优先)。
+    /// 探针粗判与产品判定的分工钉(Dialog 个案):粗判只看 subrole(取证宁滥),
+    /// 产品判定必须双信号(零误报优先)。个案名不声称全局宽窄关系。
     #[test]
-    fn probe_rough_judgment_is_looser_than_product_judgment() {
+    fn probe_rough_judgment_wider_on_dialog_subroles() {
         let s = snap("AXDialog", 0, 0);
         assert!(looks_like_panel(&s), "粗判:subrole 命中即疑似");
         assert!(!is_save_panel(&s), "产品判定:缺确认信号不通过");
+    }
+
+    /// 不变量:探针覆盖面必须是产品快速信号白名单的超集——
+    /// 白名单内每种形态(尤其 AXFloatingWindow)都必须能被 M0 探针 dump 快照并触发实验。
+    #[test]
+    fn probe_covers_every_product_quick_signal() {
+        for subrole in SUBROLE_QUICK {
+            assert!(looks_like_panel(&snap(subrole, 0, 0)), "{subrole}");
+        }
+    }
+
+    /// 已登记风险:AXFloatingWindow + 可编辑输入框会命中产品判定,
+    /// 而 Get Info/Inspector 窗口可能就是这种形态。
+    /// M0 实测复核后决定:移除该白名单条目,或加严确认信号(例如让 browsers 参与判定)。
+    #[test]
+    fn floating_window_with_editable_field_currently_matches_pending_m0() {
+        assert!(is_save_panel(&snap("AXFloatingWindow", 1, 1)));
     }
 }
