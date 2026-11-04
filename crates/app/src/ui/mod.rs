@@ -198,6 +198,10 @@ impl egui::Plugin for AtlasSideCap {
 /// 上限防「窗口永不出现」时无限排帧烧 CPU)。
 const PATCH_ATTACH_ATTEMPTS: u32 = 300;
 
+/// `MCE_OVERLAY_DEBUG` 首帧显示重试上限(浮层视口窗同样创建于注册 pass 之后;
+/// 上限防「窗口永不出现」时无限满速排帧与日志刷屏)。
+const OVERLAY_DEBUG_ATTEMPTS: u32 = 120;
+
 /// 安装 UI 字体:内置覆盖字体(`BUNDLED_FONTS`,Proportional + Monospace
 /// 同表)+ macOS 原生拉丁字体(SF Pro / SF Mono)。
 ///
@@ -605,6 +609,8 @@ pub struct App {
     /// 临时调试开关(`MCE_OVERLAY_DEBUG=1`):首帧打开浮层并定位一次,
     /// 让浮层可编译可达(clippy 无死代码)。Task 14 事件接线后移除。
     overlay_debug_pending: bool,
+    /// 调试浮层首帧显示已重试次数(见 `OVERLAY_DEBUG_ATTEMPTS`)。
+    overlay_debug_attempts: u32,
     /// 退出流程:根窗关闭请求不再取消(dev 退出按钮;托盘「退出」Task 16 已接)。
     quitting: bool,
     /// 全局热键运行时(Task 15/21):manager 保活 + 事件泵;命中走主队列直调
@@ -771,6 +777,7 @@ impl App {
             root_hide_verified: false,
             // 临时调试开关(Task 14 移除):启动后打开浮层一次并定位。
             overlay_debug_pending: std::env::var("MCE_OVERLAY_DEBUG").as_deref() == Ok("1"),
+            overlay_debug_attempts: 0,
             quitting: false,
             hotkey,
             tray,
@@ -1333,7 +1340,8 @@ impl eframe::App for App {
         self.shared().overlay.poll(Instant::now());
 
         // 临时调试开关(Task 14 移除):首帧打开浮层并定位一次。视口窗由 eframe 在
-        // 注册 pass 末尾创建,首帧未就绪时等下一帧;成功即清除标志。
+        // 注册 pass 末尾创建:窗口尚未创建属可重试(带上限,防满速自旋/日志刷屏);
+        // 窗口已存在仍失败属永久失败,停止重试并只 warn 一次。
         if self.overlay_debug_pending {
             {
                 let mut s = self.shared();
@@ -1341,16 +1349,29 @@ impl eframe::App for App {
                     s.overlay.open();
                 }
             }
-            match platform::overlay_show([100.0, 200.0, 600.0, 400.0]) {
-                Ok(()) => {
-                    self.overlay_debug_pending = false;
-                    // orderFront 后补一帧本视口 pass,确保窗内内容立即上屏。
-                    ctx.request_repaint_of(overlay::overlay_viewport_id());
-                    log::info!("MCE_OVERLAY_DEBUG:浮层已显示(临时调试开关,Task 14 移除)");
-                }
-                Err(err) => {
-                    log::info!("MCE_OVERLAY_DEBUG:浮层窗口未就绪,下帧重试:{err}");
+            if !platform::overlay_window_present() {
+                if self.overlay_debug_attempts < OVERLAY_DEBUG_ATTEMPTS {
+                    self.overlay_debug_attempts += 1;
                     ctx.request_repaint();
+                } else {
+                    self.overlay_debug_pending = false;
+                    log::warn!(
+                        "MCE_OVERLAY_DEBUG:浮层窗口 {OVERLAY_DEBUG_ATTEMPTS} 帧内未创建,放弃显示"
+                    );
+                }
+            } else {
+                match platform::overlay_show([100.0, 200.0, 600.0, 400.0]) {
+                    Ok(()) => {
+                        self.overlay_debug_pending = false;
+                        // orderFront 后补一帧本视口 pass,确保窗内内容立即上屏。
+                        ctx.request_repaint_of(overlay::overlay_viewport_id());
+                        log::info!("MCE_OVERLAY_DEBUG:浮层已显示(临时调试开关,Task 14 移除)");
+                    }
+                    Err(err) => {
+                        // 窗口已就绪仍唤起失败 = 永久失败:停止重试,只留痕一次。
+                        self.overlay_debug_pending = false;
+                        log::warn!("MCE_OVERLAY_DEBUG:浮层显示失败,不再重试:{err}");
+                    }
                 }
             }
         }
@@ -1663,6 +1684,11 @@ fn draw_overlay(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         return;
     }
     idle::note_viewport_activity(&ctx);
+    // 子视口关闭请求(⌘W/系统红点):eframe 不自行处理,转成 dismiss_requested 交给
+    // 接线层隐藏(与 palette/settings 的隐藏惯例一致),请求不悬空。
+    if ctx.input(|i| i.viewport().close_requested()) {
+        s.overlay.dismiss_requested = true;
+    }
     // 查询会话驱动:根视口被完全遮挡、`logic` 不跑时仍由此推进(与悬浮条同因)。
     s.overlay.poll(Instant::now());
     // 浮层不透明纯色底(不做毛玻璃);内容留白由 CentralPanel 默认内边距提供。

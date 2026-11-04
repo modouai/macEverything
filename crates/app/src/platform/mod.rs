@@ -382,6 +382,18 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
     }
 }
 
+/// 浮层视口窗口是否已创建(调试首帧重试判定:未创建属可重试,已创建仍失败属永久)。
+pub fn overlay_window_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_window_present()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// 隐藏浮层(`orderOut`,不销毁窗口)。
 #[allow(dead_code)] // Task 14 接线层调用(本任务仅 debug 显示路径)。
 pub fn overlay_hide() -> anyhow::Result<()> {

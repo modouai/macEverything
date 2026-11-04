@@ -1,6 +1,7 @@
 //! 保存面板目录助手浮层视口:输入框 + 目录列表;↑↓/Enter/双击/Esc。
-//! 查询复用悬浮条工作线程模式(palette.rs 查询段):防抖会话 + `client::query(dir_only=true)`
-//! + mpsc 回投。daemon 离线不弹浮层由接线层守门,本模块只管已弹出后的体验。
+//! 查询复用 `palette::spawn_entry_query_worker`(与悬浮条同一执行模型:防抖会话 +
+//! `client::query(dir_only=true)` + mpsc 回投 + 定向唤醒),本模块不再另起工作线程。
+//! daemon 离线不弹浮层由接线层守门,本模块只管已弹出后的体验。
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use client::DaemonPaths;
 
 use crate::i18n;
 use crate::session::Session;
+use crate::ui::palette;
 
 /// 防抖窗口(与悬浮条同值 60ms)。
 const DEBOUNCE: Duration = Duration::from_millis(60);
@@ -182,7 +184,7 @@ impl OverlayState {
         }
     }
 
-    /// 每帧:发起到期查询 + 收回投结果(代际校验)。仿 palette 查询段。
+    /// 每帧:发起到期查询 + 收回投结果(代际校验)。工作线程复用 palette 共享实现。
     pub fn poll(&mut self, now: Instant) {
         // 在途防抖逐帧补排(根因见 `Session::pending_delay`:同帧 0ms 立即重绘
         // 请求会吞掉防抖请求;不补排则要等下一次偶然重绘才发查询)。
@@ -191,26 +193,17 @@ impl OverlayState {
                 .request_repaint_after_for(delay, overlay_viewport_id());
         }
         if let Some(fire) = self.session.pending_at(now) {
-            // 代际号由 Session 唯一持有:发起时取 fire.generation,回收时用 accepts 校验。
-            let generation = fire.generation;
-            let query = fire.query;
-            let paths = self.paths.clone();
-            let ctx = self.ctx.clone();
-            let tx = self.query_tx.clone();
-            // UI 线程不做阻塞查询(与悬浮条同一执行模型)。
-            std::thread::spawn(move || {
-                let entries = match client::query(&paths, &query, QUERY_LIMIT, None, false, true) {
-                    Ok(out) => out.entries,
-                    Err(err) => {
-                        // 浮层不展示错误态:daemon 离线由接线层守门;查询级失败按空结果处理。
-                        log::warn!("浮层目录查询失败:{}", err.message);
-                        Vec::new()
-                    }
-                };
-                let _ = tx.send((generation, entries));
-                // 跨线程唤醒浮层视口(隐藏期不误唤醒根视口)。
-                ctx.request_repaint_of(overlay_viewport_id());
-            });
+            // 代际号由 Session 唯一持有;线程启动/错误处理/回投/唤醒统一走 palette
+            // 共享 worker(勿在本模块复制)。
+            palette::spawn_entry_query_worker(
+                self.paths.clone(),
+                self.ctx.clone(),
+                overlay_viewport_id(),
+                self.query_tx.clone(),
+                fire,
+                QUERY_LIMIT,
+                true,
+            );
         }
         while let Ok((generation, entries)) = self.query_rx.try_recv() {
             // 以 Session 为唯一真相:清空输入/关闭重开/新查询都会推进其代际号。
