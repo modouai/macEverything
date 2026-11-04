@@ -6,9 +6,6 @@
 //! SAFETY 总纪律:对外只暴露安全封装(post_combo 参数全安全类型);raw FFI
 //! 收敛在单一 unsafe 块。
 #![allow(non_snake_case)]
-// 当前整层尚未接线(保存面板助手后续任务使用),全部项判死代码属预期过渡态;
-// 接线完成后移除下方 allow,恢复逐项死代码检查。
-#![allow(dead_code)] // M0 探针/后续任务接线后移除
 
 use std::ffi::c_void;
 

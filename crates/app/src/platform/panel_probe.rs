@@ -1,4 +1,4 @@
-//! M0 探针(save-panel-assist 风险点的实机取证工具;`MCE_PANEL_PROBE=1` 启用)。
+//! M0 探针(save-panel-assist 风险点的开发取证工具;`MCE_PANEL_PROBE=1` 启用)。
 //! 单一专用 runloop 线程:CF timer 每 500ms 轮询前台 pid → 变更即重建
 //! AXObserver 并注册窗口通知 → 通知回调 dump 窗口特征快照 → 疑似保存面板
 //! 触发跳转实验(策略 A → 失败转策略 B),全程 `log::info!` 取证。

@@ -1048,7 +1048,6 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
 ///
 /// 与 `send_palette_hide` 对称:隐藏后安排「全隐缩窗」定时器,否则浮层视口的
 /// GL surface 会随窗口常驻(实测每窗约 26MB;定时器触发时再核对真实可见性)。
-#[allow(dead_code)] // Task 14 接线层调用(本任务仅 debug 显示路径)。
 pub fn overlay_hide() -> Result<()> {
     let Some(_mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("overlay_hide 非主线程调用"));

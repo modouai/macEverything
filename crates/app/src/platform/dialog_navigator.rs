@@ -158,8 +158,8 @@ impl NavMachine {
         self.step
     }
 
-    /// 策略 B 是否已参与(状态机单测读取;执行层按 `saved` 决定是否恢复剪贴板,
-    /// 生产路径暂不读取本方法,Task 14 接线时再评估)。
+    /// 策略 B 是否已参与(状态机单测读取;生产执行层按 `saved` 决定是否恢复
+    /// 剪贴板,不读本方法)。
     #[allow(dead_code)] // 仅测试消费(执行层用 saved 判据)
     pub fn used_clipboard(&self) -> bool {
         self.used_clipboard

@@ -3,6 +3,8 @@
 - 日期：<执行日期>
 - 环境：macOS <版本>；探针二进制 target/debug/macEverything-app（MCE_PANEL_PROBE=1）
 
+> 状态：探针与产品路径已实现并入主线；本表实机验证待用户执行，结论未回填。
+
 ## 操作步骤
 
 1. `MCE_PANEL_PROBE=1 ./target/debug/macEverything-app 2>&1 | tee /tmp/probe.log`

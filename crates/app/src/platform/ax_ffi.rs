@@ -7,10 +7,7 @@
 //! SAFETY 总纪律:所有 raw FFI 仅在本模块 unsafe 块内调用;对外暴露的都是
 //! 安全封装(参数为 &str/u32 等安全类型,返回 RAII 或 Option)。
 //
-// 当前整层尚未接线(保存面板助手后续任务使用),全部项判死代码属预期过渡态;
-// 接线完成后移除下方 allow,恢复逐项死代码检查。
 #![allow(non_snake_case)]
-#![allow(dead_code)] // M0 探针/后续任务接线后移除
 
 use std::ffi::{c_char, c_void};
 
@@ -108,7 +105,6 @@ pub mod attr {
     pub const TITLE: &str = "AXTitle";
     pub const VALUE: &str = "AXValue";
     pub const CHILDREN: &str = "AXChildren";
-    pub const WINDOWS: &str = "AXWindows";
     pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const FOCUSED_ELEMENT: &str = "AXFocusedElement";
     pub const POSITION: &str = "AXPosition";
