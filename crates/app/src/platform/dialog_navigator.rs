@@ -70,11 +70,6 @@ impl NavMachine {
     /// 此后每次动作执行完毕回报一个 Obs。
     pub fn on(&mut self, o: Obs) -> (Option<Act>, bool) {
         match (self.step, o) {
-            (Step::Idle, Obs::SheetOpened) | (Step::Idle, Obs::Timeout) => {
-                // 入口驱动:开始 ⌘⇧G。
-                self.step = Step::AwaitSheet;
-                (Some(Act::SendGoToFolder), false)
-            }
             (Step::AwaitSheet, Obs::SheetOpened) => {
                 self.step = Step::Fill;
                 (Some(Act::FillViaAx), false)
@@ -121,7 +116,7 @@ impl NavMachine {
         }
     }
 
-    /// 入口:显式开始(等价于 `on(Obs::SheetOpened)` 的 Idle 分支,语义更直白)。
+    /// 入口:显式开始,是发出动作的唯一入口(Idle 上的任何观测都不触发动作)。
     /// 返回 ⌘⇧G 动作;重复调用无副作用(已非 Idle 时返回 None)。
     pub fn start(&mut self) -> Option<Act> {
         if self.step != Step::Idle {
@@ -215,6 +210,19 @@ mod tests {
         let mut m = NavMachine::new();
         assert_eq!(m.start(), Some(Act::SendGoToFolder));
         assert_eq!(m.start(), None);
+    }
+
+    /// start 是唯一入口:Idle 上任何观测都不产生动作、不改变状态
+    /// (防执行层尚未 start 时收到过期观测而主动合成 ⌘⇧G)。
+    #[test]
+    fn idle_ignores_observations_until_started() {
+        let mut m = NavMachine::new();
+        for o in [Obs::Timeout, Obs::SheetClosed, Obs::SheetOpened] {
+            assert_eq!(m.on(o), (None, false), "Idle 上观测不得产生动作");
+            assert_eq!(m.step, Step::Idle, "Idle 上观测不得改变状态");
+        }
+        assert_eq!(m.start(), Some(Act::SendGoToFolder));
+        assert_eq!(m.step, Step::AwaitSheet);
     }
 
     /// 未定义转移保持原状:确认阶段的策略 A 失败不降级直接中止收尾。
