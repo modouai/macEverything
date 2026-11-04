@@ -3,9 +3,18 @@
 //! AX 屏幕坐标(左上原点、y 向下)的换算由平台层在 Task 13 完成。
 //! 与 egui 无关:窗口位置由平台层 setFrame 设置。
 
-/// 浮层 frame:panel = 保存面板 frame;screen = 所在屏幕 frame;overlay_w/h = 浮层尺寸。
-/// 边距:相邻面板 12、屏幕安全区内缩 8。
-/// 前置条件:输入为有限实数;屏幕比浮层窄/矮时返回安全区左上角,不 panic。
+/// 浮层 frame:panel = 保存面板 frame;screen = 面板**所在屏**的 **visibleFrame()**
+/// (不含菜单栏/Dock),不得用 mainScreen().frame()——副屏选择与菜单栏/Dock 遮挡
+/// 均由调用方负责。overlay_w/h = 浮层尺寸;边距:相邻面板 12、屏幕安全区内缩 8。
+///
+/// 两轴独立钳制:仅越界的轴贴到安全区边缘,另一轴保持原定位。
+/// 屏幕比浮层窄/矮时取安全区左下角,让浮层溢出右/上侧(不 panic)。
+///
+/// # Panics
+///
+/// `screen` 原点(x/y)为 NaN 时 `f64::clamp` 会 panic;`panel`/`overlay` 尺寸
+/// 为 NaN 则结果按 NaN 静默传播。调用方须保证有限值——detector 的
+/// `valid_panel_frame` 已拦截 AX 读数。
 #[allow(dead_code)] // Task 13 浮层接线后移除
 pub fn overlay_frame(
     panel: [f64; 4],
@@ -54,6 +63,14 @@ mod tests {
         assert_eq!([f[2], f[3]], [420.0, 300.0]);
     }
 
+    /// 面板贴安全区顶部、右侧放得下 → 顶部对齐后仍须被 y 上界压回。
+    /// 突变「删除 y 上界钳制」→ 本用例必红。
+    #[test]
+    fn clamps_against_top_edge() {
+        let f = overlay_frame([100.0, 800.0, 600.0, 100.0], screen(), 420.0, 300.0);
+        assert_eq!([f[0], f[1]], [712.0, 592.0]);
+    }
+
     /// 右侧越界 → 面板下方(间隙 12),水平居中对齐面板。
     /// 突变「下方分支不居中」→ 本用例必红。
     #[test]
@@ -64,7 +81,8 @@ mod tests {
         assert_eq!([f[0], f[1]], [cx, y]);
     }
 
-    /// 下方也越界 → 屏幕安全区内钳制(右/下缘留 8px 边距)。
+    /// 右侧越界落到面板下方,但下方水平居中后右缘仍越界 → x 上界钳制到
+    /// 安全区右缘(留 8px);y 未越界,保持原定位。
     #[test]
     fn clamps_into_safe_area() {
         let f = overlay_frame([1100.0, 700.0, 400.0, 300.0], screen(), 420.0, 300.0);
@@ -72,6 +90,7 @@ mod tests {
         assert!(f[1] >= 8.0, "下缘不出屏:{f:?}");
         assert!(f[0] >= 8.0, "左缘不出屏:{f:?}");
         assert!(f[1] + 300.0 <= 900.0 - 8.0, "上缘不出屏:{f:?}");
+        assert_eq!([f[0], f[1]], [1012.0, 388.0]);
     }
 
     /// 负坐标屏幕(副屏在主屏左侧/下方):钳制以 screen 原点为界,不使用绝对 0。
@@ -83,10 +102,11 @@ mod tests {
         assert!(f[1] >= -200.0 + 8.0, "{f:?}");
         assert!(f[0] + 420.0 <= -1920.0 + 1920.0 - 8.0, "{f:?}");
         assert!(f[1] + 300.0 <= -200.0 + 1080.0 - 8.0, "{f:?}");
+        assert_eq!([f[0], f[1]], [-428.0, -192.0]);
     }
 
     /// 屏幕比浮层还小时不得 panic(f64::clamp 的 min > max 会 panic);
-    /// 取安全区左上角,让浮层溢出屏幕右侧/上方。
+    /// 取安全区左下角,让浮层溢出屏幕右侧/上方。
     #[test]
     fn tiny_screen_does_not_panic() {
         let f = overlay_frame(
