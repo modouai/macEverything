@@ -50,10 +50,10 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSBitmapImageRep, NSColor, NSCompositingOperation,
     NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext,
     NSImage, NSMenu, NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
-    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView,
-    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
+    NSScreen, NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification,
 };
 use objc2_foundation::{
@@ -2224,6 +2224,57 @@ unsafe fn handle_fetch_result(
 #[allow(dead_code)] // M0 探针/后续任务接线后移除
 pub fn ax_trusted() -> bool {
     super::ax_ffi::is_process_trusted()
+}
+
+// ---------------------------------------------------------------------------
+// 剪贴板纯文本(navigator 策略 B 的 save/set/restore;M0 探针先行使用)
+//
+// NSPasteboard 一般建议主线程使用,但 generalPasteboard 的读写在现代 macOS 上
+// 允许任意线程(AppKit 未强制 main-thread check);探针实验线程直接调用属
+// M0 取证可接受范围,Task 11 产品化时再收敛调用线程契约。
+
+/// 读剪贴板纯文本(None = 无文本/非文本)。
+pub fn clipboard_text() -> Option<String> {
+    // SAFETY:NSPasteboardTypeString 为 AppKit 导出的只读 extern static 常量
+    // (objc2 0.6 统一要求 unsafe 读取;数据为进程生命周期不变的 CFString,
+    // 生成侧类型别名 NSPasteboardType = NSString)。
+    let ty: &NSString = unsafe { NSPasteboardTypeString };
+    let pb = NSPasteboard::generalPasteboard();
+    let s = pb.stringForType(ty)?;
+    Some(s.to_string())
+}
+
+/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。
+pub fn clipboard_set_text(s: &str) {
+    // SAFETY:同 clipboard_text 的常量注释。
+    let ty: &NSString = unsafe { NSPasteboardTypeString };
+    let pb = NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    let ok = pb.setString_forType(&NSString::from_str(s), ty);
+    if !ok {
+        log::warn!("[probe] 剪贴板写纯文本失败(setString_forType = false)");
+    }
+}
+
+/// 恢复(写回 save 的文本;None = 原本无文本 → clearContents 清空)。
+/// 近似语义:None 路径会连带清掉剪贴板里的非文本项——M0 取证可接受,
+/// Task 11 产品化时改多类型快照(pasteboard types 全量保存/回写)。
+pub fn clipboard_restore(saved: Option<&str>) -> bool {
+    match saved {
+        Some(t) => {
+            clipboard_set_text(t);
+            true
+        }
+        None => {
+            NSPasteboard::generalPasteboard().clearContents();
+            true
+        }
+    }
+}
+
+/// M0 探针启动转发(main.rs 按环境变量调用;见 panel_probe 模块注释)。
+pub fn probe_start() {
+    super::panel_probe::start_probe();
 }
 
 #[cfg(test)]

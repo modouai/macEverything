@@ -23,6 +23,11 @@ pub mod cg_events;
 pub mod mac;
 #[cfg(target_os = "macos")]
 pub mod mac_quicklook;
+// 保存面板助手(M0 探针 + 检测先行版):与 ax_ffi 同款 cfg,保持模块一致性。
+#[cfg(target_os = "macos")]
+pub mod panel_detector;
+#[cfg(target_os = "macos")]
+pub mod panel_probe;
 
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
@@ -600,6 +605,51 @@ pub fn panel_assist_trusted() -> bool {
     {
         false
     }
+}
+
+/// 读剪贴板纯文本(None = 无文本/非文本)。navigator 策略 B 的 save。
+/// 非 macOS 恒 None。
+pub fn clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::clipboard_text()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。非 macOS:no-op。
+pub fn clipboard_set_text(s: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        mac::clipboard_set_text(s);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = s;
+    }
+}
+
+/// 恢复(写回 save 的文本;None = 原本无文本 → 清空文本项)。非 macOS 恒 true。
+pub fn clipboard_restore(saved: Option<&str>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::clipboard_restore(saved)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = saved;
+        true
+    }
+}
+
+/// M0 探针启动(环境变量 MCE_PANEL_PROBE=1;开发取证工具,不进产品路径)。
+/// 非 macOS:no-op。
+pub fn probe_start() {
+    #[cfg(target_os = "macos")]
+    mac::probe_start();
 }
 
 /// 根窗当前是否为 key window(egui viewport focused 状态补正用;

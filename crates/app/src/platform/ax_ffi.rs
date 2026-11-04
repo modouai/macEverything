@@ -64,6 +64,7 @@ extern "C" {
         attr: CFStringRef,
         out: *mut u8,
     ) -> AXError;
+    fn AXUIElementPerformAction(el: AXUIElementRef, action: CFStringRef) -> AXError;
     fn AXObserverCreate(pid: i32, callback: AXObserverCallback, out: *mut AXObserverRef)
         -> AXError;
     fn AXObserverAddNotification(
@@ -243,6 +244,14 @@ pub fn attr_settable(el: &AXRef, attr: &str) -> bool {
     // SAFETY:out 为本栈帧可写 Boolean 出参;CFStr 生命周期覆盖调用。
     let err = unsafe { AXUIElementIsAttributeSettable(el.raw(), a.raw(), &mut out) };
     err == AX_ERROR_SUCCESS && out != 0
+}
+
+/// 执行元素动作(AXPress 等;「前往」按钮确认用)。
+pub fn perform_action(el: &AXRef, action: &str) -> bool {
+    let a = CFStr::new(action);
+    // SAFETY:CFStr 生命周期覆盖调用;无指针出参。
+    let err = unsafe { AXUIElementPerformAction(el.raw(), a.raw()) };
+    err == AX_ERROR_SUCCESS
 }
 
 /// 读字符串属性。

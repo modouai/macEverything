@@ -83,6 +83,11 @@ fn main() -> anyhow::Result<()> {
     i18n::set_lang(lang);
     log::info!("启动语言:{lang:?}(设置 {:?})", settings.language);
 
+    // M0 探针:仅显式环境变量启用(探针为开发取证工具,验证六个技术风险点)。
+    if std::env::var("MCE_PANEL_PROBE").as_deref() == Ok("1") {
+        platform::probe_start();
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
