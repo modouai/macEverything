@@ -620,15 +620,17 @@ pub fn clipboard_text() -> Option<String> {
     }
 }
 
-/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。非 macOS:no-op。
-pub fn clipboard_set_text(s: &str) {
+/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。返回写入成败。
+/// 非 macOS 恒 false。
+pub fn clipboard_set_text(s: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        mac::clipboard_set_text(s);
+        mac::clipboard_set_text(s)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = s;
+        false
     }
 }
 

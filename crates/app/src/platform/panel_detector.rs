@@ -47,11 +47,8 @@ fn count_walk(el: &AXRef, depth: usize, s: &mut PanelSnapshot) {
     }
 }
 
-/// M0 粗判(subrole 含 Dialog/SystemDialog 即疑似;完整判定 Task 8):
+/// M0 粗判(subrole 含 Dialog 即疑似;SystemDialog 已被其包含,完整判定 Task 8):
 /// 只用于探针决定是否触发实验,宁滥勿缺——漏报比误报更伤取证。
 pub fn looks_like_panel(s: &PanelSnapshot) -> bool {
-    s.subrole
-        .as_deref()
-        .map(|r| r.contains("Dialog") || r.contains("SystemDialog"))
-        .unwrap_or(false)
+    s.subrole.as_deref().is_some_and(|r| r.contains("Dialog"))
 }

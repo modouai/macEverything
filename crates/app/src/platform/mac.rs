@@ -2244,16 +2244,13 @@ pub fn clipboard_text() -> Option<String> {
     Some(s.to_string())
 }
 
-/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。
-pub fn clipboard_set_text(s: &str) {
+/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。返回 setString 成败。
+pub fn clipboard_set_text(s: &str) -> bool {
     // SAFETY:同 clipboard_text 的常量注释。
     let ty: &NSString = unsafe { NSPasteboardTypeString };
     let pb = NSPasteboard::generalPasteboard();
     pb.clearContents();
-    let ok = pb.setString_forType(&NSString::from_str(s), ty);
-    if !ok {
-        log::warn!("[probe] 剪贴板写纯文本失败(setString_forType = false)");
-    }
+    pb.setString_forType(&NSString::from_str(s), ty)
 }
 
 /// 恢复(写回 save 的文本;None = 原本无文本 → clearContents 清空)。
@@ -2261,10 +2258,7 @@ pub fn clipboard_set_text(s: &str) {
 /// Task 11 产品化时改多类型快照(pasteboard types 全量保存/回写)。
 pub fn clipboard_restore(saved: Option<&str>) -> bool {
     match saved {
-        Some(t) => {
-            clipboard_set_text(t);
-            true
-        }
+        Some(t) => clipboard_set_text(t),
         None => {
             NSPasteboard::generalPasteboard().clearContents();
             true

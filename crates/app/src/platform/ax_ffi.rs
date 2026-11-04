@@ -101,6 +101,7 @@ pub mod attr {
     pub const CHILDREN: &str = "AXChildren";
     pub const WINDOWS: &str = "AXWindows";
     pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
+    pub const FOCUSED_ELEMENT: &str = "AXFocusedElement";
     pub const POSITION: &str = "AXPosition";
     pub const SIZE: &str = "AXSize";
     /// 非公开常量(不在公开 HIServices 头),存在性待 M0 实机验证;
