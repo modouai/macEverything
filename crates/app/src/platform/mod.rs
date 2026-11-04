@@ -507,7 +507,7 @@ pub fn install_surface_reclaim(ctx: eframe::egui::Context) {
     }
 }
 
-/// 安排「三窗全隐 N 秒后缩窗释放 surface」一次性定时器(主线程;重复调用覆盖)。
+/// 安排「四窗全隐 N 秒后缩窗释放 surface」一次性定时器(主线程;重复调用覆盖)。
 /// 非 macOS:no-op。
 pub fn schedule_surface_shrink() {
     #[cfg(target_os = "macos")]

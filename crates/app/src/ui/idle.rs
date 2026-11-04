@@ -12,13 +12,13 @@
 //! ## 归属判定口径
 //!
 //! 「空闲」以**视口级输入静默**为准,不是「没有帧」——悬浮条常驻,主题跟随、
-//! 图标在途轮询等都会排帧,这些帧不代表用户在场,不重置计时。三个视口
-//! (根窗/悬浮条/设置)各自在绘制入口调 [`note_viewport_activity`],任一有输入
+//! 图标在途轮询等都会排帧,这些帧不代表用户在场,不重置计时。四个视口
+//! (根窗/悬浮条/设置/浮层)各自在绘制入口调 [`note_viewport_activity`],任一有输入
 //! 即视为活跃。
 //!
 //! ## 执行线程
 //!
-//! 归还由专用看门狗线程执行,不走帧——产品形态三窗皆隐时排帧完全停止
+//! 归还由专用看门狗线程执行,不走帧——产品形态四窗皆隐时排帧完全停止
 //! (L4 隐藏零帧红线),挂在帧上永远轮不到归还。`malloc_zone_pressure_relief`
 //! 线程无关,任何线程可调。轮询间隔 15s:最坏 75s 归还,换来空闲期 CPU 归零。
 
@@ -58,7 +58,7 @@ impl IdleGate {
         }
     }
 
-    /// 记录一次视口输入(三视口任一有输入事件即调)。
+    /// 记录一次视口输入(四视口任一有输入事件即调)。
     pub(crate) fn note_activity(&mut self, now: Instant) {
         self.last_activity = Some(now);
     }
@@ -87,7 +87,7 @@ fn gate() -> &'static Mutex<IdleGate> {
     GATE.get_or_init(|| Mutex::new(IdleGate::starting_at(Instant::now())))
 }
 
-/// 三视口绘制入口共用的活跃采样:本帧有输入事件(键/指针/滚轮/IME)才算
+/// 四视口绘制入口共用的活跃采样:本帧有输入事件(键/指针/滚轮/IME)才算
 /// 用户在场。纯排帧(主题跟随、图标轮询、动画尾巴)不算。
 pub(crate) fn note_viewport_activity(ctx: &egui::Context) {
     let had_input = ctx.input(|i| !i.events.is_empty());

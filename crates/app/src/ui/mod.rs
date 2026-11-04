@@ -1,9 +1,11 @@
-//! UI 层:三视口壳。
+//! UI 层:四视口壳。
 //!
 //! 主视口(ROOT)= 完整结果窗口(`ui/results.rs`,Task 17:表格虚拟化/列排序/多选);
 //! 第二视口 = 悬浮条(Task 12 UI;Task 14 接平台层:跨 Space/浮动级别/失焦隐藏/多屏定位);
 //! 第三视口 = 设置窗口(v2.1:620×600 固定,deferred + 常驻;视口/行为见
-//! `ui/settings.rs`,纯视图见 `ui/settings_view.rs`)。
+//! `ui/settings.rs`,纯视图见 `ui/settings_view.rs`);
+//! 第四视口 = 保存面板目录助手浮层(随保存面板出现;视口/行为见 `ui/overlay.rs`,
+//! 平台层显隐见 `platform/mac.rs` 的 `overlay_show`/`overlay_hide`)。
 //!
 //! ## 菜单栏托盘(Task 16)
 //!
@@ -379,7 +381,7 @@ fn send_palette_hide(ctx: &egui::Context, reason: &str) {
     // `sync_blur(false)` 不会执行;只发命令会让磨砂矩形残留在屏上。
     platform::hide_blur();
     ctx.send_viewport_cmd_to(palette_viewport_id(), egui::ViewportCommand::Visible(false));
-    // 三窗全隐后缩窗释放 GL surface(定时器触发时再核对真实可见性)。
+    // 四窗全隐后缩窗释放 GL surface(定时器触发时再核对真实可见性)。
     platform::schedule_surface_shrink();
     log::info!("悬浮条隐藏({reason})");
 }
@@ -602,7 +604,7 @@ pub struct App {
     fonts_logged: bool,
     /// 首帧接线已尝试次数(见 `PATCH_ATTACH_ATTEMPTS`)。
     attach_attempts: u32,
-    /// 根窗首帧隐藏纠偏已发出(产品形态三窗皆隐;见 `logic` 首帧纠偏注释)。
+    /// 根窗首帧隐藏纠偏已发出(产品形态四窗皆隐;见 `logic` 首帧纠偏注释)。
     root_hide_issued: bool,
     /// 纠偏回读已留痕一次(原生 `isVisible()` 核对;见 `logic`)。
     root_hide_verified: bool,
@@ -699,7 +701,7 @@ impl App {
             ),
             theme: theme::ThemeFollow::new(theme, theme::CHECK_INTERVAL),
             update: update::UpdateState::new(),
-            palette_visible: false, // 启动隐藏(产品形态:三窗皆隐,仅菜单栏图标)
+            palette_visible: false, // 启动隐藏(产品形态:四窗皆隐,仅菜单栏图标)
             overlay: overlay::OverlayState::new(cc.egui_ctx.clone(), paths.clone()),
         }));
         if auto_update {
@@ -1284,7 +1286,7 @@ fn hotkey_frame_events(
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 首帧纠偏(产品形态:三窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
+        // 首帧纠偏(产品形态:四窗皆隐、仅菜单栏图标,启动不弹窗;Task 21):
         // eframe 0.37 在首帧 post_rendering 里**无条件** `set_visible(true)`
         //(`native/epi_integration.rs:443-450`,白闪修复;`create_glutin_windowed_context`
         // 也把它压着 `.with_visible(false)`),故 builder 的 with_visible(false) 本身
@@ -1297,10 +1299,10 @@ impl eframe::App for App {
                 egui::ViewportId::ROOT,
                 egui::ViewportCommand::Visible(false),
             );
-            // 启动即三窗全隐:排缩窗定时器(否则首帧渲染留下的 surface 常驻)。
+            // 启动即四窗全隐:排缩窗定时器(否则首帧渲染留下的 surface 常驻)。
             platform::schedule_surface_shrink();
             ctx.request_repaint(); // 排下一帧做原生回读(纠偏命令在本帧末才应用)
-            log::info!("根窗首帧纠偏:Visible(false)(产品形态三窗皆隐)");
+            log::info!("根窗首帧纠偏:Visible(false)(产品形态四窗皆隐)");
         } else if !self.root_hide_verified {
             self.root_hide_verified = true;
             log::info!(
@@ -1467,7 +1469,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // 空闲判定采样(根视口;悬浮条/设置在各自绘制入口采样)。采样点必须在
+        // 空闲判定采样(根视口;悬浮条/设置/浮层在各自绘制入口采样)。采样点必须在
         // 真渲染 pass:logic() 在根窗隐藏期也会被 eframe 唤起,而那时读到的是
         // 上一显示帧的陈旧 events,反复记活跃会把 60s 静默计时无限后推,
         // 「全隐藏归还」就永远不会触发。

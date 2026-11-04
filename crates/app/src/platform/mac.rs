@@ -717,7 +717,7 @@ pub(crate) fn shrink_hidden_windows() -> bool {
     // glutin 让上下文常驻 current)时如实留痕并只保留缩窗效果。
     match objc2_app_kit::NSOpenGLContext::currentContext() {
         Some(ctx) => {
-            // 只清「本 app 三个视口」的上下文:currentContext 正常即 eframe 的
+            // 只清「本 app 四个视口」的上下文:currentContext 正常即 eframe 的
             // glow 上下文;若 view 关联到别的视图(未来接入第二个 GL 组件),跳过清除。
             let current_view = ctx.view(mtm);
             let owns = current_view.as_deref().is_none_or(|v| {
@@ -1050,12 +1050,19 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
 }
 
 /// 隐藏浮层(`orderOut`;窗口保留不销毁,状态在 UI 侧)。
+///
+/// 与 `send_palette_hide` 对称:隐藏后安排「全隐缩窗」定时器,否则浮层视口的
+/// GL surface 会随窗口常驻(实测每窗约 26MB;定时器触发时再核对真实可见性)。
 #[allow(dead_code)] // Task 14 接线层调用(本任务仅 debug 显示路径)。
 pub fn overlay_hide() -> Result<()> {
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return Err(anyhow!("overlay_hide 非主线程调用"));
+    };
     let win = OVERLAY.with(|cell| cell.borrow().window.clone());
     match win {
         Some(win) => {
             win.orderOut(None);
+            schedule_surface_shrink();
             Ok(())
         }
         None => Err(anyhow!("浮层窗口未就绪(视口尚未创建)")),
@@ -3071,18 +3078,40 @@ mod tests {
     }
 
     /// 模拟一次缩窗轮次(只做纯状态部分):返回每个窗口本轮是否应缩。
-    fn shrink_round(saved: &mut ShrunkSizes, live: [NSSize; 3]) -> [bool; 3] {
-        let kinds = [MainWindow::Root, MainWindow::Palette, MainWindow::Settings];
-        let mut out = [false; 3];
+    fn shrink_round(saved: &mut ShrunkSizes, live: [NSSize; 4]) -> [bool; 4] {
+        let kinds = [
+            MainWindow::Root,
+            MainWindow::Palette,
+            MainWindow::Settings,
+            MainWindow::Overlay,
+        ];
+        let mut out = [false; 4];
         for (i, kind) in kinds.into_iter().enumerate() {
             out[i] = record_shrink_slot(saved, kind, live[i]);
         }
         out
     }
 
-    /// C1 回归钉:三窗缩窗 → 只打开悬浮条(其快照被 take)→ 再次全隐缩窗。
-    /// 第二次观测到的 root/settings 是 1×1,但**不得覆盖**首次快照;之后打开
-    /// 完整窗口必须恢复原始尺寸(而不是 1×1)。
+    /// Overlay 槽位映射钉:`set`/`slot`/`take` 只在 overlay 槽位往返,不串到
+    /// 主三窗。突变:把 `MainWindow::Overlay` 的映射改成别的槽位或恒 `None`
+    /// → 本测红。
+    #[test]
+    fn overlay_slot_roundtrips_independently() {
+        let size = NSSize::new(420.0, 300.0);
+        let mut saved = ShrunkSizes::default();
+        assert_eq!(saved.slot(MainWindow::Overlay), None);
+        saved.set(MainWindow::Overlay, Some(size));
+        assert_eq!(saved.slot(MainWindow::Overlay), Some(size));
+        assert_eq!(saved.root, None, "overlay 写入不得串到 root");
+        assert_eq!(saved.palette, None, "overlay 写入不得串到 palette");
+        assert_eq!(saved.settings, None, "overlay 写入不得串到 settings");
+        assert_eq!(saved.take(MainWindow::Overlay), Some(size));
+        assert_eq!(saved.slot(MainWindow::Overlay), None, "take 后清空");
+    }
+
+    /// C1 回归钉:四窗缩窗 → 只打开悬浮条(其快照被 take)→ 再次全隐缩窗。
+    /// 第二次观测到的 root/settings/overlay 是 1×1,但**不得覆盖**首次快照;
+    /// 之后打开完整窗口必须恢复原始尺寸(而不是 1×1)。
     ///
     /// 突变:把 [`record_shrink_slot`] 改回「无条件记录/整体覆盖」→ 第二次
     /// 轮次返回全 true 且 `saved.root` 变成 1×1,本测红。
@@ -3091,30 +3120,33 @@ mod tests {
         let root = NSSize::new(1200.0, 800.0);
         let palette = NSSize::new(700.0, 500.0);
         let settings = NSSize::new(620.0, 600.0);
+        let overlay = NSSize::new(420.0, 300.0);
         let one = NSSize::new(1.0, 1.0);
 
         let mut saved = ShrunkSizes::default();
         assert_eq!(
-            shrink_round(&mut saved, [root, palette, settings]),
-            [true, true, true],
-            "首次全隐:三窗都应缩并记录原始尺寸"
+            shrink_round(&mut saved, [root, palette, settings, overlay]),
+            [true, true, true, true],
+            "首次全隐:四窗都应缩并记录原始尺寸"
         );
 
         // 用户只打开悬浮条:显示路径 take 掉 palette 快照并恢复原尺寸;
-        // root/settings 保持 1×1,快照原样保留。
+        // root/settings/overlay 保持 1×1,快照原样保留。
         assert_eq!(saved.take(MainWindow::Palette), Some(palette));
         assert_eq!(saved.root, Some(root));
         assert_eq!(saved.settings, Some(settings));
+        assert_eq!(saved.overlay, Some(overlay));
 
-        // 悬浮条再隐藏,30s 后第二次缩窗:root/settings 实际读到 1×1。
-        let shrunk = shrink_round(&mut saved, [one, palette, one]);
+        // 悬浮条再隐藏,30s 后第二次缩窗:root/settings/overlay 实际读到 1×1。
+        let shrunk = shrink_round(&mut saved, [one, palette, one, one]);
         assert_eq!(
             shrunk,
-            [false, true, false],
+            [false, true, false, false],
             "已缩窗口不得重复缩窗/重新捕获"
         );
         assert_eq!(saved.root, Some(root), "root 原始尺寸不得被 1×1 覆盖");
         assert_eq!(saved.settings, Some(settings), "settings 同上");
+        assert_eq!(saved.overlay, Some(overlay), "overlay 同上");
         assert_eq!(
             saved.palette,
             Some(palette),
@@ -3134,17 +3166,23 @@ mod tests {
             NSSize::new(1200.0, 800.0),
             NSSize::new(700.0, 500.0),
             NSSize::new(620.0, 600.0),
+            NSSize::new(420.0, 300.0),
         ];
         let one = NSSize::new(1.0, 1.0);
         let mut saved = ShrunkSizes::default();
         assert!(shrink_round(&mut saved, first).iter().all(|v| *v));
         assert!(
-            !shrink_round(&mut saved, [one; 3]).iter().any(|v| *v),
+            !shrink_round(&mut saved, [one; 4]).iter().any(|v| *v),
             "已缩窗口不应再次缩"
         );
         assert_eq!(
-            [saved.root, saved.palette, saved.settings],
-            [Some(first[0]), Some(first[1]), Some(first[2])]
+            [saved.root, saved.palette, saved.settings, saved.overlay],
+            [
+                Some(first[0]),
+                Some(first[1]),
+                Some(first[2]),
+                Some(first[3])
+            ]
         );
     }
 }

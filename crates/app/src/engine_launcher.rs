@@ -22,13 +22,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// daemon 存活监控:可见期探测间隔。连续 2 次不可连才判定退出(单次抖动不拉起)。
 const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
-/// 三窗全隐期探测间隔:界面不活跃,崩溃晚 30s 发现无感;减少唤醒与 daemon 连接。
+/// 四窗全隐期探测间隔:界面不活跃,崩溃晚 30s 发现无感;减少唤醒与 daemon 连接。
 const HIDDEN_MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 const MONITOR_FAIL_THRESHOLD: u32 = 2;
 
-/// GUI 当前是否「三窗全隐」。平台层在显隐边沿更新(mac.rs):
-/// 缩窗定时器确认三窗全隐 → true;任何显示路径(`cancel_surface_shrink`)→ false。
-/// 启动即三窗全隐(产品形态),故默认 true。
+/// GUI 当前是否「四窗全隐」。平台层在显隐边沿更新(mac.rs):
+/// 缩窗定时器确认四窗全隐 → true;任何显示路径(`cancel_surface_shrink`)→ false。
+/// 启动即四窗全隐(产品形态),故默认 true。
 static UI_HIDDEN: AtomicBool = AtomicBool::new(true);
 
 /// 平台层写入全隐状态(主线程;原子写,无锁)。
