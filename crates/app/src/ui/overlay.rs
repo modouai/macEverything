@@ -74,9 +74,11 @@ pub fn key_action(
         OverlayKey::ArrowDown if result_count > 0 => {
             OverlayKeyAction::Select(selected.saturating_add(1).min(result_count - 1))
         }
-        OverlayKey::ArrowUp if result_count > 0 => {
-            OverlayKeyAction::Select(selected.saturating_sub(1))
-        }
+        OverlayKey::ArrowUp if result_count > 0 => OverlayKeyAction::Select(
+            selected
+                .saturating_sub(1)
+                .min(result_count.saturating_sub(1)),
+        ),
         OverlayKey::ArrowDown | OverlayKey::ArrowUp => OverlayKeyAction::None,
     }
 }
@@ -452,6 +454,11 @@ mod tests {
             key_action(OverlayKey::ArrowUp, 0, 3, false, false),
             OverlayKeyAction::Select(0),
             "↑到顶 clamp 0"
+        );
+        assert_eq!(
+            key_action(OverlayKey::ArrowUp, 5, 3, false, false),
+            OverlayKeyAction::Select(2),
+            "↑ 时 selected 越界也须 clamp 到 count-1"
         );
         assert_eq!(
             key_action(OverlayKey::ArrowDown, 0, 0, false, false),
