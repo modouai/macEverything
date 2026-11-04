@@ -119,7 +119,7 @@ fn main() -> anyhow::Result<()> {
             // 完整窗口的「不透明」由内容层每帧铺整窗底色保证(ui/results.rs);
             // 此处**不可**改 false——会连带打死悬浮条透明(GL config 全局单份)。
             .with_transparent(true)
-            // 产品形态(Task 21):三窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
+            // 产品形态(Task 21):四窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
             // 待命。eframe 0.37 在首帧 post_rendering 里**无条件** set_visible(true)
             // (native/epi_integration.rs:443-450,白闪修复),故 with_visible(false)
             // 本身不足以保持隐藏:首帧纠偏在 `ui::App::logic`(发 Visible(false),

@@ -1950,6 +1950,12 @@ pub fn settings_visible() -> Option<bool> {
     find_window_by_title(mtm, root.as_deref(), &settings_window_titles()).map(|w| w.isVisible())
 }
 
+/// 浮层窗当前原生可见性(诊断用;未创建/非主线程 → None)。
+pub fn overlay_visible() -> Option<bool> {
+    let _mtm = MainThreadMarker::new()?;
+    OVERLAY.with(|cell| cell.borrow().window.as_ref().map(|w| w.isVisible()))
+}
+
 // ---------------------------------------------------------------------------
 // 内部实现
 

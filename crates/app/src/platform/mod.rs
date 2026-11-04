@@ -386,6 +386,18 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
     }
 }
 
+/// 浮层窗当前原生可见性(诊断用;未创建/非主线程 → None)。
+pub fn overlay_visible() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_visible()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// 隐藏浮层(`orderOut`,不销毁窗口)。
 pub fn overlay_hide() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]

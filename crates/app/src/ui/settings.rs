@@ -1217,6 +1217,11 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             // 纯外部动作无状态变化,不重绘(OpenWebsite 同例)。
             log::info!("设置页:保存面板助手去授权,打开系统设置");
             platform::open_accessibility_settings();
+            // 用户可能授权后直接回到别的 app:起一次性轮询线程唤醒全隐进程。
+            let save = { lock_shared(shared).settings.file.save_panel_assist };
+            if save && !platform::panel_assist_trusted() {
+                crate::ui::spawn_panel_trust_watcher(ctx);
+            }
         }
         SettingsAction::SetVolumesAuto(auto) => {
             let excluded = {

@@ -90,9 +90,10 @@ pub mod window_tokens;
 
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::autostart;
 use crate::engine_launcher;
@@ -693,6 +694,53 @@ fn bridge_panel_events(
     }
 }
 
+/// 辅助功能授权等待器去重闸(同一时刻至多一个轮询线程)。
+static TRUST_WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 尝试占用授权等待器槽位:true = 本调用取得所有权。
+fn claim_trust_watcher(slot: &AtomicBool) -> bool {
+    !slot.swap(true, Ordering::SeqCst)
+}
+
+/// 打开系统设置授权后启动一次性授权等待器。
+///
+/// 用户可能授权后直接回到别的 app,本进程全隐无帧,`logic` 的授权跃迁检测
+/// 不会运行。线程每 500ms 轮询 `AXIsProcessTrusted`,false→true 时请求一次
+/// ROOT 重绘(唤醒 `logic` 完成启用)后退出;最多 5 分钟超时。同一时刻至多一个。
+pub(crate) fn spawn_panel_trust_watcher(ctx: &egui::Context) {
+    if !claim_trust_watcher(&TRUST_WATCHER_RUNNING) {
+        return;
+    }
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("panel-trust-watch".to_owned())
+        .spawn(move || {
+            const POLL: Duration = Duration::from_millis(500);
+            const TIMEOUT: Duration = Duration::from_secs(300);
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                if platform::panel_assist_trusted() {
+                    log::info!("辅助功能授权完成:唤醒主线程启用保存面板助手");
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    log::info!("等待辅助功能授权超时(5 分钟),停止监视");
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+            TRUST_WATCHER_RUNNING.store(false, Ordering::SeqCst);
+        });
+    match spawned {
+        Ok(handle) => drop(handle), // 分离线程:一次性任务自行退出
+        Err(err) => {
+            TRUST_WATCHER_RUNNING.store(false, Ordering::SeqCst);
+            log::error!("辅助功能授权监视线程创建失败:{err}");
+        }
+    }
+}
+
 pub struct App {
     /// 二次启动唤起通道(app.sock 监听线程 → 主线程;main 接线)。
     incoming: Receiver<Incoming>,
@@ -748,6 +796,9 @@ pub struct Shared {
     pub panel_assist_trusted: bool,
     /// Esc 屏蔽(本面板存续内不再自动弹;`Closed { pid }` 按 pid 精确解除)。
     pub dismissals: platform::Dismissals,
+    /// 已被本助手 commit 跳转过的面板 pid:面板关闭(`Closed`)前不再自动弹,
+    /// 抑制跳转过程中 sheet 开关触发的重复 Shown(阻塞 1)。
+    pub handled_pids: std::collections::HashSet<i32>,
     /// 最近一次 Shown 的面板 AX frame(FellBack 重现浮层时重新定位用)。
     pub last_panel_frame: Option<[f64; 4]>,
     /// 最近一次 Shown 的面板宿主 pid(重现归因校验:迟到 FellBack 结果只有与
@@ -824,6 +875,7 @@ impl App {
             panel_assist_enabled,
             panel_assist_trusted,
             dismissals: platform::Dismissals::default(),
+            handled_pids: std::collections::HashSet::new(),
             last_panel_frame: None,
             active_panel_pid: None,
             panel_detector_start_pending: false,
@@ -1022,15 +1074,18 @@ impl App {
         while let Some(ev) = self.detector_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             let decision = {
                 let s = self.shared();
-                let blocked = match &ev {
-                    platform::PanelEvent::Shown { pid, .. } => s.dismissals.blocked(*pid),
-                    _ => false,
+                let (blocked, handled) = match &ev {
+                    platform::PanelEvent::Shown { pid, .. } => {
+                        (s.dismissals.blocked(*pid), s.handled_pids.contains(pid))
+                    }
+                    _ => (false, false),
                 };
                 platform::panel_assist::decide(
                     &ev,
                     s.panel_assist_enabled,
                     s.overlay.visible,
                     blocked,
+                    handled,
                     engine_launcher::daemon_online(),
                 )
             };
@@ -1070,6 +1125,8 @@ impl App {
                         // 事件自带 pid:宿主切换后单槽归因可能已被其他面板覆盖,
                         // 不能依赖它解除屏蔽。
                         s.dismissals.clear(pid);
+                        // 面板关闭即解除「已处理」抑制:同 pid 的新面板可再次弹。
+                        s.handled_pids.remove(&pid);
                         // 单槽与定位 frame 仅在与被销毁面板一致时清空:换绑首扫
                         // 对无面板 app 发的 Closed 不得误清另一面板的归属。
                         if s.active_panel_pid == Some(pid) {
@@ -1143,13 +1200,18 @@ impl App {
     /// 消费浮层请求(Esc/⌘W 关闭、Enter/双击提交跳转),一帧至多一个。
     fn handle_overlay_requests(&mut self, ctx: &egui::Context) {
         // 锁内只做状态读写;隐藏/线程启动在锁外。
-        let request = {
+        let (request, enabled) = {
             let mut s = self.shared();
             let request = take_overlay_request(&mut s.overlay);
             if let Some(OverlayRequest::Dismiss { pid: Some(pid) }) = &request {
                 s.dismissals.dismiss(*pid); // 本面板存续内不再自动弹
             }
-            request
+            if let Some(OverlayRequest::Commit { pid, .. }) = &request {
+                // 已本助手处理(跳转过):面板关闭前抑制重复 Shown。
+                s.handled_pids.insert(*pid);
+            }
+            let enabled = s.panel_assist_enabled;
+            (request, enabled)
         };
         match request {
             None => {}
@@ -1161,6 +1223,11 @@ impl App {
             Some(OverlayRequest::Commit { pid, path }) => {
                 if let Err(err) = platform::overlay_hide() {
                     log::warn!("浮层隐藏失败: {err}");
+                }
+                if !enabled {
+                    // 设置已关闭:不执行跳转(N3),浮层已按要求关闭。
+                    log::info!("保存面板助手已关闭,忽略跳转请求 pid={pid}");
+                    return;
                 }
                 let tx = self.navigate_tx.clone();
                 let ctx = ctx.clone();
@@ -1227,6 +1294,12 @@ impl App {
                     // 失败静默(面板未装/链接失效时无害)。
                     log::info!("托盘:保存面板助手去授权,打开系统设置");
                     platform::open_accessibility_settings();
+                    // 用户可能授权后直接回到别的 app:起一次性轮询线程唤醒
+                    // 全隐的本进程,否则授权后功能要等下次主动交互才生效。
+                    let save = self.shared().settings.file.save_panel_assist;
+                    if save && !platform::panel_assist_trusted() {
+                        spawn_panel_trust_watcher(ctx);
+                    }
                 }
                 TrayMsg::UpdateAction => {
                     let phase = { self.shared().update.phase().clone() };
@@ -1641,10 +1714,11 @@ impl eframe::App for App {
         } else if !self.root_hide_verified {
             self.root_hide_verified = true;
             log::info!(
-                "三窗皆隐回读:根窗 isVisible={:?} 悬浮条 isVisible={:?} 设置 isVisible={:?}(期望恒 false;None = 尚未创建)",
+                "四窗皆隐回读:根窗 isVisible={:?} 悬浮条 isVisible={:?} 设置 isVisible={:?} 浮层 isVisible={:?}(期望恒 false;None = 尚未创建)",
                 platform::root_visible(),
                 platform::palette_visible(),
-                platform::settings_visible()
+                platform::settings_visible(),
+                platform::overlay_visible()
             );
         }
 
@@ -2072,6 +2146,17 @@ mod tests {
                 data_dir: std::path::PathBuf::new(),
             },
         )
+    }
+
+    /// 授权等待器去重闸:同一时刻只允许一个线程;退出复位后可再次启动。
+    /// 突变 `claim_trust_watcher` 恒 true(或只 load 不 swap)→ 第二条断言红。
+    #[test]
+    fn trust_watcher_claim_is_idempotent() {
+        let slot = AtomicBool::new(false);
+        assert!(claim_trust_watcher(&slot), "首个调用取得槽位");
+        assert!(!claim_trust_watcher(&slot), "已有 watcher 时不得重复启动");
+        slot.store(false, Ordering::SeqCst); // 线程退出
+        assert!(claim_trust_watcher(&slot), "退出后可再次启动");
     }
 
     /// FellBack 重现五门表:任一不满足都丢弃迟到结果(不覆盖新面板输入,

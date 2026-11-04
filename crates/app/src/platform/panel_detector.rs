@@ -407,7 +407,11 @@ fn scan_focused(pid: i32) -> ScanOutcome {
     if !valid_panel_frame(x, y, w, h) {
         return ScanOutcome::Unknown;
     }
-    PANEL_PID.store(pid, Ordering::SeqCst);
+    // 同一面板已归因(例如 commit 后 ⌘⇧G sheet 开关触发的通知):不再重复
+    // 发 Shown;跨线程去重下沉,接线层的 handled 门负责语义收敛。
+    if PANEL_PID.swap(pid, Ordering::SeqCst) == pid {
+        return ScanOutcome::Panel;
+    }
     send(PanelEvent::Shown {
         pid,
         frame: [x, y, w, h],

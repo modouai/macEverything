@@ -43,25 +43,27 @@ pub enum Decision {
     Show,
     /// 隐藏浮层,但保留 Esc 屏蔽(宿主切换)。
     HideKeepBlock,
-    /// 隐藏浮层并解除 `pid` 的 Esc 屏蔽(面板销毁)。
+    /// 隐藏浮层并解除 `pid` 的 Esc 屏蔽(该 app 当前无面板)。
     HideAndClear { pid: i32 },
 }
 
 /// 事件 → 动作(纯函数;表驱动单测钉住全部分支)。
 ///
 /// `Shown` 必须同时满足:助手开关开启、浮层未显示(重复 Shown 去重)、该宿主
-/// 未被 Esc 屏蔽、daemon 在线;任一不满足即忽略。`HostChanged`/`Closed` 无条件
+/// 未被 Esc 屏蔽、该面板未被本助手处理过(`handled`:commit 跳转后、面板关闭前
+/// 不再自动弹)、daemon 在线;任一不满足即忽略。`HostChanged`/`Closed` 无条件
 /// 走隐藏路径——可见性由状态机兜底,重复隐藏是幂等的。
 pub fn decide(
     ev: &PanelEvent,
     enabled: bool,
     overlay_visible: bool,
     blocked: bool,
+    handled: bool,
     daemon_online: bool,
 ) -> Decision {
     match ev {
         PanelEvent::Shown { .. } => {
-            if enabled && !overlay_visible && !blocked && daemon_online {
+            if enabled && !overlay_visible && !blocked && !handled && daemon_online {
                 Decision::Show
             } else {
                 Decision::Ignore
@@ -118,51 +120,105 @@ mod tests {
         }
     }
 
-    /// 决策表:Shown 四个门(开关/已显示/屏蔽/离线)任一不满足即忽略;
+    /// 决策表:Shown 五个门(开关/已显示/屏蔽/已处理/离线)任一不满足即忽略;
     /// HostChanged/Closed 无条件走隐藏路径。
     /// 突变「去掉任一门」→ 对应断言必红。
     #[test]
     fn decide_table() {
         // 全满足才弹。
-        assert_eq!(decide(&shown(), true, false, false, true), Decision::Show);
+        assert_eq!(
+            decide(&shown(), true, false, false, false, true),
+            Decision::Show
+        );
         // 开关关闭。
         assert_eq!(
-            decide(&shown(), false, false, false, true),
+            decide(&shown(), false, false, false, false, true),
             Decision::Ignore
         );
         // 浮层已显示(重复 Shown 去重)。
-        assert_eq!(decide(&shown(), true, true, false, true), Decision::Ignore);
+        assert_eq!(
+            decide(&shown(), true, true, false, false, true),
+            Decision::Ignore
+        );
         // 该宿主已被 Esc 屏蔽。
-        assert_eq!(decide(&shown(), true, false, true, true), Decision::Ignore);
+        assert_eq!(
+            decide(&shown(), true, false, true, false, true),
+            Decision::Ignore
+        );
+        // commit 跳转后同一面板的重复 Shown(handled)不再弹。
+        assert_eq!(
+            decide(&shown(), true, false, false, true, true),
+            Decision::Ignore
+        );
         // daemon 离线:不弹空浮层。
         assert_eq!(
-            decide(&shown(), true, false, false, false),
+            decide(&shown(), true, false, false, false, false),
             Decision::Ignore
         );
         // 多门同时不满足仍是忽略。
-        assert_eq!(decide(&shown(), false, true, true, false), Decision::Ignore);
+        assert_eq!(
+            decide(&shown(), false, true, true, true, false),
+            Decision::Ignore
+        );
 
         let host = PanelEvent::HostChanged { previous_pid: 42 };
         assert_eq!(
-            decide(&host, true, true, false, true),
+            decide(&host, true, true, false, false, true),
             Decision::HideKeepBlock,
             "宿主切换须隐藏但保留屏蔽"
         );
         assert_eq!(
-            decide(&host, false, false, true, false),
+            decide(&host, false, false, true, false, false),
             Decision::HideKeepBlock,
             "宿主切换与开关/在线状态无关(幂等隐藏)"
         );
 
         assert_eq!(
-            decide(&PanelEvent::Closed { pid: 42 }, true, true, false, true),
+            decide(
+                &PanelEvent::Closed { pid: 42 },
+                true,
+                true,
+                false,
+                true,
+                true
+            ),
             Decision::HideAndClear { pid: 42 },
             "面板销毁须隐藏并按事件 pid 精确解除屏蔽"
         );
         assert_eq!(
-            decide(&PanelEvent::Closed { pid: 7 }, false, false, false, false),
+            decide(
+                &PanelEvent::Closed { pid: 7 },
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             Decision::HideAndClear { pid: 7 },
             "pid 必须原样透传(宿主切换后归因可能已被其他面板覆盖)"
+        );
+    }
+
+    /// 阻塞 1 语义:commit 后 handled 抑制重复 Shown;`Closed` 移除 handled 后
+    /// 同一 pid 的新 Shown 重新允许(解除)。
+    /// 突变「去掉 handled 门」→ 第一条 Ignore 断言必红。
+    #[test]
+    fn handled_suppresses_reshown_until_closed() {
+        use std::collections::HashSet;
+
+        let mut handled: HashSet<i32> = HashSet::new();
+        handled.insert(42); // commit 时接线层插入
+        assert_eq!(
+            decide(&shown(), true, false, false, handled.contains(&42), true),
+            Decision::Ignore,
+            "commit 后的重复 Shown 不得复现浮层"
+        );
+        // Closed 到达:接线层 remove(pid)。
+        handled.remove(&42);
+        assert_eq!(
+            decide(&shown(), true, false, false, handled.contains(&42), true),
+            Decision::Show,
+            "面板关闭后同 pid 的新 Shown 应重新允许"
         );
     }
 
@@ -202,8 +258,22 @@ mod tests {
     /// no-op,且不得误清其他 pid 的屏蔽(跨 app 关闭路径会重复确认)。
     #[test]
     fn repeated_closed_is_idempotent_and_scoped() {
-        let first = decide(&PanelEvent::Closed { pid: 5 }, true, true, false, true);
-        let second = decide(&PanelEvent::Closed { pid: 5 }, false, false, false, false);
+        let first = decide(
+            &PanelEvent::Closed { pid: 5 },
+            true,
+            true,
+            false,
+            false,
+            true,
+        );
+        let second = decide(
+            &PanelEvent::Closed { pid: 5 },
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(first, Decision::HideAndClear { pid: 5 });
         assert_eq!(first, second, "重复 Closed 决策不随开关/可见态变化");
 
