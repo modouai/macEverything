@@ -74,6 +74,7 @@ pub mod icons;
 pub mod idle;
 pub mod mascot;
 pub mod menu_actions;
+pub mod overlay_layout;
 pub mod palette;
 pub mod results;
 pub mod settings;
