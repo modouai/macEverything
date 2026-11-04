@@ -185,13 +185,64 @@ const POLL_STEP: Duration = Duration::from_millis(50);
 /// 策略 B 读回校验的重试次数(初次之外最多再等 2 次)。
 const PASTE_READBACK_RETRIES: u32 = 2;
 
-/// 输入框是否在当前焦点窗口的 AX 树中(深度 6 浅层搜索,谓词同探针:
-/// 可写 AXTextField)。探针的焦点一致/新增复核留在探针里(`panel_probe`
-/// 保留 AXPress 对照实验),执行层只做存在性观测。
-fn goto_field(pid: i32) -> Option<AXRef> {
+/// Go-to 输入框判定(纯逻辑,三条件合取):
+/// - `writable`:元素是可写 AXTextField;
+/// - `in_baseline`:元素在 ⌘⇧G 前的基线集合中(保存面板文件名框等);
+/// - `focused`:元素就是当前 `AXFocusedElement`。
+///
+/// 必须「可写 且 非基线 且 焦点」,三者任一不满足都不是 Go-to 框——
+/// 防 ⌘⇧G 未生效时误中文件名框(覆盖文件名 + 意外保存)。
+fn is_goto_candidate(writable: bool, in_baseline: bool, focused: bool) -> bool {
+    writable && !in_baseline && focused
+}
+
+/// 候选是否落在基线集合(身份比较由调用方提供;AX 侧用 `cf_equal`,
+/// 代理重建安全)。抽成泛型便于单测「候选 ∈ 基线 → 拒绝」。
+fn in_baseline<T>(candidate: &T, baseline: &[T], eq: impl Fn(&T, &T) -> bool) -> bool {
+    baseline.iter().any(|b| eq(b, candidate))
+}
+
+/// 当前 Go-to 输入框(与探针 `locate_goto_field` 同构;共享化留待 Task 15 收口)。
+///
+/// 双重复核:候选须(1)不在 ⌘⇧G 前基线中,(2)与当前 `AXFocusedElement`
+/// 经 CFEqual 同一。输入框消失 / ⌘⇧G 未生效 / 焦点未转到新框 → None。
+fn goto_field(pid: i32, baseline: &[AXRef]) -> Option<AXRef> {
     let app = ax_ffi::app_element(pid)?;
+    let focused = ax_ffi::copy_attr(&app, attr::FOCUSED_ELEMENT);
     let win = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW)?;
-    search_field(&win, 0)
+    search_field(&win, 0, &|el| {
+        is_goto_candidate(
+            writable_text_field(el),
+            in_baseline(el, baseline, ax_ffi::cf_equal),
+            focused.as_ref().is_some_and(|f| ax_ffi::cf_equal(f, el)),
+        )
+    })
+}
+
+/// ⌘⇧G 前的基线:当前焦点窗口内所有可写 AXTextField(主要是文件名框)。
+/// 引用保活整个跳转过程;代理重建下身份比较走 CFEqual(见 [`in_baseline`])。
+fn baseline_text_fields(pid: i32) -> Vec<AXRef> {
+    let Some(app) = ax_ffi::app_element(pid) else {
+        return Vec::new();
+    };
+    let Some(win) = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_writable_fields(&win, 0, &mut out);
+    out
+}
+
+fn collect_writable_fields(el: &AXRef, depth: usize, out: &mut Vec<AXRef>) {
+    if writable_text_field(el) {
+        out.push(ax_ffi::clone_ref(el));
+    }
+    if depth >= 6 {
+        return;
+    }
+    for c in ax_ffi::children(el) {
+        collect_writable_fields(&c, depth + 1, out);
+    }
 }
 
 /// 可写文本框谓词(Go-to 框与保存面板文件名框同满足;M0 探针同款)。
@@ -201,15 +252,15 @@ fn writable_text_field(el: &AXRef) -> bool {
 }
 
 /// 带深度限的谓词搜索(命中即克隆引用返回;深度 6 与探针一致)。
-fn search_field(el: &AXRef, depth: usize) -> Option<AXRef> {
-    if writable_text_field(el) {
+fn search_field(el: &AXRef, depth: usize, pred: &dyn Fn(&AXRef) -> bool) -> Option<AXRef> {
+    if pred(el) {
         return Some(ax_ffi::clone_ref(el));
     }
     if depth >= 6 {
         return None;
     }
     for c in ax_ffi::children(el) {
-        if let Some(hit) = search_field(&c, depth + 1) {
+        if let Some(hit) = search_field(&c, depth + 1, pred) {
             return Some(hit);
         }
     }
@@ -269,9 +320,14 @@ fn readback_until_match(
 /// 执行循环严格按状态机契约:先执行动作得到观测,再 `on(obs)` 转移;
 /// `done = true` 时若带 [`Act::RestoreClipboard`] 先恢复剪贴板,再按终态映射。
 /// `saved`:None = 从未保存;Some(None) = 保存时无文本;Some(Some(t)) = 原文。
+///
+/// `baseline` 在发 ⌘⇧G 前采集并在整个跳转生命周期保活:后续每一步的
+/// 「输入框仍在」自检都用「非基线 + 焦点一致」谓词,防把文件名框当成 Go-to 框。
 pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
     let mut m = NavMachine::new();
     let mut saved: Option<Option<String>> = None;
+    // ⌘⇧G 前基线(None/空 = 当时没有可写输入框)。
+    let mut baseline: Vec<AXRef> = Vec::new();
     let Some(mut act) = m.start() else {
         return NavigateOutcome::Aborted;
     };
@@ -279,21 +335,25 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
         // 1) 执行动作 → 观测。Restore 只作为 done 收尾动作执行(见 loop 末尾)。
         let obs = match act {
             Act::SendGoToFolder => {
+                // 先采基线(文件名框等既有输入框),再合成 ⌘⇧G;基线须覆盖整个跳转。
+                baseline = baseline_text_fields(pid);
                 // cg_events 的 pid 时效契约:先复核前台,再合成 ⌘⇧G。
                 if !pid_still_front(pid) {
                     Obs::SheetClosed
                 } else {
                     cg_events::post_combo(Some(pid), KEY_G, FLAG_CMD | FLAG_SHIFT);
                     let deadline = Instant::now() + STEP_TIMEOUT;
-                    if wait_until(deadline, || goto_field(pid).is_some()) {
+                    // 双重复核(非基线 + 焦点一致)才认 sheet 已打开;
+                    // 3s 内不满足 → Timeout(⌘⇧G 未生效的正确出口,不碰文件名框)。
+                    if wait_until(deadline, || goto_field(pid, &baseline).is_some()) {
                         Obs::SheetOpened
                     } else {
                         Obs::Timeout
                     }
                 }
             }
-            Act::FillViaAx => match goto_field(pid) {
-                // 输入框消失(用户 Esc 关 sheet):按 sheet 关闭回报。
+            Act::FillViaAx => match goto_field(pid, &baseline) {
+                // Go-to 框消失(用户 Esc 关 sheet):按 sheet 关闭回报。
                 None => Obs::SheetClosed,
                 Some(field) => {
                     // 直设失败不单独短路:统一以读回值判定(设置未生效时读回仍是旧值)。
@@ -304,7 +364,7 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
             Act::PasteViaClipboard => {
                 // M6 契约:无论后续检查如何,先保存原剪贴板(None = 原本无文本)。
                 saved = Some(clipboard_text());
-                match goto_field(pid) {
+                match goto_field(pid, &baseline) {
                     None => Obs::SheetClosed,
                     Some(field) => {
                         if !clipboard_set_text(path) {
@@ -329,13 +389,13 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
                 }
             }
             Act::PressReturn => {
-                // 合成 Return 前自检输入框仍在 + 前台仍是目标 pid。
-                if goto_field(pid).is_none() || !pid_still_front(pid) {
+                // 合成 Return 前自检 Go-to 框仍在(非基线 + 焦点一致)且前台仍是目标 pid。
+                if goto_field(pid, &baseline).is_none() || !pid_still_front(pid) {
                     Obs::SheetClosed
                 } else {
                     cg_events::post_combo(Some(pid), KEY_RETURN, 0);
                     let deadline = Instant::now() + STEP_TIMEOUT;
-                    if wait_until(deadline, || goto_field(pid).is_none()) {
+                    if wait_until(deadline, || goto_field(pid, &baseline).is_none()) {
                         Obs::SheetClosed
                     } else {
                         Obs::Timeout
@@ -608,6 +668,37 @@ mod tests {
             Obs::StrategyAFailed,
             "空值不等于目标路径"
         );
+    }
+
+    /// Go-to 候选三条件:可写、非基线、焦点同时满足;任一缺失拒绝。
+    /// 突变任一条件(如去掉「非基线」)→ 文件名框用例必红(防覆盖文件名)。
+    #[test]
+    fn goto_candidate_requires_writable_new_and_focused() {
+        assert!(
+            is_goto_candidate(true, false, true),
+            "三条件齐备才是 Go-to 框"
+        );
+        assert!(!is_goto_candidate(false, false, true), "不可写拒绝");
+        assert!(!is_goto_candidate(true, true, true), "基线内(文件名框)拒绝");
+        assert!(!is_goto_candidate(true, false, false), "非焦点拒绝");
+        assert!(!is_goto_candidate(false, true, false), "多条件缺失拒绝");
+    }
+
+    /// 基线身份比较走调用方谓词(AX 侧为 CFEqual);命中基线即拒绝。
+    /// 突变「any → !any」→ 两条断言必红。
+    #[test]
+    fn in_baseline_uses_identity_predicate() {
+        let baseline = [1u32, 2, 3];
+        assert!(
+            in_baseline(&2, &baseline, |a, b| a == b),
+            "既有输入框在基线内"
+        );
+        assert!(
+            !in_baseline(&4, &baseline, |a, b| a == b),
+            "新增输入框不在基线内"
+        );
+        let empty: [u32; 0] = [];
+        assert!(!in_baseline(&1, &empty, |a, b| a == b), "空基线永不命中");
     }
 
     /// 读回重试:初次 + 2 次重试内命中即成功(间隔 0 便于单测)。
