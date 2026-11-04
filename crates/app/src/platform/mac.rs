@@ -54,7 +54,7 @@ use objc2_app_kit::{
     NSScreen, NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceActiveSpaceDidChangeNotification,
+    NSWorkspaceActiveSpaceDidChangeNotification, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
     NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest, NSNotification,
@@ -351,6 +351,65 @@ fn make_space_observer(mtm: MainThreadMarker) -> Retained<SpaceObserver> {
     }
     log::info!("Space 变更通知观察者已注册(NSWorkspaceActiveSpaceDidChangeNotification)");
     observer
+}
+
+// 前台应用切换观察者(NSWorkspace 通知 → 保存面板 detector 换绑)。
+define_class!(
+    // SAFETY(define_class 的 unsafe 契约):超类 NSObject 无子类化约束;
+    // 无新增实例变量(ivars 缺省 `()`);方法签名与 AppKit 一致(单参 NSNotification);无 Drop。
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MaceAppActivateObserver"]
+    struct AppActivateObserver;
+
+    impl AppActivateObserver {
+        #[unsafe(method(appDidActivate:))]
+        fn app_did_activate(&self, _notification: &NSNotification) {
+            // frontmostApplication 直读最稳(notification.object 形态跨版本不一)
+            if let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() {
+                super::panel_detector::notify_frontmost(app.processIdentifier());
+            }
+        }
+    }
+
+    unsafe impl NSObjectProtocol for AppActivateObserver {}
+);
+
+thread_local! {
+    /// 前台应用切换观察者保活(主线程;通知中心持弱引用)。
+    /// `Retained<AppActivateObserver>` 非 Send/Sync(主线程类),故不放 static。
+    static APP_ACTIVATE_OBSERVER: RefCell<Option<Retained<AppActivateObserver>>> =
+        const { RefCell::new(None) };
+}
+
+/// 注册前台应用切换观察者(主线程;幂等——observer 由 thread_local 保活)。
+pub fn install_app_activate_observer() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::warn!("install_app_activate_observer 非主线程调用");
+        return;
+    };
+    if APP_ACTIVATE_OBSERVER.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let obs = AppActivateObserver::alloc(mtm).set_ivars(());
+    // SAFETY:主线程新分配、ivars 已置;未覆写 init,走 NSObject。
+    let obs: Retained<AppActivateObserver> = unsafe { msg_send![super(obs), init] };
+    // SAFETY:已初始化实例;通知中心持弱引用,thread_local 保活。
+    unsafe {
+        center.addObserver_selector_name_object(
+            &obs,
+            objc2::sel!(appDidActivate:),
+            Some(NSWorkspaceDidActivateApplicationNotification),
+            None,
+        );
+    }
+    APP_ACTIVATE_OBSERVER.with(|c| *c.borrow_mut() = Some(obs));
+    // 立即同步一次当前前台 pid(通知在切换时才来)
+    if let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() {
+        super::panel_detector::notify_frontmost(app.processIdentifier());
+    }
+    log::info!("前台应用切换观察者已注册");
 }
 
 /// 漂移计数(与 PoC-1 续同口径:每帧核对,漂移即重施并留痕)。
@@ -2287,6 +2346,24 @@ pub fn clipboard_restore(saved: Option<&str>) -> bool {
 /// M0 探针启动转发(main.rs 按环境变量调用;见 panel_probe 模块注释)。
 pub fn probe_start() {
     super::panel_probe::start_probe();
+}
+
+/// 临时实机开关:注册 NSWorkspace 观察者 + 启动 detector,日志打印事件流。
+/// Task 14 正式接线后移除本函数。
+pub fn detector_start_debug() {
+    install_app_activate_observer();
+    let Some(rx) = super::panel_detector::start_detector() else {
+        return;
+    };
+    log::info!("detector 已启动(MCE_PANEL_DETECTOR)");
+    // 临时:事件日志(Task 14 接线后由 UI 消费,此处移除)
+    let _ = std::thread::Builder::new()
+        .name("panel-detector-log".to_owned())
+        .spawn(move || {
+            for ev in rx {
+                log::info!("[detector] {ev:?}");
+            }
+        });
 }
 
 #[cfg(test)]

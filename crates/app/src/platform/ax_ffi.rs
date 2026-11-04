@@ -44,6 +44,13 @@ extern "C" {
     fn CFRunLoopAddSource(rl: CFRunLoopRef, src: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFRunLoopSourceCreate(
+        alloc: CFAllocatorRef,
+        order: isize,
+        context: *mut CFRunLoopSourceContext,
+    ) -> CFRunLoopSourceRef;
+    fn CFRunLoopSourceSignal(src: CFRunLoopSourceRef);
+    fn CFRunLoopWakeUp(rl: CFRunLoopRef);
     /// kCFRunLoopDefaultMode 常量符号(CoreFoundation 导出,非 inline,可直接链接)。
     static kCFRunLoopDefaultMode: CFStringRef;
 
@@ -419,6 +426,62 @@ pub fn attach_observer_to_current_runloop(obs: &AXObserverWrap) {
             AXObserverGetRunLoopSource(obs.raw()),
             kCFRunLoopDefaultMode,
         );
+    }
+}
+
+/// CFRunLoopSourceContext(C 布局;仅 perform 有意义,其余置空)。
+#[repr(C)]
+pub struct CFRunLoopSourceContext {
+    pub version: isize,
+    pub info: *mut c_void,
+    pub retain: usize,
+    pub release: usize,
+    pub copy_description: usize,
+    pub equal: usize,
+    pub hash: usize,
+    pub schedule: usize,
+    pub cancel: usize,
+    pub perform: extern "C" fn(info: *mut c_void),
+}
+
+/// 创建自定义 runloop 信号源(跨线程唤醒 detector 线程;perform 在该线程派发)。
+/// 返回 RAII 包装;调用方负责 CFRunLoopAddSource 到目标 runloop(见
+/// [`attach_signal_source`])。
+pub fn signal_source_create(perform: extern "C" fn(*mut c_void)) -> Option<AXRef> {
+    let mut ctx = CFRunLoopSourceContext {
+        version: 0,
+        info: std::ptr::null_mut(),
+        retain: 0,
+        release: 0,
+        copy_description: 0,
+        equal: 0,
+        hash: 0,
+        schedule: 0,
+        cancel: 0,
+        perform,
+    };
+    // SAFETY:ctx 为本栈帧生命周期,CF 侧只读拷贝;返回 +1 引用交 AXRef。
+    unsafe { AXRef::take(CFRunLoopSourceCreate(std::ptr::null_mut(), -1, &mut ctx)) }
+}
+
+/// 把信号源挂到当前线程 runloop。
+pub fn attach_signal_source(src: &AXRef) {
+    // SAFETY:source 生命周期由调用方(AXRef)保证;mode 为全局常量。
+    unsafe {
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src.raw(), kCFRunLoopDefaultMode);
+    }
+}
+
+/// 唤醒目标 runloop 上的信号源(跨线程调用;两指针由调用方以 AtomicPtr 共享)。
+pub fn signal_and_wake(source: *mut c_void, target_runloop: *mut c_void) {
+    // SAFETY:非空指针由调用方保证指向存活 CF 对象(进程生命周期)。
+    unsafe {
+        if !source.is_null() {
+            CFRunLoopSourceSignal(source);
+        }
+        if !target_runloop.is_null() {
+            CFRunLoopWakeUp(target_runloop);
+        }
     }
 }
 
