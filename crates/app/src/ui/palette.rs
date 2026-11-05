@@ -1166,8 +1166,15 @@ impl PaletteState {
 
         let input_resp = frame.inner;
         // 组合中的预编辑文本不触发查询(IME 未上屏;提交/取消帧 composing 已复位,
-        // 照常按最终文本查询)。
-        if input_resp.changed() && !self.ime_composing {
+        // 照常按最终文本查询)。实机(2026-11-05):中文输入法输入 ASCII 时首帧有
+        // Preedit 事件置 composing=true,后续字符作为普通文本上屏且没有 Commit
+        // 事件——沿用式 composing 会卡死,查询永不触发。此处「无 IME 事件的输入
+        // 变更」视为上屏完成,复位后照常查询。
+        let preedit = self.ime_composing && self.ime_busy;
+        if input_resp.changed() && !preedit {
+            if self.ime_composing && !self.ime_busy {
+                self.ime_composing = false;
+            }
             // 打点只覆盖「唤起后 1.5s」(首程诊断窗口);常态输入不逐键留痕,
             // 查询往返另有 `查询往返` 一行。
             if self.show_at.is_some() {

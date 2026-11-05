@@ -191,6 +191,11 @@ impl OverlayState {
                 .request_repaint_after_for(delay, overlay_viewport_id());
         }
         if let Some(fire) = self.session.pending_at(now) {
+            log::info!(
+                "[overlay] 发起目录查询 gen={} q={:?}",
+                fire.generation,
+                fire.query
+            );
             // 代际号由 Session 唯一持有;线程启动/错误处理/回投/唤醒统一走 palette
             // 共享 worker(勿在本模块复制)。
             palette::spawn_entry_query_worker(
@@ -206,8 +211,10 @@ impl OverlayState {
         while let Ok((generation, entries)) = self.query_rx.try_recv() {
             // 以 Session 为唯一真相:清空输入/关闭重开/新查询都会推进其代际号。
             if !self.session.accepts(generation) {
+                log::warn!("[overlay] 丢弃旧代结果 gen={generation}");
                 continue; // 旧代响应丢弃(慢响应后到不得覆盖新结果)
             }
+            log::info!("[overlay] 回填 {} 项 gen={generation}", entries.len());
             self.results = entries;
             self.selected = 0;
             self.scroll_to_selected = false;
@@ -255,16 +262,37 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     // IME 组合态须在读取本帧事件前跟踪(选字回车与 Commit 同帧到达,见 track_ime)。
     st.track_ime(ui);
 
+    // 固定 id + **仅在未聚焦时**请求焦点:egui 的 `request_focus` 文档明确
+    // 「Calling this will interrupt IME composition」——每帧调用会每帧打断
+    // 中文输入法组合(marked text 被清、选字 Commit 丢失,实机 2026-11-05)。
+    // 悬浮条同样只在唤起首帧聚焦(ui/palette.rs),此处对齐。
+    let input_id = egui::Id::unique("save-panel-assist-overlay-input");
+    if !ui.memory(|m| m.has_focus(input_id)) {
+        ui.memory_mut(|m| m.request_focus(input_id));
+    }
     let input = ui.add(
         egui::TextEdit::singleline(&mut st.input)
+            .id(input_id)
             .hint_text(strings.overlay_hint)
             .desired_width(f32::INFINITY),
     );
     // 组合中的预编辑文本不触发查询(IME 未上屏;提交帧 composing 已复位,照常查询)。
-    if input.changed() && !st.ime_composing {
-        st.on_input(Instant::now());
+    // 实机(2026-11-05):中文输入法输入 ASCII 时首帧有 Preedit 事件把 composing
+    // 置 true,后续字符作为普通文本上屏且没有 Commit 事件——沿用式 composing 会
+    // 卡死,查询永不触发。此处「无 IME 事件的输入变更」视为上屏完成,复位后查询。
+    if input.changed() {
+        let preedit = st.ime_composing && st.ime_busy;
+        if !preedit {
+            if st.ime_composing && !st.ime_busy {
+                st.ime_composing = false;
+            }
+            st.on_input(Instant::now());
+        }
     }
-    input.request_focus();
+    // 已聚焦时不得重复 request_focus(会 interrupt_ime,见上)。
+    if !input.has_focus() {
+        input.request_focus();
+    }
 
     // 键盘动作:IME 组合/忙时整帧让位输入法;其余交给纯函数决策。
     let (up, down, enter, escape) = ui.input(|i| {
