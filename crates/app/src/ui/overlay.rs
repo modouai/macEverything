@@ -14,6 +14,7 @@ use client::DaemonPaths;
 use crate::i18n;
 use crate::session::Session;
 use crate::ui::palette;
+use crate::ui::tokens;
 
 /// 防抖窗口(与悬浮条同值 60ms)。
 const DEBOUNCE: Duration = Duration::from_millis(60);
@@ -26,10 +27,32 @@ pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("overlay")
 }
 
-/// 浮层尺寸(逻辑像素;窗口大小)。
+/// 浮层尺寸(逻辑像素;窗口大小。高度自适应时由平台层按
+/// `overlay_layout::overlay_frame` 返回值 setContentSize)。
 pub const OVERLAY_W: f32 = 420.0;
 pub const OVERLAY_H: f32 = 300.0;
-pub const ROW_H: f32 = 26.0;
+/// 结果行高(两行文本)。
+const ROW_H: f32 = 44.0;
+/// 搜索行高。
+const SEARCH_H: f32 = 50.0;
+/// 页脚高。
+const FOOTER_H: f32 = 30.0;
+/// 面板圆角(视觉原型 v1)。
+const PANEL_RADIUS: u8 = 12;
+/// 搜索行内边距/图标/间距(视觉原型 v1)。
+const SEARCH_PAD_X: f32 = 16.0;
+const SEARCH_ICON: f32 = 15.0;
+const SEARCH_GAP: f32 = 10.0;
+/// 结果行文件夹 glyph 尺寸。
+const FOLDER_W: f32 = 24.0;
+const FOLDER_H: f32 = 19.0;
+/// 页脚左右内边距。
+const FOOTER_PAD_X: f32 = 14.0;
+/// 字号(视觉原型 v1):查询 15 / 目录名 13 / 次文本与键帽标签 11。
+const FONT_QUERY: f32 = 15.0;
+const FONT_NAME: f32 = 13.0;
+const FONT_META: f32 = 11.0;
+const FONT_KEYCAP: f32 = 10.0;
 
 /// 按键决策涉及的键(纯逻辑用;绘制层从 `egui::Key` 映射)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,14 +284,44 @@ impl OverlayState {
 }
 
 /// 绘制(ui/mod.rs 的 show_viewport_deferred 回调调用;短锁取 state 后绘制)。
-/// 键盘:↑↓ 改选中、Enter 置 commit_requested、Esc 置 dismiss_requested;
+/// 视觉:`docs/specs/overlay-visual/`(原型 v1/v2 定版;不透明材质,色板
+/// tokens::overlay = 完整结果窗口色板)。结构:面板 chrome → 搜索行 → 分隔线 →
+/// 结果区(两行文本 + 文件夹 glyph + 选中行「↵ 跳转」提示)→ 页脚(结果数 +
+/// 键帽组)。键盘:↑↓ 改选中、Enter 置 commit_requested、Esc 置 dismiss_requested;
 /// 行点击选中、双击 = 选中 + commit_requested。
 pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let strings = i18n::s();
-    ui.add_space(8.0);
-
-    // IME 组合态须在读取本帧事件前跟踪(选字回车与 Commit 同帧到达,见 track_ime)。
+    let dark = ui.ctx().theme() == egui::Theme::Dark;
+    let t = tokens::overlay(dark);
     st.track_ime(ui);
+
+    // —— 面板 chrome:不透明底 + 描边(窗口 clear_color 全透明,圆角外露桌面)——
+    let panel_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(panel_rect, egui::CornerRadius::same(PANEL_RADIUS), t.bg);
+    ui.painter().rect_stroke(
+        panel_rect,
+        egui::CornerRadius::same(PANEL_RADIUS),
+        egui::Stroke::new(1.0, t.border),
+        egui::StrokeKind::Inside,
+    );
+
+    // —— 搜索行(高 50;左 16 + 图标 15 + 间距 10;右 16)——
+    let (search_rect, _) = ui.allocate_exact_size(
+        egui::vec2(panel_rect.width(), SEARCH_H),
+        egui::Sense::hover(),
+    );
+    draw_search_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(
+                search_rect.left() + SEARCH_PAD_X + SEARCH_ICON / 2.0,
+                search_rect.center().y,
+            ),
+            egui::vec2(SEARCH_ICON, SEARCH_ICON),
+        ),
+        t.search_icon,
+    );
 
     // 固定 id + **仅在未聚焦时**请求焦点:egui 的 `request_focus` 文档明确
     // 「Calling this will interrupt IME composition」——每帧调用会每帧打断
@@ -278,11 +331,22 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     if !ui.memory(|m| m.has_focus(input_id)) {
         ui.memory_mut(|m| m.request_focus(input_id));
     }
-    let input = ui.add(
+    let input_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            search_rect.left() + SEARCH_PAD_X + SEARCH_ICON + SEARCH_GAP,
+            search_rect.top(),
+        ),
+        egui::pos2(search_rect.right() - SEARCH_PAD_X, search_rect.bottom()),
+    );
+    let input = ui.put(
+        input_rect,
         egui::TextEdit::singleline(&mut st.input)
             .id(input_id)
-            .hint_text(strings.overlay_hint)
-            .desired_width(f32::INFINITY),
+            .font(crate::ui::font::id(FONT_QUERY))
+            .text_color(t.query)
+            .frame(egui::Frame::NONE)
+            .align(egui::Align2::LEFT_CENTER)
+            .hint_text(strings.overlay_hint),
     );
     // 组合中的预编辑文本不触发查询(IME 未上屏;提交帧 composing 已复位,照常查询)。
     // 实机(2026-11-05):中文输入法输入 ASCII 时首帧有 Preedit 事件把 composing
@@ -348,41 +412,106 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
         }
     }
 
-    if st.clipboard_hint {
-        ui.add_space(2.0);
-        ui.add(egui::Label::new(egui::RichText::new(strings.overlay_clipboard_hint).weak()).wrap());
-    }
+    // —— 分隔线 ——
+    draw_divider(ui.painter(), panel_rect, search_rect.bottom(), t.divider);
 
-    ui.add_space(4.0);
+    // —— 页脚(高 30;底缘圆角与面板同半径-1;结果数 + 键帽组)——
+    egui::containers::panel::Panel::bottom("ov-footer")
+        .frame(
+            egui::Frame::new()
+                .fill(t.footer_bg)
+                .inner_margin(egui::Margin::symmetric(
+                    FOOTER_PAD_X as i8,
+                    ((FOOTER_H - 18.0) / 2.0) as i8,
+                ))
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: PANEL_RADIUS - 1,
+                    se: PANEL_RADIUS - 1,
+                }),
+        )
+        .show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.add_space(FOOTER_PAD_X);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(i18n::format::total_items(st.results.len() as u32))
+                        .font(crate::ui::font::id(FONT_META))
+                        .color(t.footer_text),
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(FOOTER_PAD_X);
+                    key_group(ui, &t, strings.overlay_key_close, "esc");
+                    key_group(ui, &t, strings.overlay_key_jump, "↵");
+                    key_group(ui, &t, strings.overlay_key_select, "↑↓");
+                });
+            });
+        });
+
+    // —— 结果区(剩余高度;两行文本行 + 空态)——
     let mut clicked_row = None;
     let mut commit = false;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
+            if st.clipboard_hint {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(strings.overlay_clipboard_hint)
+                            .font(crate::ui::font::id(FONT_META))
+                            .color(t.path),
+                    )
+                    .truncate(),
+                );
+                ui.add_space(2.0);
+            }
             if st.results.is_empty() {
-                if !st.input.is_empty() {
-                    ui.add_space(6.0);
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(strings.empty_no_match).weak(),
-                    ));
-                }
+                // 空输入 = 引导态;有输入无匹配 = 无匹配态。居中 ghost + 文案。
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(14.0);
+                        let (ghost, _) =
+                            ui.allocate_exact_size(egui::vec2(40.0, 26.0), egui::Sense::hover());
+                        ui.painter().rect_stroke(
+                            ghost,
+                            6.0,
+                            egui::Stroke::new(1.5, t.empty_text),
+                            egui::StrokeKind::Middle,
+                        );
+                        ui.add_space(8.0);
+                        let text = if st.input.is_empty() {
+                            strings.overlay_hint
+                        } else {
+                            strings.empty_no_match
+                        };
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(text)
+                                .font(crate::ui::font::id(FONT_META))
+                                .color(t.empty_text),
+                        ));
+                    });
+                });
                 return;
             }
-            for (i, entry) in st.results.iter().enumerate() {
-                let response = draw_row(ui, entry, i == st.selected);
-                // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
-                if i == st.selected && st.scroll_to_selected {
-                    ui.scroll_to_rect(response.rect, None);
-                }
-                if response.clicked() {
-                    clicked_row = Some(i);
-                }
-                if response.double_clicked() {
-                    clicked_row = Some(i);
-                    commit = true;
-                }
-            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (i, entry) in st.results.iter().enumerate() {
+                        let response = draw_row(ui, entry, i == st.selected, &t);
+                        // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
+                        if i == st.selected && st.scroll_to_selected {
+                            ui.scroll_to_rect(response.rect, None);
+                        }
+                        if response.clicked() {
+                            clicked_row = Some(i);
+                        }
+                        if response.double_clicked() {
+                            clicked_row = Some(i);
+                            commit = true;
+                        }
+                    }
+                });
         });
     st.scroll_to_selected = false; // 本帧已消费(点击/查询回填同样不重复滚动)
     if let Some(i) = clicked_row {
@@ -395,29 +524,142 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     }
 }
 
-/// 单行:选中底色 + 「目录名 — 完整路径」(单行截断);整行可点击。
-fn draw_row(ui: &mut egui::Ui, entry: &HitEntry, selected: bool) -> egui::Response {
-    let width = ui.available_width();
-    let fill = if selected {
-        ui.visuals().selection.bg_fill
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let response = egui::Frame::new()
-        .fill(fill)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
+/// 单行(两行文本;原型 v1 定版):文件夹 glyph + 目录名(主)/完整路径(次);
+/// 选中 = 选中底 + 目录名加粗 + 右端「↵ 跳转」提示。整行可点击。
+/// 动作提示宽度恒预留:未选行不显示,但文本不因选中切换而回流。
+fn draw_row(
+    ui: &mut egui::Ui,
+    entry: &HitEntry,
+    selected: bool,
+    t: &tokens::Overlay,
+) -> egui::Response {
+    egui::Frame::new()
+        .fill(if selected {
+            t.selected_bg
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
-            ui.set_min_width((width - 12.0).max(0.0));
-            ui.set_min_height(ROW_H - 4.0);
+            ui.set_min_height(ROW_H - 8.0);
             ui.horizontal_centered(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&entry.name).strong()).truncate());
-                ui.add(egui::Label::new(egui::RichText::new("—").weak()));
-                ui.add(egui::Label::new(egui::RichText::new(&entry.path).weak()).truncate());
+                // 文件夹 glyph(矢量两段;内存优先,不落 NSWorkspace 图标纹理)。
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(FOLDER_W, FOLDER_H), egui::Sense::hover());
+                draw_folder_glyph(ui.painter(), icon_rect, t);
+                ui.add_space(10.0);
+                let chip_w = text_w(
+                    ui,
+                    &format!("↵ {}", crate::i18n::s().overlay_key_jump),
+                    FONT_META,
+                ) + 12.0;
+                let text_w = (ui.available_width() - chip_w).max(0.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(text_w);
+                    let mut name = egui::RichText::new(&entry.name)
+                        .font(crate::ui::font::id(FONT_NAME))
+                        .color(if selected { t.name_selected } else { t.name });
+                    if selected {
+                        name = name.strong();
+                    }
+                    ui.add(egui::Label::new(name).truncate());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&entry.path)
+                                .font(crate::ui::font::id(FONT_META))
+                                .color(t.path),
+                        )
+                        .truncate(),
+                    );
+                });
+                if selected {
+                    ui.add_space(6.0);
+                    let (chip_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(chip_w, 20.0), egui::Sense::hover());
+                    ui.painter().rect_filled(chip_rect, 5.0, t.action_bg);
+                    ui.painter().text(
+                        chip_rect.center(),
+                        egui::Align2::LEFT_CENTER,
+                        format!("↵ {}", crate::i18n::s().overlay_key_jump),
+                        crate::ui::font::id(FONT_META),
+                        t.action_text,
+                    );
+                }
             });
         })
-        .response;
-    response.interact(egui::Sense::click())
+        .response
+        .interact(egui::Sense::click())
+}
+
+/// 行内文本宽测量(键帽/动作提示排版用;悬浮条 text_w 同款)。
+fn text_w(ui: &egui::Ui, text: &str, base: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            crate::ui::font::id(base),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
+}
+
+/// 分隔线(面板全宽 1px)。
+fn draw_divider(p: &egui::Painter, panel_rect: egui::Rect, y: f32, color: egui::Color32) {
+    p.line_segment(
+        [
+            egui::pos2(panel_rect.left(), y),
+            egui::pos2(panel_rect.right(), y),
+        ],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+/// 文件夹 glyph(矢量两段:后标签 + 前身;macOS 蓝色文件夹示意;零纹理内存)。
+fn draw_folder_glyph(p: &egui::Painter, rect: egui::Rect, t: &tokens::Overlay) {
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(1.0, 0.0),
+            egui::vec2(11.0, 4.5),
+        ),
+        egui::CornerRadius::same(2),
+        t.folder_back,
+    );
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            rect.left_bottom() + egui::vec2(0.0, -15.0),
+            egui::vec2(rect.width(), 15.0),
+        ),
+        egui::CornerRadius::same(3),
+        t.folder_front,
+    );
+}
+
+/// 搜索图标(⌕;悬浮条 §5.2 同款形态,5 行复制以维持模块自洽)。
+fn draw_search_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6, color);
+    let c = rect.center() - egui::vec2(1.5, 1.5);
+    p.circle_stroke(c, 5.5, stroke);
+    p.line_segment([c + egui::vec2(4.0, 4.0), c + egui::vec2(8.0, 8.0)], stroke);
+}
+
+/// 键帽组:标签 + 键帽(底:圆角 4;悬浮条页脚同族)。
+fn key_group(ui: &mut egui::Ui, t: &tokens::Overlay, label: &str, key: &str) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(label)
+            .font(crate::ui::font::id(FONT_META))
+            .color(t.keycap_text),
+    ));
+    let key_w = text_w(ui, key, FONT_KEYCAP) + 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(key_w, 18.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 4.0, t.keycap_bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        key,
+        crate::ui::font::id(FONT_KEYCAP),
+        t.keycap_text,
+    );
 }
 
 /// app 包判定:目录名以 `.app` 结尾,或路径位于某个 `.app` 包内部(Contents 等)。

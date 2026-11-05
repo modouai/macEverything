@@ -5,8 +5,8 @@
 
 use eframe::egui;
 
-/// `#RRGGBBAA` → `Color32`。
-fn c(hex: u32) -> egui::Color32 {
+/// `#RRGGBBAA` → `Color32`(入参 u64:占位色等 9 位十六进制字面量直接可写)。
+fn c(hex: u64) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
         ((hex >> 24) & 0xFF) as u8,
         ((hex >> 16) & 0xFF) as u8,
@@ -203,6 +203,90 @@ pub const fn list_h(rows: usize) -> f32 {
     }
 }
 
+/// 保存面板目录助手浮层 token（`overlay-visual/prototype.html` v1 定版；
+/// 不透明材质，色值取自 §4.2「完整结果窗口颜色」+ 原型补充的占位/空态/文件夹三档）。
+///
+/// 规则同 §4.1：绘制代码只读这里，禁散落色值。
+#[derive(Clone, Copy)]
+pub struct Overlay {
+    /// 面板底（**不透明**;无毛玻璃,内存优先——2026-11-05 用户约束）。
+    pub bg: egui::Color32,
+    /// 面板描边。
+    pub border: egui::Color32,
+    pub divider: egui::Color32,
+    pub search_icon: egui::Color32,
+    /// 查询文本。
+    pub query: egui::Color32,
+    /// 选中行底。
+    pub selected_bg: egui::Color32,
+    /// 目录名（主文本）。
+    pub name: egui::Color32,
+    /// 目录名（选中行,加粗）。
+    pub name_selected: egui::Color32,
+    /// 完整路径（次文本）。
+    pub path: egui::Color32,
+    /// 「↵ 跳转」动作提示字。
+    pub action_text: egui::Color32,
+    /// 「↵ 跳转」动作提示底。
+    pub action_bg: egui::Color32,
+    /// 页脚底（§4.2 状态栏底同源）。
+    pub footer_bg: egui::Color32,
+    pub footer_text: egui::Color32,
+    pub keycap_bg: egui::Color32,
+    pub keycap_text: egui::Color32,
+    /// 空态文本。
+    pub empty_text: egui::Color32,
+    /// 文件夹 glyph 前身/后标签（自绘矢量;内存优先不用 NSWorkspace 图标纹理）。
+    pub folder_front: egui::Color32,
+    pub folder_back: egui::Color32,
+}
+
+pub fn overlay(is_dark: bool) -> Overlay {
+    if is_dark {
+        Overlay {
+            bg: c(0x1A1D22FF),
+            border: c(0xFFFFFF1F),
+            divider: c(0xFFFFFF14),
+            search_icon: c(0x8B929AFF),
+            query: c(0xF2F4F7FF),
+            selected_bg: c(0xFFFFFF1F),
+            name: c(0xE4E7EBFF),
+            name_selected: c(0xFFFFFFFF),
+            path: c(0x8B929AFF),
+            action_text: c(0xC6CBD1FF),
+            action_bg: c(0xFFFFFF1AFF),
+            footer_bg: c(0xFFFFFF0AFF),
+            footer_text: c(0x8B929AFF),
+            keycap_bg: c(0xFFFFFF1AFF),
+            keycap_text: c(0xC6CBD1FF),
+            empty_text: c(0x6D757EFF),
+            folder_front: c(0x4E9BE8FF),
+            folder_back: c(0x3D87D6FF),
+        }
+    } else {
+        Overlay {
+            bg: c(0xFFFFFFFF),
+            border: c(0x0F172A1F),
+            divider: c(0x00000012),
+            search_icon: c(0x6B7280FF),
+            query: c(0x1A1D22FF),
+            selected_bg: c(0x5B6FD91F),
+            name: c(0x1F242BFF),
+            name_selected: c(0x14181EFF),
+            path: c(0x5F6774FF),
+            action_text: c(0x4B5563FF),
+            action_bg: c(0x0000000FFF),
+            footer_bg: c(0x00000005FF),
+            footer_text: c(0x5F6774FF),
+            keycap_bg: c(0x0000000DFF),
+            keycap_text: c(0x4B5563FF),
+            empty_text: c(0x9AA2ADFF),
+            folder_front: c(0x5CA6EEFF),
+            folder_back: c(0x4A94E4FF),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,12 +387,12 @@ mod tests {
         for (i, (dark_val, dark_hex, light_hex, name)) in rows.iter().enumerate() {
             assert_eq!(
                 dark_val.to_array(),
-                c(*dark_hex).to_array(),
+                c(u64::from(*dark_hex)).to_array(),
                 "{name} 深色值不符 §4.1"
             );
             assert_eq!(
                 light[i].to_array(),
-                c(*light_hex).to_array(),
+                c(u64::from(*light_hex)).to_array(),
                 "{name} 浅色值不符 §4.1"
             );
         }
