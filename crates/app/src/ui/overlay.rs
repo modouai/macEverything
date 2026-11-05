@@ -29,7 +29,7 @@ pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
 
 /// 浮层尺寸(逻辑像素;窗口大小。高度自适应时由平台层按
 /// `overlay_layout::overlay_frame` 返回值 setContentSize)。
-pub const OVERLAY_W: f32 = 420.0;
+pub const OVERLAY_W: f32 = 480.0;
 pub const OVERLAY_H: f32 = 300.0;
 /// 结果行高(两行文本)。
 const ROW_H: f32 = 44.0;
@@ -533,63 +533,86 @@ fn draw_row(
     selected: bool,
     t: &tokens::Overlay,
 ) -> egui::Response {
-    egui::Frame::new()
-        .fill(if selected {
+    // 占位分配(拿 y 与点击响应)。行高**精确锁定** ROW_H:内容(字体缩放/加粗/
+    // 选中 chip)再高也只在该矩形内绘制——Frame 自动尺寸会被两行文本撑高,
+    // 造成「首行比其他行高」(实机 2026-11-05;悬浮条行同款固定高度模式)。
+    let (slot, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_H),
+        egui::Sense::click(),
+    );
+    let rect = egui::Rect::from_min_size(slot.min, egui::vec2(slot.width(), ROW_H));
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    row_ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(8),
+        if selected {
             t.selected_bg
         } else {
             egui::Color32::TRANSPARENT
-        })
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(10, 4))
-        .show(ui, |ui| {
-            ui.set_min_height(ROW_H - 8.0);
-            ui.horizontal_centered(|ui| {
-                // 文件夹 glyph(矢量两段;内存优先,不落 NSWorkspace 图标纹理)。
-                let (icon_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(FOLDER_W, FOLDER_H), egui::Sense::hover());
-                draw_folder_glyph(ui.painter(), icon_rect, t);
-                ui.add_space(10.0);
-                let chip_w = text_w(
-                    ui,
-                    &format!("⏎ {}", crate::i18n::s().overlay_key_jump),
-                    FONT_META,
-                ) + 12.0;
-                let text_w = (ui.available_width() - chip_w).max(0.0);
-                ui.vertical(|ui| {
-                    ui.set_min_width(text_w);
-                    let mut name = egui::RichText::new(&entry.name)
-                        .font(crate::ui::font::id(FONT_NAME))
-                        .color(if selected { t.name_selected } else { t.name });
-                    if selected {
-                        name = name.strong();
-                    }
-                    ui.add(egui::Label::new(name).truncate());
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&entry.path)
-                                .font(crate::ui::font::id(FONT_META))
-                                .color(t.path),
-                        )
-                        .truncate(),
-                    );
-                });
-                if selected {
-                    ui.add_space(6.0);
-                    let (chip_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(chip_w, 20.0), egui::Sense::hover());
-                    ui.painter().rect_filled(chip_rect, 5.0, t.action_bg);
-                    ui.painter().text(
-                        chip_rect.center(),
-                        egui::Align2::LEFT_CENTER,
-                        format!("⏎ {}", crate::i18n::s().overlay_key_jump),
-                        crate::ui::font::id(FONT_META),
-                        t.action_text,
-                    );
-                }
-            });
-        })
-        .response
-        .interact(egui::Sense::click())
+        },
+    );
+    // 文件夹 glyph(矢量两段;内存优先,不落 NSWorkspace 图标纹理)。
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 10.0 + FOLDER_W / 2.0, rect.center().y),
+        egui::vec2(FOLDER_W, FOLDER_H),
+    );
+    draw_folder_glyph(row_ui.painter(), icon_rect, t);
+    // 文本列(图标右 + 10;选中行右缘预留 chip 宽;上下方向居中由字号自然撑出)。
+    let tx = icon_rect.max.x + 10.0;
+    let chip_w = text_w(
+        &row_ui,
+        &format!("⏎ {}", crate::i18n::s().overlay_key_jump),
+        FONT_META,
+    ) + 12.0;
+    let text_right = if selected {
+        rect.right() - 10.0 - chip_w
+    } else {
+        rect.right() - 10.0
+    };
+    let mut text_ui = row_ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(
+                egui::pos2(tx, rect.top()),
+                egui::pos2(text_right, rect.bottom()),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    text_ui.add(
+        egui::Label::new(
+            egui::RichText::new(&entry.name)
+                .font(crate::ui::font::id(FONT_NAME))
+                .color(if selected { t.name_selected } else { t.name }),
+        )
+        .truncate(),
+    );
+    text_ui.add(
+        egui::Label::new(
+            egui::RichText::new(&entry.path)
+                .font(crate::ui::font::id(FONT_META))
+                .color(t.path),
+        )
+        .truncate(),
+    );
+    // 选中行的动作提示 chip(右端;画在行矩形内右侧,垂直居中)。
+    if selected {
+        let chip_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 10.0 - chip_w / 2.0, rect.center().y),
+            egui::vec2(chip_w, 20.0),
+        );
+        row_ui.painter().rect_filled(chip_rect, 5.0, t.action_bg);
+        row_ui.painter().text(
+            chip_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("⏎ {}", crate::i18n::s().overlay_key_jump),
+            crate::ui::font::id(FONT_META),
+            t.action_text,
+        );
+    }
+    resp
 }
 
 /// 行内文本宽测量(键帽/动作提示排版用;悬浮条 text_w 同款)。
