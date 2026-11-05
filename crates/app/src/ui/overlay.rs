@@ -29,7 +29,7 @@ pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
 
 /// 浮层尺寸(逻辑像素;窗口大小。高度自适应时由平台层按
 /// `overlay_layout::overlay_frame` 返回值 setContentSize)。
-pub const OVERLAY_W: f32 = 480.0;
+pub const OVERLAY_W: f32 = 600.0;
 pub const OVERLAY_H: f32 = 300.0;
 /// 结果行高(两行文本)。
 const ROW_H: f32 = 44.0;
@@ -248,7 +248,9 @@ impl OverlayState {
                 .take(DISPLAY_LIMIT)
                 .collect();
             self.selected = 0;
-            self.scroll_to_selected = false;
+            // 新结果回填 = 新列表:滚动复位到首行(否则重搜后视口停在上次
+            // 滚动位置;与悬浮条同款修复,2026-11-05)。
+            self.scroll_to_selected = true;
         }
     }
 

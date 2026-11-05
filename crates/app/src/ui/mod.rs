@@ -1110,6 +1110,13 @@ impl App {
                         continue;
                     }
                     ctx.request_repaint_of(overlay::overlay_viewport_id());
+                    // setContentSize(宽 480/高度自适应)后 GL surface 异步重排:
+                    // 首帧可能仍按旧尺寸绘制,新暴露区域 = 未绘制底(stale,
+                    // 实机 2026-11-05「深浅混色」)。补一次延迟重绘覆盖重排后帧。
+                    ctx.request_repaint_after_for(
+                        std::time::Duration::from_millis(120),
+                        overlay::overlay_viewport_id(),
+                    );
                 }
                 platform::Decision::HideKeepBlock => {
                     self.shared().overlay.close();
