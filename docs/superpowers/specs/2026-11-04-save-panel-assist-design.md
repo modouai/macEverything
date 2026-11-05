@@ -65,7 +65,7 @@ NSWorkspace(前台切换) → panel_detector → overlay(浮层窗口) → query
 
 - 独立 NSPanel，复用悬浮条五要素 NonactivatingPanel 组合（canBecomeKeyWindow / NonactivatingPanel / Floating / CanJoinAllSpaces / orderFrontRegardless），集中在 `platform/mac.rs` 同层
 - **改类后窗口销毁前必须还原窗口类**（winit drop abort 教训，沿用现有纪律）
-- 位置：保存面板 frame 附近（优先右侧 → 越界下方 → 再越界屏幕内安全区），定位算法为纯几何函数
+- 位置：紧贴保存面板下沿（浮层顶 = 面板底,间隙 0,水平居中对齐面板;越界两轴独立钳制进所在屏安全区），定位算法为纯几何函数。（2026-11-05 修订:原「优先右侧 → 越界下方」实机观感不佳,改为下沿贴合优先）
 - 出现即成为 key window 接收键盘，宿主 app 不被激活；操作完成或 Esc 后立即让出 key
 
 ### 3.4 跳转执行（dialog_navigator）
