@@ -524,6 +524,10 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
         // 双击提交与键盘提交同因:唤醒 ROOT 的 logic 消费请求(见上)。
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
+    // 浮层可见期连续排帧(与悬浮条排帧纪律一致;全隐期不受影响):平台层
+    // setContentSize(自适应高度/宽度变更)与 GL surface 重排存在 1-2 帧滞后,
+    // 单帧重绘会留下未绘制条带(实机 2026-11-05「深浅混色/外框矩形」)。
+    ui.ctx().request_repaint();
 }
 
 /// 单行(两行文本;原型 v1 定版):文件夹 glyph + 目录名(主)/完整路径(次);

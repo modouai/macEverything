@@ -993,7 +993,7 @@ fn ax_frame_to_appkit(ax: [f64; 4], primary: NSRect) -> [f64; 4] {
 ///
 /// 顺序照 [`show_palette`]:定位先于显示;不激活 app、不切 Space。
 /// `ax_frame` 为检测器上报的 AX 屏幕坐标(左上原点、y 向下)。
-pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
+pub fn overlay_show(ax_frame: [f64; 4]) -> Result<[f64; 4]> {
     ensure_overlay_patched()?;
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("overlay_show 非主线程调用"));
@@ -1046,7 +1046,7 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
         win.isKeyWindow(),
         win.isVisible()
     );
-    Ok(())
+    Ok(frame)
 }
 
 /// 隐藏浮层(`orderOut`;窗口保留不销毁,状态在 UI 侧)。

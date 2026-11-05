@@ -1109,10 +1109,19 @@ impl App {
                         self.shared().overlay.close();
                         continue;
                     }
+                    // 尺寸同步走 egui 原生通道:overlay_show 直接 setContentSize
+                    // 绕过 winit,winit/egui 的尺寸状态滞后 → ui.max_rect 按旧值
+                    // 绘制,新增条带无人绘制(实机 2026-11-05「深浅混色/外框矩形」)。
+                    // InnerSize 与原生尺寸一致 = 状态同步无副作用;配合
+                    // show_overlay 尾部的可见期连续排帧,任何滞后一帧内收敛。
+                    ctx.send_viewport_cmd_to(
+                        overlay::overlay_viewport_id(),
+                        egui::ViewportCommand::InnerSize(egui::vec2(
+                            frame[2] as f32,
+                            frame[3] as f32,
+                        )),
+                    );
                     ctx.request_repaint_of(overlay::overlay_viewport_id());
-                    // setContentSize(宽 480/高度自适应)后 GL surface 异步重排:
-                    // 首帧可能仍按旧尺寸绘制,新暴露区域 = 未绘制底(stale,
-                    // 实机 2026-11-05「深浅混色」)。补一次延迟重绘覆盖重排后帧。
                     ctx.request_repaint_after_for(
                         std::time::Duration::from_millis(120),
                         overlay::overlay_viewport_id(),
@@ -1200,6 +1209,10 @@ impl App {
                 self.shared().overlay.close();
                 continue;
             }
+            ctx.send_viewport_cmd_to(
+                overlay::overlay_viewport_id(),
+                egui::ViewportCommand::InnerSize(egui::vec2(frame[2] as f32, frame[3] as f32)),
+            );
             ctx.request_repaint_of(overlay::overlay_viewport_id());
         }
     }
