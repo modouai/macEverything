@@ -1166,8 +1166,15 @@ impl PaletteState {
 
         let input_resp = frame.inner;
         // 组合中的预编辑文本不触发查询(IME 未上屏;提交/取消帧 composing 已复位,
-        // 照常按最终文本查询)。
-        if input_resp.changed() && !self.ime_composing {
+        // 照常按最终文本查询)。实机(2026-11-05):中文输入法输入 ASCII 时首帧有
+        // Preedit 事件置 composing=true,后续字符作为普通文本上屏且没有 Commit
+        // 事件——沿用式 composing 会卡死,查询永不触发。此处「无 IME 事件的输入
+        // 变更」视为上屏完成,复位后照常查询。
+        let preedit = self.ime_composing && self.ime_busy;
+        if input_resp.changed() && !preedit {
+            if self.ime_composing && !self.ime_busy {
+                self.ime_composing = false;
+            }
             // 打点只覆盖「唤起后 1.5s」(首程诊断窗口);常态输入不逐键留痕,
             // 查询往返另有 `查询往返` 一行。
             if self.show_at.is_some() {
@@ -1510,7 +1517,7 @@ pub(crate) fn spawn_query_worker(
     let sort = sort_str(fire.sort);
     let desc = fire.desc;
     std::thread::spawn(move || {
-        let payload = match client::query(&paths, &fire.query, limit, sort, desc) {
+        let payload = match client::query(&paths, &fire.query, limit, sort, desc, false) {
             Ok(out) => Payload::Hits {
                 entries: out.entries,
                 total: out.total,
@@ -1542,6 +1549,34 @@ pub(crate) fn spawn_query_worker(
         });
         // 跨线程唤醒:定向目标视口(悬浮条:根视口隐藏/遮挡时不被根窗节流拖住;
         // 完整窗口:根视口隐藏期 eframe 走 run_logic,状态照常落地,不破隐藏零帧)。
+        ctx.request_repaint_of(viewport);
+    });
+}
+
+/// 轻量查询工作线程:执行模型与 `spawn_query_worker` 相同(UI 线程绝不做阻塞查询、
+/// 结果经 mpsc 回投并定向唤醒 `viewport`),但只回投 `Vec<HitEntry>`——保存面板
+/// 浮层不需要总命中数/耗时/引擎状态,故不附带 `/status` 往返。`dir_only` 为真时
+/// 只查目录。悬浮条与浮层共用,勿复制第三份。
+pub(crate) fn spawn_entry_query_worker(
+    paths: DaemonPaths,
+    ctx: egui::Context,
+    viewport: egui::ViewportId,
+    tx: mpsc::Sender<(u64, Vec<HitEntry>)>,
+    fire: Fire,
+    limit: u32,
+    dir_only: bool,
+) {
+    std::thread::spawn(move || {
+        let entries = match client::query(&paths, &fire.query, limit, None, false, dir_only) {
+            Ok(out) => out.entries,
+            Err(err) => {
+                // 浮层不展示错误态:daemon 离线由接线层守门;查询级失败按空结果处理。
+                log::warn!("目录查询失败(dir_only={dir_only}):{}", err.message);
+                Vec::new()
+            }
+        };
+        let _ = tx.send((fire.generation, entries));
+        // 跨线程唤醒目标视口(隐藏期不误唤醒根视口)。
         ctx.request_repaint_of(viewport);
     });
 }

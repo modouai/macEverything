@@ -83,6 +83,11 @@ fn main() -> anyhow::Result<()> {
     i18n::set_lang(lang);
     log::info!("启动语言:{lang:?}(设置 {:?})", settings.language);
 
+    // M0 探针:仅显式环境变量启用(探针为开发取证工具,验证六个技术风险点)。
+    if std::env::var("MCE_PANEL_PROBE").as_deref() == Ok("1") {
+        platform::probe_start();
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macEverything")
@@ -114,7 +119,7 @@ fn main() -> anyhow::Result<()> {
             // 完整窗口的「不透明」由内容层每帧铺整窗底色保证(ui/results.rs);
             // 此处**不可**改 false——会连带打死悬浮条透明(GL config 全局单份)。
             .with_transparent(true)
-            // 产品形态(Task 21):三窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
+            // 产品形态(Task 21):四窗皆隐、仅菜单栏图标 —— 启动不弹窗,登录自启静默
             // 待命。eframe 0.37 在首帧 post_rendering 里**无条件** set_visible(true)
             // (native/epi_integration.rs:443-450,白闪修复),故 with_visible(false)
             // 本身不足以保持隐藏:首帧纠偏在 `ui::App::logic`(发 Visible(false),
@@ -157,8 +162,12 @@ fn trace_eframe() -> bool {
 }
 
 /// 极简日志:stderr(与 cli 的 init_logger 同形态;文件日志待 Task 10 接数据目录)。
+/// 诊断开关 `MCE_APP_LOG=<路径>`:追加写文件——`open` 启动时 stderr 被 launchd
+/// 丢弃,实机排障只能靠此出口(与 `MCE_TRACE_EFRAME` 同款诊断环境变量先例)。
 fn init_logger() {
-    struct StderrLogger;
+    struct StderrLogger {
+        file: Option<std::sync::Mutex<std::fs::File>>,
+    }
 
     impl log::Log for StderrLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
@@ -174,7 +183,14 @@ fn init_logger() {
 
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
-                eprintln!("[{}] {}", record.level(), record.args());
+                let line = format!("[{}] {}", record.level(), record.args());
+                eprintln!("{line}");
+                if let Some(f) = &self.file {
+                    use std::io::Write;
+                    if let Ok(mut f) = f.lock() {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
             }
         }
 
@@ -186,7 +202,16 @@ fn init_logger() {
     } else {
         log::LevelFilter::Info
     };
-    if log::set_boxed_logger(Box::new(StderrLogger)).is_ok() {
+    let file = std::env::var_os("MCE_APP_LOG")
+        .and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        })
+        .map(std::sync::Mutex::new);
+    if log::set_boxed_logger(Box::new(StderrLogger { file })).is_ok() {
         log::set_max_level(max);
     }
 }

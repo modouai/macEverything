@@ -144,6 +144,13 @@ App 需要与 CLI 同款协议与客户端行为(连接 / 按需 stat / 离线�
 - **主题跟随自建探测**:改类断掉 winit 的主题 KVO(`NSKVONotifying_WinitWindow` 被移除),改为渲染帧查询系统外观(`NSApp.effectiveAppearance`),仅在悬浮条可见期按节流检查。
 - **排帧纪律**:只在悬浮条可见期排帧(含主题检查);全隐藏期不排帧,事件循环回 `Wait`——隐藏态 CPU 0% 的机制。
 
+### 保存面板目录助手(浮层 = 第四视口)
+
+- `panel_assist`:跨平台事件/屏蔽状态与「事件 + 状态 → 动作」决策纯逻辑;有效开关 = 设置开启 ∧ 辅助功能已授权。
+- `panel_detector`:专用 runloop 线程 + 前台应用 AXObserver,按窗口快速信号(subrole)+ 可编辑输入框/按钮组确认保存/打开面板,事件经 mpsc 回投 UI。
+- `dialog_navigator`:跳转状态机与执行层——⌘⇧G 唤出「前往文件夹」后,按 AX 直设路径优先、剪贴板 ⌘V 降级;AX CF 层调用与合成键在后台线程执行。
+- 浮层视口(deferred + 常驻):按面板 frame 定位,↑↓/点击选目录,↵/双击提交,Esc 按宿主 pid 屏蔽本次面板。
+
 ## v2.5 增补:CLI 集成(实现态摘要)
 
 设计推导见 `specs/cli-integration-v2.5/design.md`。

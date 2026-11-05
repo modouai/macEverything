@@ -24,13 +24,17 @@ pub struct Pattern {
     pub suffix_anchor: bool,
 }
 
-/// 一次查询的完整匹配计划:文件名词 + 路径词 + 两个全局开关。
+/// 一次查询的完整匹配计划:文件名词 + 路径词 + 两个解析开关 + 调用方级目录过滤。
 #[derive(Debug)]
 pub struct QueryPlan {
     pub name_terms: Vec<Pattern>,
     pub path_terms: Vec<Pattern>,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// 仅目录(保存面板助手):候选层过滤非目录,total 同口径。
+    /// parse 恒 false;由调用方(engine 外的 daemon/client)按协议位显式置位,
+    /// 不在 parse 语法内。
+    pub dir_only: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -77,6 +81,7 @@ pub fn parse(query: &str) -> Result<QueryPlan, ParseError> {
         path_terms: Vec::new(),
         case_sensitive,
         whole_word,
+        dir_only: false,
     };
     for word in words {
         match word {
@@ -209,6 +214,11 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
         .flat_map_iter(|&(start, chunk)| {
             (start..).zip(chunk.iter()).filter_map(|(idx, e)| {
                 if !e.is_live() || !view.entry_valid(idx) {
+                    return None;
+                }
+                // dir_only(保存面板助手):候选层滤掉非目录,rows 只剩目录,
+                // total(rows 长度)自然同口径只计目录。
+                if plan.dir_only && !e.is_dir() {
                     return None;
                 }
                 if !plan.path_terms.is_empty() {
@@ -788,6 +798,53 @@ mod match_tests {
         let out = execute(&i, &parse("*").unwrap(), 0);
         assert!(out.hits.is_empty());
         assert_eq!(out.total, 5);
+    }
+
+    /// dir_only = true 时只返回目录;total 同步只计目录(截断前全量口径不变)。
+    /// 突变「execute 去掉 dir_only 过滤」时文件命中回归必红。
+    #[test]
+    fn dir_only_filters_files_and_counts_total() {
+        let i = sample();
+        // "r" 恰命中 projects(目录)与 README.md(文件);Documents/budget/季度报告 无 r
+        let mut plan = parse("r").unwrap();
+        plan.dir_only = true;
+        let out = execute(&i, &plan, 100);
+        assert_eq!(out.total, 1, "只计目录");
+        assert_eq!(i.display_name(out.hits[0]), b"projects");
+        // 默认 plan(false)行为不变:文件照常命中。
+        let all = execute(&i, &parse("r").unwrap(), 100);
+        assert_eq!(all.total, 2, "缺省仍命中文件");
+        assert!(
+            all.hits.iter().any(|&h| i.display_name(h) == b"README.md"),
+            "缺省不过滤:README.md 应在 hits 中"
+        );
+    }
+
+    /// dir_only 与 path: 词组合:候选(命中目录的直接子项)中的文件同样被过滤。
+    /// 突变「dir_only 过滤不作用于 path 候选」时 total 回归 2,必红。
+    #[test]
+    fn dir_only_filters_path_candidate_files() {
+        let i = sample();
+        let mut plan = parse("path:documents").unwrap(); // Documents 下两个文件
+        plan.dir_only = true;
+        assert_eq!(execute(&i, &plan, 100).total, 0, "子项全是文件,全被滤掉");
+    }
+
+    /// path: + dir_only 的保持侧正例:命中目录下的子目录存活(命中且 is_dir),
+    /// 同层文件被滤除。内联树,不改共享 sample()(其计数被既有测试钉死)。
+    /// 突变「dir_only 误杀目录或整段丢弃 path 候选」时必红。
+    #[test]
+    fn dir_only_keeps_subdirs_under_path_hit() {
+        let mut i = Index::new();
+        let docs = i.insert("Documents", NO_PARENT, true);
+        let sub = i.insert("archive", docs, true);
+        let _ = i.insert("notes.txt", docs, false);
+        let mut plan = parse("path:documents").unwrap();
+        plan.dir_only = true;
+        let out = execute(&i, &plan, 100);
+        assert_eq!(out.total, 1, "只剩子目录");
+        assert_eq!(out.hits, vec![sub], "子目录存活");
+        assert!(i.entry(sub).is_dir(), "存活项必须是目录");
     }
 
     fn names(i: &Index, hits: &[u32]) -> Vec<String> {

@@ -16,12 +16,43 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
+pub mod ax_ffi;
+#[cfg(target_os = "macos")]
+pub mod cg_events;
+// 保存面板跳转状态机 + 平台执行层(Task 11;执行层动作→AX/合成键/剪贴板)。
+#[cfg(target_os = "macos")]
+pub mod dialog_navigator;
+#[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
 pub mod mac_quicklook;
+/// 保存面板助手的跨平台事件/屏蔽状态与决策纯逻辑(UI 接线层与单测使用)。
+pub mod panel_assist;
+// 保存面板助手(M0 探针 + 检测先行版):与 ax_ffi 同款 cfg,保持模块一致性。
+#[cfg(target_os = "macos")]
+pub mod panel_detector;
+#[cfg(target_os = "macos")]
+pub mod panel_probe;
+
+pub use panel_assist::{Decision, Dismissals, PanelEvent};
+
+/// 跳转结果(执行层 [`dialog_navigator::NavigateOutcome`] 的唯一真相;
+/// 非 macOS 的同名 stub 只为保持 facade 可编译)。
+#[cfg(target_os = "macos")]
+pub use dialog_navigator::NavigateOutcome;
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigateOutcome {
+    Done,
+    FellBackToClipboard,
+    Aborted,
+}
 
 /// 悬浮条窗口标题(ui 的 ViewportBuilder 与平台层按标题定位原生窗,两处必须一致)。
 pub const PALETTE_TITLE: &str = "palette";
+
+/// 保存面板目录助手浮层窗口标题(同上:builder 与平台层定位两处必须一致)。
+pub const OVERLAY_TITLE: &str = "overlay";
 
 /// 设置窗可接受的两种原生标题(查找时同时匹配,避免切换瞬间竞态)。
 ///
@@ -310,6 +341,18 @@ pub fn ensure_patched() -> anyhow::Result<()> {
     }
 }
 
+/// 每帧核对浮层窗补丁(与悬浮条同法;视口窗未创建时 no-op,下帧再试)。
+pub fn ensure_overlay_patched() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::ensure_overlay_patched()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 /// 唤起悬浮条:原生定位 + `orderFrontRegardless` + `makeKeyWindow`(不激活 app)。
 /// 返回实际面板宽(按鼠标所在屏回填;调用方据此同步 UI 布局宽)。
 ///
@@ -324,6 +367,46 @@ pub fn show_palette(top_inset: f64) -> anyhow::Result<f64> {
     {
         let _ = top_inset;
         Err(anyhow::anyhow!("非 macOS:悬浮条原生唤起不可用"))
+    }
+}
+
+/// 唤起保存面板目录助手浮层(原生定位 + 置前 + 成 key;不激活 app)。
+///
+/// `ax_frame` = 检测器上报的保存面板 frame,AX 屏幕坐标(左上原点、y 向下)。
+/// 平台层负责换算 AppKit 坐标、按面板中心所在屏定位。
+pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_show(ax_frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ax_frame;
+        Err(anyhow::anyhow!("非 macOS:浮层原生唤起不可用"))
+    }
+}
+
+/// 浮层窗当前原生可见性(诊断用;未创建/非主线程 → None)。
+pub fn overlay_visible() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_visible()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 隐藏浮层(`orderOut`,不销毁窗口)。
+pub fn overlay_hide() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_hide()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
     }
 }
 
@@ -427,7 +510,7 @@ pub fn install_surface_reclaim(ctx: eframe::egui::Context) {
     }
 }
 
-/// 安排「三窗全隐 N 秒后缩窗释放 surface」一次性定时器(主线程;重复调用覆盖)。
+/// 安排「四窗全隐 N 秒后缩窗释放 surface」一次性定时器(主线程;重复调用覆盖)。
 /// 非 macOS:no-op。
 pub fn schedule_surface_shrink() {
     #[cfg(target_os = "macos")]
@@ -583,6 +666,111 @@ pub fn attached() -> bool {
     {
         false
     }
+}
+
+/// 辅助功能授权状态(保存面板助手;macOS)。
+pub fn panel_assist_trusted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::ax_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 启动保存面板检测器(产品路径;主线程调用)。
+///
+/// 先注册 NSWorkspace 前台应用切换观察者(检测器的换绑来源),再启动 detector。
+/// detector 常驻不可停止;返回 None = 权限缺失/初始化失败(调用方按开关重试或忽略)。
+pub fn panel_detector_start() -> Option<std::sync::mpsc::Receiver<PanelEvent>> {
+    #[cfg(target_os = "macos")]
+    {
+        if !mac::install_app_activate_observer() {
+            log::warn!("保存面板检测未启动:前台应用切换观察者注册失败");
+            return None;
+        }
+        panel_detector::start_detector()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 打开系统设置 → 隐私与安全性 → 辅助功能(保存面板助手授权入口)。
+pub fn open_accessibility_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        mac::open_accessibility_settings()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {}
+}
+
+/// 读剪贴板纯文本(None = 无文本/非文本)。navigator 策略 B 的 save。
+/// 非 macOS 恒 None。
+pub fn clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::clipboard_text()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。返回写入成败。
+/// 非 macOS 恒 false。
+pub fn clipboard_set_text(s: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::clipboard_set_text(s)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = s;
+        false
+    }
+}
+
+/// 恢复(写回 save 的文本;None = 原本无文本 → 清空文本项)。非 macOS 恒 true。
+pub fn clipboard_restore(saved: Option<&str>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::clipboard_restore(saved)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = saved;
+        true
+    }
+}
+
+/// 把保存面板跳转到指定目录(阻塞;调用方在后台线程执行)。
+///
+/// 状态机驱动策略 A(AX 直设)/策略 B(剪贴板 + ⌘V)降级,收尾恢复剪贴板;
+/// 返回终态供浮层接线层决定后续提示(design §5)。
+/// 非 macOS 恒 `Aborted`(交付面仅 macOS,stub 只为保持 facade 可编译)。
+pub fn navigate_panel(pid: i32, path: &str) -> NavigateOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        dialog_navigator::run_navigate(pid, path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, path);
+        NavigateOutcome::Aborted
+    }
+}
+
+/// M0 探针启动(环境变量 MCE_PANEL_PROBE=1;开发取证工具,不进产品路径)。
+/// 非 macOS:no-op。
+pub fn probe_start() {
+    #[cfg(target_os = "macos")]
+    mac::probe_start();
 }
 
 /// 根窗当前是否为 key window(egui viewport focused 状态补正用;

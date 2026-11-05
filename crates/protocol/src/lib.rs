@@ -28,6 +28,12 @@ pub enum Request {
         /// 字段不 bump v,缺省不发送。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         desc: Option<bool>,
+        /// 仅目录(true 时引擎过滤非目录条目;保存面板助手的目录搜索用)。
+        /// None/Some(false) = 不过滤(与缺省同义),仅 Some(true) 生效——消费端
+        /// 不得用 matches!(dir_only, Some(_)) 判定开启。
+        /// 同 sort/desc:纯新增可选字段不 bump v,缺省不发送。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir_only: Option<bool>,
     },
     Status {
         v: u32,
@@ -207,6 +213,7 @@ mod tests {
             limit: 100,
             sort: None,
             desc: None,
+            dir_only: None,
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(
@@ -304,6 +311,7 @@ mod tests {
             limit: 10,
             sort: Some("size".into()),
             desc: Some(true),
+            dir_only: None,
         };
         let b = encode(&r).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r);
@@ -323,6 +331,7 @@ mod tests {
             limit: 10,
             sort: Some("size".into()),
             desc: None,
+            dir_only: None,
         };
         let b = encode(&r).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r);
@@ -380,6 +389,63 @@ mod tests {
         );
     }
 
+    /// dir_only 向后兼容钉:旧请求(无键)解码 dir_only=None;None 不上线,
+    /// 混跑期旧 daemon 收到的消息与旧客户端完全同形;Some(true/false) 线上
+    /// 为 JSON bool,经长度头协议往返无损。
+    #[test]
+    fn dir_only_backward_compatible_and_omits_on_wire() {
+        let old_req = br#"{"msg":"query","v":1,"query":"a","limit":10}"#;
+        let r: Request = serde_json::from_slice(old_req).unwrap();
+        assert!(matches!(r, Request::Query { dir_only: None, .. }));
+
+        let r2 = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+            desc: None,
+            dir_only: None,
+        };
+        let body = serde_json::to_string(&r2).unwrap();
+        assert!(!body.contains("dir_only"), "None 不应序列化:{body}");
+
+        let r3 = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+            desc: None,
+            dir_only: Some(true),
+        };
+        let b = encode(&r3).unwrap();
+        assert_eq!(decode_request(&b[4..]).unwrap(), r3);
+        assert!(
+            serde_json::to_string(&r3)
+                .unwrap()
+                .contains(r#""dir_only":true"#),
+            "Some(true) 线上应为 JSON bool"
+        );
+
+        // Some(false) 线上是 JSON false(不是字符串):缺省语义钉保证消费端
+        // 不会误把 Some(false) 当开启(见字段注释「仅 Some(true) 生效」)。
+        let r4 = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+            desc: None,
+            dir_only: Some(false),
+        };
+        let b = encode(&r4).unwrap();
+        assert_eq!(decode_request(&b[4..]).unwrap(), r4);
+        assert!(
+            serde_json::to_string(&r4)
+                .unwrap()
+                .contains(r#""dir_only":false"#),
+            "Some(false) 线上应为 JSON false"
+        );
+    }
+
     /// sort/desc=None(CLI/App 不传)编码不含两键:v1 线上形态逐字节保持,
     /// 混跑期旧 daemon 收到的消息与旧客户端完全同形。
     #[test]
@@ -390,6 +456,7 @@ mod tests {
             limit: 10,
             sort: None,
             desc: None,
+            dir_only: None,
         };
         let body = serde_json::to_string(&r).unwrap();
         assert!(!body.contains("sort"), "None 不应序列化 sort 键:{body}");

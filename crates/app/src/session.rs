@@ -88,6 +88,15 @@ impl Session {
         }
     }
 
+    /// 复位会话(关闭/重新打开浮层等):清 pending/last_fired,推进代际号作废在途
+    /// 响应,状态回 Idle。排序/方向/防抖窗保持。
+    pub fn reset(&mut self) {
+        self.pending = None;
+        self.last_fired = None;
+        self.generation += 1;
+        self.state = State::Idle;
+    }
+
     /// 窗口到期(自最近一次输入/排序变更起算 debounce)且有待发 → 发起
     /// (gen+=1, State=Searching);否则 None。
     pub fn pending_at(&mut self, now: Instant) -> Option<Fire> {
@@ -110,6 +119,11 @@ impl Session {
 
     /// 代际校验:当代(= 最近一次 pending_at 发出的代)接受,旧代丢弃。
     pub fn accept_response(&mut self, generation: u64) -> bool {
+        self.accepts(generation)
+    }
+
+    /// 代际校验(只读):generation 是否为当前代。
+    pub fn accepts(&self, generation: u64) -> bool {
         generation == self.generation
     }
 
@@ -191,6 +205,49 @@ mod tests {
         assert!(g2 > g1);
         assert!(!s.accept_response(g1), "旧代响应丢弃");
         assert!(s.accept_response(g2), "当代响应接受");
+    }
+
+    /// `accepts`:当代接受、旧代拒绝(只读,不推进代际号)。
+    #[test]
+    fn accepts_only_current_generation() {
+        let mut s = Session::new(Duration::from_millis(10));
+        let base = Instant::now();
+        s.on_input("a", base);
+        let g1 = s
+            .pending_at(base + Duration::from_millis(20))
+            .expect("窗口到应发起")
+            .generation;
+        assert!(s.accepts(g1), "当代接受");
+        assert!(!s.accepts(g1.wrapping_sub(1)), "旧代拒绝");
+        s.on_input("b", base + Duration::from_millis(30));
+        let g2 = s
+            .pending_at(base + Duration::from_millis(50))
+            .expect("窗口到应发起")
+            .generation;
+        assert!(s.accepts(g2));
+        assert!(!s.accepts(g1), "新代发出后旧代拒绝");
+    }
+
+    /// `reset`:清 pending/last_fired、推进代际号作废在途、状态回 Idle。
+    #[test]
+    fn reset_invalidates_inflight_and_idles() {
+        let mut s = Session::new(Duration::from_millis(10));
+        let base = Instant::now();
+        s.on_input("a", base);
+        let g = s
+            .pending_at(base + Duration::from_millis(20))
+            .expect("窗口到应发起")
+            .generation;
+        assert!(s.accepts(g));
+        s.reset();
+        assert!(!s.accepts(g), "reset 后在途旧代不被接受");
+        assert!(matches!(s.state, State::Idle), "状态回 Idle");
+        assert_eq!(s.pending_delay(base), None, "pending 清空");
+        assert_eq!(
+            s.pending_at(base + Duration::from_secs(1)),
+            None,
+            "last_fired/pending 清空后不复活查询"
+        );
     }
 
     #[test]

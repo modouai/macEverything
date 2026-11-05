@@ -22,13 +22,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// daemon 存活监控:可见期探测间隔。连续 2 次不可连才判定退出(单次抖动不拉起)。
 const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
-/// 三窗全隐期探测间隔:界面不活跃,崩溃晚 30s 发现无感;减少唤醒与 daemon 连接。
+/// 四窗全隐期探测间隔:界面不活跃,崩溃晚 30s 发现无感;减少唤醒与 daemon 连接。
 const HIDDEN_MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 const MONITOR_FAIL_THRESHOLD: u32 = 2;
 
-/// GUI 当前是否「三窗全隐」。平台层在显隐边沿更新(mac.rs):
-/// 缩窗定时器确认三窗全隐 → true;任何显示路径(`cancel_surface_shrink`)→ false。
-/// 启动即三窗全隐(产品形态),故默认 true。
+/// GUI 当前是否「四窗全隐」。平台层在显隐边沿更新(mac.rs):
+/// 缩窗定时器确认四窗全隐 → true;任何显示路径(`cancel_surface_shrink`)→ false。
+/// 启动即四窗全隐(产品形态),故默认 true。
 static UI_HIDDEN: AtomicBool = AtomicBool::new(true);
 
 /// 平台层写入全隐状态(主线程;原子写,无锁)。
@@ -53,6 +53,11 @@ fn monitor_interval(hidden: bool) -> Duration {
 /// 用户主动停止(手动重启的 stop 段)或启动时就是离线态则保持 false —— 离线
 /// 是用户可见的合法状态,监控不得擅自把 daemon 拉回来。
 static EXPECTED_RUNNING: AtomicBool = AtomicBool::new(false);
+/// daemon 最近一次存活探测结果(健康监控每轮写入;浮层接线读缓存后决定是否弹,
+/// 避免在主线程每收到一个 Shown 事件就做一次 2s 超时往返)。
+/// 拉起/重启成功后由 [`ensure_engine`] 立即置 true,消除「重启后全隐期最长 30s
+/// 仍被判离线」的窗口;其余时段最坏陈旧一个探测周期。
+static DAEMON_ONLINE: AtomicBool = AtomicBool::new(false);
 /// 用户主动 stop/重启期间的暂停闸:期间探测失败不计入、不触发拉起。
 static MONITOR_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
@@ -62,6 +67,12 @@ pub fn set_expected_running(expected: bool) {
 
 pub fn expected_running() -> bool {
     EXPECTED_RUNNING.load(Ordering::SeqCst)
+}
+
+/// daemon 最近一次存活探测是否连通(缓存值;健康监控推进)。
+/// 全隐期探测间隔为 30s,故该值最坏陈旧一个探测周期;调用方只用于低成本守门。
+pub fn daemon_online() -> bool {
+    DAEMON_ONLINE.load(Ordering::Relaxed)
 }
 
 /// 暂停存活监控(RAII):手动「重启引擎」的 stop 窗口不得被监控当成崩溃。
@@ -125,11 +136,15 @@ where
         .spawn(move || {
             let mut tracker = LivenessTracker::default();
             let mut last_stop_intent = false;
+            // 先立即探测一次:浮层层在启动后即可读到在线状态(否则要等首个
+            // 5s/30s 周期,期间的保存面板会因缓存为 false 而不弹)。
+            DAEMON_ONLINE.store(client::ping(&paths), Ordering::Relaxed);
             loop {
                 // 每轮重新取间隔:全隐/可见切换在下一轮生效(最迟一个周期)。
                 let interval = monitor_interval(ui_hidden());
                 std::thread::sleep(interval);
                 let connectable = client::ping(&paths);
+                DAEMON_ONLINE.store(connectable, Ordering::Relaxed);
                 let expected = expected_running();
                 let suspended = MONITOR_SUSPENDED.load(Ordering::SeqCst);
                 // CLI stop 成功后的意图标记:用户主动停止不是崩溃,不拉起。
@@ -284,6 +299,7 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
         let skew = match client::daemon_version(paths) {
             Some(v) if v == env!("CARGO_PKG_VERSION") => {
                 log::info!("引擎已在运行,版本匹配({v}),跳过拉起");
+                DAEMON_ONLINE.store(true, Ordering::Relaxed);
                 return Ok(());
             }
             other => other,
@@ -335,6 +351,9 @@ pub fn ensure_engine(paths: &client::DaemonPaths) -> Result<()> {
     loop {
         if client::connect(paths).is_some() {
             log::info!("引擎已就绪");
+            // 拉起/重启成功后立即刷新在线缓存;否则全隐期健康监控最长 30s 才
+            // 更新,窗口内的保存面板 Shown 会被误判离线而吞掉。
+            DAEMON_ONLINE.store(true, Ordering::Relaxed);
             return Ok(());
         }
         if Instant::now() >= deadline {

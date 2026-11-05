@@ -43,6 +43,9 @@ objc2-app-kit = { version = "0.3", features = [
     # Task 14b 切 Space 豁免:NSWorkspace + NSWorkspaceActiveSpaceDidChangeNotification
     # (通知经 NSWorkspace.notificationCenter() 注册;该 feature 连带 foundation/NSNotification)。
     "NSWorkspace",
+    # M0 探针(panel_probe):NSWorkspace.frontmostApplication 的返回类型
+    # NSRunningApplication 须有独立 feature 才可见(方法本身挂在 NSWorkspace 下)。
+    "NSRunningApplication",
     # Task 18 原生右键菜单:NSMenu/NSMenuItem(PoC-3 定稿路径;弹出还要求
     # NSMenuItem + NSResponder + NSView 三 feature 同时在场)。
     "NSMenu",

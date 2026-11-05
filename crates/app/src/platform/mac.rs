@@ -50,11 +50,11 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSBitmapImageRep, NSColor, NSCompositingOperation,
     NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext,
     NSImage, NSMenu, NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
-    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardWriting, NSResponder, NSScreen, NSView,
-    NSViewLayerContentsPlacement, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceActiveSpaceDidChangeNotification,
+    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
+    NSScreen, NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceActiveSpaceDidChangeNotification, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
     NSArray, NSData, NSError, NSHTTPURLResponse, NSLocale, NSMutableURLRequest, NSNotification,
@@ -127,8 +127,10 @@ pub fn kill_process_group(pid: u32, signal: i32) {
 /// 悬浮条窗口标题(定义在 facade,ui 与平台层共用;`NSApp.windows()` 中按此定位)。
 use super::{
     monotonic_ms, palette_width, settings_window_titles, MenuEntry, SpaceChange, ICON_PX,
-    PALETTE_TITLE,
+    OVERLAY_TITLE, PALETTE_TITLE,
 };
+use crate::ui::overlay::{OVERLAY_H, OVERLAY_W};
+use crate::ui::overlay_layout;
 
 /// 面板顶边位置:面板顶边距**可见区顶**(`visibleFrame`,已扣菜单栏)固定 110。
 /// 视觉稿 y=110 是含 28px 菜单栏的画布坐标,故物理位置比画布低 28;
@@ -353,6 +355,69 @@ fn make_space_observer(mtm: MainThreadMarker) -> Retained<SpaceObserver> {
     observer
 }
 
+// 前台应用切换观察者(NSWorkspace 通知 → 保存面板 detector 换绑)。
+// 说明:实现用 DidActivate 而非计划字面的 WillActivate——回调里直读
+// frontmostApplication 更准确,勿「修正」为 WillActivate。
+define_class!(
+    // SAFETY(define_class 的 unsafe 契约):超类 NSObject 无子类化约束;
+    // 无新增实例变量(ivars 缺省 `()`);方法签名与 AppKit 一致(单参 NSNotification);无 Drop。
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MaceAppActivateObserver"]
+    struct AppActivateObserver;
+
+    impl AppActivateObserver {
+        #[unsafe(method(appDidActivate:))]
+        fn app_did_activate(&self, _notification: &NSNotification) {
+            // frontmostApplication 直读最稳(notification.object 形态跨版本不一)
+            if let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() {
+                super::panel_detector::notify_frontmost(app.processIdentifier());
+            }
+        }
+    }
+
+    unsafe impl NSObjectProtocol for AppActivateObserver {}
+);
+
+thread_local! {
+    /// 前台应用切换观察者保活(主线程;通知中心持弱引用)。
+    /// `Retained<AppActivateObserver>` 非 Send/Sync(主线程类),故不放 static。
+    static APP_ACTIVATE_OBSERVER: RefCell<Option<Retained<AppActivateObserver>>> =
+        const { RefCell::new(None) };
+}
+
+/// 注册前台应用切换观察者(主线程;幂等——observer 由 thread_local 保活)。
+/// 返回 true = 已注册(含此前已注册);false = 非主线程或注册失败。
+pub fn install_app_activate_observer() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::warn!("install_app_activate_observer 非主线程调用");
+        return false;
+    };
+    if APP_ACTIVATE_OBSERVER.with(|c| c.borrow().is_some()) {
+        return true;
+    }
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let obs = AppActivateObserver::alloc(mtm).set_ivars(());
+    // SAFETY:主线程新分配、ivars 已置;未覆写 init,走 NSObject。
+    let obs: Retained<AppActivateObserver> = unsafe { msg_send![super(obs), init] };
+    // SAFETY:已初始化实例;通知中心持弱引用,thread_local 保活。
+    unsafe {
+        center.addObserver_selector_name_object(
+            &obs,
+            objc2::sel!(appDidActivate:),
+            Some(NSWorkspaceDidActivateApplicationNotification),
+            None,
+        );
+    }
+    APP_ACTIVATE_OBSERVER.with(|c| *c.borrow_mut() = Some(obs));
+    // 立即同步一次当前前台 pid(通知在切换时才来)
+    if let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() {
+        super::panel_detector::notify_frontmost(app.processIdentifier());
+    }
+    log::info!("前台应用切换观察者已注册");
+    true
+}
+
 /// 漂移计数(与 PoC-1 续同口径:每帧核对,漂移即重施并留痕)。
 ///
 /// `Copy`:漂移核对在借用外做(AppKit 调用可能重入一帧),计数取出→核对→写回。
@@ -395,9 +460,9 @@ struct PaletteState {
     vib: Option<Retained<NSVisualEffectView>>,
     /// 上帧垫窗是否可见(显隐边沿检测:只在翻转时调 orderFront/orderOut)。
     blur_visible: bool,
-    /// 全隐缩窗时保存的三窗 contentSize(Some = 当前处于 1×1 缩窗态)。
+    /// 全隐缩窗时保存的各窗 contentSize(Some = 当前处于 1×1 缩窗态)。
     ///
-    /// 背景:隐藏走 `orderOut` 不销毁,三视口的 GL drawable 池(每窗 1 块
+    /// 背景:隐藏走 `orderOut` 不销毁,各视口的 GL drawable 池(每窗 1 块
     /// `IOGPUSurfaceMTL` + 3 块 AppKit 共享 WindowServer)常驻约 78MB。
     /// `clearDrawable` 实测只能释放部分且数秒后被 AppKit 重建;把**隐藏窗口
     /// 的 contentSize 缩到 1×1** 可让 WindowServer/GL 真正回收 surface
@@ -405,7 +470,7 @@ struct PaletteState {
     shrunk: ShrunkSizes,
 }
 
-/// 缩窗前的 contentSize 快照(主线程;三窗各一份)。
+/// 缩窗前的 contentSize 快照(主线程;各窗一份)。
 ///
 /// 不变式:`Some(size)` = 该窗口当前处于 1×1 缩窗态,显示前须恢复为 `size`。
 /// 因此**已缩过的窗口不得重新捕获**——重新捕获时读到的是 1×1,会覆盖原始尺寸
@@ -415,6 +480,7 @@ struct ShrunkSizes {
     root: Option<NSSize>,
     palette: Option<NSSize>,
     settings: Option<NSSize>,
+    overlay: Option<NSSize>,
 }
 
 impl ShrunkSizes {
@@ -423,6 +489,7 @@ impl ShrunkSizes {
             MainWindow::Root => self.root,
             MainWindow::Palette => self.palette,
             MainWindow::Settings => self.settings,
+            MainWindow::Overlay => self.overlay,
         }
     }
 
@@ -431,6 +498,7 @@ impl ShrunkSizes {
             MainWindow::Root => self.root = size,
             MainWindow::Palette => self.palette = size,
             MainWindow::Settings => self.settings = size,
+            MainWindow::Overlay => self.overlay = size,
         }
     }
 
@@ -455,12 +523,13 @@ fn record_shrink_slot(saved: &mut ShrunkSizes, kind: MainWindow, observed: NSSiz
     true
 }
 
-/// 三个主视口窗口(缩窗/恢复的定向对象)。
+/// 三个主视口窗口 + 保存面板助手浮层(缩窗/恢复的定向对象)。
 #[derive(Clone, Copy, Debug)]
 enum MainWindow {
     Root,
     Palette,
     Settings,
+    Overlay,
 }
 
 /// 全隐缩窗定时器代号:显示动作递增即可作废尚未触发的旧定时器。
@@ -520,7 +589,7 @@ fn shrink_timer_is_current(scheduled: u64, current: u64) -> bool {
 /// 安排一次「全隐 N 秒后缩窗」一次性定时器(主队列;重复调用覆盖旧代)。
 ///
 /// 必须在主线程调用;全隐期没有帧,定时器是唯一能跑到缩窗逻辑的路径。
-/// 触发时再核对三窗原生 `isVisible()`——期间若有窗口显示,直接跳过
+/// 触发时再核对各窗原生 `isVisible()`——期间若有窗口显示,直接跳过
 /// (显示路径已递增 `SHRINK_GEN`,正常情况连这里都到不了)。
 pub fn schedule_surface_shrink() {
     if MainThreadMarker::new().is_none() {
@@ -538,7 +607,7 @@ pub fn schedule_surface_shrink() {
             return;
         }
         if shrink_hidden_windows() {
-            log::info!("全隐 {secs}s:三视口 contentSize 缩到 1×1(surface 释放)");
+            log::info!("全隐 {secs}s:各视口 contentSize 缩到 1×1(surface 释放)");
         }
     });
 }
@@ -547,11 +616,11 @@ pub fn schedule_surface_shrink() {
 /// 尺寸恢复由 [`restore_window_size`] 在具体显示路径完成)。
 pub fn cancel_surface_shrink() {
     SHRINK_GEN.fetch_add(1, Ordering::SeqCst);
-    // 任何显示路径都会走到这里:退出「三窗全隐」,健康探测恢复 5s 间隔。
+    // 任何显示路径都会走到这里:退出「全隐」,健康探测恢复 5s 间隔。
     crate::engine_launcher::set_ui_hidden(false);
 }
 
-/// 三窗均不可见时把 contentSize 缩到 1×1(返回本次是否有窗口被新缩)。
+/// 各窗均不可见时把 contentSize 缩到 1×1(返回本次是否有窗口被新缩)。
 ///
 /// 只在主线程;任一主窗可见则整体跳过。尺寸快照存 [`PaletteState::shrunk`],
 /// 显示前由 [`restore_window_size`] 恢复。AppKit 调用期间**不持** PALETTE 借用
@@ -561,7 +630,7 @@ pub fn cancel_surface_shrink() {
 /// 捕获后整体覆盖(第二次缩窗会把 root/settings 的原始尺寸写成 1×1,完整
 /// 窗口/设置从此恢复成 1×1 不可用)。
 ///
-/// **重入安全**(I2):每个窗口「先登记尺寸 → 缩 → 立刻回读三窗可见性」。
+/// **重入安全**(I2):每个窗口「先登记尺寸 → 缩 → 立刻回读各窗可见性」。
 /// `setContentSize` 可能被 winit 同步派发成一帧,重入帧若执行显示路径并
 /// orderFront,就回滚本窗口并放弃本轮,避免把刚显示的窗口继续缩成 1×1。
 #[allow(deprecated)] // NSOpenGLContext 自 macOS 10.14 起标记废弃,但 glow/CGL 后端仍用它。
@@ -579,11 +648,15 @@ pub(crate) fn shrink_hidden_windows() -> bool {
     let Some(settings) = find_window_by_title(mtm, Some(&root), &settings_window_titles()) else {
         return false;
     };
-    let windows = [
+    let overlay = find_window_by_title(mtm, Some(&root), &[OVERLAY_TITLE]);
+    let mut windows = vec![
         (&root, MainWindow::Root, "root"),
         (&palette, MainWindow::Palette, "palette"),
         (&settings, MainWindow::Settings, "settings"),
     ];
+    if let Some(overlay) = overlay.as_ref() {
+        windows.push((overlay, MainWindow::Overlay, "overlay"));
+    }
     // 最小化窗口的恢复可能绕过本 app 的显示路径(点 Dock 图标),1×1 尺寸会
     // 直接呈现在用户面前;全屏窗口的尺寸由系统 Space 管理。两类一律不缩。
     if windows.iter().any(|(win, _, _)| {
@@ -595,11 +668,11 @@ pub(crate) fn shrink_hidden_windows() -> bool {
         crate::engine_launcher::set_ui_hidden(false);
         return false;
     }
-    // 三窗全隐已确认:健康探测退避到 30s(见 engine_launcher::monitor_interval)。
+    // 全隐已确认:健康探测退避到 30s(见 engine_launcher::monitor_interval)。
     crate::engine_launcher::set_ui_hidden(true);
 
     let mut kept = false;
-    for (win, kind, name) in windows {
+    for &(win, kind, name) in &windows {
         let before = win
             .contentView()
             .map_or_else(|| win.frame().size, |view| view.frame().size);
@@ -631,12 +704,12 @@ pub(crate) fn shrink_hidden_windows() -> bool {
         kept = true;
     }
     if !kept {
-        // 三窗早已全部缩过:无需重复清 drawable/图集。
+        // 各窗早已全部缩过:无需重复清 drawable/图集。
         return false;
     }
 
     // 仅缩窗有时仍会留下上一尺寸的 AppKit 后备用 surface(实测 9–19MB 波动);
-    // 再对三窗 drawable 做一次 clearDrawable,并把上下文停到已缩为 1×1 的
+    // 再对各窗 drawable 做一次 clearDrawable,并把上下文停到已缩为 1×1 的
     // root 视图上(ctx.view 保持非 nil,glutin 的 is_view_current 不会 panic;
     // 当前 drawable 只剩 2×2 像素)。两者合起来实测稳定到 ≈150KB。
     //
@@ -644,7 +717,7 @@ pub(crate) fn shrink_hidden_windows() -> bool {
     // glutin 让上下文常驻 current)时如实留痕并只保留缩窗效果。
     match objc2_app_kit::NSOpenGLContext::currentContext() {
         Some(ctx) => {
-            // 只清「本 app 三个视口」的上下文:currentContext 正常即 eframe 的
+            // 只清「本 app 四个视口」的上下文:currentContext 正常即 eframe 的
             // glow 上下文;若 view 关联到别的视图(未来接入第二个 GL 组件),跳过清除。
             let current_view = ctx.view(mtm);
             let owns = current_view.as_deref().is_none_or(|v| {
@@ -655,10 +728,10 @@ pub(crate) fn shrink_hidden_windows() -> bool {
                     .any(|own| Retained::as_ptr(&own) == vp)
             });
             if !owns {
-                log::warn!("全隐缩窗:当前 GL 上下文不属于三视口,仅缩窗(未清 drawable)");
+                log::warn!("全隐缩窗:当前 GL 上下文不属于本 app 视口,仅缩窗(未清 drawable)");
                 return true;
             }
-            for (win, _, name) in windows {
+            for &(win, _, name) in &windows {
                 let Some(view) = win.contentView() else {
                     continue;
                 };
@@ -699,6 +772,25 @@ fn restore_window_size(win: &NSWindow, kind: MainWindow) -> bool {
 
 thread_local! {
     static PALETTE: RefCell<PaletteState> = RefCell::new(PaletteState::default());
+}
+
+/// 保存面板目录助手浮层的窗口平台状态(主线程单例)。
+///
+/// 浮层与悬浮条共用换类/五要素流程,但独立一套状态:两者生命周期不同(浮层随保存
+/// 面板出现/消失),且浮层不做毛玻璃垫窗、不需要定位锚(定位由面板 frame 决定)。
+#[derive(Default)]
+struct OverlayWinState {
+    /// 浮层窗(视口窗创建后首见即缓存;持引用保活)。
+    window: Option<Retained<NSWindow>>,
+    /// 换类前的原类(还原用;与悬浮条同法)。
+    orig_class: Option<*const AnyClass>,
+    /// 换类前类名(诊断 + 还原判据)。
+    class_before: String,
+    drift: Drift,
+}
+
+thread_local! {
+    static OVERLAY: RefCell<OverlayWinState> = RefCell::new(OverlayWinState::default());
 }
 
 /// 鼠标任意键当前是否按下(全局状态快照;NSEvent.pressedMouseButtons)。
@@ -781,7 +873,7 @@ pub fn ensure_patched() -> Result<()> {
             return Ok(()); // 视口窗未创建;下帧再试
         };
         // ② 借用外:换类 + 五要素 + 补丁 a(可重入,不持状态借用)
-        let (orig_class, class_before) = convert(&win)?;
+        let (orig_class, class_before) = convert(&win, "悬浮条")?;
         PALETTE.with(|cell| {
             let mut st = cell.borrow_mut();
             st.orig_class = Some(orig_class);
@@ -848,6 +940,128 @@ pub fn show_palette(top_inset: f64) -> Result<f64> {
         win.isVisible()
     );
     Ok(panel_w)
+}
+
+/// 每帧/唤醒核对:找浮层窗(首见即换类 + 五要素);已接则核对漂移。
+///
+/// 与 [`ensure_patched`] 同纪律:所有 AppKit 调用在 OVERLAY 借用外;视口窗由
+/// eframe 在注册该视口的 pass 末尾创建,首见前返回 Ok(调用方下帧重试)。
+pub fn ensure_overlay_patched() -> Result<()> {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return Err(anyhow!("ensure_overlay_patched 非主线程调用"));
+    };
+    let attached = OVERLAY.with(|cell| cell.borrow().window.is_some());
+    if !attached {
+        let root = PALETTE.with(|cell| cell.borrow().root.clone());
+        let Some(win) = find_window_by_title(mtm, root.as_deref(), &[OVERLAY_TITLE]) else {
+            return Ok(()); // 视口窗未创建;调用方下帧重试
+        };
+        // 借用外:换类 + 五要素(可重入,不持状态借用)。
+        let (orig_class, class_before) = convert(&win, "浮层")?;
+        OVERLAY.with(|cell| {
+            let mut st = cell.borrow_mut();
+            st.orig_class = Some(orig_class);
+            st.class_before = class_before;
+            st.window = Some(win);
+        });
+    }
+    let (win, drift) = OVERLAY.with(|cell| {
+        let st = cell.borrow();
+        (st.window.clone(), st.drift)
+    });
+    let Some(win) = win else {
+        return Ok(()); // 上面刚置位,理论不可达
+    };
+    let mut drift = drift;
+    reassert(&mut drift, &win);
+    OVERLAY.with(|cell| cell.borrow_mut().drift = drift);
+    Ok(())
+}
+
+/// AX 屏幕坐标(主屏左上原点、y 向下)→ AppKit 屏幕坐标(主屏左下原点、y 向上)。
+/// `primary` = 主屏 frame(菜单栏所在屏;AX 坐标的参照系)。
+fn ax_frame_to_appkit(ax: [f64; 4], primary: NSRect) -> [f64; 4] {
+    [
+        primary.origin.x + ax[0],
+        primary.origin.y + primary.size.height - (ax[1] + ax[3]),
+        ax[2],
+        ax[3],
+    ]
+}
+
+/// 唤起浮层:补丁 → 面板中心所在屏定位(`overlay_layout` 纯几何)→ 置前 + 成 key。
+///
+/// 顺序照 [`show_palette`]:定位先于显示;不激活 app、不切 Space。
+/// `ax_frame` 为检测器上报的 AX 屏幕坐标(左上原点、y 向下)。
+pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
+    ensure_overlay_patched()?;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return Err(anyhow!("overlay_show 非主线程调用"));
+    };
+    let win = OVERLAY
+        .with(|cell| cell.borrow().window.clone())
+        .ok_or_else(|| anyhow!("浮层窗口未就绪(视口尚未创建)"))?;
+    // 全隐缩窗态:先作废定时器、恢复 contentSize,再定位。
+    cancel_surface_shrink();
+    restore_window_size(&win, MainWindow::Overlay);
+
+    // AX 坐标参照主屏(菜单栏所在屏);NSScreen::screens 首元素即主屏。
+    let screens = NSScreen::screens(mtm);
+    let primary = screens
+        .iter()
+        .next()
+        .or_else(|| NSScreen::mainScreen(mtm))
+        .ok_or_else(|| anyhow!("取不到主屏,无法换算 AX 坐标"))?;
+    let panel = ax_frame_to_appkit(ax_frame, primary.frame());
+    let center = NSPoint::new(panel[0] + panel[2] / 2.0, panel[1] + panel[3] / 2.0);
+    // 面板中心所在屏,不是鼠标所在屏(浮层跟随面板,而非跟随光标)。
+    let screen = screen_with_point(mtm, center).ok_or_else(|| anyhow!("保存面板所在屏查不到"))?;
+    let visible = screen.visibleFrame();
+    let frame = overlay_layout::overlay_frame(
+        panel,
+        [
+            visible.origin.x,
+            visible.origin.y,
+            visible.size.width,
+            visible.size.height,
+        ],
+        OVERLAY_W as f64,
+        OVERLAY_H as f64,
+    );
+    win.setFrameOrigin(NSPoint::new(frame[0], frame[1]));
+    let responder_ok = restore_first_responder(&win);
+    win.orderFrontRegardless();
+    win.makeKeyWindow();
+    log::info!(
+        "浮层唤起:window_number={} origin=({:.0}, {:.0}) 尺寸 {:.0}×{:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        win.windowNumber(),
+        frame[0],
+        frame[1],
+        frame[2],
+        frame[3],
+        win.isKeyWindow(),
+        win.isVisible()
+    );
+    Ok(())
+}
+
+/// 隐藏浮层(`orderOut`;窗口保留不销毁,状态在 UI 侧)。
+///
+/// 与 `send_palette_hide` 对称:隐藏后安排「全隐缩窗」定时器,否则浮层视口的
+/// GL surface 会随窗口常驻(实测每窗约 26MB;定时器触发时再核对真实可见性)。
+pub fn overlay_hide() -> Result<()> {
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return Err(anyhow!("overlay_hide 非主线程调用"));
+    };
+    let win = OVERLAY.with(|cell| cell.borrow().window.clone());
+    match win {
+        Some(win) => {
+            win.orderOut(None);
+            schedule_surface_shrink();
+            Ok(())
+        }
+        None => Err(anyhow!("浮层窗口未就绪(视口尚未创建)")),
+    }
 }
 
 /// 显示完整窗口(根窗):激活 app + 置前 + 成 key/main。
@@ -1452,6 +1666,25 @@ pub fn reanchor() {
 pub fn revert_class() {
     // 退出时作废尚未触发的缩窗定时器(避免退出流程里再动窗口尺寸)。
     cancel_surface_shrink();
+    // 浮层窗同样经过换类:窗口销毁前必须还原(遗漏 → winit drop abort)。
+    // 放在悬浮条分支之前,确保悬浮条未接上时也执行。
+    let (win, orig, class_before) = OVERLAY.with(|cell| {
+        let st = cell.borrow();
+        (st.window.clone(), st.orig_class, st.class_before.clone())
+    });
+    if let (Some(win), Some(orig)) = (win, orig) {
+        let obj: *mut AnyObject = (Retained::as_ptr(&win) as *const NSWindow)
+            .cast_mut()
+            .cast();
+        let cur = obj_class(obj);
+        if class_name(cur) != class_before {
+            // SAFETY:orig 是换类前 runtime 实测读到的类指针(类对象由运行时持有,
+            // 存活);换回是 `object_setClass` 的逆操作,实例大小不变的前提同换类时。
+            let _ = unsafe { &*objc2::ffi::object_setClass(obj, orig) };
+            log::info!("浮层窗口类还原:{} → {class_before}", class_name(cur));
+        }
+        OVERLAY.with(|cell| cell.borrow_mut().orig_class = None);
+    }
     // 重入安全(同 show_palette):状态短借用取出,object_setClass 在借用外。
     let (win, orig, class_before) = PALETTE.with(|cell| {
         let st = cell.borrow();
@@ -1718,6 +1951,12 @@ pub fn settings_visible() -> Option<bool> {
     find_window_by_title(mtm, root.as_deref(), &settings_window_titles()).map(|w| w.isVisible())
 }
 
+/// 浮层窗当前原生可见性(诊断用;未创建/非主线程 → None)。
+pub fn overlay_visible() -> Option<bool> {
+    let _mtm = MainThreadMarker::new()?;
+    OVERLAY.with(|cell| cell.borrow().window.as_ref().map(|w| w.isVisible()))
+}
+
 // ---------------------------------------------------------------------------
 // 内部实现
 
@@ -1774,7 +2013,8 @@ fn window_title_matches(actual: &str, expected: &str) -> bool {
 ///
 /// 重入安全:不碰 PALETTE 状态——原类指针与类名**返回给调用方**存(调用方短借用写回)。
 /// 期间 `configure` 的 AppKit 调用可重入一帧,帧内状态访问须无借用冲突。
-fn convert(win: &NSWindow) -> Result<(*const AnyClass, String)> {
+/// `role` 只进日志(悬浮条/浮层共用本流程,两类窗口的定位与生命周期各自独立)。
+fn convert(win: &NSWindow, role: &str) -> Result<(*const AnyClass, String)> {
     let obj: *const AnyObject = (win as *const NSWindow).cast::<AnyObject>();
     let before = obj_class(obj);
     let size_before = before.instance_size();
@@ -1783,7 +2023,7 @@ fn convert(win: &NSWindow) -> Result<(*const AnyClass, String)> {
     if size_before != size_target {
         // 实例大小不一致时换类即 UB:拒绝并留痕(产品不 panic,退化 = 无跨 Space 补丁)。
         return Err(anyhow!(
-            "悬浮条窗换类被拒:实例大小不一致(当前类 {} {size_before} vs 目标类 {size_target})",
+            "{role}窗换类被拒:实例大小不一致(当前类 {} {size_before} vs 目标类 {size_target})",
             class_name(before)
         ));
     }
@@ -1792,17 +2032,17 @@ fn convert(win: &NSWindow) -> Result<(*const AnyClass, String)> {
     let old = unsafe { &*objc2::ffi::object_setClass(obj.cast_mut(), target as *const AnyClass) };
     let class_before = class_name(before);
     log::info!(
-        "悬浮条窗换类:{} → {}(旧类回读 {};实例大小 {size_before}=={size_target})",
+        "{role}窗换类:{} → {}(旧类回读 {};实例大小 {size_before}=={size_target})",
         class_before,
         class_name(target),
         class_name(old)
     );
-    configure(win);
+    configure(win, role);
     Ok((before as *const AnyClass, class_before))
 }
 
 /// 换类后施加属性(五要素的 2~4 + NSPanel 三属性 + 补丁 a)。
-fn configure(ns: &NSWindow) {
+fn configure(ns: &NSWindow, role: &str) {
     ns.setLevel(NSFloatingWindowLevel);
     ns.setCollectionBehavior(target_behavior());
     // 跨全屏硬条件(spike 差分实证:缺 NonactivatingPanel 即不在全部 Space 全屏窗上方)。
@@ -1818,7 +2058,7 @@ fn configure(ns: &NSWindow) {
     // 高度变化呈现(PoC-6 定案):resize 时旧帧钉左上、裁切而非缩放拉伸。
     let placement = set_top_left_placement(ns);
     log::info!(
-        "悬浮条窗属性:level={} CanJoinAllSpaces={} FullScreenAuxiliary={} styleMask={:#x} first_responder={ok} layer_placement={placement:?}",
+        "{role}窗属性:level={} CanJoinAllSpaces={} FullScreenAuxiliary={} styleMask={:#x} first_responder={ok} layer_placement={placement:?}",
         ns.level(),
         ns.collectionBehavior()
             .contains(NSWindowCollectionBehavior::CanJoinAllSpaces),
@@ -2218,6 +2458,75 @@ unsafe fn handle_fetch_result(
         return Err(format!("响应体过大: {len} 字节"));
     }
     Ok(data.to_vec())
+}
+
+/// AX 授权查询(ax_ffi 转发;mac.rs 为平台层 unsafe 集中点,故经此转出)。
+pub fn ax_trusted() -> bool {
+    super::ax_ffi::is_process_trusted()
+}
+
+/// 打开系统设置的辅助功能授权面板(深链;非关键路径——面板未装/链接失效时无害)。
+pub fn open_accessibility_settings() {
+    let url = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+    // spawn 即返回;wait 放后台线程收尾(不 join 会留僵尸进程,update.rs open_url 同款)。
+    match std::process::Command::new("open").arg(url).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                // 深链失效恰好表现为 open 非零退出(面板未装/链接名变更),须留痕。
+                Ok(st) if !st.success() => {
+                    log::warn!("打开辅助功能设置:open 退出异常({st}):{url}")
+                }
+                Ok(_) => {}
+                Err(err) => log::warn!("等待 open 退出失败: {err}"),
+            });
+        }
+        Err(err) => log::warn!("打开辅助功能设置失败({url}): {err}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 剪贴板纯文本(navigator 策略 B 的 save/set/restore;M0 探针先行使用)
+//
+// NSPasteboard 一般建议主线程使用,但 generalPasteboard 的读写在现代 macOS 上
+// 允许任意线程(AppKit 未强制 main-thread check);当前 navigator 后台线程
+// 直接调用,调用线程契约未收敛(遗留项)。
+
+/// 读剪贴板纯文本(None = 无文本/非文本)。
+pub fn clipboard_text() -> Option<String> {
+    // SAFETY:NSPasteboardTypeString 为 AppKit 导出的只读 extern static 常量
+    // (objc2 0.6 统一要求 unsafe 读取;数据为进程生命周期不变的 CFString,
+    // 生成侧类型别名 NSPasteboardType = NSString)。
+    let ty: &NSString = unsafe { NSPasteboardTypeString };
+    let pb = NSPasteboard::generalPasteboard();
+    let s = pb.stringForType(ty)?;
+    Some(s.to_string())
+}
+
+/// 写剪贴板纯文本(先 clearContents 保证只留纯文本一项)。返回 setString 成败。
+pub fn clipboard_set_text(s: &str) -> bool {
+    // SAFETY:同 clipboard_text 的常量注释。
+    let ty: &NSString = unsafe { NSPasteboardTypeString };
+    let pb = NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    pb.setString_forType(&NSString::from_str(s), ty)
+}
+
+/// 恢复(写回 save 的文本;None = 原本无文本 → clearContents 清空)。
+/// 当前快照仅纯文本:None 路径会连带清掉剪贴板里的非文本项;多类型快照
+/// (pasteboard types 全量保存/回写)为独立遗留项。
+pub fn clipboard_restore(saved: Option<&str>) -> bool {
+    match saved {
+        Some(t) => clipboard_set_text(t),
+        None => {
+            NSPasteboard::generalPasteboard().clearContents();
+            true
+        }
+    }
+}
+
+/// M0 探针启动转发(main.rs 按环境变量调用;见 panel_probe 模块注释)。
+pub fn probe_start() {
+    super::panel_probe::start_probe();
 }
 
 #[cfg(test)]
@@ -2727,19 +3036,59 @@ mod tests {
         assert!(!super::shrink_timer_is_current(8, 7), "不可能:反序也拒绝");
     }
 
+    /// AX 坐标为左上原点、y 向下;AppKit 为左下原点、y 向上。
+    /// 突变「不减 (ax_y + h)」或「不减主屏高」→ 本测试必红。
+    #[test]
+    fn ax_frame_converts_to_appkit_coordinates() {
+        let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
+        // AX:顶边 y=200、高 400 → AppKit 底边 y = 900 − (200+400) = 300。
+        assert_eq!(
+            super::ax_frame_to_appkit([100.0, 200.0, 600.0, 400.0], primary),
+            [100.0, 300.0, 600.0, 400.0]
+        );
+        // 主屏原点非零(理论上主屏恒 0,这里钉住换算不依赖绝对 0)。
+        let shifted = NSRect::new(NSPoint::new(-50.0, 10.0), NSSize::new(1440.0, 900.0));
+        assert_eq!(
+            super::ax_frame_to_appkit([0.0, 0.0, 10.0, 20.0], shifted),
+            [-50.0, 10.0 + 900.0 - 20.0, 10.0, 20.0]
+        );
+    }
+
     /// 模拟一次缩窗轮次(只做纯状态部分):返回每个窗口本轮是否应缩。
-    fn shrink_round(saved: &mut ShrunkSizes, live: [NSSize; 3]) -> [bool; 3] {
-        let kinds = [MainWindow::Root, MainWindow::Palette, MainWindow::Settings];
-        let mut out = [false; 3];
+    fn shrink_round(saved: &mut ShrunkSizes, live: [NSSize; 4]) -> [bool; 4] {
+        let kinds = [
+            MainWindow::Root,
+            MainWindow::Palette,
+            MainWindow::Settings,
+            MainWindow::Overlay,
+        ];
+        let mut out = [false; 4];
         for (i, kind) in kinds.into_iter().enumerate() {
             out[i] = record_shrink_slot(saved, kind, live[i]);
         }
         out
     }
 
-    /// C1 回归钉:三窗缩窗 → 只打开悬浮条(其快照被 take)→ 再次全隐缩窗。
-    /// 第二次观测到的 root/settings 是 1×1,但**不得覆盖**首次快照;之后打开
-    /// 完整窗口必须恢复原始尺寸(而不是 1×1)。
+    /// Overlay 槽位映射钉:`set`/`slot`/`take` 只在 overlay 槽位往返,不串到
+    /// 主三窗。突变:把 `MainWindow::Overlay` 的映射改成别的槽位或恒 `None`
+    /// → 本测红。
+    #[test]
+    fn overlay_slot_roundtrips_independently() {
+        let size = NSSize::new(420.0, 300.0);
+        let mut saved = ShrunkSizes::default();
+        assert_eq!(saved.slot(MainWindow::Overlay), None);
+        saved.set(MainWindow::Overlay, Some(size));
+        assert_eq!(saved.slot(MainWindow::Overlay), Some(size));
+        assert_eq!(saved.root, None, "overlay 写入不得串到 root");
+        assert_eq!(saved.palette, None, "overlay 写入不得串到 palette");
+        assert_eq!(saved.settings, None, "overlay 写入不得串到 settings");
+        assert_eq!(saved.take(MainWindow::Overlay), Some(size));
+        assert_eq!(saved.slot(MainWindow::Overlay), None, "take 后清空");
+    }
+
+    /// C1 回归钉:四窗缩窗 → 只打开悬浮条(其快照被 take)→ 再次全隐缩窗。
+    /// 第二次观测到的 root/settings/overlay 是 1×1,但**不得覆盖**首次快照;
+    /// 之后打开完整窗口必须恢复原始尺寸(而不是 1×1)。
     ///
     /// 突变:把 [`record_shrink_slot`] 改回「无条件记录/整体覆盖」→ 第二次
     /// 轮次返回全 true 且 `saved.root` 变成 1×1,本测红。
@@ -2748,30 +3097,33 @@ mod tests {
         let root = NSSize::new(1200.0, 800.0);
         let palette = NSSize::new(700.0, 500.0);
         let settings = NSSize::new(620.0, 600.0);
+        let overlay = NSSize::new(420.0, 300.0);
         let one = NSSize::new(1.0, 1.0);
 
         let mut saved = ShrunkSizes::default();
         assert_eq!(
-            shrink_round(&mut saved, [root, palette, settings]),
-            [true, true, true],
-            "首次全隐:三窗都应缩并记录原始尺寸"
+            shrink_round(&mut saved, [root, palette, settings, overlay]),
+            [true, true, true, true],
+            "首次全隐:四窗都应缩并记录原始尺寸"
         );
 
         // 用户只打开悬浮条:显示路径 take 掉 palette 快照并恢复原尺寸;
-        // root/settings 保持 1×1,快照原样保留。
+        // root/settings/overlay 保持 1×1,快照原样保留。
         assert_eq!(saved.take(MainWindow::Palette), Some(palette));
         assert_eq!(saved.root, Some(root));
         assert_eq!(saved.settings, Some(settings));
+        assert_eq!(saved.overlay, Some(overlay));
 
-        // 悬浮条再隐藏,30s 后第二次缩窗:root/settings 实际读到 1×1。
-        let shrunk = shrink_round(&mut saved, [one, palette, one]);
+        // 悬浮条再隐藏,30s 后第二次缩窗:root/settings/overlay 实际读到 1×1。
+        let shrunk = shrink_round(&mut saved, [one, palette, one, one]);
         assert_eq!(
             shrunk,
-            [false, true, false],
+            [false, true, false, false],
             "已缩窗口不得重复缩窗/重新捕获"
         );
         assert_eq!(saved.root, Some(root), "root 原始尺寸不得被 1×1 覆盖");
         assert_eq!(saved.settings, Some(settings), "settings 同上");
+        assert_eq!(saved.overlay, Some(overlay), "overlay 同上");
         assert_eq!(
             saved.palette,
             Some(palette),
@@ -2791,17 +3143,23 @@ mod tests {
             NSSize::new(1200.0, 800.0),
             NSSize::new(700.0, 500.0),
             NSSize::new(620.0, 600.0),
+            NSSize::new(420.0, 300.0),
         ];
         let one = NSSize::new(1.0, 1.0);
         let mut saved = ShrunkSizes::default();
         assert!(shrink_round(&mut saved, first).iter().all(|v| *v));
         assert!(
-            !shrink_round(&mut saved, [one; 3]).iter().any(|v| *v),
+            !shrink_round(&mut saved, [one; 4]).iter().any(|v| *v),
             "已缩窗口不应再次缩"
         );
         assert_eq!(
-            [saved.root, saved.palette, saved.settings],
-            [Some(first[0]), Some(first[1]), Some(first[2])]
+            [saved.root, saved.palette, saved.settings, saved.overlay],
+            [
+                Some(first[0]),
+                Some(first[1]),
+                Some(first[2]),
+                Some(first[3])
+            ]
         );
     }
 }
