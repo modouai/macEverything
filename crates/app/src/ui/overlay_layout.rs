@@ -6,10 +6,15 @@
 
 /// 浮层 frame:panel = 保存面板 frame;screen = 面板**所在屏**的 **visibleFrame()**
 /// (不含菜单栏/Dock),不得用 mainScreen().frame()——副屏选择与菜单栏/Dock 遮挡
-/// 均由调用方负责。overlay_w/h = 浮层尺寸;屏幕安全区内缩 8。
+/// 均由调用方负责。overlay_w/h = 期望浮层尺寸;屏幕安全区内缩 8。
+///
+/// **高度自适应**:面板下方到安全区下界的可用空间不足期望高度时,压缩浮层
+/// 高度到可用值(下限 [`MIN_H`],保住输入框 + 两三行结果),始终紧贴面板下沿
+/// 且不越屏;返回 frame 的高度是实际值,调用方须按返回尺寸设窗(不能只用
+/// 期望尺寸 setFrameOrigin)。
 ///
 /// 两轴独立钳制:仅越界的轴贴到安全区边缘,另一轴保持原定位;面板下沿低于
-/// 安全区下界时,浮层贴屏幕安全区下缘(仍保持在面板正下方方向)。
+/// 安全区下界时,浮层取 [`MIN_H`] 并贴屏幕安全区下缘。
 /// 屏幕比浮层窄/矮时取安全区左下角,让浮层溢出右/上侧(不 panic)。
 ///
 /// # Panics
@@ -27,17 +32,24 @@ pub fn overlay_frame(
     let (sx, sy, sw, sh) = (screen[0], screen[1], screen[2], screen[3]);
     // 紧贴面板下沿:浮层顶 = 面板底(间隙 0),水平居中对齐面板。
     let x = panel[0] + panel[2] / 2.0 - overlay_w / 2.0;
-    let y = panel[1] - overlay_h;
+    // 高度自适应:下方可用空间 = 面板底 → 安全区下界;不足则压缩,地板 MIN_H。
+    let available = panel[1] - (sy + EDGE);
+    let h = overlay_h.min(available.max(MIN_H));
+    let y = panel[1] - h;
     // 钳制进屏幕安全区。屏幕比浮层窄/矮时 max 会小于 min,先抬到 min,
     // 否则 f64::clamp(min > max) 会 panic;此时浮层贴安全区左/下缘。
     let min_x = sx + EDGE;
     let max_x = (sx + sw - EDGE - overlay_w).max(min_x);
     let min_y = sy + EDGE;
-    let max_y = (sy + sh - EDGE - overlay_h).max(min_y);
+    let max_y = (sy + sh - EDGE - h).max(min_y);
     let x = x.clamp(min_x, max_x);
     let y = y.clamp(min_y, max_y);
-    [x, y, overlay_w, overlay_h]
+    [x, y, overlay_w, h]
 }
+
+/// 自适应高度下限:输入框 + 两三行结果(再小失去可用性;面板底已贴近屏幕底
+/// 的退化场景浮层会叠在面板下部,仍优先保住「紧贴下沿」的方向感)。
+const MIN_H: f64 = 120.0;
 
 #[cfg(test)]
 mod tests {
@@ -55,7 +67,7 @@ mod tests {
         let expected_x = 100.0 + 600.0 / 2.0 - 420.0 / 2.0; // 水平居中对齐面板
         assert_eq!([f[0], f[1]], [expected_x, 100.0]);
         assert_eq!(f[1] + f[3], 400.0, "浮层顶紧贴面板底(间隙 0)");
-        assert_eq!([f[2], f[3]], [420.0, 300.0]);
+        assert_eq!([f[2], f[3]], [420.0, 300.0], "空间充足 = 期望全高");
     }
 
     /// 面板靠左、水平居中后左缘越界 → x 钳制到安全区左缘(留 8px);
@@ -66,13 +78,24 @@ mod tests {
         assert_eq!([f[0], f[1]], [8.0, 100.0]);
     }
 
-    /// 面板下沿低于安全区下界(放不下完整浮层)→ y 钳制到安全区下缘,
-    /// 浮层仍保持在面板正下方方向;x 未越界保持居中。
-    /// 突变「删除 y 下界钳制」→ 本用例必红。
+    /// 下方空间不足但 ≥ 高度下限:高度压缩到可用值,仍紧贴面板下沿且浮层底
+    /// = 安全区下界(两端都贴)。突变「高度不压缩」→ 本用例必红。
     #[test]
-    fn clamps_y_when_panel_bottom_below_safe_area() {
-        let f = overlay_frame([100.0, 100.0, 600.0, 400.0], screen(), 420.0, 300.0);
+    fn shrinks_height_when_space_below_is_tight() {
+        let f = overlay_frame([100.0, 250.0, 600.0, 400.0], screen(), 420.0, 300.0);
+        // 可用 = 250 - 8 = 242 ∈ [120, 300) → 高度压缩为 242,两端都贴。
         assert_eq!([f[0], f[1]], [190.0, 8.0]);
+        assert_eq!(f[3], 242.0, "高度自适应:可用 242 → 高 242");
+        assert_eq!(f[1] + f[3], 250.0, "压缩后仍紧贴面板下沿");
+    }
+
+    /// 面板底几乎贴着屏幕底(可用 < 高度下限)→ 取下限 120,浮层底部被安全区
+    /// 下界钳住(叠在面板下部,保持下沿方向感)。突变「无下限」→ 本用例必红。
+    #[test]
+    fn min_height_floor_when_panel_hugs_screen_bottom() {
+        let f = overlay_frame([100.0, 60.0, 600.0, 400.0], screen(), 420.0, 300.0);
+        assert_eq!([f[0], f[1]], [190.0, 8.0]);
+        assert_eq!(f[3], 120.0, "高度下限 120");
     }
 
     /// 面板靠右、水平居中后右缘越界 → x 钳制到安全区右缘(留 8px)。
@@ -88,15 +111,18 @@ mod tests {
     fn clamps_within_negative_origin_screen() {
         let screen = [-1920.0, -200.0, 1920.0, 1080.0];
         let f = overlay_frame([-400.0, -100.0, 600.0, 400.0], screen, 420.0, 300.0);
+        // 可用 = -100 - (-192) = 92 < 下限 120 → 高度取下限,浮层底被安全区
+        // 下界钳住(轻微叠面板下部,保住可用性)。
         assert!(f[0] >= -1920.0 + 8.0, "{f:?}");
         assert!(f[1] >= -200.0 + 8.0, "{f:?}");
         assert!(f[0] + 420.0 <= -1920.0 + 1920.0 - 8.0, "{f:?}");
-        assert!(f[1] + 300.0 <= -200.0 + 1080.0 - 8.0, "{f:?}");
+        assert!(f[1] + f[3] <= -200.0 + 1080.0 - 8.0, "{f:?}");
         assert_eq!([f[0], f[1]], [-428.0, -192.0]);
+        assert_eq!(f[3], 120.0);
     }
 
     /// 屏幕比浮层还小时不得 panic(f64::clamp 的 min > max 会 panic);
-    /// 取安全区左下角,让浮层溢出屏幕右侧/上方。
+    /// 取安全区左下角,高度取下限。
     #[test]
     fn tiny_screen_does_not_panic() {
         let f = overlay_frame(
@@ -106,6 +132,6 @@ mod tests {
             300.0,
         );
         assert_eq!([f[0], f[1]], [8.0, 8.0]);
-        assert_eq!([f[2], f[3]], [420.0, 300.0]);
+        assert_eq!(f[3], 120.0, "退化场景高度取下限");
     }
 }

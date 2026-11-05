@@ -1028,6 +1028,10 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
         OVERLAY_W as f64,
         OVERLAY_H as f64,
     );
+    // 高度自适应:先设内容尺寸再定位(「全隐缩窗/恢复」同款 setContentSize
+    // 路径;无装饰窗 contentSize == frame 尺寸。setContentSize 可能触发 winit
+    // 同步重入一帧,AppKit 调用期间不持借用的纪律同 restore_window_size)。
+    win.setContentSize(NSSize::new(frame[2], frame[3]));
     win.setFrameOrigin(NSPoint::new(frame[0], frame[1]));
     let responder_ok = restore_first_responder(&win);
     win.orderFrontRegardless();
