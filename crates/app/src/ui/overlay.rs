@@ -442,7 +442,7 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(FOOTER_PAD_X);
                     key_group(ui, &t, strings.overlay_key_close, "esc");
-                    key_group(ui, &t, strings.overlay_key_jump, "↵");
+                    key_group(ui, &t, strings.overlay_key_jump, "⏎");
                     key_group(ui, &t, strings.overlay_key_select, "↑↓");
                 });
             });
@@ -551,7 +551,7 @@ fn draw_row(
                 ui.add_space(10.0);
                 let chip_w = text_w(
                     ui,
-                    &format!("↵ {}", crate::i18n::s().overlay_key_jump),
+                    &format!("⏎ {}", crate::i18n::s().overlay_key_jump),
                     FONT_META,
                 ) + 12.0;
                 let text_w = (ui.available_width() - chip_w).max(0.0);
@@ -581,7 +581,7 @@ fn draw_row(
                     ui.painter().text(
                         chip_rect.center(),
                         egui::Align2::LEFT_CENTER,
-                        format!("↵ {}", crate::i18n::s().overlay_key_jump),
+                        format!("⏎ {}", crate::i18n::s().overlay_key_jump),
                         crate::ui::font::id(FONT_META),
                         t.action_text,
                     );
