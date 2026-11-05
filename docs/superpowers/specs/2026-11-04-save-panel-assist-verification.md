@@ -1,7 +1,7 @@
 # 保存面板目录助手 · 实机验证清单
 
 - 日期：2026-11-05
-- 状态：**主链路已实机通过**（2026-11-05，TextEdit 保存面板）；剩余项见 §8
+- 状态：**主链路已实机通过**（2026-11-05，TextEdit 保存面板）；检测适配专项（XMind/Edge/文本编辑漏报 + WPS 误报）同日修复并实机通过，见 §0 续表；剩余项见 §8
 - 分支：feat/save-panel-assist
 - 设计：`docs/superpowers/specs/2026-11-04-save-panel-assist-design.md`
 - 探针结论表：`docs/superpowers/specs/2026-11-04-save-panel-assist-probe-findings.md`（M0 结果回填处）
@@ -19,6 +19,9 @@
 | 5 | Enter 后 Go-to 弹窗出现但未跳转 | `CGEventPostToPid` 对保存面板无效（M0 验证点③实机答案） | 全局 HID post（globals 前已复核前台 pid）（516c3f2） |
 | 6 | ⌘⇧G 后定位不到输入框 | Go-to sheet 的输入框在独立 AXWindows 窗口，不在 AXFocusedWindow 树里 | 输入框定位改为「焦点窗口 + AXWindows 全列表」（516c3f2） |
 | 7 | 中文输入法无法上屏（空格/数字作为普通键进入） | 浮层每帧 `request_focus` → egui `interrupt_ime()` 每帧打断组合，marked text 被清、Commit 丢失 | 仅在未聚焦时请求焦点（8e53b22）；winit 取证见 MCE_APP_LOG 诊断工具（299c72d） |
+| 8 | XMind/Edge/文本编辑保存面板不弹浮层（漏报） | 面板以 sheet 形态（subrole 读不到）或标准窗口形态（AXStandardWindow）呈现，subrole 白名单两形态全漏；另有 Edge 换绑瞬态被拒后不重试不扫描 | 快速信号加 AXSheet 路径与「标准窗+标题精确命中」路径；判定统一叠加结构指纹（位置侧栏名命中 ∥ 浏览容器≥3）；换绑失败重试（tick 倒数五档）+ 失败也扫描 + 错误码留痕 |
+| 9 | WPS 查找框/查找和替换/下拉框误触发浮层 | 数量阈值（e≥1 b≥1）无判别力：查找 e1 b9、替换 e1 b12、下拉框 AXSheet e1 b1 全能过；文档/网页窗口也带位置名命中 | 结构指纹为根本判别维度（弹层 loc0 r≤1，真面板 loc≥1 或 r≥3）；标准窗形态由标题精确命中面板名单区分文档窗口 |
+| 10 | 换绑重试 timer 两次实机 SIGSEGV（panel-detector 线程） | `CFRunLoopTimerCreate` 第 4 参误声明为 f64（真实为整数 flags），ARM64 整数参数整体错位一格，callout/context 读歪，首次调用即段错误（两份崩溃寄存器指纹一致 = 确定性）；probe 同款声明从未执行故未暴露 | FFI 签名修正（ax_ffi + panel_probe）；timer 生命周期简化为常驻单 timer + tick 倒数，消灭动态创建/销毁/回调内自释放 |
 
 已通过项：主链路（浮层出现 → 目录搜索 → Enter → 面板跳到目标目录，策略 A 直设成功）、跳转后浮层不复现、Esc 关闭与本次面板内屏蔽、点击浮层保持、中文输入法上屏、Finder 显示简介（⌘I）不误报。
 
@@ -144,12 +147,12 @@
 | daemon 在线缓存 | 全隐期最坏陈旧 30s（L11） |
 | R2 首次 Shown 被去重 | `daemon_online=false` 或 `overlay_show` 失败时，同面板后续 Shown 被抑制；实机确认是否可接受 |
 
-## 8. 剩余待验证项（2026-11-05 主链路通过后）
+## 8. 剩余待验证项（2026-11-05 主链路 + 检测适配专项通过后）
 
 - 多屏：面板拖到副屏（含负坐标屏）浮层定位
 - 深路径（≥6 级）跳转
 - 剪贴板还原：构造策略 A 失败场景验证策略 B（正常路径走策略 A，不碰剪贴板）
 - daemon 离线时打开面板：不出浮层（在线缓存 30s 陈旧窗口，见 L11）
-- VS Code / Pages / Numbers 等第三方保存面板
 - 资源与退出：浮层 Esc 后 30s 全隐缩窗（含 overlay）与内存回落；连续 20 次开/关；浮层显示中退出无 drop abort
 - 授权闭环：撤销授权 → 重启 → 托盘授权后直接回编辑器即生效（4.3）
+- 检测适配补充实机：VS Code / Pages / Numbers 等第三方面板的形态取证（AXSheet/标准窗/指纹覆盖面）；换绑重试路径的实机触发（瞬态拒绝复现窗口期较短，日志已可观测 `换绑失败,xxms 后重试`）

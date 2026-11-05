@@ -773,6 +773,13 @@ pub fn probe_start() {
     mac::probe_start();
 }
 
+/// AX 兼容性诊断探针(MCE_PANEL_AX_PROBE=<pid>;开发取证工具,不进产品路径)。
+/// 非 macOS:no-op。
+pub fn ax_diag_probe(pid: i32) {
+    #[cfg(target_os = "macos")]
+    mac::ax_diag_probe(pid);
+}
+
 /// 根窗当前是否为 key window(egui viewport focused 状态补正用;
 /// 非 macOS/未接句柄恒 None)。
 pub fn root_is_key() -> Option<bool> {

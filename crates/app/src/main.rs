@@ -32,6 +32,17 @@ fn data_dir() -> anyhow::Result<PathBuf> {
 fn main() -> anyhow::Result<()> {
     init_logger();
 
+    // AX 兼容性诊断探针(MCE_PANEL_AX_PROBE=<pid>;开发取证工具,不进产品路径):
+    // 对目标进程做「基线注册 → 写 manual-accessibility → 复测」一次性取证后
+    // 退出。必须在单实例 acquire 之前:诊断实例不得触碰 app.sock/托盘/热键。
+    if let Some(pid) = std::env::var("MCE_PANEL_AX_PROBE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        platform::ax_diag_probe(pid);
+        return Ok(());
+    }
+
     let paths = client::DaemonPaths {
         data_dir: data_dir()?,
     };

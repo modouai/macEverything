@@ -2,7 +2,7 @@
 //! 确认可编辑输入框/按钮组) + 产品事件层(NSWorkspace 前台切换通知驱动,
 //! 专用 runloop 线程换绑 AXObserver,mpsc 输出 [`PanelEvent`])。
 //! 快照结构与 AX 树解耦,纯数据可序列化可测。
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -23,6 +23,38 @@ pub struct PanelSnapshot {
     /// 子树内文件浏览容器(AXScrollArea/AXSplitGroup)数。
     /// 当前仅取证字段,不参与 `is_save_panel`;特征表修订时评估是否纳入确认信号。
     pub browsers: usize,
+    /// 子树内「标准文件位置名」命中数(静态文本/按钮标题,见 [`LOCATION_NAMES`])。
+    /// NSSavePanel 系面板必嵌位置侧栏(桌面/下载/文稿…),查找/密码/格式等
+    /// 普通 sheet 不含——sheet 形态的结构级判别指纹(2026-11-05 实测引入)。
+    pub location_hits: usize,
+}
+
+/// 标准文件位置名(中英;en 不分大小写)。覆盖 NSSavePanel 侧栏与「位置」
+/// 弹层的可见标签;macOS 版本漂移时按实机特征表修订。
+const LOCATION_NAMES: &[&str] = &[
+    "桌面",
+    "下载",
+    "文稿",
+    "文档",
+    "最近使用",
+    "最近项目",
+    "隔空投送",
+    "airdrop",
+    "icloud",
+    "desktop",
+    "downloads",
+    "documents",
+    "recents",
+    "applications",
+    "应用程序",
+    "我的mac",
+    "my mac",
+];
+
+/// 值是否命中任一标准位置名(en 不分大小写)。
+fn hits_location_name(v: &str) -> bool {
+    let lower = v.to_lowercase();
+    LOCATION_NAMES.iter().any(|n| lower.contains(n))
 }
 
 /// 从 AX 窗口元素采集特征快照(浅层遍历;AX IPC 逐元素往返,探针/检测入口各一次)。
@@ -34,6 +66,7 @@ pub fn snapshot_of_window(win: &AXRef) -> PanelSnapshot {
         editable_text_fields: 0,
         buttons: 0,
         browsers: 0,
+        location_hits: 0,
     };
     count_walk(win, 0, &mut s);
     s
@@ -44,7 +77,25 @@ fn count_walk(el: &AXRef, depth: usize, s: &mut PanelSnapshot) {
         Some("AXTextField") if ax_ffi::attr_settable(el, attr::VALUE) => {
             s.editable_text_fields += 1
         }
-        Some("AXButton") => s.buttons += 1,
+        Some("AXButton") => {
+            s.buttons += 1;
+            // 按钮标题参与位置名匹配(「位置」弹层按钮/侧栏行)。
+            for key in [attr::TITLE, "AXDescription"] {
+                if let Some(v) = ax_ffi::attr_string(el, key) {
+                    if hits_location_name(&v) {
+                        s.location_hits += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        Some("AXStaticText") => {
+            if let Some(v) = ax_ffi::attr_string(el, attr::VALUE) {
+                if hits_location_name(&v) {
+                    s.location_hits += 1;
+                }
+            }
+        }
         Some("AXScrollArea" | "AXSplitGroup") => s.browsers += 1,
         _ => {}
     }
@@ -56,9 +107,10 @@ fn count_walk(el: &AXRef, depth: usize, s: &mut PanelSnapshot) {
     }
 }
 
-/// M0 探针粗判:subrole 含 Dialog 或命中产品快速信号白名单即疑似
-/// (取证用,宁滥勿缺——漏报比误报更伤取证)。白名单形态(尤其 AXFloatingWindow)
-/// 不一定含 Dialog,故此处必须取并集,保证探针能对其 dump 快照并触发实验。
+/// M0 探针粗判:subrole 含 Dialog、命中产品快速信号白名单或为 AXSheet 形态
+/// 即疑似(取证用,宁滥勿缺——漏报比误报更伤取证)。白名单形态(尤其
+/// AXFloatingWindow)不一定含 Dialog,故此处必须取并集,保证探针能对其 dump
+/// 快照并触发实验。
 ///
 /// 与 [`is_save_panel`] 分工:本函数只看快速信号,用于探针决定是否触发实验;
 /// 产品判定必须叠加确认信号(可编辑输入框 + 按钮组),零误报优先。
@@ -66,27 +118,77 @@ pub fn looks_like_panel(s: &PanelSnapshot) -> bool {
     s.subrole
         .as_deref()
         .is_some_and(|r| r.contains("Dialog") || SUBROLE_QUICK.contains(&r))
+        || s.role.as_deref() == Some(ROLE_QUICK_SHEET)
 }
 
-/// 快速信号:window subrole 白名单(设计推定 subrole 集合;M0 findings 回填后修订)。
+/// 快速信号一:window subrole 白名单(独立对话框/浮窗形态)。
 /// 判定为「疑似」而非「确认」——确认必须叠加结构信号。
 /// 注:AXStandardWindow 等普通窗口 subrole 不在列(防误报)。
 const SUBROLE_QUICK: &[&str] = &["AXSystemDialog", "AXDialog", "AXFloatingWindow"];
 
-/// 确认信号阈值:保存/打开面板必含可编辑文件名输入框与按钮组;
-/// 普通对话框(如确认弹窗)无此组合。
+/// 快速信号二:role = AXSheet(附着宿主的 sheet 形态)。实机(2026-11-05,
+/// TextEdit/XMind/Edge 三家一致):保存面板以 sheet 附着宿主窗口,sheet 元素
+/// 的 subrole 读不到(None),只有 role 可辨——subrole 白名单对此形态全漏。
+const ROLE_QUICK_SHEET: &str = "AXSheet";
+
+/// 快速信号三:AXStandardWindow + 标题精确命中面板名单。实机(2026-11-05,
+/// XMind/第三方 app):打开面板以标准窗口形态呈现(e1 b15 r8 loc7),subrole
+/// 防误报白名单不含 AXStandardWindow(普通文档窗口全是它)——分界在标题:
+/// 面板窗口标题恒为打开/存储/另存为系,文档窗口标题是文件名。标题必须精确
+/// 相等(en 不分大小写),防「打开xx.docx」类文档名误命中。
+const ROLE_QUICK_WINDOW: &str = "AXWindow";
+const SUBROLE_QUICK_WINDOW: &str = "AXStandardWindow";
+const PANEL_TITLES: &[&str] = &[
+    "打开",
+    "存储",
+    "存储为",
+    "储存",
+    "另存为",
+    "保存",
+    "open",
+    "save",
+    "save as",
+    "open file",
+    "save file",
+];
+
+/// 标题是否精确命中面板名单(en 不分大小写)。
+fn title_is_panel_name(title: &str) -> bool {
+    PANEL_TITLES.iter().any(|n| n.eq_ignore_ascii_case(title))
+}
+
+/// 确认信号阈值:保存/打开面板必含可编辑文件名输入框与按钮组(数量底线)。
+/// 实测教训(2026-11-05):数量维度单独不构成判别力——WPS 查找框 AXDialog
+/// e1 b9、查找和替换 e1 b12、下拉框 AXSheet e1 b1 全部能过数量关,必须叠加
+/// 结构指纹(下),它才是真正的判别维度。
 const CONFIRM_EDITABLE_MIN: usize = 1;
 const CONFIRM_BUTTONS_MIN: usize = 1;
 
-/// 产品判定(设计 §3.1 两级):快速信号命中 **且** 确认信号满足。
-/// 纯函数(无 AX 调用),特征表数据化供 macOS 版本漂移时修订。
+/// 结构指纹阈值:NSSavePanel 系面板必嵌位置侧栏(「桌面/下载/文稿…」静态
+/// 文本,见 [`LOCATION_NAMES`])——查找/密码/打印/下拉等普通弹层不含;侧栏
+/// 被宿主隐藏的极简面板以文件浏览容器 ≥3 兜底(实测真面板 r5-9,弹层 r≤1)。
+const CONFIRM_LOCATION_MIN: usize = 1;
+const CONFIRM_BROWSERS_MIN: usize = 3;
+
+/// 产品判定(设计 §3.1 两级):快速信号(subrole 白名单 **或** AXSheet 形态)
+/// 命中 **且** 数量确认 **且** 结构指纹。数量阈值只是底线,判别力在结构指纹
+/// ——两条形态路径(窗口/sheet)统一适用(2026-11-05 实机:查找/替换窗口
+/// 形态与下拉框 sheet 形态的误报都只有数量信号,无指纹)。纯函数(无 AX 调用),
+/// 特征表数据化供 macOS 版本漂移时修订。
 pub fn is_save_panel(s: &PanelSnapshot) -> bool {
-    let quick_ok = s
-        .subrole
-        .as_deref()
-        .map(|r| SUBROLE_QUICK.contains(&r))
-        .unwrap_or(false);
-    quick_ok && s.editable_text_fields >= CONFIRM_EDITABLE_MIN && s.buttons >= CONFIRM_BUTTONS_MIN
+    let quick_ok = s.role.as_deref() == Some(ROLE_QUICK_SHEET)
+        || s.subrole
+            .as_deref()
+            .map(|r| SUBROLE_QUICK.contains(&r))
+            .unwrap_or(false)
+        || (s.role.as_deref() == Some(ROLE_QUICK_WINDOW)
+            && s.subrole.as_deref() == Some(SUBROLE_QUICK_WINDOW)
+            && s.title.as_deref().is_some_and(title_is_panel_name));
+    let quantity_ok =
+        s.editable_text_fields >= CONFIRM_EDITABLE_MIN && s.buttons >= CONFIRM_BUTTONS_MIN;
+    let fingerprint_ok =
+        s.location_hits >= CONFIRM_LOCATION_MIN || s.browsers >= CONFIRM_BROWSERS_MIN;
+    quick_ok && quantity_ok && fingerprint_ok
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +206,11 @@ static SIGNAL_SRC: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_m
 static DETECTOR_RL: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// 事件接收端断开的一次性标志(避免每个事件重复 warn/stop)。
 static SEND_FAILED: AtomicBool = AtomicBool::new(false);
+/// 换绑重试已用预算(notify_frontmost 激活时重置;排程消费,detector 线程独占)。
+static REBIND_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+/// 换绑重试剩余 tick 数(0 = 无在途重试;常驻 timer 每 TICK_SECS 秒递减,
+/// 到 1 时触发换绑。detector 线程独占读写,主线程只在激活时清零)。
+static RETRY_TICKS_LEFT: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     /// 当前 observer(仅 detector 线程使用;AXObserverWrap 无 Send)。
@@ -182,6 +289,9 @@ pub fn notify_frontmost(pid: i32) {
     if pid > 0 && pid as u32 == std::process::id() {
         return;
     }
+    // 新激活 = 新的瞬态拒绝窗口(2026-11-05 实机:Edge 激活瞬间注册被连续拒绝,
+    // 数秒后同 pid 空闲时注册成功):重置重试预算。
+    REBIND_ATTEMPTS.store(0, Ordering::SeqCst);
     FRONT_PID.store(pid, Ordering::SeqCst);
     // SAFETY:两个指针均为 detector 线程写入的进程生命周期 CF 对象 raw;
     // 未就绪时为 null,signal_and_wake 内部判空。
@@ -225,6 +335,8 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>, ready: mpsc::SyncSender<bool>) {
         shutdown_forever();
     }
     log::info!("detector: 运行");
+    // 常驻重试 timer(唯一、随进程存活、永不销毁;tick 倒数见 schedule_rebind_retry)。
+    ax_ffi::timer_install_repeating(RETRY_TICK_SECS, on_retry_tick);
     ax_ffi::run_current_runloop();
     shutdown_forever();
 }
@@ -274,23 +386,49 @@ enum ScanOutcome {
 }
 
 /// 换绑首扫结果是否应发 `Closed { pid }`(纯逻辑,单测钉住三态收敛)。
-fn should_send_closed_on_rebind(outcome: ScanOutcome) -> bool {
-    outcome == ScanOutcome::NoPanel
+/// 双门:绑定成功(observer 可继续观察销毁)+ 扫描确认无面板;任一不满足
+/// 都不得解除屏蔽(绑定失败时后续状态无人观察,屏蔽泄漏到面板关闭为止)。
+fn should_send_closed_on_rebind(bound_ok: bool, outcome: ScanOutcome) -> bool {
+    bound_ok && outcome == ScanOutcome::NoPanel
 }
 
-/// 换绑观察者并首扫;仅当**确认**当前 app 无保存面板时发 `Closed { pid }`。
+/// 重试节奏 = 常驻重复 timer(唯一、随进程存活、永不销毁)每 [`RETRY_TICK_SECS`]
+/// 秒递减 [`RETRY_TICKS_LEFT`],到 1 时触发换绑。不做动态创建/销毁——2026-11-05
+/// 实机教训:一次性 timer「回调内自我 invalidate + release」破坏 runloop 内部
+/// 引用导致 UAF(CFRunLoopTimerCreate 内 SIGSEGV);常驻单 timer 是 M0 探针
+/// 已长期验证的稳定形态。
+const RETRY_TICK_SECS: f64 = 0.25;
+/// 换绑重试 tick 档位:1/2/4/8/16 tick = 0.25s/0.5s/1s/2s/4s,覆盖约 8s 的
+/// 瞬态拒绝恢复窗口(2026-11-05 Edge 实测)。
+const REBIND_RETRY_DELAY_TICKS: [u32; 5] = [1, 2, 4, 8, 16];
+
+/// 换绑重试档位(tick 数;attempt 从 0 计)。超预算返回 None:放弃本轮,等下次
+/// 前台切换重置预算。实测(2026-11-05,Edge):注册可能在激活瞬间被目标 app
+/// 瞬态拒绝,不重试 = 该 app 永久失联。
+fn rebind_retry_delay_ticks(attempt: usize) -> Option<u32> {
+    REBIND_RETRY_DELAY_TICKS.get(attempt).copied()
+}
+
+/// 换绑观察者并首扫;仅当「绑定成功 **且** 确认无面板」时发 `Closed { pid }`。
 ///
 /// 收敛「面板在别的 app 前台期间关闭」的 Esc 屏蔽泄漏:detector 在非前台 app
 /// 上收不到销毁通知,切回该 app 后这次首扫是唯一确认点——没有面板就按
 /// 「该 app 当前无面板」解除屏蔽(接线层 clear 无屏蔽 pid 为 no-op)。
 /// AX 读取失败不确认(否则会误清仍有效面板的屏蔽);命中面板也不发,保证
 /// 「切走再切回同一面板仍开着」不会重新弹。
+///
+/// 绑定失败也扫描:面板可见性(`Shown`)只依赖 AX 读取,不依赖 observer——
+/// 实机(2026-11-05,Edge)注册在激活瞬间被瞬态拒绝时,若不同时扫描,该 app
+/// 在重试成功前完全失明。绑定失败时不发 `Closed`(AX 状态未证实,不得解除
+/// 屏蔽),并安排延迟重试(见 [`schedule_rebind_retry`])。
 fn rebind_and_scan(pid: i32) {
-    if !rebind_observer(pid) {
-        return;
-    }
-    if should_send_closed_on_rebind(scan_focused(pid)) {
+    let bound_ok = rebind_observer(pid);
+    let outcome = scan_focused(pid);
+    if should_send_closed_on_rebind(bound_ok, outcome) {
         send(PanelEvent::Closed { pid });
+    }
+    if !bound_ok {
+        schedule_rebind_retry();
     }
 }
 
@@ -319,7 +457,8 @@ fn rebind_observer(pid: i32) -> bool {
     ] {
         match ax_ffi::observer_add_notification(&obs, &el, n, pid as usize) {
             Ok(()) => registered += 1,
-            Err(e) => log::debug!("detector: 通知注册失败 pid={pid} {n} err={e}"),
+            // 实测教训(2026-11-05):错误码是定位瞬态拒绝的唯一线索,info 留痕。
+            Err(e) => log::info!("detector: 通知注册失败 pid={pid} {n} err={e}"),
         }
     }
     // 三类通知全部被拒(隐藏 AX 树)时新 observer 无意义:不换绑、保留旧绑定,
@@ -339,6 +478,10 @@ fn rebind_observer(pid: i32) -> bool {
         *c.borrow_mut() = Some(obs);
     });
     BOUND_PID.with(|c| c.set(pid));
+    // 绑定成功:重置重试预算与在途倒数(后续失败从第 0 档重新计)。
+    REBIND_ATTEMPTS.store(0, Ordering::SeqCst);
+    RETRY_TICKS_LEFT.store(0, Ordering::SeqCst);
+    log::info!("detector: 已绑定前台 pid={pid}(通知 {registered}/3)");
     // M4 契约:换绑即前台宿主变化。此前若有面板归因,先发 HostChanged 让接线层
     // 隐藏浮层但保留 Dismissals(Esc 屏蔽持续到该面板真正关闭,design §4);
     // 不发 Closed,随后清空归因。
@@ -407,11 +550,21 @@ fn scan_focused(pid: i32) -> ScanOutcome {
     }
     // 任一候选命中保存面板且可定位 → Panel;全部读取成功且未命中 → NoPanel;
     // 有候选但任一读取失败 → Unknown(保守,不解除屏蔽)。
+    // 观测留痕(2026-11-05 教训:扫描零日志使「绑定成功但判定未见」无从排查):
+    // NoPanel 时输出全部候选紧凑形态(面板在窗口列表里但形态不匹配是本轮实测
+    // 漏报特征),命中面板时输出命中形态。
+    let mut dialog_rejected: Option<PanelSnapshot> = None;
+    let mut cand_forms: Vec<String> = Vec::with_capacity(candidates.len());
     for win in &candidates {
         let snap = snapshot_of_window(win);
+        cand_forms.push(snap_summary(&snap));
         if !is_save_panel(&snap) {
+            if dialog_rejected.is_none() && looks_like_panel(&snap) {
+                dialog_rejected = Some(snap.clone());
+            }
             continue;
         }
+        log::info!("detector: 面板命中 pid={pid} {}", snap_summary(&snap));
         let Some((x, y)) = ax_ffi::attr_point(win, attr::POSITION) else {
             return ScanOutcome::Unknown;
         };
@@ -435,14 +588,87 @@ fn scan_focused(pid: i32) -> ScanOutcome {
         return ScanOutcome::Panel;
     }
     if candidates.is_empty() || read_failed {
+        log::info!(
+            "detector: 扫描未知态 pid={pid} candidates={} read_failed={read_failed}",
+            candidates.len()
+        );
         return ScanOutcome::Unknown;
     }
+    if let Some(s) = dialog_rejected {
+        log::info!(
+            "detector: 疑似面板被确认信号否决 pid={pid} {}",
+            snap_summary(&s)
+        );
+    }
+    log::info!(
+        "detector: 扫描确认无面板 pid={pid} candidates={} forms={:?}",
+        candidates.len(),
+        cand_forms
+    );
     ScanOutcome::NoPanel
+}
+
+/// 快照单行摘要(日志形态取证用;role/subrole/标题/可编辑框/按钮/浏览容器)。
+fn snap_summary(s: &PanelSnapshot) -> String {
+    format!(
+        "{}/{} {:?} e{} b{} r{} loc{}",
+        s.role.as_deref().unwrap_or("?"),
+        s.subrole.as_deref().unwrap_or("?"),
+        s.title.as_deref().unwrap_or(""),
+        s.editable_text_fields,
+        s.buttons,
+        s.browsers,
+        s.location_hits
+    )
 }
 
 /// 面板 frame 合法性:坐标/宽高必须有限,宽高必须为正(NaN/∞ 与 <=0 均拒绝)。
 fn valid_panel_frame(x: f64, y: f64, w: f64, h: f64) -> bool {
     x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
+}
+
+// —— 换绑重试(瞬态拒绝的恢复路径;常驻 timer + tick 倒数,detector 线程) ——
+
+/// 换绑失败后安排延迟重试(detector 线程调用):写剩余 tick 数,常驻 timer
+/// 每 [`RETRY_TICK_SECS`] 秒递减,到 1 触发 [`on_retry_tick`] 换绑。预算档位
+/// 见 [`rebind_retry_delay_ticks`],耗尽不再排程。重复排程 = 覆盖剩余计数
+/// (最新失败的节奏接管,旧倒数作废,timer 本体永不动)。
+fn schedule_rebind_retry() {
+    let attempt = REBIND_ATTEMPTS.load(Ordering::SeqCst);
+    let Some(ticks) = rebind_retry_delay_ticks(attempt) else {
+        log::info!(
+            "detector: 重试预算耗尽,等待下次前台切换(front pid={})",
+            FRONT_PID.load(Ordering::SeqCst)
+        );
+        return;
+    };
+    REBIND_ATTEMPTS.store(attempt + 1, Ordering::SeqCst);
+    RETRY_TICKS_LEFT.store(ticks, Ordering::SeqCst);
+    log::info!(
+        "detector: 换绑失败,{}ms 后重试(第 {}/{} 次)",
+        (RETRY_TICK_SECS * f64::from(ticks) * 1000.0) as u64,
+        attempt + 1,
+        REBIND_RETRY_DELAY_TICKS.len()
+    );
+}
+
+/// 常驻重试 timer 的 tick(detector 线程,每 [`RETRY_TICK_SECS`] 秒):
+/// 倒数到 1 时按需重试换绑。无在途倒数即空转返回(一次原子读)。
+extern "C" fn on_retry_tick(_info: *mut std::ffi::c_void) {
+    let left = RETRY_TICKS_LEFT.load(Ordering::SeqCst);
+    if left == 0 {
+        return;
+    }
+    if left > 1 {
+        RETRY_TICKS_LEFT.store(left - 1, Ordering::SeqCst);
+        return;
+    }
+    RETRY_TICKS_LEFT.store(0, Ordering::SeqCst);
+    let pid = FRONT_PID.load(Ordering::SeqCst);
+    let bound = BOUND_PID.with(|c| c.get());
+    if needs_rebind(bound, pid) {
+        rebind_and_scan(pid);
+    }
 }
 
 fn send(ev: PanelEvent) {
@@ -469,14 +695,18 @@ mod tests {
             editable_text_fields: editable,
             buttons,
             browsers: 1,
+            location_hits: 0,
         }
     }
 
-    /// 契约:快速信号 + 确认信号双满足才判定;任一缺失为否。
-    /// 突变「去掉 editable/button 确认(仅 subrole 判定)」→ 第三用例必红。
+    /// 契约:快速信号 + 数量确认 + 结构指纹三者齐备才判定,任一缺失为否。
+    /// 突变「去掉 editable/button 数量关」→ 第 3/4 用例红;「去掉指纹关」→
+    /// 第 5 用例红(sheet_without_location_fingerprint_rejected 亦红)。
     #[test]
     fn quick_and_confirm_signals_both_required() {
-        assert!(is_save_panel(&snap("AXSystemDialog", 1, 2)));
+        let mut full = snap("AXSystemDialog", 1, 2);
+        full.location_hits = 1;
+        assert!(is_save_panel(&full), "三信号齐备");
         assert!(
             !is_save_panel(&snap("AXStandardWindow", 1, 2)),
             "subrole 不中"
@@ -486,6 +716,10 @@ mod tests {
             "无可写输入框"
         );
         assert!(!is_save_panel(&snap("AXSystemDialog", 1, 0)), "无按钮");
+        assert!(
+            !is_save_panel(&snap("AXSystemDialog", 1, 2)),
+            "无结构指纹(loc0 r1)不得判定"
+        );
     }
 
     /// 标题不参与判定:打开面板标题为「打开」仍判定为是。
@@ -493,6 +727,7 @@ mod tests {
     #[test]
     fn title_not_part_of_judgment_open_title_still_matches() {
         let mut s = snap("AXSystemDialog", 1, 2);
+        s.location_hits = 1;
         s.title = Some("打开".into());
         assert!(is_save_panel(&s));
     }
@@ -503,6 +738,56 @@ mod tests {
         let mut s = snap("AXSystemDialog", 1, 2);
         s.subrole = None;
         assert!(!is_save_panel(&s));
+    }
+
+    /// 实测形态(2026-11-05,TextEdit/XMind/Edge 三家一致):保存面板以
+    /// AXSheet 附着宿主窗口,subrole 读不到(None),确认信号 e3/b11、位置名
+    /// 命中 ≥1(位置侧栏)。突变去掉 `role == ROLE_QUICK_SHEET` 路径 → 必红。
+    #[test]
+    fn sheet_form_without_subrole_matches_with_confirm() {
+        let mut s = snap("AXSystemDialog", 3, 11);
+        s.role = Some("AXSheet".into());
+        s.subrole = None;
+        s.location_hits = 1;
+        s.browsers = 6;
+        assert!(
+            is_save_panel(&s),
+            "AXSheet + 数量信号 + 位置指纹(实测漏报形态)"
+        );
+        s.buttons = 0;
+        assert!(!is_save_panel(&s), "缺按钮仍否决(确认信号不豁免)");
+        s.buttons = 11;
+        s.editable_text_fields = 0;
+        assert!(!is_save_panel(&s), "缺可编辑框仍否决(确认信号不豁免)");
+        s.editable_text_fields = 3;
+        s.role = Some("AXWindow".into());
+        assert!(
+            !is_save_panel(&s),
+            "AXWindow 无 subrole 不判定(防误报守卫保留)"
+        );
+    }
+
+    /// sheet 结构指纹(误报回归钉,2026-11-05 实机):数量阈值挡不住「查找框
+    /// e2 b3 / 密码 sheet e2 b2 / 格式弹层」——它们无位置侧栏且浏览容器少。
+    /// 突变去掉 `(location_hits >= 1 || browsers >= MIN)` → 用例必红。
+    #[test]
+    fn sheet_without_location_fingerprint_rejected() {
+        let mut s = snap("AXSystemDialog", 2, 3);
+        s.role = Some("AXSheet".into());
+        s.subrole = None;
+        s.location_hits = 0;
+        s.browsers = 1;
+        assert!(!is_save_panel(&s), "查找框形态(无位置指纹)不得判定");
+        s.buttons = 2;
+        s.editable_text_fields = 2;
+        assert!(!is_save_panel(&s), "密码 sheet 形态不得判定");
+        // 侧栏隐藏的极简面板兜底:数量满足 + 浏览容器 ≥3 仍判定。
+        s.browsers = 3;
+        assert!(is_save_panel(&s), "浏览容器 ≥3 兜底(极简保存面板)");
+        // 位置指纹兜底:容器不足但有侧栏命中仍判定。
+        s.browsers = 1;
+        s.location_hits = 1;
+        assert!(is_save_panel(&s), "位置指纹命中兜底");
     }
 
     /// 探针粗判与产品判定的分工钉(Dialog 个案):粗判只看 subrole(取证宁滥),
@@ -521,27 +806,104 @@ mod tests {
         for subrole in SUBROLE_QUICK {
             assert!(looks_like_panel(&snap(subrole, 0, 0)), "{subrole}");
         }
+        let mut sheet = snap("", 0, 0);
+        sheet.role = Some("AXSheet".into());
+        sheet.subrole = None;
+        assert!(looks_like_panel(&sheet), "AXSheet role 形态");
     }
 
-    /// 已登记风险:AXFloatingWindow + 可编辑输入框会命中产品判定,
-    /// 而 Get Info/Inspector 窗口可能就是这种形态。
-    /// M0 实测复核后决定:移除该白名单条目,或加严确认信号(例如让 browsers 参与判定)。
+    /// 已登记风险闭环(2026-11-05 实机):AXFloatingWindow + 可编辑输入框曾会
+    /// 命中产品判定(Get Info/Inspector 误报嫌疑)——结构指纹挡住:此类窗口
+    /// 无位置侧栏且容器少;带指纹的浮窗形态面板(如有)仍可放行。
     #[test]
-    fn floating_window_with_editable_field_currently_matches_pending_m0() {
-        assert!(is_save_panel(&snap("AXFloatingWindow", 1, 1)));
+    fn floating_window_without_fingerprint_rejected() {
+        let mut s = snap("AXFloatingWindow", 1, 1);
+        assert!(!is_save_panel(&s), "浮窗无指纹(等效 Get Info)不判定");
+        s.location_hits = 1;
+        assert!(is_save_panel(&s), "带指纹才放行");
     }
 
-    /// M4 三态收敛:只有「确认无面板」才发 Closed;AX 读取失败(Unknown)
-    /// 不得解除屏蔽,命中面板也不发。
-    /// 突变 `should_send_closed_on_rebind` 改为 `outcome != Panel` → Unknown 用例红。
+    /// 实机误报回归钉(2026-11-05):WPS 查找/查找和替换为窗口形态
+    /// (AXDialog e1 b9/e1 b12),旧判定纯数量即放行误触发浮层;
+    /// 结构指纹(无位置侧栏、无浏览容器)闭环。突变去掉指纹关 → 本用例必红。
     #[test]
-    fn rebind_closed_only_on_confirmed_no_panel() {
-        assert!(!should_send_closed_on_rebind(ScanOutcome::Panel));
-        assert!(should_send_closed_on_rebind(ScanOutcome::NoPanel));
+    fn find_replace_dialog_window_form_rejected() {
+        let mut s = snap("AXDialog", 1, 9);
+        s.title = Some("查找".into());
+        assert!(!is_save_panel(&s), "查找框(无指纹)不得判定");
+        let mut r = snap("AXDialog", 1, 12);
+        r.title = Some("查找和替换".into());
+        assert!(!is_save_panel(&r), "查找和替换不得判定");
+        // 真面板对照:另存为窗口形态有浏览容器(位置侧栏),放行。
+        let mut save = snap("AXDialog", 3, 22);
+        save.title = Some("另存为".into());
+        save.browsers = 8;
+        assert!(is_save_panel(&save), "另存为窗口形态放行");
+    }
+
+    /// 漏报回归钉(2026-11-05):部分 app 的打开面板以 AXStandardWindow 标准窗
+    /// 形态呈现(XMind 实测 e1 b15 r8 loc7),仅「标准窗 + 标题命中面板名单 +
+    /// 指纹」放行。突变去掉标题路径 → 本用例必红。
+    #[test]
+    fn standard_window_open_panel_matches_via_title() {
+        let mut s = snap("AXStandardWindow", 1, 15);
+        s.title = Some("打开".into());
+        s.browsers = 8;
+        s.location_hits = 7;
+        assert!(is_save_panel(&s), "标准窗形态打开面板放行");
+    }
+
+    /// 标准窗标题路径防误报钉(2026-11-05 实机):普通文档/网页窗口也可能带
+    /// 位置名指纹(标题栏路径/最近列表/页面内容),标题是唯一分界——必须
+    /// 精确命中面板名单才放行。突变放宽标题匹配 → 用例必红。
+    #[test]
+    fn standard_window_documents_rejected_by_title_gate() {
+        let mut ppt = snap("AXStandardWindow", 1, 42);
+        ppt.title = Some("部委经营思路汇报".into());
+        ppt.browsers = 4;
+        ppt.location_hits = 7;
+        assert!(!is_save_panel(&ppt), "文档窗口(带指纹无面板标题)不判定");
+        let mut web = snap("AXStandardWindow", 5, 24);
+        web.title = Some("搜索 - Microsoft 必应".into());
+        web.browsers = 8;
+        web.location_hits = 2;
+        assert!(!is_save_panel(&web), "网页窗口不判定");
+        let mut lookalike = snap("AXStandardWindow", 1, 15);
+        lookalike.title = Some("打开指导书.docx".into());
+        lookalike.browsers = 8;
+        lookalike.location_hits = 7;
         assert!(
-            !should_send_closed_on_rebind(ScanOutcome::Unknown),
+            !is_save_panel(&lookalike),
+            "文档名含「打开」但非精确相等不判定"
+        );
+    }
+
+    /// M4 三态收敛 × 绑定门:只有「绑定成功 **且** 确认无面板」才发 Closed;
+    /// 绑定失败(状态无人观察)/AX 读取失败不得解除屏蔽,命中面板也不发。
+    /// 突变 `should_send_closed_on_rebind` 去掉 `bound_ok &&` → 绑定失败用例必红。
+    #[test]
+    fn rebind_closed_only_on_bound_and_confirmed_no_panel() {
+        assert!(!should_send_closed_on_rebind(true, ScanOutcome::Panel));
+        assert!(should_send_closed_on_rebind(true, ScanOutcome::NoPanel));
+        assert!(
+            !should_send_closed_on_rebind(true, ScanOutcome::Unknown),
             "AX 读取失败不得解除屏蔽"
         );
+        assert!(
+            !should_send_closed_on_rebind(false, ScanOutcome::NoPanel),
+            "绑定失败不得解除屏蔽"
+        );
+    }
+
+    /// 重试档位:5 档 tick(1/2/4/8/16 = 0.25s~4s),超预算 None(放弃,等
+    /// 下次激活重置)。突变改 `REBIND_RETRY_DELAY_TICKS` 长度或值 → 用例必红。
+    #[test]
+    fn rebind_retry_schedule_five_steps_then_give_up() {
+        assert_eq!(rebind_retry_delay_ticks(0), Some(1));
+        assert_eq!(rebind_retry_delay_ticks(1), Some(2));
+        assert_eq!(rebind_retry_delay_ticks(4), Some(16));
+        assert_eq!(rebind_retry_delay_ticks(5), None, "预算耗尽必须放弃");
+        assert_eq!(rebind_retry_delay_ticks(usize::MAX), None);
     }
 
     /// M2:仅当前台 pid 有效且变化时才换绑;相同 pid 的重复 signal 不得重复换绑/扫描。

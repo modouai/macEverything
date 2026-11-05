@@ -79,11 +79,15 @@ struct TimerContext {
 
 extern "C" {
     fn CFAbsoluteTimeGetCurrent() -> f64;
+    // 真实签名(CFRunLoop.h):第 4 参是整数 flags(CFOptionFlags),没有
+    // tolerance 参数——误声明为 f64 会令整数参数整体错位一格(ARM64 ABI:
+    // 整数走 x 寄存器、浮点走 v 寄存器),首次调用即 SIGSEGV(2026-11-05 实测,
+    // 与 ax_ffi 同款教训)。
     fn CFRunLoopTimerCreate(
         alloc: *mut std::ffi::c_void,
         fire_date: f64,
         interval: f64,
-        tolerance: f64,
+        flags: u64,
         order: isize,
         callout: extern "C" fn(*mut std::ffi::c_void),
         context: *mut TimerContext,
@@ -118,7 +122,7 @@ fn install_poll_timer() -> bool {
             std::ptr::null_mut(),
             CFAbsoluteTimeGetCurrent() + 0.5,
             0.5,
-            0.0,
+            0,
             0,
             poll_callout,
             &mut ctx,
@@ -495,4 +499,103 @@ fn walk(el: &AXRef, depth: usize, pred: &dyn Fn(&AXRef) -> bool, out: &mut Vec<A
     for c in ax_ffi::children(el) {
         walk(&c, depth + 1, pred, out);
     }
+}
+
+// —— AX 兼容性诊断(MCE_PANEL_AX_PROBE=<pid>;开发取证,不进产品路径) ——
+//
+// 背景(2026-11-05 实机):部分宿主(XMind/Edge/文本编辑)保存面板不触发浮层,
+// 日志只见「三类通知全部注册失败」。嫌疑:Chromium/Electron 宿主默认不初始化
+// AX 服务(懒加载,等 AT 客户端触发),通知注册被整批拒绝。
+// 本探针对目标进程做一次性取证:基线注册/快照 → 写 AXManualAccessibility
+// (Electron)+ AXEnhancedUserInterface(Chromium;VoiceOver 同款)→ 等树构建
+// → 分档复测。结论回填 probe-findings,并决定产品 detector 的修复形态。
+
+/// 诊断用占位回调(只测注册返回码,不消费事件)。
+extern "C" fn ax_diag_noop(
+    _obs: *mut std::ffi::c_void,
+    _el: *mut std::ffi::c_void,
+    _notification: *const std::ffi::c_void,
+    _refcon: *mut std::ffi::c_void,
+) {
+}
+
+/// 对 pid 做一轮三类通知注册,逐条记录 AXError(0 = 成功)。observer 不挂
+/// runloop:诊断只测「目标进程此刻是否接受注册」,函数返回即随栈释放,
+/// 不留 runloop source 残留。
+fn ax_diag_register_round(pid: i32, tag: &str) {
+    let Some(el) = ax_ffi::app_element(pid) else {
+        log::info!("[axdiag/{tag}] app element 创建失败 pid={pid}");
+        return;
+    };
+    let Some(obs) = ax_ffi::observer_create(pid, ax_diag_noop) else {
+        log::info!("[axdiag/{tag}] AXObserverCreate 失败 pid={pid}");
+        return;
+    };
+    for n in [
+        note::WINDOW_CREATED,
+        note::FOCUSED_WINDOW_CHANGED,
+        note::UI_ELEMENT_DESTROYED,
+    ] {
+        let code = ax_ffi::observer_add_notification(&obs, &el, n, 0)
+            .err()
+            .unwrap_or(0);
+        log::info!("[axdiag/{tag}] 注册 {n} err={code}");
+    }
+}
+
+/// dump 焦点窗口 + AXWindows 快照(tag 区分轮次;判定输入与 detector 同源)。
+fn ax_diag_dump_windows(pid: i32, tag: &str) {
+    let Some(app) = ax_ffi::app_element(pid) else {
+        log::info!("[axdiag/{tag}] app element 创建失败 pid={pid}");
+        return;
+    };
+    match ax_ffi::copy_attr_err(&app, attr::FOCUSED_WINDOW) {
+        Ok(f) => {
+            let s = super::panel_detector::snapshot_of_window(&f);
+            log::info!("[axdiag/{tag}] 焦点窗口 {s:?}");
+        }
+        Err(e) => log::info!("[axdiag/{tag}] 焦点窗口读取失败 err={e}"),
+    }
+    match ax_ffi::copy_attr_err(&app, attr::WINDOWS) {
+        Ok(w) => match ax_ffi::array_elements(&w) {
+            Some(wins) => {
+                log::info!("[axdiag/{tag}] AXWindows {} 个", wins.len());
+                for (i, win) in wins.iter().enumerate() {
+                    let s = super::panel_detector::snapshot_of_window(win);
+                    log::info!("[axdiag/{tag}] 窗口[{i}] {s:?}");
+                }
+            }
+            None => log::info!("[axdiag/{tag}] AXWindows 非 CFArray 形态"),
+        },
+        Err(e) => log::info!("[axdiag/{tag}] AXWindows 读取失败 err={e}"),
+    }
+}
+
+/// AX 兼容性诊断入口(main.rs:MCE_PANEL_AX_PROBE=<pid> → 本函数 → 进程退出)。
+/// 主线程调用;全程 log::info(经 MCE_APP_LOG 落盘),无 UI、无托盘、无热键。
+pub fn ax_diag_and_exit(pid: i32) {
+    log::info!(
+        "[axdiag] === 开始 pid={pid} trusted={}",
+        ax_ffi::is_process_trusted()
+    );
+    ax_diag_register_round(pid, "基线");
+    ax_diag_dump_windows(pid, "基线");
+    let Some(el) = ax_ffi::app_element(pid) else {
+        log::info!("[axdiag] app element 创建失败,中止 pid={pid}");
+        return;
+    };
+    for name in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+        match ax_ffi::set_attr_bool(&el, name) {
+            Ok(()) => log::info!("[axdiag] 已写 {name}=true"),
+            Err(e) => log::info!("[axdiag] 写 {name} 失败 err={e}"),
+        }
+    }
+    // 树构建有延迟:累计 500ms/1s/1.5s 三档,每档复测快照与注册。
+    for (round, wait_ms) in [(1, 500u64), (2, 1000), (3, 1500)] {
+        std::thread::sleep(Duration::from_millis(wait_ms));
+        let tag = format!("复测{round}");
+        ax_diag_dump_windows(pid, &tag);
+        ax_diag_register_round(pid, &tag);
+    }
+    log::info!("[axdiag] === 结束 pid={pid}");
 }

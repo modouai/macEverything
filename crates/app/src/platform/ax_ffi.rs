@@ -80,6 +80,8 @@ extern "C" {
     ) -> AXError;
     fn AXObserverGetRunLoopSource(obs: AXObserverRef) -> CFRunLoopSourceRef;
     fn AXValueGetValue(value: CFTypeRef, t: i32, out: *mut c_void) -> u8;
+    /// CFBoolean true 单例(CoreFoundation 导出常量;跨进程 AX 布尔属性写值)。
+    static kCFBooleanTrue: CFTypeRef;
     fn CFGetTypeID(cf: CFTypeRef) -> usize;
     fn CFStringGetTypeID() -> usize;
     fn CFArrayGetTypeID() -> usize;
@@ -88,6 +90,69 @@ extern "C" {
     fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
     /// CFBase.h 真实签名返回同一引用;调用点忽略返回值即可。
     fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+    fn CFAbsoluteTimeGetCurrent() -> f64;
+    // 真实签名(CFRunLoop.h):CFRunLoopTimerCreate(allocator, fireDate,
+    // interval, flags: CFOptionFlags 整数, order: CFIndex, callout, context)。
+    // 教训(2026-11-05):第 4 参误声明为 f64 会令整数参数整体错位一格
+    // (ARM64 整数走 x 寄存器、浮点走 v 寄存器),callout/context 全部读歪,
+    // 首次调用即 SIGSEGV 于 CFRunLoopTimerCreate 内。
+    fn CFRunLoopTimerCreate(
+        alloc: CFAllocatorRef,
+        fire_date: f64,
+        interval: f64,
+        flags: u64,
+        order: isize,
+        callout: extern "C" fn(*mut c_void),
+        context: *mut CFRunLoopTimerContext,
+    ) -> *mut c_void;
+    fn CFRunLoopAddTimer(rl: CFRunLoopRef, t: *mut c_void, mode: CFStringRef);
+}
+
+/// CFRunLoopTimerContext 手工镜像(C 布局;只传零值,info 不挂载)。
+#[repr(C)]
+pub struct CFRunLoopTimerContext {
+    pub version: isize,
+    pub info: *mut c_void,
+    pub retain: usize,
+    pub release: usize,
+    pub copy_description: usize,
+}
+
+/// 在当前线程 runloop 安装**常驻重复** timer(interval 秒周期,callout 永续派发,
+/// 随进程存活;不提供销毁路径)。重试节奏用「原子倒数 tick」实现,不做动态
+/// 创建/销毁,常驻单 timer 是最简形态。
+///
+/// SAFETY 契约:callout 为无捕获 C 函数指针;timer 引用有意常驻(runloop 持
+/// 引用,本调用方持有的 +1 不再释放)。
+pub fn timer_install_repeating(interval_secs: f64, callout: extern "C" fn(*mut std::ffi::c_void)) {
+    let mut ctx = CFRunLoopTimerContext {
+        version: 0,
+        info: std::ptr::null_mut(),
+        retain: 0,
+        release: 0,
+        copy_description: 0,
+    };
+    // SAFETY:ctx 为本函数栈上零值结构,CF 创建时拷贝所需字段;interval > 0
+    // 即周期触发;flags/order 置 0(无特殊标志、无优先级语义)。
+    let raw = unsafe {
+        CFRunLoopTimerCreate(
+            std::ptr::null_mut(),
+            CFAbsoluteTimeGetCurrent() + interval_secs,
+            interval_secs,
+            0,
+            0,
+            callout,
+            &mut ctx,
+        )
+    };
+    if raw.is_null() {
+        log::error!("ax_ffi: CFRunLoopTimerCreate 失败(常驻 timer 未安装)");
+        return;
+    }
+    // 挂到当前线程 runloop(必须;不挂永不触发)。
+    // SAFETY:raw 为本函数刚产出的 +1 引用,有意随进程存活(裸指针无 Drop,
+    // 不释放即常驻;runloop 侧另持自身引用)。
+    unsafe { CFRunLoopAddTimer(CFRunLoopGetCurrent(), raw, kCFRunLoopDefaultMode) };
 }
 
 /// AXObserver 回调(C 函数指针,无环境捕获;状态经 refcon/static 传递)。
@@ -239,6 +304,19 @@ pub fn set_attr(el: &AXRef, attr: &str, value: &CFStr) -> Result<(), AXError> {
     let a = CFStr::new(attr);
     // SAFETY:value 为调用方借用,生命周期覆盖调用;常量属性名合法。
     let err = unsafe { AXUIElementSetAttributeValue(el.raw(), a.raw(), value.raw()) };
+    if err == AX_ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// 写布尔属性(AXManualAccessibility/AXEnhancedUserInterface 等跨进程开关:
+/// Chromium/Electron 宿主默认不初始化 AX 服务,写 true 强制建树;VoiceOver 同款)。
+pub fn set_attr_bool(el: &AXRef, attr: &str) -> Result<(), AXError> {
+    let a = CFStr::new(attr);
+    // SAFETY:kCFBooleanTrue 为进程级常量单例,生命周期覆盖调用;属性名常量合法。
+    let err = unsafe { AXUIElementSetAttributeValue(el.raw(), a.raw(), kCFBooleanTrue) };
     if err == AX_ERROR_SUCCESS {
         Ok(())
     } else {

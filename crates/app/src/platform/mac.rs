@@ -2529,6 +2529,11 @@ pub fn probe_start() {
     super::panel_probe::start_probe();
 }
 
+/// AX 兼容性诊断转发(main.rs MCE_PANEL_AX_PROBE=<pid>;见 panel_probe::ax_diag_and_exit)。
+pub fn ax_diag_probe(pid: i32) {
+    super::panel_probe::ax_diag_and_exit(pid);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
