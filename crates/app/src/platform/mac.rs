@@ -1033,7 +1033,8 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
     win.orderFrontRegardless();
     win.makeKeyWindow();
     log::info!(
-        "浮层唤起:origin=({:.0}, {:.0}) 尺寸 {:.0}×{:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        "浮层唤起:window_number={} origin=({:.0}, {:.0}) 尺寸 {:.0}×{:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        win.windowNumber(),
         frame[0],
         frame[1],
         frame[2],

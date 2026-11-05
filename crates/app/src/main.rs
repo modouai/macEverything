@@ -162,8 +162,12 @@ fn trace_eframe() -> bool {
 }
 
 /// 极简日志:stderr(与 cli 的 init_logger 同形态;文件日志待 Task 10 接数据目录)。
+/// 诊断开关 `MCE_APP_LOG=<路径>`:追加写文件——`open` 启动时 stderr 被 launchd
+/// 丢弃,实机排障只能靠此出口(与 `MCE_TRACE_EFRAME` 同款诊断环境变量先例)。
 fn init_logger() {
-    struct StderrLogger;
+    struct StderrLogger {
+        file: Option<std::sync::Mutex<std::fs::File>>,
+    }
 
     impl log::Log for StderrLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
@@ -179,7 +183,14 @@ fn init_logger() {
 
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
-                eprintln!("[{}] {}", record.level(), record.args());
+                let line = format!("[{}] {}", record.level(), record.args());
+                eprintln!("{line}");
+                if let Some(f) = &self.file {
+                    use std::io::Write;
+                    if let Ok(mut f) = f.lock() {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
             }
         }
 
@@ -191,7 +202,16 @@ fn init_logger() {
     } else {
         log::LevelFilter::Info
     };
-    if log::set_boxed_logger(Box::new(StderrLogger)).is_ok() {
+    let file = std::env::var_os("MCE_APP_LOG")
+        .and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        })
+        .map(std::sync::Mutex::new);
+    if log::set_boxed_logger(Box::new(StderrLogger { file })).is_ok() {
         log::set_max_level(max);
     }
 }
