@@ -374,7 +374,7 @@ pub fn show_palette(top_inset: f64) -> anyhow::Result<f64> {
 ///
 /// `ax_frame` = 检测器上报的保存面板 frame,AX 屏幕坐标(左上原点、y 向下)。
 /// 平台层负责换算 AppKit 坐标、按面板中心所在屏定位。
-pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<[f64; 4]> {
+pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         mac::overlay_show(ax_frame)
