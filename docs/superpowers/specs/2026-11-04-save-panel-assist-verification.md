@@ -1,9 +1,28 @@
 # 保存面板目录助手 · 实机验证清单
 
 - 日期：2026-11-05
-- 分支：feat/save-panel-assist（待合并；验证通过后合并）
+- 状态：**主链路已实机通过**（2026-11-05，TextEdit 保存面板）；剩余项见 §8
+- 分支：feat/save-panel-assist
 - 设计：`docs/superpowers/specs/2026-11-04-save-panel-assist-design.md`
 - 探针结论表：`docs/superpowers/specs/2026-11-04-save-panel-assist-probe-findings.md`（M0 结果回填处）
+
+## 0. 实机验证结论（2026-11-05，已通过项）
+
+实机暴露并已修复的问题（对应 commit）：
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | detector 启动即失败 `AXObserverCreate 失败` | 启动用 pid=0 占位创建 observer，AX 拒绝 | observer 延后到首个真实前台 pid 创建（a4a879a） |
+| 2 | 浮层闪现即消失 | 宽口径「任意元素销毁 → Closed」+ 面板失 key 后仅看 AXFocusedWindow 误判无面板 | 销毁后重扫三态判定；扫描加入 AXWindows 全窗口（a4a879a） |
+| 3 | 点击浮层即消失 | 点击使自身进程成为前台，被当作宿主切换 → Closed | detector 忽略自身 pid 的前台激活（a4a879a） |
+| 4 | 搜索永远「无匹配项」 | 中文输入法首帧 Preedit 置 `ime_composing=true` 后无事件复位，输入变更永不触发查询 | 无 IME 事件的输入变更视为上屏完成并复位（8e53b22） |
+| 5 | Enter 后 Go-to 弹窗出现但未跳转 | `CGEventPostToPid` 对保存面板无效（M0 验证点③实机答案） | 全局 HID post（globals 前已复核前台 pid）（516c3f2） |
+| 6 | ⌘⇧G 后定位不到输入框 | Go-to sheet 的输入框在独立 AXWindows 窗口，不在 AXFocusedWindow 树里 | 输入框定位改为「焦点窗口 + AXWindows 全列表」（516c3f2） |
+| 7 | 中文输入法无法上屏（空格/数字作为普通键进入） | 浮层每帧 `request_focus` → egui `interrupt_ime()` 每帧打断组合，marked text 被清、Commit 丢失 | 仅在未聚焦时请求焦点（8e53b22）；winit 取证见 MCE_APP_LOG 诊断工具（299c72d） |
+
+已通过项：主链路（浮层出现 → 目录搜索 → Enter → 面板跳到目标目录，策略 A 直设成功）、跳转后浮层不复现、Esc 关闭与本次面板内屏蔽、点击浮层保持、中文输入法上屏、Finder 显示简介（⌘I）不误报。
+
+诊断工具：`MCE_APP_LOG=<路径>` 将日志写入文件（`open` 启动时 stderr 被 launchd 丢弃）；`MCE_PANEL_PROBE=1` 为 M0 探针。
 
 验证分三段：M0 探针（独立取证）→ 产品链路冒烟 → 错误路径 / 授权 / 误报 / 资源。
 每项通过打勾；异常记录实际现象与日志摘录。**M0 结论先回填 probe-findings，再做产品链路验收。**
@@ -124,3 +143,13 @@
 | AXFloatingWindow 白名单 | M0 实测后修订特征表（L9） |
 | daemon 在线缓存 | 全隐期最坏陈旧 30s（L11） |
 | R2 首次 Shown 被去重 | `daemon_online=false` 或 `overlay_show` 失败时，同面板后续 Shown 被抑制；实机确认是否可接受 |
+
+## 8. 剩余待验证项（2026-11-05 主链路通过后）
+
+- 多屏：面板拖到副屏（含负坐标屏）浮层定位
+- 深路径（≥6 级）跳转
+- 剪贴板还原：构造策略 A 失败场景验证策略 B（正常路径走策略 A，不碰剪贴板）
+- daemon 离线时打开面板：不出浮层（在线缓存 30s 陈旧窗口，见 L11）
+- VS Code / Pages / Numbers 等第三方保存面板
+- 资源与退出：浮层 Esc 后 30s 全隐缩窗（含 overlay）与内存回落；连续 20 次开/关；浮层显示中退出无 drop abort
+- 授权闭环：撤销授权 → 重启 → 托盘授权后直接回编辑器即生效（4.3）
