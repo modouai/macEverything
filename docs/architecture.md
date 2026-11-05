@@ -147,7 +147,7 @@ App 需要与 CLI 同款协议与客户端行为(连接 / 按需 stat / 离线�
 ### 保存面板目录助手(浮层 = 第四视口)
 
 - `panel_assist`:跨平台事件/屏蔽状态与「事件 + 状态 → 动作」决策纯逻辑;有效开关 = 设置开启 ∧ 辅助功能已授权。
-- `panel_detector`:专用 runloop 线程 + 前台应用 AXObserver,按窗口快速信号(subrole)+ 可编辑输入框/按钮组确认保存/打开面板,事件经 mpsc 回投 UI。
+- `panel_detector`:专用 runloop 线程 + 前台应用 AXObserver,识别保存/打开面板 = 快速信号(subrole 白名单 ∥ AXSheet 形态 ∥ 标准窗+标题精确命中面板名单)∧ 数量底线(可编辑框/按钮)∧ 结构指纹(位置侧栏名命中 ∥ 浏览容器≥3);换绑失败走常驻 timer tick 倒数自动重试(0.25s~4s 五档),绑定失败也扫描(Shown 只依赖 AX 读);事件经 mpsc 回投 UI。诊断:`MCE_PANEL_AX_PROBE=<pid>` 一次性 AX 取证探针。
 - `dialog_navigator`:跳转状态机与执行层——⌘⇧G 唤出「前往文件夹」后,按 AX 直设路径优先、剪贴板 ⌘V 降级;AX CF 层调用与合成键在后台线程执行。
 - 浮层视口(deferred + 常驻):按面板 frame 定位,↑↓/点击选目录,↵/双击提交,Esc 按宿主 pid 屏蔽本次面板。
 

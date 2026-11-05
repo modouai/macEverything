@@ -107,18 +107,22 @@ fn count_walk(el: &AXRef, depth: usize, s: &mut PanelSnapshot) {
     }
 }
 
-/// M0 探针粗判:subrole 含 Dialog、命中产品快速信号白名单或为 AXSheet 形态
-/// 即疑似(取证用,宁滥勿缺——漏报比误报更伤取证)。白名单形态(尤其
-/// AXFloatingWindow)不一定含 Dialog,故此处必须取并集,保证探针能对其 dump
-/// 快照并触发实验。
+/// M0 探针粗判:subrole 含 Dialog、命中产品快速信号三路(subrole 白名单 ∥
+/// AXSheet 形态 ∥ 标准窗+标题命中面板名单)即疑似(取证用,宁滥勿缺——漏报
+/// 比误报更伤取证)。必须与 [`is_save_panel`] 的快速信号保持超集关系(不变量
+/// 测试 [`probe_covers_every_product_quick_signal` 钉住]),保证每种产品形态
+/// 都能被 M0 探针 dump 快照并触发实验。
 ///
 /// 与 [`is_save_panel`] 分工:本函数只看快速信号,用于探针决定是否触发实验;
-/// 产品判定必须叠加确认信号(可编辑输入框 + 按钮组),零误报优先。
+/// 产品判定必须叠加确认信号,零误报优先。
 pub fn looks_like_panel(s: &PanelSnapshot) -> bool {
     s.subrole
         .as_deref()
         .is_some_and(|r| r.contains("Dialog") || SUBROLE_QUICK.contains(&r))
         || s.role.as_deref() == Some(ROLE_QUICK_SHEET)
+        || (s.role.as_deref() == Some(ROLE_QUICK_WINDOW)
+            && s.subrole.as_deref() == Some(SUBROLE_QUICK_WINDOW)
+            && s.title.as_deref().is_some_and(title_is_panel_name))
 }
 
 /// 快速信号一:window subrole 白名单(独立对话框/浮窗形态)。
@@ -392,6 +396,15 @@ fn should_send_closed_on_rebind(bound_ok: bool, outcome: ScanOutcome) -> bool {
     bound_ok && outcome == ScanOutcome::NoPanel
 }
 
+/// 换绑成功后是否应发 `HostChanged`(纯逻辑):仅当存在面板归因(previous≠0)
+/// 且归因宿主 ≠ 新绑定宿主(真宿主切换)时成立。重试成功对同一 pid 的绑定
+/// 不是宿主切换——「绑定失败也扫描」可能已把归因记到该 pid 上,归因仍有效,
+/// 必须保留(评审 2026-11-05:否则对开着的面板误隐藏浮层并清空用户输入)。
+/// 突变去掉 `previous != bound_pid` → `host_changed_only_on_real_host_switch` 必红。
+fn host_changed_on_rebind(previous: i32, bound_pid: i32) -> bool {
+    previous != 0 && previous != bound_pid
+}
+
 /// 重试节奏 = 常驻重复 timer(唯一、随进程存活、永不销毁)每 [`RETRY_TICK_SECS`]
 /// 秒递减 [`RETRY_TICKS_LEFT`],到 1 时触发换绑。不做动态创建/销毁——2026-11-05
 /// 实机教训:一次性 timer「回调内自我 invalidate + release」破坏 runloop 内部
@@ -482,11 +495,15 @@ fn rebind_observer(pid: i32) -> bool {
     REBIND_ATTEMPTS.store(0, Ordering::SeqCst);
     RETRY_TICKS_LEFT.store(0, Ordering::SeqCst);
     log::info!("detector: 已绑定前台 pid={pid}(通知 {registered}/3)");
-    // M4 契约:换绑即前台宿主变化。此前若有面板归因,先发 HostChanged 让接线层
-    // 隐藏浮层但保留 Dismissals(Esc 屏蔽持续到该面板真正关闭,design §4);
-    // 不发 Closed,随后清空归因。
-    let previous = PANEL_PID.swap(0, Ordering::SeqCst);
-    if previous != 0 {
+    // M4 契约:HostChanged 只在「归因宿主 ≠ 新绑定宿主」(真宿主切换)时发出,
+    // 让接线层隐藏浮层但保留 Dismissals(Esc 屏蔽持续到该面板真正关闭,design
+    // §4),归因随发随清。例外(重试路径):「绑定失败也扫描」可能已把归因记到
+    // 正在重绑的同一 pid 上——此刻绑定成功但宿主从未切换,归因仍有效,保留
+    // 不动,否则会对开着的面板误隐藏浮层并清空用户输入(2026-11-05 评审收敛)。
+    // PANEL_PID 仅 detector 线程读写,load-判断-store 无竞态。
+    let previous = PANEL_PID.load(Ordering::SeqCst);
+    if host_changed_on_rebind(previous, pid) {
+        PANEL_PID.store(0, Ordering::SeqCst);
         send(PanelEvent::HostChanged {
             previous_pid: previous,
         });
@@ -810,6 +827,9 @@ mod tests {
         sheet.role = Some("AXSheet".into());
         sheet.subrole = None;
         assert!(looks_like_panel(&sheet), "AXSheet role 形态");
+        let mut window_form = snap("AXStandardWindow", 0, 0);
+        window_form.title = Some("打开".into());
+        assert!(looks_like_panel(&window_form), "标准窗+标题形态");
     }
 
     /// 已登记风险闭环(2026-11-05 实机):AXFloatingWindow + 可编辑输入框曾会
@@ -913,6 +933,22 @@ mod tests {
         assert!(needs_rebind(0, 42), "首次绑定");
         assert!(!needs_rebind(42, 42), "前台未变不换绑");
         assert!(needs_rebind(42, 7), "前台变化换绑");
+    }
+
+    /// M4 契约收窄(2026-11-05 评审):HostChanged 只在真宿主切换时发出;
+    /// 重试成功绑定「归因即同一 pid」不算宿主切换(归因保留,面板可能仍开着)。
+    /// 突变去掉 `previous != bound_pid` → 用例必红。
+    #[test]
+    fn host_changed_only_on_real_host_switch() {
+        assert!(!host_changed_on_rebind(0, 42), "无归因不发");
+        assert!(
+            host_changed_on_rebind(7, 42),
+            "归因宿主 ≠ 新绑定宿主 = 真切换"
+        );
+        assert!(
+            !host_changed_on_rebind(42, 42),
+            "归因即新绑定宿主(重试路径)不发,保留归因"
+        );
     }
 
     /// M3:坐标/尺寸为 NaN/∞,或宽高 <=0 时不可作为合法 frame
