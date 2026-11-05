@@ -105,6 +105,9 @@ pub mod attr {
     pub const TITLE: &str = "AXTitle";
     pub const VALUE: &str = "AXValue";
     pub const CHILDREN: &str = "AXChildren";
+    /// 应用的窗口列表(detector 全窗口扫描:浮层抢键盘后保存面板不在
+    /// AXFocusedWindow 上,但仍在 AXWindows 里)。
+    pub const WINDOWS: &str = "AXWindows";
     pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const FOCUSED_ELEMENT: &str = "AXFocusedElement";
     pub const POSITION: &str = "AXPosition";
@@ -335,6 +338,31 @@ pub fn attr_size(el: &AXRef, attr: &str) -> Option<(f64, f64)> {
 struct XY {
     x: f64,
     y: f64,
+}
+
+/// CFArray 值(AXWindows 等数组属性)→ 元素 Vec(类型守卫;元素 CFRetain
+/// 后交 AXRef 接管)。None = 属性读取失败或非 CFArray 形态。
+pub fn array_elements(arr: &AXRef) -> Option<Vec<AXRef>> {
+    let raw = arr.raw();
+    // SAFETY:先比对 CFTypeID 确认是 CFArray 再遍历(与 children/value_string
+    // 守卫模式一致);元素引用归数组所有,CFRetain 复制后交 AXRef 接管。
+    unsafe {
+        if CFGetTypeID(raw) != CFArrayGetTypeID() {
+            return None;
+        }
+        let n = CFArrayGetCount(raw);
+        let mut out = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let e = CFArrayGetValueAtIndex(raw, i); // 未经 retain
+            if !e.is_null() {
+                CFRetain(e);
+                if let Some(r) = AXRef::take(e as *mut c_void) {
+                    out.push(r);
+                }
+            }
+        }
+        Some(out)
+    }
 }
 
 /// 子元素列表(AXChildren;快照遍历与按钮定位共用)。

@@ -52,15 +52,10 @@ pub fn start_probe() {
 }
 
 fn runloop_thread() {
-    // 首个 observer 绑 pid=0 占位(poll 到真实前台后重建);source 挂本线程 runloop。
+    // source 挂本线程 runloop;observer 不预建——AXObserverCreate 需要真实目标
+    // pid(占位 pid=0 会被拒绝),首个前台 pid 到达时由 rebind_observer 创建。
     // 线程内 fatal 失败走 log::error + return(expect 的 stderr 在 Finder 启动
     // 形态不可见,取证工具必须留日志)。
-    let Some(obs) = ax_ffi::observer_create(0, on_ax_event) else {
-        log::error!("[probe] AXObserverCreate 失败(辅助功能权限未授予?),探针线程退出");
-        return;
-    };
-    ax_ffi::attach_observer_to_current_runloop(&obs);
-    OBSERVER.with(|c| *c.borrow_mut() = Some(obs));
     if !install_poll_timer() {
         log::error!("[probe] 轮询 timer 安装失败,探针线程退出(无轮询即失效)");
         return;

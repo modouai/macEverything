@@ -176,6 +176,12 @@ pub fn start_detector() -> Option<mpsc::Receiver<PanelEvent>> {
 /// 被跳过,detector 发布完成后的启动扫描必然能看到该 pid;两处 `SeqCst` 不得
 /// 调换或降级(否则前台切换可能丢失)。
 pub fn notify_frontmost(pid: i32) {
+    // 忽略自身进程:点击浮层/设置窗等我们的窗口会让前台变成 macEverything 本身
+    // (实机:点击浮层 → 自身被激活 → 换绑 → 扫到无面板 → Closed → 浮层消失)。
+    // 宿主面板仍在原 app 里,不能把「切到自己」当作宿主切换。
+    if pid > 0 && pid as u32 == std::process::id() {
+        return;
+    }
     FRONT_PID.store(pid, Ordering::SeqCst);
     // SAFETY:两个指针均为 detector 线程写入的进程生命周期 CF 对象 raw;
     // 未就绪时为 null,signal_and_wake 内部判空。
@@ -194,21 +200,14 @@ fn runloop_thread(tx: mpsc::Sender<PanelEvent>, ready: mpsc::SyncSender<bool>) {
         let _ = ready.send(false);
         return;
     };
-    // observer 占位(创建成功前不 attach;失败时信号源随局部变量释放)
-    let Some(obs) = ax_ffi::observer_create(0, on_ax_event) else {
-        log::error!("detector: AXObserverCreate 失败(权限?),线程退出");
-        fail_init();
-        let _ = ready.send(false);
-        return;
-    };
     // 全部 fallible 初始化完成后,再挂 runloop 并发布跨线程指针。
+    // observer 不预建:AXObserverCreate 需要真实目标 pid(占位 pid=0 会被拒绝),
+    // 首个前台 pid(通知写入 FRONT_PID)到达时由 rebind_observer 创建并挂 runloop。
     ax_ffi::attach_signal_source(&src);
-    ax_ffi::attach_observer_to_current_runloop(&obs);
     let signal_raw = src.raw();
     let runloop_raw = ax_ffi::current_runloop_raw();
     // RAII 保活
     SOURCE.with(|c| *c.borrow_mut() = Some(src));
-    OBSERVER.with(|c| *c.borrow_mut() = Some(obs));
     // 最后发布:notify_frontmost 在此之前读到 null 即安全跳过;发布后对象由
     // SOURCE 保活到 detector 线程结束。
     SIGNAL_SRC.store(signal_raw, Ordering::SeqCst);
@@ -367,12 +366,14 @@ extern "C" fn on_ax_event(
     }
     let n = ax_ffi::cfstring_to_string(notification).unwrap_or_default();
     if n == note::UI_ELEMENT_DESTROYED {
-        // 宽口径(同探针):app 内任何元素销毁都按面板关闭处理——
-        // 产品侧后果仅为 Closed 事件偏早(接线层隐藏浮层),可接受。
-        // 旧归因值随事件交给接线层,用于按 pid 精确解除 Esc 屏蔽。
-        let panel = PANEL_PID.swap(0, Ordering::SeqCst);
-        if panel != 0 {
-            send(PanelEvent::Closed { pid: panel });
+        // 实机收窄(2026-11-05):宽口径「任意元素销毁即面板关闭」在保存面板
+        // 打开期间会被面板内部元素销毁(焦点切换/控件重建)频繁触发,形成
+        // Shown→Closed→Shown 循环(浮层闪现即消失,实机复现)。改为销毁后重扫
+        // 焦点窗口:仍在面板上则忽略;确认不再是面板(读取成功且判定否)才发
+        // Closed。Unknown(读取失败)不解除——与扫描三态纪律一致。
+        if PANEL_PID.load(Ordering::SeqCst) == pid && scan_focused(pid) == ScanOutcome::NoPanel {
+            PANEL_PID.store(0, Ordering::SeqCst);
+            send(PanelEvent::Closed { pid });
         }
         return;
     }
@@ -388,35 +389,55 @@ fn scan_focused(pid: i32) -> ScanOutcome {
     let Some(app) = ax_ffi::app_element(pid) else {
         return ScanOutcome::Unknown;
     };
-    let Some(win) = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW) else {
-        return ScanOutcome::Unknown;
-    };
-    let snap = snapshot_of_window(&win);
-    if !is_save_panel(&snap) {
-        return ScanOutcome::NoPanel;
+    // 候选窗口:焦点窗口优先 + AXWindows 全列表。实机(2026-11-05):浮层拿到
+    // 键盘焦点后保存面板不再是 AXFocusedWindow(但仍在 AXWindows 中),只看
+    // 焦点窗口会把「面板仍开着」误判成 NoPanel → 点击浮层即消失。
+    let mut candidates: Vec<AXRef> = Vec::new();
+    let mut read_failed = false;
+    match ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW) {
+        Some(f) => candidates.push(f),
+        None => read_failed = true,
     }
-    let Some((x, y)) = ax_ffi::attr_point(&win, attr::POSITION) else {
-        return ScanOutcome::Unknown;
-    };
-    let Some((w, h)) = ax_ffi::attr_size(&win, attr::SIZE) else {
-        return ScanOutcome::Unknown;
-    };
-    // M3:0/负/NaN/∞ 坐标或尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
-    // 宁缺毋滥,避免把浮层定位到 (NaN,NaN) 或零尺寸。
-    // 注:「尺寸非法时等后续通知重扫」是未验证假设,Task 15 实机确认。
-    if !valid_panel_frame(x, y, w, h) {
-        return ScanOutcome::Unknown;
+    match ax_ffi::copy_attr(&app, attr::WINDOWS)
+        .as_ref()
+        .and_then(ax_ffi::array_elements)
+    {
+        Some(mut w) => candidates.append(&mut w),
+        None => read_failed = true,
     }
-    // 同一面板已归因(例如 commit 后 ⌘⇧G sheet 开关触发的通知):不再重复
-    // 发 Shown;跨线程去重下沉,接线层的 handled 门负责语义收敛。
-    if PANEL_PID.swap(pid, Ordering::SeqCst) == pid {
+    // 任一候选命中保存面板且可定位 → Panel;全部读取成功且未命中 → NoPanel;
+    // 有候选但任一读取失败 → Unknown(保守,不解除屏蔽)。
+    for win in &candidates {
+        let snap = snapshot_of_window(win);
+        if !is_save_panel(&snap) {
+            continue;
+        }
+        let Some((x, y)) = ax_ffi::attr_point(win, attr::POSITION) else {
+            return ScanOutcome::Unknown;
+        };
+        let Some((w, h)) = ax_ffi::attr_size(win, attr::SIZE) else {
+            return ScanOutcome::Unknown;
+        };
+        // M3:0/负/NaN/∞ 坐标或尺寸不是合法屏幕坐标(AX 布局未完成或读取异常),
+        // 宁缺毋滥,避免把浮层定位到 (NaN,NaN) 或零尺寸。
+        if !valid_panel_frame(x, y, w, h) {
+            return ScanOutcome::Unknown;
+        }
+        // 同一面板已归因(例如 commit 后 ⌘⇧G sheet 开关触发的通知):不再重复
+        // 发 Shown;跨线程去重下沉,接线层的 handled 门负责语义收敛。
+        if PANEL_PID.swap(pid, Ordering::SeqCst) == pid {
+            return ScanOutcome::Panel;
+        }
+        send(PanelEvent::Shown {
+            pid,
+            frame: [x, y, w, h],
+        });
         return ScanOutcome::Panel;
     }
-    send(PanelEvent::Shown {
-        pid,
-        frame: [x, y, w, h],
-    });
-    ScanOutcome::Panel
+    if candidates.is_empty() || read_failed {
+        return ScanOutcome::Unknown;
+    }
+    ScanOutcome::NoPanel
 }
 
 /// 面板 frame 合法性:坐标/宽高必须有限,宽高必须为正(NaN/∞ 与 <=0 均拒绝)。
