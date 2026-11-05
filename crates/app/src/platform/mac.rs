@@ -1028,10 +1028,11 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<[f64; 4]> {
         OVERLAY_W as f64,
         OVERLAY_H as f64,
     );
-    // 高度自适应:先设内容尺寸再定位(「全隐缩窗/恢复」同款 setContentSize
-    // 路径;无装饰窗 contentSize == frame 尺寸。setContentSize 可能触发 winit
-    // 同步重入一帧,AppKit 调用期间不持借用的纪律同 restore_window_size)。
-    win.setContentSize(NSSize::new(frame[2], frame[3]));
+    // 只定位,不改尺寸:尺寸单一来源 = UI 层的 ViewportCommand::InnerSize
+    // (悬浮条 send_h 同款)。原生 setContentSize 与该命令是**两个尺寸源**,
+    // 并存时 winit/egui 尺寸状态滞后于 NSWindow → ui.max_rect 按旧值绘制,
+    // 新增条带无人绘制(实机 2026-11-05「深浅混色/外框矩形」根因)。
+    // NSWindow.setFrameOrigin 保持原点(左下)语义:面板底固定,浮层向上生长。
     win.setFrameOrigin(NSPoint::new(frame[0], frame[1]));
     let responder_ok = restore_first_responder(&win);
     win.orderFrontRegardless();

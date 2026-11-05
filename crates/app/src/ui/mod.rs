@@ -1122,8 +1122,9 @@ impl App {
                         )),
                     );
                     ctx.request_repaint_of(overlay::overlay_viewport_id());
+                    // 尺寸命令异步落地:32ms 补排一帧(悬浮条 send_h 同值同教训)。
                     ctx.request_repaint_after_for(
-                        std::time::Duration::from_millis(120),
+                        std::time::Duration::from_millis(32),
                         overlay::overlay_viewport_id(),
                     );
                 }

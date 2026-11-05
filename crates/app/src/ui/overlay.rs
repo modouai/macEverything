@@ -29,7 +29,7 @@ pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
 
 /// 浮层尺寸(逻辑像素;窗口大小。高度自适应时由平台层按
 /// `overlay_layout::overlay_frame` 返回值 setContentSize)。
-pub const OVERLAY_W: f32 = 600.0;
+pub const OVERLAY_W: f32 = 520.0;
 pub const OVERLAY_H: f32 = 300.0;
 /// 结果行高(两行文本)。
 const ROW_H: f32 = 44.0;
@@ -129,6 +129,8 @@ pub struct OverlayState {
     ime_busy: bool,
     /// 选中项变更后把该行滚入可见区(本帧消费后清零)。
     scroll_to_selected: bool,
+    /// 滚轮累积量(逻辑 px;滚轮驱动选行,行高为步进;open 时清零)。
+    wheel_accum: f32,
     /// 查询会话(防抖 + 代际号唯一真相;在途响应以 `Session::accepts` 判定)。
     session: Session,
     query_tx: Sender<(u64, Vec<HitEntry>)>,
@@ -153,6 +155,7 @@ impl OverlayState {
             ime_composing: false,
             ime_busy: false,
             scroll_to_selected: false,
+            wheel_accum: 0.0,
             session: Session::new(DEBOUNCE),
             query_tx,
             query_rx,
@@ -173,6 +176,7 @@ impl OverlayState {
         self.ime_composing = false;
         self.ime_busy = false;
         self.scroll_to_selected = false;
+        self.wheel_accum = 0.0;
         // 首帧内容:平台层 orderFront 后须有一次本视口的 pass,否则窗内是旧帧/空白。
         self.ctx.request_repaint_of(overlay_viewport_id());
     }
@@ -291,6 +295,11 @@ impl OverlayState {
 /// 结果区(两行文本 + 文件夹 glyph + 选中行「↵ 跳转」提示)→ 页脚(结果数 +
 /// 键帽组)。键盘:↑↓ 改选中、Enter 置 commit_requested、Esc 置 dismiss_requested;
 /// 行点击选中、双击 = 选中 + commit_requested。
+/// 当前结果数(滚轮采样用;show_overlay 前段 result_count 尚未定义)。
+fn result_count_now(st: &OverlayState) -> usize {
+    st.results.len()
+}
+
 pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let strings = i18n::s();
     let dark = ui.ctx().theme() == egui::Theme::Dark;
@@ -366,6 +375,48 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     // 已聚焦时不得重复 request_focus(会 interrupt_ime,见上)。
     if !input.has_focus() {
         input.request_focus();
+    }
+
+    // 滚轮驱动选行(原型交互:滚轮 = 移动选中行,选中行居中;IME 组合中不驱动)。
+    // ScrollArea 关闭滚轮滚动(见下),滚轮事件在此按行步进消费。
+    if !st.ime_composing && !st.ime_busy && result_count_now(st) > 0 {
+        let dy = ui.input(|i| i.smooth_scroll_delta.y);
+        if dy.abs() > 0.05 {
+            st.wheel_accum -= dy; // 向下滚(delta.y<0)= 选下一行
+            while st.wheel_accum >= ROW_H {
+                st.wheel_accum -= ROW_H;
+                if let OverlayKeyAction::Select(idx) = key_action(
+                    OverlayKey::ArrowDown,
+                    st.selected,
+                    st.results.len(),
+                    false,
+                    false,
+                ) {
+                    if idx != st.selected {
+                        st.selected = idx;
+                        st.scroll_to_selected = true;
+                    }
+                }
+            }
+            while st.wheel_accum <= -ROW_H {
+                st.wheel_accum += ROW_H;
+                if let OverlayKeyAction::Select(idx) = key_action(
+                    OverlayKey::ArrowUp,
+                    st.selected,
+                    st.results.len(),
+                    false,
+                    false,
+                ) {
+                    if idx != st.selected {
+                        st.selected = idx;
+                        st.scroll_to_selected = true;
+                    }
+                }
+            }
+            if st.wheel_accum.abs() > ROW_H {
+                st.wheel_accum = 0.0; // 剩余不足一行且超界,丢弃防漂移
+            }
+        }
     }
 
     // 键盘动作:IME 组合/忙时整帧让位输入法;其余交给纯函数决策。
@@ -497,13 +548,15 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                // 滚轮滚动关闭:滚轮驱动选行(选中行居中),列表视图跟随选中。
+                .scroll(egui::Vec2b::FALSE)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for (i, entry) in st.results.iter().enumerate() {
                         let response = draw_row(ui, entry, i == st.selected, &t);
-                        // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
+                        // 选中行滚入可视区**并居中**(原型交互:选中行在视口中间)。
                         if i == st.selected && st.scroll_to_selected {
-                            ui.scroll_to_rect(response.rect, None);
+                            ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
                         }
                         if response.clicked() {
                             clicked_row = Some(i);
