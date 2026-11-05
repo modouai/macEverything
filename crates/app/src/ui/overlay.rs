@@ -18,7 +18,9 @@ use crate::ui::palette;
 /// 防抖窗口(与悬浮条同值 60ms)。
 const DEBOUNCE: Duration = Duration::from_millis(60);
 /// 单次查询上限:浮层列表短,无需滚动加载。
-const QUERY_LIMIT: u32 = 30;
+const QUERY_LIMIT: u32 = 200;
+/// 浮层列表显示上限(查询侧多取:排除 .app 包后仍有足够普通目录)。
+const DISPLAY_LIMIT: usize = 30;
 
 pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("overlay")
@@ -215,7 +217,13 @@ impl OverlayState {
                 continue; // 旧代响应丢弃(慢响应后到不得覆盖新结果)
             }
             log::info!("[overlay] 回填 {} 项 gen={generation}", entries.len());
-            self.results = entries;
+            // 排除 app 包(bundle 是目录且引擎置顶排序,但不是保存目标);
+            // 查询多取、显示截断,避免 app 包挤掉普通目录。
+            self.results = entries
+                .into_iter()
+                .filter(|e| !is_app_bundle(&e.name, &e.path))
+                .take(DISPLAY_LIMIT)
+                .collect();
             self.selected = 0;
             self.scroll_to_selected = false;
         }
@@ -410,6 +418,35 @@ fn draw_row(ui: &mut egui::Ui, entry: &HitEntry, selected: bool) -> egui::Respon
         })
         .response;
     response.interact(egui::Sense::click())
+}
+
+/// app 包判定:目录名以 `.app` 结尾,或路径位于某个 `.app` 包内部(Contents 等)。
+/// `.app` 是目录(dir_only 不过滤)且被引擎按「APP 置顶」排序,但保存目标不会是
+/// 应用包——浮层结果一律排除(实机:搜索结果被 .app 占满)。
+fn is_app_bundle(name: &str, path: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".app") || path.to_ascii_lowercase().contains(".app/")
+}
+
+#[cfg(test)]
+mod app_bundle_tests {
+    use super::is_app_bundle;
+
+    #[test]
+    fn filters_app_bundles_by_name_or_ancestor() {
+        assert!(is_app_bundle("Safari.app", "/Applications/Safari.app"));
+        assert!(is_app_bundle("Xcode.APP", "/Applications/Xcode.APP"));
+        assert!(
+            is_app_bundle("Contents", "/Applications/Safari.app/Contents"),
+            "包内目录也应排除"
+        );
+        assert!(!is_app_bundle("tmp", "/Users/me/tmp"));
+        assert!(!is_app_bundle("appbackup", "/Users/me/appbackup"));
+        assert!(
+            !is_app_bundle("应用.app备份", "/Users/me/应用.app备份"),
+            "非 .app 后缀"
+        );
+        assert!(!is_app_bundle("文档", "/Users/me/文档"));
+    }
 }
 
 #[cfg(test)]
