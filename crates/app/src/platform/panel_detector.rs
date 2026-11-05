@@ -21,7 +21,8 @@ pub struct PanelSnapshot {
     /// 子树内 AXButton 数。
     pub buttons: usize,
     /// 子树内文件浏览容器(AXScrollArea/AXSplitGroup)数。
-    /// 当前仅取证字段,不参与 `is_save_panel`;特征表修订时评估是否纳入确认信号。
+    /// 参与 [`is_save_panel`] 结构指纹(≥3 在位置侧栏不可见时兜底,见
+    /// `CONFIRM_BROWSERS_MIN`;2026-11-05 实机:真面板 r5-9,弹层 r≤1)。
     pub browsers: usize,
     /// 子树内「标准文件位置名」命中数(静态文本/按钮标题,见 [`LOCATION_NAMES`])。
     /// NSSavePanel 系面板必嵌位置侧栏(桌面/下载/文稿…),查找/密码/格式等
@@ -174,11 +175,11 @@ const CONFIRM_BUTTONS_MIN: usize = 1;
 const CONFIRM_LOCATION_MIN: usize = 1;
 const CONFIRM_BROWSERS_MIN: usize = 3;
 
-/// 产品判定(设计 §3.1 两级):快速信号(subrole 白名单 **或** AXSheet 形态)
-/// 命中 **且** 数量确认 **且** 结构指纹。数量阈值只是底线,判别力在结构指纹
-/// ——两条形态路径(窗口/sheet)统一适用(2026-11-05 实机:查找/替换窗口
-/// 形态与下拉框 sheet 形态的误报都只有数量信号,无指纹)。纯函数(无 AX 调用),
-/// 特征表数据化供 macOS 版本漂移时修订。
+/// 产品判定(设计 §3.1 两级):快速信号(subrole 白名单 ∥ AXSheet 形态 ∥
+/// 标准窗+标题精确命中面板名单)命中 **且** 数量确认 **且** 结构指纹。数量
+/// 阈值只是底线,判别力在结构指纹——三条形态路径统一适用(2026-11-05 实机:
+/// 查找/替换窗口形态与下拉框 sheet 形态的误报都只有数量信号,无指纹)。纯函数
+/// (无 AX 调用),特征表数据化供 macOS 版本漂移时修订。
 pub fn is_save_panel(s: &PanelSnapshot) -> bool {
     let quick_ok = s.role.as_deref() == Some(ROLE_QUICK_SHEET)
         || s.subrole
@@ -210,10 +211,12 @@ static SIGNAL_SRC: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_m
 static DETECTOR_RL: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// 事件接收端断开的一次性标志(避免每个事件重复 warn/stop)。
 static SEND_FAILED: AtomicBool = AtomicBool::new(false);
-/// 换绑重试已用预算(notify_frontmost 激活时重置;排程消费,detector 线程独占)。
+/// 换绑重试已用预算(on_signal 真宿主切换时重置;排程消费,**detector 线程
+/// 独占读写**——重置已从主线程 notify_frontmost 移入 on_signal,消除丢更新竞态)。
 static REBIND_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 /// 换绑重试剩余 tick 数(0 = 无在途重试;常驻 timer 每 TICK_SECS 秒递减,
-/// 到 1 时触发换绑。detector 线程独占读写,主线程只在激活时清零)。
+/// 到 1 时触发换绑。**detector 线程独占读写**:排程写入、tick 递减、换绑成功
+/// 与真宿主切换时清零)。
 static RETRY_TICKS_LEFT: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
@@ -236,9 +239,10 @@ thread_local! {
 /// (最长 1s);线程失败/超时 → None,不交出半死 receiver。
 ///
 /// 停止契约:detector 常驻,不支持真正停止——设置关闭由接线层忽略事件即可
-/// (detector 仅通知驱动、无轮询,空转成本可忽略)。若将来需要 stop,必须先
-/// `CFRunLoopStop` 再清空 `SIGNAL_SRC`/`DETECTOR_RL`;反序会让主线程
-/// `CFRunLoopWakeUp` 命中已释放 runloop。
+/// (通知驱动 + 一个 0.25s 常驻重试 tick timer,空闲期每次 tick 仅一次原子读,
+/// 空转成本可忽略)。若将来需要 stop,必须先 `CFRunLoopStop` 再清空
+/// `SIGNAL_SRC`/`DETECTOR_RL`;反序会让主线程 `CFRunLoopWakeUp` 命中已释放
+/// runloop。timer 挂同一 runloop,随之停止、引用随进程存活。
 pub fn start_detector() -> Option<mpsc::Receiver<PanelEvent>> {
     if STARTED.swap(true, Ordering::SeqCst) {
         return None;
@@ -293,9 +297,6 @@ pub fn notify_frontmost(pid: i32) {
     if pid > 0 && pid as u32 == std::process::id() {
         return;
     }
-    // 新激活 = 新的瞬态拒绝窗口(2026-11-05 实机:Edge 激活瞬间注册被连续拒绝,
-    // 数秒后同 pid 空闲时注册成功):重置重试预算。
-    REBIND_ATTEMPTS.store(0, Ordering::SeqCst);
     FRONT_PID.store(pid, Ordering::SeqCst);
     // SAFETY:两个指针均为 detector 线程写入的进程生命周期 CF 对象 raw;
     // 未就绪时为 null,signal_and_wake 内部判空。
@@ -372,6 +373,11 @@ extern "C" fn on_signal(_info: *mut std::ffi::c_void) {
     if !needs_rebind(bound, pid) {
         return;
     }
+    // 真宿主切换 = 新的瞬态拒绝窗口:在此重置重试预算与在途倒数。重置原在
+    // notify_frontmost(主线程),与 detector 线程的 load→store 存在丢更新竞态;
+    // 移到本线程后 REBIND_ATTEMPTS/RETRY_TICKS_LEFT 全部单线程写。
+    REBIND_ATTEMPTS.store(0, Ordering::SeqCst);
+    RETRY_TICKS_LEFT.store(0, Ordering::SeqCst);
     rebind_and_scan(pid);
 }
 
