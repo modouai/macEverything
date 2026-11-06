@@ -235,15 +235,59 @@ fn candidate_windows(app: &AXRef) -> Vec<AXRef> {
     wins
 }
 
-fn goto_field(pid: i32, baseline: &[AXRef]) -> Option<AXRef> {
+/// 找到宿主的保存面板窗口(与 detector 共用同一判定器,避免两套特征表)。
+fn find_save_panel_window(app: &AXRef) -> Option<AXRef> {
+    candidate_windows(app).into_iter().find(|win| {
+        super::panel_detector::is_save_panel(&super::panel_detector::snapshot_of_window(win))
+    })
+}
+
+/// 把保存面板重新设回宿主的 main/key 窗口并等待生效。
+///
+/// 点击非 key 的浮层会让本进程成为前台(见 `notify_frontmost` 注释);
+/// `activate_app` 只把宿主 app 拉到前台,键盘焦点不一定回到保存面板 sheet
+/// (实机 2026-11-06:激活成功但 ⌘⇧G 仍落空)。逐项尝试 AXRaise / AXMain /
+/// AXFocused / app.AXFocusedWindow,再轮询 AXFocusedWindow 确认。
+fn focus_save_panel(pid: i32) -> bool {
+    let Some(app) = ax_ffi::app_element(pid) else {
+        return false;
+    };
+    let Some(panel) = find_save_panel_window(&app) else {
+        log::warn!("[navigator] 未找到保存面板窗口,无法恢复焦点 pid={pid}");
+        return false;
+    };
+    let raised = ax_ffi::perform_action(&panel, "AXRaise");
+    let main = ax_ffi::set_attr_bool(&panel, attr::MAIN);
+    let focused = ax_ffi::set_attr_bool(&panel, attr::FOCUSED);
+    let app_focus = ax_ffi::set_attr_element(&app, attr::FOCUSED_WINDOW, &panel);
+    log::info!(
+        "[navigator] 恢复面板焦点:raise={raised} main={main:?} focused={focused:?} app_focused_window={app_focus:?}"
+    );
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let confirmed = wait_until(deadline, || {
+        ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW).is_some_and(|w| ax_ffi::cf_equal(&w, &panel))
+    });
+    log::info!("[navigator] 面板焦点确认 focused_window_is_panel={confirmed}");
+    // 只认「确认读回焦点窗口 == 保存面板」:任一 setter 成功不代表焦点已转移,
+    // 盲目发 ⌘⇧G 会落进宿主其它窗口(评审 2026-11-06)。
+    confirmed
+}
+
+fn goto_field(pid: i32, baseline: &super::PanelBaseline) -> Option<AXRef> {
     let app = ax_ffi::app_element(pid)?;
     let focused = ax_ffi::copy_attr(&app, attr::FOCUSED_ELEMENT);
     for win in candidate_windows(&app) {
+        // Go-to sheet 必出现在基线之后的新窗口;基线窗口(保存面板自身)内的
+        // 输入框一律不是候选——即使点击/切换目录导致字段引用重建、旧字段
+        // 基线失效,也不会把文件名框误当 Go-to 框(评审 2026-11-06)。
+        if in_baseline(&win, &baseline.windows, ax_ffi::cf_equal) {
+            continue;
+        }
         // 快路径:窗口级焦点元素(焦点元素即候选,只需「可写 + 非基线」)。
         if let Some(fe) = ax_ffi::copy_attr(&win, attr::FOCUSED_ELEMENT) {
             if is_goto_candidate(
                 writable_text_field(&fe),
-                in_baseline(&fe, baseline, ax_ffi::cf_equal),
+                in_baseline(&fe, &baseline.fields, ax_ffi::cf_equal),
                 true,
             ) {
                 return Some(fe);
@@ -254,7 +298,7 @@ fn goto_field(pid: i32, baseline: &[AXRef]) -> Option<AXRef> {
         if let Some(hit) = search_field(&win, 0, &|el| {
             is_goto_candidate(
                 writable_text_field(el),
-                in_baseline(el, baseline, ax_ffi::cf_equal),
+                in_baseline(el, &baseline.fields, ax_ffi::cf_equal),
                 focused.as_ref().is_none_or(|f| ax_ffi::cf_equal(f, el)),
             )
         }) {
@@ -264,17 +308,27 @@ fn goto_field(pid: i32, baseline: &[AXRef]) -> Option<AXRef> {
     None
 }
 
-/// ⌘⇧G 前的基线:应用全部窗口内的可写 AXTextField(主要是文件名框)。
+/// ⌘⇧G 前的基线:应用全部窗口 + 窗口内可写 AXTextField(主要是文件名框)。
 /// 引用保活整个跳转过程;代理重建下身份比较走 CFEqual(见 [`in_baseline`])。
-fn baseline_text_fields(pid: i32) -> Vec<AXRef> {
+/// 窗口集是主判据:Go-to sheet 是新窗口,旧窗口内的字段一律排除。
+fn baseline_text_fields(pid: i32) -> super::PanelBaseline {
     let Some(app) = ax_ffi::app_element(pid) else {
-        return Vec::new();
+        return super::PanelBaseline {
+            windows: Vec::new(),
+            fields: Vec::new(),
+        };
     };
-    let mut out = Vec::new();
-    for win in candidate_windows(&app) {
-        collect_writable_fields(&win, 0, &mut out);
+    let windows = candidate_windows(&app);
+    let mut fields = Vec::new();
+    for win in &windows {
+        collect_writable_fields(win, 0, &mut fields);
     }
-    out
+    super::PanelBaseline { windows, fields }
+}
+
+/// 供接线层在浮层唤起期后台预采集(见 `platform::panel_baseline_collect`)。
+pub fn baseline_for(pid: i32) -> super::PanelBaseline {
+    baseline_text_fields(pid)
 }
 
 fn collect_writable_fields(el: &AXRef, depth: usize, out: &mut Vec<AXRef>) {
@@ -397,79 +451,132 @@ fn outcome_of(step: Step, has_saved: bool) -> (NavigateOutcome, bool) {
     }
 }
 
+/// 发 ⌘⇧G 并等待 Go-to 输入框出现(调用方已确认前台是宿主)。
+fn send_goto_and_wait(pid: i32, baseline: &super::PanelBaseline, t_start: Instant) -> Obs {
+    // 子 sheet 会让保存面板暂时从 AXWindows 消失:在跳转窗口内标记 detector,
+    // 避免瞬态 NoPanel 误发 Closed(清掉 handled_pids → 浮层重现)。
+    super::panel_detector::mark_navigating(Duration::from_secs(2));
+    cg_events::post_combo(None, KEY_G, FLAG_CMD | FLAG_SHIFT);
+    log::info!(
+        "[navigator] 已发 ⌘⇧G,等待 Go-to 输入框(3s)t+{}ms",
+        t_start.elapsed().as_millis()
+    );
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    // 双重复核(非基线 + 焦点一致)才认 sheet 已打开;
+    // 3s 内不满足 → Timeout(⌘⇧G 未生效的正确出口,不碰文件名框)。
+    if wait_until(deadline, || goto_field(pid, baseline).is_some()) {
+        log::info!(
+            "[navigator] Go-to 输入框已定位 t+{}ms",
+            t_start.elapsed().as_millis()
+        );
+        Obs::SheetOpened
+    } else {
+        // 超时诊断:候选窗口与可写输入框概况(定位失败时一次性 dump)。
+        if let Some(app) = ax_ffi::app_element(pid) {
+            let wins = candidate_windows(&app);
+            for (i, w) in wins.iter().enumerate().take(8) {
+                log::warn!(
+                    "[navigator] 诊断 win[{i}] role={:?} subrole={:?} title={:?}",
+                    ax_ffi::attr_string(w, attr::ROLE),
+                    ax_ffi::attr_string(w, attr::SUBROLE),
+                    ax_ffi::attr_string(w, attr::TITLE)
+                );
+            }
+            let mut fields = Vec::new();
+            for w in &wins {
+                collect_writable_fields(w, 0, &mut fields);
+            }
+            log::warn!(
+                "[navigator] 诊断 可写输入框 {} 个,基线 {} 个/窗口 {} 个",
+                fields.len(),
+                baseline.fields.len(),
+                baseline.windows.len()
+            );
+        }
+        log::warn!("[navigator] 3s 内未定位 Go-to 输入框(⌘⇧G 未生效或 post 目标错误)");
+        Obs::Timeout
+    }
+}
+
 /// 完整跳转(阻塞;调用方在后台线程执行)。
 ///
 /// 执行循环严格按状态机契约:先执行动作得到观测,再 `on(obs)` 转移;
 /// `done = true` 时先按 [`outcome_of`] 执行剪贴板收尾,再返回终态。
 /// `saved`:None = 从未保存;Some(None) = 保存时无文本;Some(Some(t)) = 原文。
 ///
-/// `baseline` 在 `m.start()` 后、首个动作执行前采集并在整个跳转生命周期保活:
+/// `baseline` 在 `m.start()` 后、首个动作执行前取得并在整个跳转生命周期保活:
 /// 后续每一步的「输入框仍在」自检都用「非基线 + 焦点一致」谓词,
-/// 防把文件名框当成 Go-to 框。
-pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
+/// 防把文件名框当成 Go-to 框。接线层传入浮层唤起期的后台预采集结果
+/// (`prefetched`)以避开回车后的同步 AX 树遍历;None/空则当场同步采集兜底。
+pub fn run_navigate(
+    pid: i32,
+    path: &str,
+    prefetched: Option<super::PanelBaseline>,
+) -> NavigateOutcome {
     let mut m = NavMachine::new();
     let mut saved: Option<Option<String>> = None;
     let Some(mut act) = m.start() else {
         return NavigateOutcome::Aborted;
     };
-    // ⌘⇧G 前基线(首个动作执行前采集,整个跳转生命周期保活)。
-    // 遗留(Task 15 实机评估):基线谓词的策略细节(采集时机、焦点暂离)
-    // 以实机取证为准。
-    let baseline = baseline_text_fields(pid);
-    if baseline.is_empty() {
+    // 端到端计时(日志 t+ms):定位「回车后明显分步」的耗时点。
+    let t_start = Instant::now();
+    // ⌘⇧G 前基线(首个动作执行前取得,整个跳转生命周期保活)。
+    let (baseline, source) = match prefetched.filter(|b| !b.fields.is_empty()) {
+        Some(b) => (b, "预采集命中"),
+        None => (baseline_text_fields(pid), "同步采集"),
+    };
+    log::info!(
+        "[navigator] 基线{source} {}ms",
+        t_start.elapsed().as_millis()
+    );
+    if baseline.fields.is_empty() {
         // 空基线可能是瞬时 AX 读取失败:此时无法区分 Go-to 框与文件名框,
         // 保守中止(宁可不跳转,也不冒误覆盖文件名的风险)。
         log::warn!("[navigator] 基线为空(可写输入框未采到),保守中止 pid={pid}");
         return NavigateOutcome::Aborted;
     }
     log::info!(
-        "[navigator] 开始 pid={pid} path={path} 基线 {} 个可写输入框",
-        baseline.len()
+        "[navigator] 开始 pid={pid} path={path} 基线 {} 个输入框/{} 个窗口 t+{}ms",
+        baseline.fields.len(),
+        baseline.windows.len(),
+        t_start.elapsed().as_millis()
     );
     loop {
         // 1) 执行动作 → 观测。Restore 只作为 done 收尾动作执行(见 loop 末尾)。
         let obs = match act {
             Act::SendGoToFolder => {
                 // cg_events 的 pid 时效契约:先复核前台,再合成 ⌘⇧G。
+                // 二次跳转场景:用户点击非 key 的浮层会让本进程成为前台
+                // (见 notify_frontmost 注释),此时不能直接中止——先显式
+                // 激活宿主 app 并把前台还给它,再发键。
                 if !pid_still_front(pid) {
-                    log::warn!("[navigator] ⌘⇧G 前复核:前台已切换,中止 pid={pid}");
-                    Obs::SheetClosed
-                } else {
-                    cg_events::post_combo(None, KEY_G, FLAG_CMD | FLAG_SHIFT);
-                    log::info!("[navigator] 已发 ⌘⇧G,等待 Go-to 输入框(3s)");
-                    let deadline = Instant::now() + STEP_TIMEOUT;
-                    // 双重复核(非基线 + 焦点一致)才认 sheet 已打开;
-                    // 3s 内不满足 → Timeout(⌘⇧G 未生效的正确出口,不碰文件名框)。
-                    if wait_until(deadline, || goto_field(pid, &baseline).is_some()) {
-                        log::info!("[navigator] Go-to 输入框已定位");
-                        Obs::SheetOpened
-                    } else {
-                        // 超时诊断:候选窗口与可写输入框概况(定位失败时一次性 dump)。
-                        if let Some(app) = ax_ffi::app_element(pid) {
-                            let wins = candidate_windows(&app);
-                            for (i, w) in wins.iter().enumerate().take(8) {
-                                log::warn!(
-                                    "[navigator] 诊断 win[{i}] role={:?} subrole={:?} title={:?}",
-                                    ax_ffi::attr_string(w, attr::ROLE),
-                                    ax_ffi::attr_string(w, attr::SUBROLE),
-                                    ax_ffi::attr_string(w, attr::TITLE)
-                                );
-                            }
-                            let mut fields = Vec::new();
-                            for w in &wins {
-                                collect_writable_fields(w, 0, &mut fields);
-                            }
-                            log::warn!(
-                                "[navigator] 诊断 可写输入框 {} 个,基线 {} 个",
-                                fields.len(),
-                                baseline.len()
-                            );
-                        }
-                        log::warn!(
-                            "[navigator] 3s 内未定位 Go-to 输入框(⌘⇧G 未生效或 post 目标错误)"
+                    log::info!(
+                        "[navigator] 前台不是宿主(点击浮层致自身激活),请求恢复宿主 pid={pid} t+{}ms",
+                        t_start.elapsed().as_millis()
+                    );
+                    let requested = super::activate_app(pid);
+                    log::info!("[navigator] 宿主激活请求={requested},等待前台恢复(1s)");
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    if wait_until(deadline, || pid_still_front(pid)) {
+                        log::info!(
+                            "[navigator] 宿主已回到前台 t+{}ms",
+                            t_start.elapsed().as_millis()
                         );
-                        Obs::Timeout
+                        // 宿主被激活 ≠ 保存面板 sheet 拿回键盘焦点:显式恢复并
+                        // 以读回确认作为发键门槛;确认失败宁可不跳,也不把
+                        // ⌘⇧G 送进宿主其它窗口。
+                        if focus_save_panel(pid) {
+                            send_goto_and_wait(pid, &baseline, t_start)
+                        } else {
+                            log::warn!("[navigator] 保存面板焦点未恢复,中止本次跳转 pid={pid}");
+                            Obs::SheetClosed
+                        }
+                    } else {
+                        log::warn!("[navigator] 前台未恢复宿主,中止 pid={pid}");
+                        Obs::SheetClosed
                     }
+                } else {
+                    send_goto_and_wait(pid, &baseline, t_start)
                 }
             }
             Act::FillViaAx => match goto_field(pid, &baseline) {
@@ -484,8 +591,14 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
                     let verdict =
                         fill_verdict(ax_ffi::attr_string(&field, attr::VALUE).as_deref(), path);
                     match verdict {
-                        Obs::SheetOpened => log::info!("[navigator] 策略 A:直设 value 成功"),
-                        _ => log::warn!("[navigator] 策略 A:直设 value 读回不匹配,降级策略 B"),
+                        Obs::SheetOpened => log::info!(
+                            "[navigator] 策略 A:直设 value 成功 t+{}ms",
+                            t_start.elapsed().as_millis()
+                        ),
+                        _ => log::warn!(
+                            "[navigator] 策略 A:直设 value 读回不匹配,降级策略 B t+{}ms",
+                            t_start.elapsed().as_millis()
+                        ),
                     }
                     verdict
                 }
@@ -544,13 +657,22 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
                     Obs::SheetClosed
                 } else {
                     cg_events::post_combo(None, KEY_RETURN, 0);
-                    log::info!("[navigator] 已发 Return,等待 sheet 关闭(3s)");
+                    log::info!(
+                        "[navigator] 已发 Return,等待 sheet 关闭(3s)t+{}ms",
+                        t_start.elapsed().as_millis()
+                    );
                     let deadline = Instant::now() + STEP_TIMEOUT;
                     if wait_until(deadline, || goto_field(pid, &baseline).is_none()) {
-                        log::info!("[navigator] go-to sheet 已关闭(跳转提交)");
+                        log::info!(
+                            "[navigator] go-to sheet 已关闭(跳转提交)t+{}ms",
+                            t_start.elapsed().as_millis()
+                        );
                         Obs::SheetClosed
                     } else {
-                        log::warn!("[navigator] Return 后 3s 内 sheet 未关闭");
+                        log::warn!(
+                            "[navigator] Return 后 3s 内 sheet 未关闭 t+{}ms",
+                            t_start.elapsed().as_millis()
+                        );
                         Obs::Timeout
                     }
                 }
@@ -582,6 +704,10 @@ pub fn run_navigate(pid: i32, path: &str) -> NavigateOutcome {
                     }
                 }
             }
+            log::info!(
+                "[navigator] 结束 → {outcome:?} 总耗时 {}ms",
+                t_start.elapsed().as_millis()
+            );
             return outcome;
         }
         let Some(a) = next else {

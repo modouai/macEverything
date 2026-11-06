@@ -1007,6 +1007,9 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     if crate::platform::settings_visible() == Some(false) {
         return;
     }
+    // 授权跃迁不可只依赖 ROOT 帧:用户在系统设置授权后切回设置窗时,ROOT
+    // 可能没有重绘请求,运行期就会表现为「必须重启才生效」。
+    crate::ui::refresh_panel_assist_trust_shared(shared, &ctx);
     // 空闲判定采样(设置视口输入;三视口共用同一口径,见 ui/idle.rs)。
     crate::ui::idle::note_viewport_activity(&ctx);
     let now = Instant::now();

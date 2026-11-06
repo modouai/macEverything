@@ -147,9 +147,9 @@ App 需要与 CLI 同款协议与客户端行为(连接 / 按需 stat / 离线�
 ### 保存面板目录助手(浮层 = 第四视口)
 
 - `panel_assist`:跨平台事件/屏蔽状态与「事件 + 状态 → 动作」决策纯逻辑;有效开关 = 设置开启 ∧ 辅助功能已授权。
-- `panel_detector`:专用 runloop 线程 + 前台应用 AXObserver,识别保存/打开面板 = 快速信号(subrole 白名单 ∥ AXSheet 形态 ∥ 标准窗+标题精确命中面板名单)∧ 数量底线(可编辑框/按钮)∧ 结构指纹(位置侧栏名命中 ∥ 浏览容器≥3);换绑失败走常驻 timer tick 倒数自动重试(0.25s~4s 五档),绑定失败也扫描(Shown 只依赖 AX 读);事件经 mpsc 回投 UI。诊断:`MCE_PANEL_AX_PROBE=<pid>` 一次性 AX 取证探针。
-- `dialog_navigator`:跳转状态机与执行层——⌘⇧G 唤出「前往文件夹」后,按 AX 直设路径优先、剪贴板 ⌘V 降级;AX CF 层调用与合成键在后台线程执行。
-- 浮层视口(deferred + 常驻):按面板 frame 定位,↑↓/点击选目录,↵/双击提交,Esc 按宿主 pid 屏蔽本次面板。
+- `panel_detector`:专用 runloop 线程 + 前台应用 AXObserver,识别保存/打开面板 = 快速信号(subrole 白名单 ∥ AXSheet 形态 ∥ 标准窗+标题精确命中面板名单)∧ 数量底线(可编辑框/按钮)∧ 结构指纹(位置侧栏名命中 ∥ 浏览容器≥3);换绑失败走常驻 timer tick 倒数自动重试(0.25s~4s 五档),绑定失败也扫描(Shown 只依赖 AX 读);事件经 mpsc 回投 UI。扫描三态中「存在其他 sheet」判 Unknown 而非 NoPanel——⌘⇧G 前往文件夹期间保存面板暂时不可见,误发 `Closed` 会清掉接线层 `handled`,跳转成功后浮层重现并清空输入(`no_panel_conclusive`,2026-11-06 实机)。诊断:`MCE_PANEL_AX_PROBE=<pid>` 一次性 AX 取证探针。
+- `dialog_navigator`:跳转状态机与执行层——⌘⇧G 唤出「前往文件夹」后,按 AX 直设路径优先、剪贴板 ⌘V 降级;AX CF 层调用与合成键在后台线程执行。跳转基线在浮层唤起期后台预采集(`panel_baseline_collect`:窗口集 + 可写输入框集),Go-to 候选必须落在基线后的新窗口,旧窗口内的文件名框一律排除,避免字段引用重建导致误覆盖;回车后直接消费,避免同步 AX 树遍历(~80ms)。浮层请求经 `dispatch2::DispatchQueue::main().exec_async` 在绘制 pass 结束后执行「原生隐藏 + 启动跳转」:既绕开 ROOT 隐藏窗口 100ms 重绘节流,又保证 `orderOut` 不在浮层自身重绘回调内(否则宿主面板拿不回键盘焦点,⌘⇧G 落空,2026-11-06 实机)。
+- 浮层视口(deferred + 常驻):按面板 frame 定位,↑↓/点击选目录,↵/双击提交,Esc 按宿主 pid 屏蔽本次面板。跳转成功(Done)后浮层被动复现(`overlay_show_passive`:定位 + `orderFrontRegardless`,**不 makeKey**),输入/结果/选中保留,键盘焦点留在宿主保存面板(可继续输入文件名/保存);点击非 key 浮层会让本进程成为前台,二次跳转时 navigator 先激活宿主并用 AX 将保存面板 raise 为 main/focused,再发 ⌘⇧G。FellBack 显示「路径已复制」;Esc 关闭仍清空状态。
 
 ## v2.5 增补:CLI 集成(实现态摘要)
 
