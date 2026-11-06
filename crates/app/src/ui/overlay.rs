@@ -29,7 +29,7 @@ pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
 
 /// 浮层尺寸(逻辑像素;窗口大小。高度自适应时由平台层按
 /// `overlay_layout::overlay_frame` 返回值 setContentSize)。
-pub const OVERLAY_W: f32 = 520.0;
+pub const OVERLAY_W: f32 = 600.0;
 pub const OVERLAY_H: f32 = 300.0;
 /// 结果行高(两行文本)。
 const ROW_H: f32 = 44.0;
@@ -133,8 +133,6 @@ pub struct OverlayState {
     session: Session,
     query_tx: Sender<(u64, Vec<HitEntry>)>,
     query_rx: Receiver<(u64, Vec<HitEntry>)>,
-    /// 混色取证(临时):已记录过诊断日志的绘制矩形,矩形或主题变化才再记。
-    diag_logged: Option<(egui::Rect, bool)>,
 }
 
 impl OverlayState {
@@ -155,7 +153,6 @@ impl OverlayState {
             ime_composing: false,
             ime_busy: false,
             scroll_to_selected: false,
-            diag_logged: None,
             session: Session::new(DEBOUNCE),
             query_tx,
             query_rx,
@@ -300,17 +297,6 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let t = tokens::overlay(dark);
     st.track_ime(ui);
 
-    // —— 混色取证(临时):首帧/矩形或主题变化各记一条,拿当帧绘制真值 ——
-    let diag_rect = ui.max_rect();
-    if st.diag_logged != Some((diag_rect, dark)) {
-        log::info!(
-            "[ov-diag] rect={diag_rect:?} dark={dark} bg={:02X?} footer={:02X?}",
-            t.bg.to_array(),
-            t.footer_bg.to_array()
-        );
-        st.diag_logged = Some((diag_rect, dark));
-    }
-
     // —— 面板 chrome:不透明底 + 描边(窗口 clear_color 全透明,圆角外露桌面)——
     let panel_rect = ui.max_rect();
     ui.painter()
@@ -362,7 +348,7 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             .text_color(t.query)
             .frame(egui::Frame::NONE)
             .align(egui::Align2::LEFT_CENTER)
-            .hint_text(strings.overlay_hint),
+            .hint_text(strings.overlay_input_hint),
     );
     // 组合中的预编辑文本不触发查询(IME 未上屏;提交帧 composing 已复位,照常查询)。
     // 实机(2026-11-05):中文输入法输入 ASCII 时首帧有 Preedit 事件把 composing

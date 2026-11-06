@@ -84,6 +84,7 @@ catalog! {
     tray_panel_assist_auth: "保存面板助手待授权…" / "Save-Panel Assist Needs Permission…",
     // 保存面板目录助手浮层
     overlay_hint: "输入目录名…" / "Type a directory name…",
+    overlay_input_hint: "输入文字搜索，选择目录回车后自动跳转" / "Type to search; select a folder and press Return to jump",
     overlay_clipboard_hint: "路径已复制，按 ⌘⇧G 后 ⌘V 粘贴" / "Path copied — press ⌘⇧G then ⌘V",
     overlay_key_select: "选择" / "Select",
     overlay_key_jump: "跳转" / "Jump",
