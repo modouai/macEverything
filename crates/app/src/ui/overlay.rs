@@ -133,6 +133,8 @@ pub struct OverlayState {
     session: Session,
     query_tx: Sender<(u64, Vec<HitEntry>)>,
     query_rx: Receiver<(u64, Vec<HitEntry>)>,
+    /// 混色取证(临时):已记录过诊断日志的绘制矩形,矩形或主题变化才再记。
+    diag_logged: Option<(egui::Rect, bool)>,
 }
 
 impl OverlayState {
@@ -153,6 +155,7 @@ impl OverlayState {
             ime_composing: false,
             ime_busy: false,
             scroll_to_selected: false,
+            diag_logged: None,
             session: Session::new(DEBOUNCE),
             query_tx,
             query_rx,
@@ -296,6 +299,17 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let dark = ui.ctx().theme() == egui::Theme::Dark;
     let t = tokens::overlay(dark);
     st.track_ime(ui);
+
+    // —— 混色取证(临时):首帧/矩形或主题变化各记一条,拿当帧绘制真值 ——
+    let diag_rect = ui.max_rect();
+    if st.diag_logged != Some((diag_rect, dark)) {
+        log::info!(
+            "[ov-diag] rect={diag_rect:?} dark={dark} bg={:02X?} footer={:02X?}",
+            t.bg.to_array(),
+            t.footer_bg.to_array()
+        );
+        st.diag_logged = Some((diag_rect, dark));
+    }
 
     // —— 面板 chrome:不透明底 + 描边(窗口 clear_color 全透明,圆角外露桌面)——
     let panel_rect = ui.max_rect();
