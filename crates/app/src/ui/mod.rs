@@ -2095,7 +2095,9 @@ fn draw_palette(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 
 /// 浮层视口绘制回调(deferred:自己的 pass 内运行)。
 ///
-/// 锁纪律同 `draw_palette`:短锁取 `Shared` 后在本回调内绘制(无原生调用);
+/// 锁纪律同 `draw_palette`:短锁取 `Shared` 后在本回调内绘制;例外同款——
+/// 主题探测 `maybe_apply` 内含 `current_theme()` 原生 getter(无 winit 同步
+/// 派发,无死锁史,悬浮条 pass 同位调用),其余原生调用一律锁外。
 /// 隐藏期直接返回,保持全隐缩窗后的回收帧为空 pass(不重新长字形图集)。
 fn draw_overlay(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx().clone();
@@ -2103,9 +2105,11 @@ fn draw_overlay(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     if !s.overlay.visible {
         return;
     }
-    // 主题跟随(浮层可见期):浮层 pass 自排节流探测,与悬浮条/设置 pass 同款
-    // (theme.rs 排帧纪律:只在「有窗可见」期探测;隐藏期本 pass 不跑,零帧红线不受影响)。
+    // 主题跟随(浮层可见期):节流探测 + 自排下一探测帧,与悬浮条/根 logic/
+    // 设置 pass 同款(theme.rs L4:只在「有窗可见」期探测;隐藏期由上方早返回
+    // 挡住不排帧,零帧红线不受影响)。
     s.theme.maybe_apply(&ctx, Instant::now());
+    ctx.request_repaint_after(theme::CHECK_INTERVAL);
     idle::note_viewport_activity(&ctx);
     // 子视口关闭请求(⌘W/系统红点):eframe 不自行处理,转成 dismiss_requested 交给
     // 接线层隐藏(与 palette/settings 的隐藏惯例一致),请求不悬空。

@@ -9,7 +9,8 @@ use eframe::egui;
 ///
 /// 超长字面量会被这里的低位截取**静默**改色——曾两次写出 10 位(多打 FF):
 /// 「半透明黑」→ 不透明近黑(浅色页脚黑条)、「半透明白」→ 不透明黄(深色页脚
-/// 黄条),实机实证 2026-11-06。`debug_assert` 在开发构建直接 panic,钉住测试兜底。
+/// 黄条),实机实证 2026-11-06。`debug_assert` 只拦**超过** 8 位(值域无法区分
+/// 「7 位少打」与「8 位前导零」);不足 8 位由两张钉住表(§4.1 + overlay)兜底。
 fn c(hex: u64) -> egui::Color32 {
     debug_assert!(hex <= 0xFFFF_FFFF, "色值字面量超 8 位(RRGGBBAA): {hex:#X}");
     egui::Color32::from_rgba_unmultiplied(
@@ -208,8 +209,9 @@ pub const fn list_h(rows: usize) -> f32 {
     }
 }
 
-/// 保存面板目录助手浮层 token（`overlay-visual/prototype.html` v1 定版；
-/// 不透明材质，色值取自 §4.2「完整结果窗口颜色」+ 原型补充的占位/空态/文件夹三档）。
+/// 保存面板目录助手浮层 token（**几何真源 = `prototype-incontext.html` v2 +
+/// design §3.3 的宽 600**(2026-11-06 实机定版;v1 原型的 420/52/46/32 已作废);
+/// 不透明材质,色值取自 §4.2「完整结果窗口颜色」+ 原型补充的占位/空态/文件夹档)。
 ///
 /// 规则同 §4.1：绘制代码只读这里，禁散落色值。
 #[derive(Clone, Copy)]
@@ -230,9 +232,9 @@ pub struct Overlay {
     pub name_selected: egui::Color32,
     /// 完整路径（次文本）。
     pub path: egui::Color32,
-    /// 「↵ 跳转」动作提示字。
+    /// 「⏎ 跳转」动作提示字。
     pub action_text: egui::Color32,
-    /// 「↵ 跳转」动作提示底。
+    /// 「⏎ 跳转」动作提示底。
     pub action_bg: egui::Color32,
     /// 页脚底（§4.2 状态栏底同源）。
     pub footer_bg: egui::Color32,
@@ -241,7 +243,10 @@ pub struct Overlay {
     pub keycap_text: egui::Color32,
     /// 空态文本。
     pub empty_text: egui::Color32,
-    /// 文件夹 glyph 前身/后标签（自绘矢量;内存优先不用 NSWorkspace 图标纹理）。
+    /// 文件夹 glyph 前身/后标签（自绘矢量两段式;内存优先不用 NSWorkspace 图标
+    /// 纹理,推翻 v1 原型「实现走系统真实图标」路线）。前身 = v2 原型单色
+    /// （浅 0x5CA6EE/深 0x4E9BE8);后标签 = 实现派生（前身同色系加深,无原型出处,
+    /// 现值由钉住测试看守)。
     pub folder_front: egui::Color32,
     pub folder_back: egui::Color32,
 }
@@ -407,7 +412,8 @@ mod tests {
         }
     }
 
-    /// 钉住：浮层 token 与 `overlay-visual/prototype.html` v1 定版表逐项相等。
+    /// 钉住：浮层 token 与定版真源逐项相等(几何与色值 = `prototype-incontext.html`
+    /// v2 + design §3.3;例外:`folder_back` 为实现派生色,见 `Overlay` 字段注释)。
     /// 回归背景：浅色半透明黑三件套曾误写 10 位字面量 → c() 解码成不透明近黑
     /// （页脚黑条，实机取证 2026-11-06）；整表钉死。
     #[test]

@@ -295,6 +295,7 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let strings = i18n::s();
     let dark = ui.ctx().theme() == egui::Theme::Dark;
     let t = tokens::overlay(dark);
+    let home = home_dir(); // 家目录预取:每帧一次(路径行 ~ 压缩;读不到 = 不压缩)
     st.track_ime(ui);
 
     // —— 面板 chrome:不透明底 + 描边(窗口 clear_color 全透明,圆角外露桌面)——
@@ -500,7 +501,7 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for (i, entry) in st.results.iter().enumerate() {
-                        let response = draw_row(ui, entry, i == st.selected, &t);
+                        let response = draw_row(ui, entry, i == st.selected, &t, home.as_deref());
                         // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
                         if i == st.selected && st.scroll_to_selected {
                             ui.scroll_to_rect(response.rect, None);
@@ -526,14 +527,15 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     }
 }
 
-/// 单行(两行文本;原型 v1 定版):文件夹 glyph + 目录名(主)/完整路径(次);
-/// 选中 = 选中底 + 目录名加粗 + 右端「↵ 跳转」提示。整行可点击。
-/// 动作提示宽度恒预留:未选行不显示,但文本不因选中切换而回流。
+/// 单行(两行文本):文件夹 glyph + 目录名(主)/完整路径(次);
+/// 选中 = 选中底 + 目录名加粗 + 右端「⏎ 跳转」提示(宽度恒预留)。整行可点击,
+/// 悬停 tooltip 回完整路径。home = 预取的家目录(show_overlay 每帧一次)。
 fn draw_row(
     ui: &mut egui::Ui,
     entry: &HitEntry,
     selected: bool,
     t: &tokens::Overlay,
+    home: Option<&str>,
 ) -> egui::Response {
     // 占位分配(拿 y 与点击响应)。行高**精确锁定** ROW_H:内容(字体缩放/加粗/
     // 选中 chip)再高也只在该矩形内绘制——Frame 自动尺寸会被两行文本撑高,
@@ -563,18 +565,15 @@ fn draw_row(
         egui::vec2(FOLDER_W, FOLDER_H),
     );
     draw_folder_glyph(row_ui.painter(), icon_rect, t);
-    // 文本列(图标右 + 10;选中行右缘预留 chip 宽;上下方向居中由字号自然撑出)。
+    // 文本列(图标右 + 10;**动作提示宽度恒预留**(未选行也扣 chip_w):
+    // 选中切换时文本宽不变,elide/截断断点不回流、行文字不跳动)。
     let tx = icon_rect.max.x + 10.0;
     let chip_w = text_w(
         &row_ui,
         &format!("⏎ {}", crate::i18n::s().overlay_key_jump),
         FONT_META,
     ) + 12.0;
-    let text_right = if selected {
-        rect.right() - 10.0 - chip_w
-    } else {
-        rect.right() - 10.0
-    };
+    let text_right = rect.right() - 10.0 - chip_w;
     let mut text_ui = row_ui.new_child(
         egui::UiBuilder::new()
             .max_rect(egui::Rect::from_min_max(
@@ -596,7 +595,7 @@ fn draw_row(
     // 两端,尾部以目录名收束与首行呼应。悬停行 tooltip 给回全路径(见 resp)。
     let path_max_w = text_right - tx;
     let measure = |s: &str| text_w(&row_ui, s, FONT_META);
-    let shown_path = path_display(&entry.path, home_dir().as_deref(), path_max_w, &measure);
+    let shown_path = path_display(&entry.path, home, path_max_w, &measure);
     text_ui.add(
         egui::Label::new(
             egui::RichText::new(shown_path.as_ref())
