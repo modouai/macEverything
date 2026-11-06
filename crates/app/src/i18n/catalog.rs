@@ -84,7 +84,11 @@ catalog! {
     tray_panel_assist_auth: "保存面板助手待授权…" / "Save-Panel Assist Needs Permission…",
     // 保存面板目录助手浮层
     overlay_hint: "输入目录名…" / "Type a directory name…",
+    overlay_input_hint: "输入文字搜索，选择目录回车后自动跳转" / "Type to search; select a folder and press Return to jump",
     overlay_clipboard_hint: "路径已复制，按 ⌘⇧G 后 ⌘V 粘贴" / "Path copied — press ⌘⇧G then ⌘V",
+    overlay_key_select: "选择" / "Select",
+    overlay_key_jump: "跳转" / "Jump",
+    overlay_key_close: "关闭" / "Close",
     update_open_failed: "无法打开下载页" / "Couldn't open the download page",
     update_status_idle: "尚未检查" / "Not checked yet",
     update_status_checking: "正在检查…" / "Checking…",

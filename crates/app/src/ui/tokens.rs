@@ -5,8 +5,14 @@
 
 use eframe::egui;
 
-/// `#RRGGBBAA` → `Color32`。
-fn c(hex: u32) -> egui::Color32 {
+/// `#RRGGBBAA` → `Color32`(入参 u64;**字面量必须恰 8 位**:前 6 位 RGB、后 2 位 alpha)。
+///
+/// 超长字面量会被这里的低位截取**静默**改色——曾两次写出 10 位(多打 FF):
+/// 「半透明黑」→ 不透明近黑(浅色页脚黑条)、「半透明白」→ 不透明黄(深色页脚
+/// 黄条),实机实证 2026-11-06。`debug_assert` 只拦**超过** 8 位(值域无法区分
+/// 「7 位少打」与「8 位前导零」);不足 8 位由两张钉住表(§4.1 + overlay)兜底。
+fn c(hex: u64) -> egui::Color32 {
+    debug_assert!(hex <= 0xFFFF_FFFF, "色值字面量超 8 位(RRGGBBAA): {hex:#X}");
     egui::Color32::from_rgba_unmultiplied(
         ((hex >> 24) & 0xFF) as u8,
         ((hex >> 16) & 0xFF) as u8,
@@ -203,6 +209,98 @@ pub const fn list_h(rows: usize) -> f32 {
     }
 }
 
+/// 保存面板目录助手浮层 token（**几何真源 = `prototype-incontext.html` v2 +
+/// design §3.3 的宽 600**(2026-11-06 实机定版;v1 原型的 420/52/46/32 已作废);
+/// 不透明材质,色值取自 §4.2「完整结果窗口颜色」+ 原型补充的占位/空态/文件夹档)。
+///
+/// 规则同 §4.1：绘制代码只读这里，禁散落色值。
+#[derive(Clone, Copy)]
+pub struct Overlay {
+    /// 面板底（**不透明**;无毛玻璃,内存优先——2026-11-05 用户约束）。
+    pub bg: egui::Color32,
+    /// 面板描边。
+    pub border: egui::Color32,
+    pub divider: egui::Color32,
+    pub search_icon: egui::Color32,
+    /// 查询文本。
+    pub query: egui::Color32,
+    /// 选中行底。
+    pub selected_bg: egui::Color32,
+    /// 目录名（主文本）。
+    pub name: egui::Color32,
+    /// 目录名（选中行,加粗）。
+    pub name_selected: egui::Color32,
+    /// 完整路径（次文本）。
+    pub path: egui::Color32,
+    /// 「⏎ 跳转」动作提示字。
+    pub action_text: egui::Color32,
+    /// 「⏎ 跳转」动作提示底。
+    pub action_bg: egui::Color32,
+    /// 页脚底（§4.2 状态栏底同源）。
+    pub footer_bg: egui::Color32,
+    pub footer_text: egui::Color32,
+    pub keycap_bg: egui::Color32,
+    pub keycap_text: egui::Color32,
+    /// 空态文本。
+    pub empty_text: egui::Color32,
+    /// 文件夹 glyph 前身/后标签（自绘矢量两段式;内存优先不用 NSWorkspace 图标
+    /// 纹理,推翻 v1 原型「实现走系统真实图标」路线）。前身 = v2 原型单色
+    /// （浅 0x5CA6EE/深 0x4E9BE8);后标签 = 实现派生（前身同色系加深,无原型出处,
+    /// 现值由钉住测试看守)。
+    pub folder_front: egui::Color32,
+    pub folder_back: egui::Color32,
+}
+
+pub fn overlay(is_dark: bool) -> Overlay {
+    if is_dark {
+        Overlay {
+            bg: c(0x1A1D22FF),
+            border: c(0xFFFFFF1F),
+            divider: c(0xFFFFFF14),
+            search_icon: c(0x8B929AFF),
+            query: c(0xF2F4F7FF),
+            selected_bg: c(0xFFFFFF1F),
+            name: c(0xE4E7EBFF),
+            name_selected: c(0xFFFFFFFF),
+            path: c(0x8B929AFF),
+            action_text: c(0xC6CBD1FF),
+            // 半透明白三件套曾误写 10 位字面量(多打 FF),c() 解码成不透明黄色
+            // (深色页脚黄条实证 2026-11-06);与浅色三件套同病同修。
+            action_bg: c(0xFFFFFF1A),
+            footer_bg: c(0xFFFFFF0A),
+            footer_text: c(0x8B929AFF),
+            keycap_bg: c(0xFFFFFF1A),
+            keycap_text: c(0xC6CBD1FF),
+            empty_text: c(0x6D757EFF),
+            folder_front: c(0x4E9BE8FF),
+            folder_back: c(0x3D87D6FF),
+        }
+    } else {
+        Overlay {
+            bg: c(0xFFFFFFFF),
+            border: c(0x0F172A1F),
+            divider: c(0x00000012),
+            search_icon: c(0x6B7280FF),
+            query: c(0x1A1D22FF),
+            selected_bg: c(0x5B6FD91F),
+            name: c(0x1F242BFF),
+            name_selected: c(0x14181EFF),
+            path: c(0x5F6774FF),
+            action_text: c(0x4B5563FF),
+            // 半透明黑三件套曾误写 10 位十六进制字面量(多打 FF),c() 解码成
+            // **不透明近黑**——浮层页脚整条呈黑色(实证 2026-11-06)。钉住测试防再犯。
+            action_bg: c(0x0000000F),
+            footer_bg: c(0x00000005),
+            footer_text: c(0x5F6774FF),
+            keycap_bg: c(0x0000000D),
+            keycap_text: c(0x4B5563FF),
+            empty_text: c(0x9AA2ADFF),
+            folder_front: c(0x5CA6EEFF),
+            folder_back: c(0x4A94E4FF),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,13 +401,75 @@ mod tests {
         for (i, (dark_val, dark_hex, light_hex, name)) in rows.iter().enumerate() {
             assert_eq!(
                 dark_val.to_array(),
-                c(*dark_hex).to_array(),
+                c(u64::from(*dark_hex)).to_array(),
                 "{name} 深色值不符 §4.1"
             );
             assert_eq!(
                 light[i].to_array(),
-                c(*light_hex).to_array(),
+                c(u64::from(*light_hex)).to_array(),
                 "{name} 浅色值不符 §4.1"
+            );
+        }
+    }
+
+    /// 钉住：浮层 token 与定版真源逐项相等(几何与色值 = `prototype-incontext.html`
+    /// v2 + design §3.3;例外:`folder_back` 为实现派生色,见 `Overlay` 字段注释)。
+    /// 回归背景：浅色半透明黑三件套曾误写 10 位字面量 → c() 解码成不透明近黑
+    /// （页脚黑条，实机取证 2026-11-06）；整表钉死。
+    #[test]
+    fn overlay_tokens_match_spec_table() {
+        let dark = overlay(true);
+        let light = overlay(false);
+        let light_vals: [egui::Color32; 18] = [
+            light.bg,
+            light.border,
+            light.divider,
+            light.search_icon,
+            light.query,
+            light.selected_bg,
+            light.name,
+            light.name_selected,
+            light.path,
+            light.action_text,
+            light.action_bg,
+            light.footer_bg,
+            light.footer_text,
+            light.keycap_bg,
+            light.keycap_text,
+            light.empty_text,
+            light.folder_front,
+            light.folder_back,
+        ];
+        let rows: [(egui::Color32, u64, u64, &str); 18] = [
+            (dark.bg, 0x1A1D22FF, 0xFFFFFFFF, "面板底"),
+            (dark.border, 0xFFFFFF1F, 0x0F172A1F, "面板描边"),
+            (dark.divider, 0xFFFFFF14, 0x00000012, "分隔线"),
+            (dark.search_icon, 0x8B929AFF, 0x6B7280FF, "搜索图标"),
+            (dark.query, 0xF2F4F7FF, 0x1A1D22FF, "查询文本"),
+            (dark.selected_bg, 0xFFFFFF1F, 0x5B6FD91F, "选中行底"),
+            (dark.name, 0xE4E7EBFF, 0x1F242BFF, "目录名"),
+            (dark.name_selected, 0xFFFFFFFF, 0x14181EFF, "目录名(选中)"),
+            (dark.path, 0x8B929AFF, 0x5F6774FF, "完整路径"),
+            (dark.action_text, 0xC6CBD1FF, 0x4B5563FF, "动作提示字"),
+            (dark.action_bg, 0xFFFFFF1A, 0x0000000F, "动作提示底"),
+            (dark.footer_bg, 0xFFFFFF0A, 0x00000005, "页脚底"),
+            (dark.footer_text, 0x8B929AFF, 0x5F6774FF, "页脚文字"),
+            (dark.keycap_bg, 0xFFFFFF1A, 0x0000000D, "键帽底"),
+            (dark.keycap_text, 0xC6CBD1FF, 0x4B5563FF, "键帽文字"),
+            (dark.empty_text, 0x6D757EFF, 0x9AA2ADFF, "空态文本"),
+            (dark.folder_front, 0x4E9BE8FF, 0x5CA6EEFF, "文件夹前身"),
+            (dark.folder_back, 0x3D87D6FF, 0x4A94E4FF, "文件夹后标签"),
+        ];
+        for (i, (val, dark_hex, light_hex, name)) in rows.iter().enumerate() {
+            assert_eq!(
+                val.to_array(),
+                c(*dark_hex).to_array(),
+                "{name} 深色值不符浮层定版表"
+            );
+            assert_eq!(
+                light_vals[i].to_array(),
+                c(*light_hex).to_array(),
+                "{name} 浅色值不符浮层定版表"
             );
         }
     }

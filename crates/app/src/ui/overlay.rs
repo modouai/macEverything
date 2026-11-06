@@ -14,6 +14,7 @@ use client::DaemonPaths;
 use crate::i18n;
 use crate::session::Session;
 use crate::ui::palette;
+use crate::ui::tokens;
 
 /// 防抖窗口(与悬浮条同值 60ms)。
 const DEBOUNCE: Duration = Duration::from_millis(60);
@@ -26,10 +27,32 @@ pub(crate) fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("overlay")
 }
 
-/// 浮层尺寸(逻辑像素;窗口大小)。
-pub const OVERLAY_W: f32 = 420.0;
+/// 浮层尺寸(逻辑像素;窗口大小。高度自适应时由平台层按
+/// `overlay_layout::overlay_frame` 返回值 setContentSize)。
+pub const OVERLAY_W: f32 = 600.0;
 pub const OVERLAY_H: f32 = 300.0;
-pub const ROW_H: f32 = 26.0;
+/// 结果行高(两行文本)。
+const ROW_H: f32 = 44.0;
+/// 搜索行高。
+const SEARCH_H: f32 = 50.0;
+/// 页脚高。
+const FOOTER_H: f32 = 30.0;
+/// 面板圆角(视觉原型 v1)。
+const PANEL_RADIUS: u8 = 12;
+/// 搜索行内边距/图标/间距(视觉原型 v1)。
+const SEARCH_PAD_X: f32 = 16.0;
+const SEARCH_ICON: f32 = 15.0;
+const SEARCH_GAP: f32 = 10.0;
+/// 结果行文件夹 glyph 尺寸。
+const FOLDER_W: f32 = 24.0;
+const FOLDER_H: f32 = 19.0;
+/// 页脚左右内边距。
+const FOOTER_PAD_X: f32 = 14.0;
+/// 字号(视觉原型 v1):查询 15 / 目录名 13 / 次文本与键帽标签 11。
+const FONT_QUERY: f32 = 15.0;
+const FONT_NAME: f32 = 13.0;
+const FONT_META: f32 = 11.0;
+const FONT_KEYCAP: f32 = 10.0;
 
 /// 按键决策涉及的键(纯逻辑用;绘制层从 `egui::Key` 映射)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +248,9 @@ impl OverlayState {
                 .take(DISPLAY_LIMIT)
                 .collect();
             self.selected = 0;
-            self.scroll_to_selected = false;
+            // 新结果回填 = 新列表:滚动复位到首行(否则清空重搜后视口停在
+            // 上次滚到的位置;实机 2026-11-05)。
+            self.scroll_to_selected = true;
         }
     }
 
@@ -261,14 +286,45 @@ impl OverlayState {
 }
 
 /// 绘制(ui/mod.rs 的 show_viewport_deferred 回调调用;短锁取 state 后绘制)。
-/// 键盘:↑↓ 改选中、Enter 置 commit_requested、Esc 置 dismiss_requested;
+/// 视觉:`docs/specs/overlay-visual/`(原型 v1/v2 定版;不透明材质,色板
+/// tokens::overlay = 完整结果窗口色板)。结构:面板 chrome → 搜索行 → 分隔线 →
+/// 结果区(两行文本 + 文件夹 glyph + 选中行「↵ 跳转」提示)→ 页脚(结果数 +
+/// 键帽组)。键盘:↑↓ 改选中、Enter 置 commit_requested、Esc 置 dismiss_requested;
 /// 行点击选中、双击 = 选中 + commit_requested。
 pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     let strings = i18n::s();
-    ui.add_space(8.0);
-
-    // IME 组合态须在读取本帧事件前跟踪(选字回车与 Commit 同帧到达,见 track_ime)。
+    let dark = ui.ctx().theme() == egui::Theme::Dark;
+    let t = tokens::overlay(dark);
+    let home = home_dir(); // 家目录预取:每帧一次(路径行 ~ 压缩;读不到 = 不压缩)
     st.track_ime(ui);
+
+    // —— 面板 chrome:不透明底 + 描边(窗口 clear_color 全透明,圆角外露桌面)——
+    let panel_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(panel_rect, egui::CornerRadius::same(PANEL_RADIUS), t.bg);
+    ui.painter().rect_stroke(
+        panel_rect,
+        egui::CornerRadius::same(PANEL_RADIUS),
+        egui::Stroke::new(1.0, t.border),
+        egui::StrokeKind::Inside,
+    );
+
+    // —— 搜索行(高 50;左 16 + 图标 15 + 间距 10;右 16)——
+    let (search_rect, _) = ui.allocate_exact_size(
+        egui::vec2(panel_rect.width(), SEARCH_H),
+        egui::Sense::hover(),
+    );
+    draw_search_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(
+                search_rect.left() + SEARCH_PAD_X + SEARCH_ICON / 2.0,
+                search_rect.center().y,
+            ),
+            egui::vec2(SEARCH_ICON, SEARCH_ICON),
+        ),
+        t.search_icon,
+    );
 
     // 固定 id + **仅在未聚焦时**请求焦点:egui 的 `request_focus` 文档明确
     // 「Calling this will interrupt IME composition」——每帧调用会每帧打断
@@ -278,11 +334,22 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     if !ui.memory(|m| m.has_focus(input_id)) {
         ui.memory_mut(|m| m.request_focus(input_id));
     }
-    let input = ui.add(
+    let input_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            search_rect.left() + SEARCH_PAD_X + SEARCH_ICON + SEARCH_GAP,
+            search_rect.top(),
+        ),
+        egui::pos2(search_rect.right() - SEARCH_PAD_X, search_rect.bottom()),
+    );
+    let input = ui.put(
+        input_rect,
         egui::TextEdit::singleline(&mut st.input)
             .id(input_id)
-            .hint_text(strings.overlay_hint)
-            .desired_width(f32::INFINITY),
+            .font(crate::ui::font::id(FONT_QUERY))
+            .text_color(t.query)
+            .frame(egui::Frame::NONE)
+            .align(egui::Align2::LEFT_CENTER)
+            .hint_text(strings.overlay_input_hint),
     );
     // 组合中的预编辑文本不触发查询(IME 未上屏;提交帧 composing 已复位,照常查询)。
     // 实机(2026-11-05):中文输入法输入 ASCII 时首帧有 Preedit 事件把 composing
@@ -348,41 +415,106 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
         }
     }
 
-    if st.clipboard_hint {
-        ui.add_space(2.0);
-        ui.add(egui::Label::new(egui::RichText::new(strings.overlay_clipboard_hint).weak()).wrap());
-    }
+    // —— 分隔线 ——
+    draw_divider(ui.painter(), panel_rect, search_rect.bottom(), t.divider);
 
-    ui.add_space(4.0);
+    // —— 页脚(高 30;底缘圆角与面板同半径-1;结果数 + 键帽组)——
+    egui::containers::panel::Panel::bottom("ov-footer")
+        .frame(
+            egui::Frame::new()
+                .fill(t.footer_bg)
+                .inner_margin(egui::Margin::symmetric(
+                    FOOTER_PAD_X as i8,
+                    ((FOOTER_H - 18.0) / 2.0) as i8,
+                ))
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: PANEL_RADIUS - 1,
+                    se: PANEL_RADIUS - 1,
+                }),
+        )
+        .show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.add_space(FOOTER_PAD_X);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(i18n::format::total_items(st.results.len() as u32))
+                        .font(crate::ui::font::id(FONT_META))
+                        .color(t.footer_text),
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(FOOTER_PAD_X);
+                    key_group(ui, &t, strings.overlay_key_close, "esc");
+                    key_group(ui, &t, strings.overlay_key_jump, "⏎");
+                    key_group(ui, &t, strings.overlay_key_select, "↑↓");
+                });
+            });
+        });
+
+    // —— 结果区(剩余高度;两行文本行 + 空态)——
     let mut clicked_row = None;
     let mut commit = false;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
+            if st.clipboard_hint {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(strings.overlay_clipboard_hint)
+                            .font(crate::ui::font::id(FONT_META))
+                            .color(t.path),
+                    )
+                    .truncate(),
+                );
+                ui.add_space(2.0);
+            }
             if st.results.is_empty() {
-                if !st.input.is_empty() {
-                    ui.add_space(6.0);
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(strings.empty_no_match).weak(),
-                    ));
-                }
+                // 空输入 = 引导态;有输入无匹配 = 无匹配态。居中 ghost + 文案。
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(14.0);
+                        let (ghost, _) =
+                            ui.allocate_exact_size(egui::vec2(40.0, 26.0), egui::Sense::hover());
+                        ui.painter().rect_stroke(
+                            ghost,
+                            6.0,
+                            egui::Stroke::new(1.5, t.empty_text),
+                            egui::StrokeKind::Middle,
+                        );
+                        ui.add_space(8.0);
+                        let text = if st.input.is_empty() {
+                            strings.overlay_hint
+                        } else {
+                            strings.empty_no_match
+                        };
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(text)
+                                .font(crate::ui::font::id(FONT_META))
+                                .color(t.empty_text),
+                        ));
+                    });
+                });
                 return;
             }
-            for (i, entry) in st.results.iter().enumerate() {
-                let response = draw_row(ui, entry, i == st.selected);
-                // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
-                if i == st.selected && st.scroll_to_selected {
-                    ui.scroll_to_rect(response.rect, None);
-                }
-                if response.clicked() {
-                    clicked_row = Some(i);
-                }
-                if response.double_clicked() {
-                    clicked_row = Some(i);
-                    commit = true;
-                }
-            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (i, entry) in st.results.iter().enumerate() {
+                        let response = draw_row(ui, entry, i == st.selected, &t, home.as_deref());
+                        // 键盘移动后跟随滚动(与悬浮条同款):选中行必须留在可视区内。
+                        if i == st.selected && st.scroll_to_selected {
+                            ui.scroll_to_rect(response.rect, None);
+                        }
+                        if response.clicked() {
+                            clicked_row = Some(i);
+                        }
+                        if response.double_clicked() {
+                            clicked_row = Some(i);
+                            commit = true;
+                        }
+                    }
+                });
         });
     st.scroll_to_selected = false; // 本帧已消费(点击/查询回填同样不重复滚动)
     if let Some(i) = clicked_row {
@@ -395,29 +527,261 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     }
 }
 
-/// 单行:选中底色 + 「目录名 — 完整路径」(单行截断);整行可点击。
-fn draw_row(ui: &mut egui::Ui, entry: &HitEntry, selected: bool) -> egui::Response {
-    let width = ui.available_width();
-    let fill = if selected {
-        ui.visuals().selection.bg_fill
-    } else {
-        egui::Color32::TRANSPARENT
+/// 单行(两行文本):文件夹 glyph + 目录名(主)/完整路径(次);
+/// 选中 = 选中底 + 目录名加粗 + 右端「⏎ 跳转」提示(宽度恒预留)。整行可点击,
+/// 悬停 tooltip 回完整路径。home = 预取的家目录(show_overlay 每帧一次)。
+fn draw_row(
+    ui: &mut egui::Ui,
+    entry: &HitEntry,
+    selected: bool,
+    t: &tokens::Overlay,
+    home: Option<&str>,
+) -> egui::Response {
+    // 占位分配(拿 y 与点击响应)。行高**精确锁定** ROW_H:内容(字体缩放/加粗/
+    // 选中 chip)再高也只在该矩形内绘制——Frame 自动尺寸会被两行文本撑高,
+    // 造成「首行比其他行高」(实机 2026-11-05;悬浮条行同款固定高度模式)。
+    let (slot, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_H),
+        egui::Sense::click(),
+    );
+    let rect = egui::Rect::from_min_size(slot.min, egui::vec2(slot.width(), ROW_H));
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    row_ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(8),
+        if selected {
+            t.selected_bg
+        } else {
+            egui::Color32::TRANSPARENT
+        },
+    );
+    // 文件夹 glyph(矢量两段;内存优先,不落 NSWorkspace 图标纹理)。
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 10.0 + FOLDER_W / 2.0, rect.center().y),
+        egui::vec2(FOLDER_W, FOLDER_H),
+    );
+    draw_folder_glyph(row_ui.painter(), icon_rect, t);
+    // 文本列(图标右 + 10;**动作提示宽度恒预留**(未选行也扣 chip_w):
+    // 选中切换时文本宽不变,elide/截断断点不回流、行文字不跳动)。
+    let tx = icon_rect.max.x + 10.0;
+    let chip_w = text_w(
+        &row_ui,
+        &format!("⏎ {}", crate::i18n::s().overlay_key_jump),
+        FONT_META,
+    ) + 12.0;
+    let text_right = rect.right() - 10.0 - chip_w;
+    let mut text_ui = row_ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(
+                egui::pos2(tx, rect.top()),
+                egui::pos2(text_right, rect.bottom()),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    text_ui.add(
+        egui::Label::new(
+            egui::RichText::new(&entry.name)
+                .font(crate::ui::font::id(FONT_NAME))
+                .color(if selected { t.name_selected } else { t.name }),
+        )
+        .truncate(),
+    );
+    // 路径行显示:家目录压缩(~)→ 仍超宽才中段省略(头锚点+…+尾)。宽度 600
+    // 定版后深路径常态溢出,尾部截断会先切掉最有区分度的深层目录;中段保留
+    // 两端,尾部以目录名收束与首行呼应。悬停行 tooltip 给回全路径(见 resp)。
+    let path_max_w = text_right - tx;
+    let measure = |s: &str| text_w(&row_ui, s, FONT_META);
+    let shown_path = path_display(&entry.path, home, path_max_w, &measure);
+    text_ui.add(
+        egui::Label::new(
+            egui::RichText::new(shown_path.as_ref())
+                .font(crate::ui::font::id(FONT_META))
+                .color(t.path),
+        )
+        .truncate(), // 兜底;经 elide_middle 的串已恰好放得下,理论不触发
+    );
+    // 选中行的动作提示 chip(右端;画在行矩形内右侧,垂直居中)。
+    if selected {
+        let chip_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 10.0 - chip_w / 2.0, rect.center().y),
+            egui::vec2(chip_w, 20.0),
+        );
+        row_ui.painter().rect_filled(chip_rect, 5.0, t.action_bg);
+        row_ui.painter().text(
+            chip_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("⏎ {}", crate::i18n::s().overlay_key_jump),
+            crate::ui::font::id(FONT_META),
+            t.action_text,
+        );
+    }
+    resp.on_hover_text(entry.path.clone()) // 悬停回全路径:中段省略的信息找回口
+}
+
+/// 行内文本宽测量(键帽/动作提示排版用;悬浮条 text_w 同款)。
+fn text_w(ui: &egui::Ui, text: &str, base: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            crate::ui::font::id(base),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
+}
+
+// —— 长路径显示(product 2026-11-06 定版):家目录压缩(~)→ 中段省略 ——
+//
+// 数据层零改动:压缩/省略只发生在显示串,复制/跳转/tooltip 永远用全路径。
+
+/// 家目录(仅显示压缩用;读不到返回 None,不压缩)。
+fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok().filter(|h| h.starts_with('/'))
+}
+
+/// 家目录前缀压缩为 `~`(macOS Finder 惯例):`/Users/x/a` → `~/a`;
+/// 恰为家目录 → `~`;不在家目录下 → 原样。
+fn compact_home<'a>(path: &'a str, home: Option<&str>) -> std::borrow::Cow<'a, str> {
+    let Some(home) = home else {
+        return std::borrow::Cow::Borrowed(path);
     };
-    let response = egui::Frame::new()
-        .fill(fill)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.set_min_width((width - 12.0).max(0.0));
-            ui.set_min_height(ROW_H - 4.0);
-            ui.horizontal_centered(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&entry.name).strong()).truncate());
-                ui.add(egui::Label::new(egui::RichText::new("—").weak()));
-                ui.add(egui::Label::new(egui::RichText::new(&entry.path).weak()).truncate());
-            });
-        })
-        .response;
-    response.interact(egui::Sense::click())
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    if path == home {
+        return std::borrow::Cow::Owned("~".into());
+    }
+    if let Some(rest) = path.strip_prefix(home).filter(|r| r.starts_with('/')) {
+        return std::borrow::Cow::Owned(format!("~{rest}"));
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// 中段省略:保留头部锚点(以 `/` 结尾且宽 ≤ 上限 1/4 的最长前缀)+「…」+
+/// 尾部,二分尾长至恰好放得下。`None` = 原样即可(放得下,或连「锚点+…」
+/// 都放不下的极端窄行——交回调用方的尾部截断兜底)。同串同宽必得同结果。
+fn elide_middle(text: &str, max_w: f32, measure: &dyn Fn(&str) -> f32) -> Option<String> {
+    if measure(text) <= max_w {
+        return None;
+    }
+    const ELL: &str = "…";
+    let ell_w = measure(ELL);
+    let chars: Vec<char> = text.chars().collect();
+    // 头部锚点:从长到短找以 `/` 结尾且放得进 1/4 宽的前缀;没有则空头。
+    let mut head_end = 0usize;
+    for i in (1..=chars.len()).rev() {
+        if chars[i - 1] != '/' {
+            continue;
+        }
+        let prefix: String = chars[..i].iter().collect();
+        if measure(&prefix) <= max_w * 0.25 {
+            head_end = i;
+            break;
+        }
+    }
+    let head: String = chars[..head_end].iter().collect();
+    let head_w = measure(&head);
+    if head_w + ell_w > max_w {
+        return None;
+    }
+    // 二分尾长 b:不变量 b=lo 放得下、b=hi 放不下。hi 初值 = 头后全部字符
+    // (head+…+全尾 比原文更长 ⇒ 必超);lo 初值 0 已由上面的锚点检查保证放得下。
+    let mut lo = 0usize;
+    let mut hi = chars.len() - head_end;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        let s: String = head
+            .chars()
+            .chain(ELL.chars())
+            .chain(chars[chars.len() - mid..].iter().copied())
+            .collect();
+        if measure(&s) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut out = head;
+    out.push_str(ELL);
+    out.extend(chars[chars.len() - lo..].iter());
+    Some(out)
+}
+
+/// 路径行显示串:家目录压缩 → 仍超宽才中段省略。
+fn path_display<'a>(
+    path: &'a str,
+    home: Option<&str>,
+    max_w: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> std::borrow::Cow<'a, str> {
+    let compacted = compact_home(path, home);
+    match elide_middle(&compacted, max_w, measure) {
+        Some(elided) => std::borrow::Cow::Owned(elided),
+        None => compacted,
+    }
+}
+
+/// 分隔线(面板全宽 1px)。
+fn draw_divider(p: &egui::Painter, panel_rect: egui::Rect, y: f32, color: egui::Color32) {
+    p.line_segment(
+        [
+            egui::pos2(panel_rect.left(), y),
+            egui::pos2(panel_rect.right(), y),
+        ],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+/// 文件夹 glyph(矢量两段:后标签 + 前身;macOS 蓝色文件夹示意;零纹理内存)。
+fn draw_folder_glyph(p: &egui::Painter, rect: egui::Rect, t: &tokens::Overlay) {
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(1.0, 0.0),
+            egui::vec2(11.0, 4.5),
+        ),
+        egui::CornerRadius::same(2),
+        t.folder_back,
+    );
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            rect.left_bottom() + egui::vec2(0.0, -15.0),
+            egui::vec2(rect.width(), 15.0),
+        ),
+        egui::CornerRadius::same(3),
+        t.folder_front,
+    );
+}
+
+/// 搜索图标(⌕;悬浮条 §5.2 同款形态,5 行复制以维持模块自洽)。
+fn draw_search_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6, color);
+    let c = rect.center() - egui::vec2(1.5, 1.5);
+    p.circle_stroke(c, 5.5, stroke);
+    p.line_segment([c + egui::vec2(4.0, 4.0), c + egui::vec2(8.0, 8.0)], stroke);
+}
+
+/// 键帽组:标签 + 键帽(底:圆角 4;悬浮条页脚同族)。
+fn key_group(ui: &mut egui::Ui, t: &tokens::Overlay, label: &str, key: &str) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(label)
+            .font(crate::ui::font::id(FONT_META))
+            .color(t.keycap_text),
+    ));
+    let key_w = text_w(ui, key, FONT_KEYCAP) + 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(key_w, 18.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 4.0, t.keycap_bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        key,
+        crate::ui::font::id(FONT_KEYCAP),
+        t.keycap_text,
+    );
 }
 
 /// app 包判定:目录名以 `.app` 结尾,或路径位于某个 `.app` 包内部(Contents 等)。
@@ -446,6 +810,126 @@ mod app_bundle_tests {
             "非 .app 后缀"
         );
         assert!(!is_app_bundle("文档", "/Users/me/文档"));
+    }
+}
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::{compact_home, elide_middle, path_display};
+
+    /// 假测宽:每字符恒宽 10。让宽度断言可精确手算(中英混排的真实测宽
+    /// 由 draw_row 的 text_w 承担,这里只钉算法)。
+    fn fake(s: &str) -> f32 {
+        s.chars().count() as f32 * 10.0
+    }
+
+    #[test]
+    fn compact_home_prefix_rules() {
+        assert_eq!(compact_home("/Users/bob/a/b", Some("/Users/bob")), "~/a/b");
+        assert_eq!(compact_home("/Users/bob", Some("/Users/bob")), "~");
+        assert_eq!(
+            compact_home("/Users/bob/a", Some("/Users/bob/")),
+            "~/a",
+            "家目录尾斜杠应容忍"
+        );
+        assert_eq!(
+            compact_home("/Users/bobx/a", Some("/Users/bob")),
+            "/Users/bobx/a",
+            "仅前缀同名不算家目录内"
+        );
+        assert_eq!(
+            compact_home("/Volumes/ssd/x", Some("/Users/bob")),
+            "/Volumes/ssd/x"
+        );
+        assert_eq!(compact_home("/Users/bob/a", None), "/Users/bob/a");
+    }
+
+    #[test]
+    fn elide_middle_fits_unchanged() {
+        assert!(elide_middle("abc", 40.0, &fake).is_none());
+        assert!(
+            elide_middle("abcdef", 60.0, &fake).is_none(),
+            "恰好放得下不算溢出"
+        );
+    }
+
+    #[test]
+    fn elide_middle_keeps_tail_when_no_head() {
+        // 10 字符 100 宽,max 60:头无 `/` → 空;头 0 + … 10 + 尾 b×10 ≤ 60 ⇒ b=5。
+        assert_eq!(
+            elide_middle("abcdefghij", 60.0, &fake).as_deref(),
+            Some("…fghij")
+        );
+    }
+
+    #[test]
+    fn elide_middle_keeps_short_head_and_deep_tail() {
+        // "/ab/x/cd/efgh" 13 字符 130 宽,max 100:锚点上限 25 → "/ab/"(40)超,
+        // "/"(10)入选;二分落点尾 8 字符(恰 100),精确钉死。
+        assert_eq!(
+            elide_middle("/ab/x/cd/efgh", 100.0, &fake).as_deref(),
+            Some("/…/cd/efgh")
+        );
+    }
+
+    #[test]
+    fn elide_middle_exact_split_at_root_anchor() {
+        // 同串 max 120:上限 30 仍只有 "/" 入选;二分落点尾 10 字符(恰 120)。
+        assert_eq!(
+            elide_middle("/ab/x/cd/efgh", 120.0, &fake).as_deref(),
+            Some("/…/x/cd/efgh")
+        );
+    }
+
+    #[test]
+    fn elide_middle_selects_fitting_head() {
+        // "a/b/cdefghijkl" 14 字符 140 宽,max 100:上限 25 → "a/b/"(40)超,
+        // "a/"(20)入选(非根锚点);二分落点尾 7 字符。
+        assert_eq!(
+            elide_middle("a/b/cdefghijkl", 100.0, &fake).as_deref(),
+            Some("a/…fghijkl")
+        );
+    }
+
+    #[test]
+    fn elide_middle_deterministic() {
+        let a = elide_middle("/long/aaa/bbb/ccc/ddd/eee/fff", 90.0, &fake);
+        let b = elide_middle("/long/aaa/bbb/ccc/ddd/eee/fff", 90.0, &fake);
+        assert_eq!(a, b, "同串同宽必得同结果");
+    }
+
+    #[test]
+    fn elide_middle_degenerate_falls_back() {
+        // 极端窄行:连「空锚点+…」都放不下 → None(调用方尾部截断兜底)。
+        assert!(elide_middle("abcdefghij", 8.0, &fake).is_none());
+    }
+
+    #[test]
+    fn path_display_compacts_then_elides() {
+        let home = Some("/Users/bob");
+        // 宽度足够:只压缩,不出省略号。
+        assert_eq!(
+            path_display("/Users/bob/proj/x", home, 1000.0, &fake).as_ref(),
+            "~/proj/x"
+        );
+        // 宽度不足:压缩后再中段省略(手算:/Users/bob/proj/deep/x → 13 字符
+        // 130 宒,max 100 → "~/​…/deep/x" 恰 100)。
+        let out = path_display("/Users/bob/proj/deep/x", home, 100.0, &fake);
+        assert_eq!(out.as_ref(), "~/…/deep/x");
+    }
+
+    #[test]
+    fn path_display_result_never_exceeds_width() {
+        // 一批真实形态的深路径:核心不变量 = 结果必放得下。
+        let paths = [
+            "/Users/bob/Library/Application Support/Google/Chrome/Default/Sessions",
+            "/Volumes/SSD/work/repo/crates/engine/src/benches/data/inner",
+            "~/very/long/path/that/does/not/fit/anywhere/at/all",
+        ];
+        for p in paths {
+            let out = path_display(p, Some("/Users/bob"), 70.0, &fake);
+            assert!(fake(out.as_ref()) <= 70.0, "{p} → {out} 超宽");
+        }
     }
 }
 

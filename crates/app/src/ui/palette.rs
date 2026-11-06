@@ -654,7 +654,9 @@ impl PaletteState {
                 self.stat_ms = stat_ms;
                 self.selected = 0;
                 self.visible_rows = ROWS_INITIAL;
-                self.scroll_to_selected = false;
+                // 新结果回填 = 新列表:滚动复位到首行(否则清空重搜后视口停在
+                // 上次滚到的位置,用户看不到首行;实机 2026-11-05)。
+                self.scroll_to_selected = true;
                 if offline {
                     self.session.mark_offline(); // 结果来自落盘索引
                 } else {
