@@ -5,8 +5,13 @@
 
 use eframe::egui;
 
-/// `#RRGGBBAA` → `Color32`(入参 u64:占位色等 9 位十六进制字面量直接可写)。
+/// `#RRGGBBAA` → `Color32`(入参 u64;**字面量必须恰 8 位**:前 6 位 RGB、后 2 位 alpha)。
+///
+/// 超长字面量会被这里的低位截取**静默**改色——曾两次写出 10 位(多打 FF):
+/// 「半透明黑」→ 不透明近黑(浅色页脚黑条)、「半透明白」→ 不透明黄(深色页脚
+/// 黄条),实机实证 2026-11-06。`debug_assert` 在开发构建直接 panic,钉住测试兜底。
 fn c(hex: u64) -> egui::Color32 {
+    debug_assert!(hex <= 0xFFFF_FFFF, "色值字面量超 8 位(RRGGBBAA): {hex:#X}");
     egui::Color32::from_rgba_unmultiplied(
         ((hex >> 24) & 0xFF) as u8,
         ((hex >> 16) & 0xFF) as u8,
@@ -254,10 +259,12 @@ pub fn overlay(is_dark: bool) -> Overlay {
             name_selected: c(0xFFFFFFFF),
             path: c(0x8B929AFF),
             action_text: c(0xC6CBD1FF),
-            action_bg: c(0xFFFFFF1AFF),
-            footer_bg: c(0xFFFFFF0AFF),
+            // 半透明白三件套曾误写 10 位字面量(多打 FF),c() 解码成不透明黄色
+            // (深色页脚黄条实证 2026-11-06);与浅色三件套同病同修。
+            action_bg: c(0xFFFFFF1A),
+            footer_bg: c(0xFFFFFF0A),
             footer_text: c(0x8B929AFF),
-            keycap_bg: c(0xFFFFFF1AFF),
+            keycap_bg: c(0xFFFFFF1A),
             keycap_text: c(0xC6CBD1FF),
             empty_text: c(0x6D757EFF),
             folder_front: c(0x4E9BE8FF),
@@ -438,10 +445,10 @@ mod tests {
             (dark.name_selected, 0xFFFFFFFF, 0x14181EFF, "目录名(选中)"),
             (dark.path, 0x8B929AFF, 0x5F6774FF, "完整路径"),
             (dark.action_text, 0xC6CBD1FF, 0x4B5563FF, "动作提示字"),
-            (dark.action_bg, 0xFFFFFF1AFF, 0x0000000F, "动作提示底"),
-            (dark.footer_bg, 0xFFFFFF0AFF, 0x00000005, "页脚底"),
+            (dark.action_bg, 0xFFFFFF1A, 0x0000000F, "动作提示底"),
+            (dark.footer_bg, 0xFFFFFF0A, 0x00000005, "页脚底"),
             (dark.footer_text, 0x8B929AFF, 0x5F6774FF, "页脚文字"),
-            (dark.keycap_bg, 0xFFFFFF1AFF, 0x0000000D, "键帽底"),
+            (dark.keycap_bg, 0xFFFFFF1A, 0x0000000D, "键帽底"),
             (dark.keycap_text, 0xC6CBD1FF, 0x4B5563FF, "键帽文字"),
             (dark.empty_text, 0x6D757EFF, 0x9AA2ADFF, "空态文本"),
             (dark.folder_front, 0x4E9BE8FF, 0x5CA6EEFF, "文件夹前身"),
