@@ -591,13 +591,19 @@ fn draw_row(
         )
         .truncate(),
     );
+    // 路径行显示:家目录压缩(~)→ 仍超宽才中段省略(头锚点+…+尾)。宽度 600
+    // 定版后深路径常态溢出,尾部截断会先切掉最有区分度的深层目录;中段保留
+    // 两端,尾部以目录名收束与首行呼应。悬停行 tooltip 给回全路径(见 resp)。
+    let path_max_w = text_right - tx;
+    let measure = |s: &str| text_w(&row_ui, s, FONT_META);
+    let shown_path = path_display(&entry.path, home_dir().as_deref(), path_max_w, &measure);
     text_ui.add(
         egui::Label::new(
-            egui::RichText::new(&entry.path)
+            egui::RichText::new(shown_path.as_ref())
                 .font(crate::ui::font::id(FONT_META))
                 .color(t.path),
         )
-        .truncate(),
+        .truncate(), // 兜底;经 elide_middle 的串已恰好放得下,理论不触发
     );
     // 选中行的动作提示 chip(右端;画在行矩形内右侧,垂直居中)。
     if selected {
@@ -614,7 +620,7 @@ fn draw_row(
             t.action_text,
         );
     }
-    resp
+    resp.on_hover_text(entry.path.clone()) // 悬停回全路径:中段省略的信息找回口
 }
 
 /// 行内文本宽测量(键帽/动作提示排版用;悬浮条 text_w 同款)。
@@ -627,6 +633,98 @@ fn text_w(ui: &egui::Ui, text: &str, base: f32) -> f32 {
         )
         .size()
         .x
+}
+
+// —— 长路径显示(product 2026-11-06 定版):家目录压缩(~)→ 中段省略 ——
+//
+// 数据层零改动:压缩/省略只发生在显示串,复制/跳转/tooltip 永远用全路径。
+
+/// 家目录(仅显示压缩用;读不到返回 None,不压缩)。
+fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok().filter(|h| h.starts_with('/'))
+}
+
+/// 家目录前缀压缩为 `~`(macOS Finder 惯例):`/Users/x/a` → `~/a`;
+/// 恰为家目录 → `~`;不在家目录下 → 原样。
+fn compact_home<'a>(path: &'a str, home: Option<&str>) -> std::borrow::Cow<'a, str> {
+    let Some(home) = home else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    if path == home {
+        return std::borrow::Cow::Owned("~".into());
+    }
+    if let Some(rest) = path.strip_prefix(home).filter(|r| r.starts_with('/')) {
+        return std::borrow::Cow::Owned(format!("~{rest}"));
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// 中段省略:保留头部锚点(以 `/` 结尾且宽 ≤ 上限 1/4 的最长前缀)+「…」+
+/// 尾部,二分尾长至恰好放得下。`None` = 原样即可(放得下,或连「锚点+…」
+/// 都放不下的极端窄行——交回调用方的尾部截断兜底)。同串同宽必得同结果。
+fn elide_middle(text: &str, max_w: f32, measure: &dyn Fn(&str) -> f32) -> Option<String> {
+    if measure(text) <= max_w {
+        return None;
+    }
+    const ELL: &str = "…";
+    let ell_w = measure(ELL);
+    let chars: Vec<char> = text.chars().collect();
+    // 头部锚点:从长到短找以 `/` 结尾且放得进 1/4 宽的前缀;没有则空头。
+    let mut head_end = 0usize;
+    for i in (1..=chars.len()).rev() {
+        if chars[i - 1] != '/' {
+            continue;
+        }
+        let prefix: String = chars[..i].iter().collect();
+        if measure(&prefix) <= max_w * 0.25 {
+            head_end = i;
+            break;
+        }
+    }
+    let head: String = chars[..head_end].iter().collect();
+    let head_w = measure(&head);
+    if head_w + ell_w > max_w {
+        return None;
+    }
+    // 二分尾长 b:不变量 b=lo 放得下、b=hi 放不下。hi 初值 = 头后全部字符
+    // (head+…+全尾 比原文更长 ⇒ 必超);lo 初值 0 已由上面的锚点检查保证放得下。
+    let mut lo = 0usize;
+    let mut hi = chars.len() - head_end;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        let s: String = head
+            .chars()
+            .chain(ELL.chars())
+            .chain(chars[chars.len() - mid..].iter().copied())
+            .collect();
+        if measure(&s) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut out = head;
+    out.push_str(ELL);
+    out.extend(chars[chars.len() - lo..].iter());
+    Some(out)
+}
+
+/// 路径行显示串:家目录压缩 → 仍超宽才中段省略。
+fn path_display<'a>(
+    path: &'a str,
+    home: Option<&str>,
+    max_w: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> std::borrow::Cow<'a, str> {
+    let compacted = compact_home(path, home);
+    match elide_middle(&compacted, max_w, measure) {
+        Some(elided) => std::borrow::Cow::Owned(elided),
+        None => compacted,
+    }
 }
 
 /// 分隔线(面板全宽 1px)。
@@ -713,6 +811,126 @@ mod app_bundle_tests {
             "非 .app 后缀"
         );
         assert!(!is_app_bundle("文档", "/Users/me/文档"));
+    }
+}
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::{compact_home, elide_middle, path_display};
+
+    /// 假测宽:每字符恒宽 10。让宽度断言可精确手算(中英混排的真实测宽
+    /// 由 draw_row 的 text_w 承担,这里只钉算法)。
+    fn fake(s: &str) -> f32 {
+        s.chars().count() as f32 * 10.0
+    }
+
+    #[test]
+    fn compact_home_prefix_rules() {
+        assert_eq!(compact_home("/Users/bob/a/b", Some("/Users/bob")), "~/a/b");
+        assert_eq!(compact_home("/Users/bob", Some("/Users/bob")), "~");
+        assert_eq!(
+            compact_home("/Users/bob/a", Some("/Users/bob/")),
+            "~/a",
+            "家目录尾斜杠应容忍"
+        );
+        assert_eq!(
+            compact_home("/Users/bobx/a", Some("/Users/bob")),
+            "/Users/bobx/a",
+            "仅前缀同名不算家目录内"
+        );
+        assert_eq!(
+            compact_home("/Volumes/ssd/x", Some("/Users/bob")),
+            "/Volumes/ssd/x"
+        );
+        assert_eq!(compact_home("/Users/bob/a", None), "/Users/bob/a");
+    }
+
+    #[test]
+    fn elide_middle_fits_unchanged() {
+        assert!(elide_middle("abc", 40.0, &fake).is_none());
+        assert!(
+            elide_middle("abcdef", 60.0, &fake).is_none(),
+            "恰好放得下不算溢出"
+        );
+    }
+
+    #[test]
+    fn elide_middle_keeps_tail_when_no_head() {
+        // 10 字符 100 宽,max 60:头无 `/` → 空;头 0 + … 10 + 尾 b×10 ≤ 60 ⇒ b=5。
+        assert_eq!(
+            elide_middle("abcdefghij", 60.0, &fake).as_deref(),
+            Some("…fghij")
+        );
+    }
+
+    #[test]
+    fn elide_middle_keeps_short_head_and_deep_tail() {
+        // "/ab/x/cd/efgh" 13 字符 130 宽,max 100:锚点上限 25 → "/ab/"(40)超,
+        // "/"(10)入选;二分落点尾 8 字符(恰 100),精确钉死。
+        assert_eq!(
+            elide_middle("/ab/x/cd/efgh", 100.0, &fake).as_deref(),
+            Some("/…/cd/efgh")
+        );
+    }
+
+    #[test]
+    fn elide_middle_exact_split_at_root_anchor() {
+        // 同串 max 120:上限 30 仍只有 "/" 入选;二分落点尾 10 字符(恰 120)。
+        assert_eq!(
+            elide_middle("/ab/x/cd/efgh", 120.0, &fake).as_deref(),
+            Some("/…/x/cd/efgh")
+        );
+    }
+
+    #[test]
+    fn elide_middle_selects_fitting_head() {
+        // "a/b/cdefghijkl" 14 字符 140 宽,max 100:上限 25 → "a/b/"(40)超,
+        // "a/"(20)入选(非根锚点);二分落点尾 7 字符。
+        assert_eq!(
+            elide_middle("a/b/cdefghijkl", 100.0, &fake).as_deref(),
+            Some("a/…fghijkl")
+        );
+    }
+
+    #[test]
+    fn elide_middle_deterministic() {
+        let a = elide_middle("/long/aaa/bbb/ccc/ddd/eee/fff", 90.0, &fake);
+        let b = elide_middle("/long/aaa/bbb/ccc/ddd/eee/fff", 90.0, &fake);
+        assert_eq!(a, b, "同串同宽必得同结果");
+    }
+
+    #[test]
+    fn elide_middle_degenerate_falls_back() {
+        // 极端窄行:连「空锚点+…」都放不下 → None(调用方尾部截断兜底)。
+        assert!(elide_middle("abcdefghij", 8.0, &fake).is_none());
+    }
+
+    #[test]
+    fn path_display_compacts_then_elides() {
+        let home = Some("/Users/bob");
+        // 宽度足够:只压缩,不出省略号。
+        assert_eq!(
+            path_display("/Users/bob/proj/x", home, 1000.0, &fake).as_ref(),
+            "~/proj/x"
+        );
+        // 宽度不足:压缩后再中段省略(手算:/Users/bob/proj/deep/x → 13 字符
+        // 130 宒,max 100 → "~/​…/deep/x" 恰 100)。
+        let out = path_display("/Users/bob/proj/deep/x", home, 100.0, &fake);
+        assert_eq!(out.as_ref(), "~/…/deep/x");
+    }
+
+    #[test]
+    fn path_display_result_never_exceeds_width() {
+        // 一批真实形态的深路径:核心不变量 = 结果必放得下。
+        let paths = [
+            "/Users/bob/Library/Application Support/Google/Chrome/Default/Sessions",
+            "/Volumes/SSD/work/repo/crates/engine/src/benches/data/inner",
+            "~/very/long/path/that/does/not/fit/anywhere/at/all",
+        ];
+        for p in paths {
+            let out = path_display(p, Some("/Users/bob"), 70.0, &fake);
+            assert!(fake(out.as_ref()) <= 70.0, "{p} → {out} 超宽");
+        }
     }
 }
 
