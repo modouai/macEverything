@@ -155,3 +155,86 @@ M0 结果决定策略 A/B 默认值与检测通知选型；任一风险点不可
 - 手动兜底热键：检测漏报时的显式入口
 - 最近使用目录排序
 - 误报应用排除列表
+
+## 9. 2026-11-06 实机修订（跳转后状态与启动时序）
+
+### 9.1 跳转成功后浮层重现、输入被清空
+
+- 现象：跳转链路成功，但目录切换完成后浮层重新出现，搜索框为空。
+- 根因：⌘⇧G 的「前往文件夹」子 sheet 会让保存面板暂时从 `AXWindows` 消失；
+  扫描因此判 `NoPanel` 并发出 `Closed`，接线层清掉 `handled_pids`。子 sheet 关闭
+  后保存面板重新可见，又被当成新面板发 `Shown`，`overlay.open()` 复位输入。
+- 修复：扫描三态增加「存在其他 sheet」判据——候选窗口里只要有不通过面板判定
+  的 `AXSheet`，且当前处于本助手跳转窗口内（`mark_navigating` 置 2s 截止），
+  返回 `Unknown` 而不是 `NoPanel`（`transient_sheet_blocks_close`）。宿主的
+  无关 sheet 不会长期压制 `Closed`；子 sheet 消失后 observer 的销毁通知会再次
+  扫描，届时无 sheet 才可确认关闭。
+- 钉住测试：`transient_sheet_only_during_navigation`（突变改成只看
+  `saw_sheet` 必红）。
+
+### 9.2 回车后节奏「按步骤走」
+
+实机日志（`MCE_APP_LOG`，全局 `+xxms` 时间戳）显示 1289ms 的构成：
+
+| 阶段 | 耗时 | 性质 |
+|---|---|---|
+| 回车 → ROOT 取走请求 | 104ms | eframe 对不可见窗口的 100ms 重绘节流 |
+| 基线采集（同步 AX 树遍历） | 83ms | 可消除 |
+| 发 ⌘⇧G → 定位输入框 | 386ms | 系统 sheet 动画 |
+| AX 直设路径 + 读回 | 3ms | 可忽略 |
+| Return → 目录切换完成 | 816ms | 系统导航（随目标路径/文件系统变化） |
+
+两项修复：
+
+1. **基线预采集**：浮层唤起时后台线程采集可写输入框基线（`panel_baseline`），
+   回车后由跳转线程直接消费；pid 不匹配/为空时同步采集兜底。
+2. **主队列投递**：浮层 pass 内只取走请求与状态，`orderOut` + 启动跳转经
+   `dispatch2::DispatchQueue::main().exec_async` 投到主队列，等当前 pass 结束后执行。不可在本 pass
+   内同步 `orderOut`——实机证明宿主保存面板来不及拿回键盘焦点，⌘⇧G 落空，
+   跳转直接失效。
+
+修复后同链路实测 1013ms；可控部分（187ms）归零，剩余为系统 sheet 动画与目录
+导航。ROOT 消费路径保留为兜底（浮层 pass 未跑时）。
+
+### 9.3 跳转完成后保留浮层与搜索状态（2026-11-06 产品修订）
+
+原设计「提交后 orderOut，本面板存续内不再自动出现」在实机反馈中不符合使用
+预期：用户跳转后仍希望看到搜索浮层，且输入内容不能被清空。
+
+修订后的行为：
+
+- 提交跳转：`OverlayState::hide_keep_state` 只隐藏窗口，不清输入/结果/选中，
+  保留 `panel_pid`；
+- 跳转成功（`NavigateOutcome::Done`）：接线层校验五门（助手启用、浮层未显示、
+  结果 pid 仍归因当前面板、定位 frame 仍在、未被 Esc 屏蔽）后调用
+  `platform::overlay_show_passive` 被动复现——定位 + `orderFrontRegardless`，
+  **不 makeKey**，键盘焦点留在宿主保存面板，用户可继续输入文件名/保存；
+  输入/结果/选中原样保留；
+  - 为什么不让浮层持有焦点：makeKey 复现会抢走保存面板的键盘焦点，用户无法
+    继续输入文件名（2026-11-06 实机反馈）。
+  - 二次跳转：点击非 key 浮层会让 macEverything 自身成为前台。navigator 在
+    发 ⌘⇧G 前检测到「前台不是宿主」时，先激活宿主 app，再用 AX `AXRaise` +
+    `AXFocused` + `app.AXFocusedWindow` 恢复保存面板焦点，以
+    `AXFocusedWindow == 保存面板` 读回确认后才发键（实机确认
+    `focused_window_is_panel=true`，跳转成功）。
+- 失败/中止（FellBack/Aborted）：维持原行为（FellBack 显示「路径已复制」，
+  Aborted 不复现）；
+- 保存面板关闭（`Closed`）：浮层照常关闭并清空状态；
+- Esc：仍按 `close` 清空并屏蔽本面板。
+
+由此替代原不打扰规则中的「跳转成功后静置不再出现」一项（验证清单 2.6）；
+「Esc 关闭后本面板不再自动弹」不变。
+
+### 9.4 运行期开关与授权即时生效（2026-11-06 实机反馈）
+
+现象：用户在系统设置授权后切回 App，功能不生效，必须重启。
+
+- 根因：授权跃迁只在 ROOT 的 `logic` 帧检测；设置页可见但 ROOT 没有重绘
+  请求时（用户直接去系统设置授权再切回），跃迁永远不被发现。
+- 修复：
+  - 授权跃迁收敛到 `refresh_panel_assist_trust_shared`，ROOT `logic` 与设置页
+    pass 共用；设置页可见期也能发现 false→true 并置一次性 detector 启动标记；
+  - 启动时若「开关开启但未授权」，静默挂授权监视器（500ms 轮询，5 分钟上限），
+    授权后主动唤醒 ROOT 消费启动标记；
+  - 设置页开关关→开仍走 `apply_panel_assist` → pending → ROOT logic 启动
+    detector，无需重启。

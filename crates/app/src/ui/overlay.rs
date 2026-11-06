@@ -192,6 +192,38 @@ impl OverlayState {
         self.scroll_to_selected = false;
     }
 
+    /// 跳转提交:仅隐藏窗口,保留输入/结果/选中与面板归因。
+    ///
+    /// 跳转完成后由接线层 `reopen_keep_state` 原样复现(用户要求保留搜索状态,
+    /// 避免「清空输入」);Esc 关闭仍走 [`close`](清空)。
+    pub fn hide_keep_state(&mut self) {
+        self.visible = false;
+        self.clipboard_hint = false; // 新一轮提交不得携带上一轮 FellBack 提示
+        self.commit_requested = false;
+        self.dismiss_requested = false;
+        self.ime_composing = false;
+        self.ime_busy = false;
+        self.scroll_to_selected = false;
+    }
+
+    /// 跳转完成后保留状态复现:输入/结果/选中原样保留。
+    ///
+    /// 平台层以被动形态置前(不 makeKey):键盘焦点留在宿主的保存面板,用户
+    /// 可继续输入文件名/保存;点击浮层后它才成为 key 进入搜索。点击非 key
+    /// 浮层会激活 macEverything 自身,二次跳转由 navigator 的「激活宿主 +
+    /// AX 恢复保存面板焦点」兜底处理(2026-11-06 实机验证)。
+    pub fn reopen_keep_state(&mut self) {
+        self.visible = true;
+        self.clipboard_hint = false;
+        self.commit_requested = false;
+        self.dismiss_requested = false;
+        self.ime_composing = false;
+        self.ime_busy = false;
+        self.scroll_to_selected = false;
+        // 首帧内容:平台层 orderFront 后须有一次本视口的 pass。
+        self.ctx.request_repaint_of(overlay_viewport_id());
+    }
+
     /// 输入变更 → 防抖会话;清空输入立即清结果并作废在途响应。
     pub fn on_input(&mut self, now: Instant) {
         self.session.on_input(&self.input, now);
@@ -398,8 +430,9 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
             OverlayKeyAction::None => {}
             OverlayKeyAction::Commit => {
                 st.commit_requested = true;
-                // 请求由 ROOT 视口的 App::logic 消费;ROOT 全隐时没有帧,必须主动
-                // 请求一次(可能被节流 ≥100ms,但会执行),否则请求永久挂起。
+                log::info!("[overlay] Enter 提交");
+                // 本 pass 末尾取走请求并经主队列投递出 pass 执行(draw_overlay);
+                // 同时唤醒 ROOT 作兜底(ROOT 全隐时该请求被节流 ≥100ms,但不阻塞主路径)。
                 ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
             }
             OverlayKeyAction::Dismiss => {
@@ -522,7 +555,8 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
     }
     if commit {
         st.commit_requested = true;
-        // 双击提交与键盘提交同因:唤醒 ROOT 的 logic 消费请求(见上)。
+        log::info!("[overlay] 双击提交");
+        // 与键盘提交同因:浮层 pass 末尾取走请求;ROOT 唤醒仅作兜底。
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
 }
@@ -1052,6 +1086,33 @@ mod tests {
         assert!(!st.dismiss_requested, "关闭须清取消请求");
         assert_eq!(st.panel_pid, None, "关闭须清面板 pid");
         assert!(!st.session.accepts(inflight), "关闭后旧代响应应作废");
+    }
+
+    /// 跳转提交只隐藏不清状态;跳转完成复现时输入/结果/选中原样保留。
+    /// 突变把 `hide_keep_state` 换成 `close` → 输入/结果断言必红。
+    #[test]
+    fn hide_keep_state_and_reopen_keep_state_preserve_search_state() {
+        let mut st = state();
+        st.open();
+        st.input = "报告".to_owned();
+        st.results = vec![entry("a", "/a", true)];
+        st.selected = 0;
+        st.panel_pid = Some(7);
+        st.clipboard_hint = true; // 上一轮 FellBack 提示不得带入下一轮
+        st.commit_requested = true;
+        st.hide_keep_state();
+        assert!(!st.visible, "提交后窗口应隐藏");
+        assert!(!st.clipboard_hint, "提交须清空上一轮剪贴板提示");
+        assert_eq!(st.input, "报告", "提交不得清空输入");
+        assert_eq!(st.results.len(), 1, "提交不得清空结果");
+        assert_eq!(st.panel_pid, Some(7), "提交须保留面板归因");
+        assert!(!st.commit_requested, "隐藏须清提交请求");
+
+        st.reopen_keep_state();
+        assert!(st.visible);
+        assert_eq!(st.input, "报告", "复现后输入仍在");
+        assert_eq!(st.results.len(), 1, "复现后结果仍在");
+        assert_eq!(st.selected, 0);
     }
 
     /// 清空输入立即清结果并推进 Session 代际(旧响应不得回填)。

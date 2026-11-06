@@ -3,8 +3,8 @@
 //! 专用 runloop 线程换绑 AXObserver,mpsc 输出 [`PanelEvent`])。
 //! 快照结构与 AX 树解耦,纯数据可序列化可测。
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::ax_ffi::{self, attr, note, AXObserverWrap, AXRef};
 // 事件定义在跨平台模块(UI 接线层与单测共用);此处只需导入事件类型。
@@ -218,6 +218,11 @@ static REBIND_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 /// 到 1 时触发换绑。**detector 线程独占读写**:排程写入、tick 递减、换绑成功
 /// 与真宿主切换时清零)。
 static RETRY_TICKS_LEFT: AtomicU32 = AtomicU32::new(0);
+/// 本助手跳转的「子 sheet 瞬态」窗口截止时刻。⌘⇧G 的「前往文件夹」子 sheet
+/// 让保存面板暂时从 AXWindows 消失;仅在这段窗口内允许把「存在其他 sheet +
+/// 无面板」判为 Unknown。超出窗口仍无面板 → NoPanel,避免宿主无关 sheet
+/// 长期压制 Closed(评审 2026-11-06)。
+static NAVIGATING_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 thread_local! {
     /// 当前 observer(仅 detector 线程使用;AXObserverWrap 无 Send)。
@@ -547,6 +552,36 @@ extern "C" fn on_ax_event(
     let _ = scan_focused(pid);
 }
 
+/// 标记「本助手正在执行一次跳转」:子 sheet 出现后的瞬态 NoPanel 只在
+/// `window` 内不解除面板归因。由 navigator 后台线程在发 ⌘⇧G 前调用;
+/// 不显式清除,截止时刻自然过期(避免漏清导致永久压制)。
+pub fn mark_navigating(window: Duration) {
+    let until = Instant::now() + window;
+    let mut slot = match NAVIGATING_UNTIL.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(until);
+}
+
+fn navigating_active() -> bool {
+    let slot = match NAVIGATING_UNTIL.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.is_some_and(|until| Instant::now() < until)
+}
+
+/// 「存在其他 sheet + 无面板」是否应视为瞬态(不解除面板归因)。
+///
+/// 只有本助手跳转期间的 ⌘⇧G 子 sheet 属于此列;宿主的无关 sheet(文档里
+/// 另开的模态框等)不能长期压制 `Closed`,否则同 app 的下一个保存面板会被
+/// `handled_pids` 永久吞掉(评审 2026-11-06)。
+/// 突变改成 `saw_sheet` → `transient_sheet_only_during_navigation` 必红。
+fn transient_sheet_blocks_close(saw_sheet: bool, navigating: bool) -> bool {
+    saw_sheet && navigating
+}
+
 /// 扫描前台 app 的焦点窗口(三态,见 [`ScanOutcome`])。
 ///
 /// 只有「焦点窗口读取成功且不是保存面板」返回 `NoPanel`;任何 AX 读取失败
@@ -577,11 +612,15 @@ fn scan_focused(pid: i32) -> ScanOutcome {
     // NoPanel 时输出全部候选紧凑形态(面板在窗口列表里但形态不匹配是本轮实测
     // 漏报特征),命中面板时输出命中形态。
     let mut dialog_rejected: Option<PanelSnapshot> = None;
+    let mut saw_sheet = false;
     let mut cand_forms: Vec<String> = Vec::with_capacity(candidates.len());
     for win in &candidates {
         let snap = snapshot_of_window(win);
         cand_forms.push(snap_summary(&snap));
         if !is_save_panel(&snap) {
+            if snap.role.as_deref() == Some(ROLE_QUICK_SHEET) {
+                saw_sheet = true;
+            }
             if dialog_rejected.is_none() && looks_like_panel(&snap) {
                 dialog_rejected = Some(snap.clone());
             }
@@ -623,8 +662,18 @@ fn scan_focused(pid: i32) -> ScanOutcome {
             snap_summary(&s)
         );
     }
+    // 子 sheet(⌘⇧G 前往文件夹)在场时保存面板会暂时不可见:仅在本助手
+    // 跳转窗口内判 Unknown,不得发 Closed(见 transient_sheet_blocks_close)。
+    let navigating = navigating_active();
+    if transient_sheet_blocks_close(saw_sheet, navigating) {
+        log::info!(
+            "detector: 扫描未知态 pid={pid} candidates={} saw_sheet={saw_sheet} navigating={navigating} forms={cand_forms:?}",
+            candidates.len()
+        );
+        return ScanOutcome::Unknown;
+    }
     log::info!(
-        "detector: 扫描确认无面板 pid={pid} candidates={} forms={:?}",
+        "detector: 扫描确认无面板 pid={pid} candidates={} saw_sheet={saw_sheet} forms={:?}",
         candidates.len(),
         cand_forms
     );
@@ -919,6 +968,20 @@ mod tests {
             !should_send_closed_on_rebind(false, ScanOutcome::NoPanel),
             "绑定失败不得解除屏蔽"
         );
+    }
+
+    /// 子 sheet 瞬态只在「本助手跳转窗口内」压制 Closed:宿主无关 sheet
+    /// 不得长期吞掉同 app 的下一个面板(否则 handled_pids 永久泄漏)。
+    /// 突变改成 `saw_sheet` → 第二断言必红。
+    #[test]
+    fn transient_sheet_only_during_navigation() {
+        assert!(transient_sheet_blocks_close(true, true));
+        assert!(
+            !transient_sheet_blocks_close(true, false),
+            "非跳转期的其他 sheet 不得压制 Closed"
+        );
+        assert!(!transient_sheet_blocks_close(false, true));
+        assert!(!transient_sheet_blocks_close(false, false));
     }
 
     /// 重试档位:5 档 tick(1/2/4/8/16 = 0.25s~4s),超预算 None(放弃,等

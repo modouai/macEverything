@@ -175,6 +175,9 @@ pub mod attr {
     pub const WINDOWS: &str = "AXWindows";
     pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const FOCUSED_ELEMENT: &str = "AXFocusedElement";
+    /// 窗口主/焦点态(保存面板重新夺回键盘焦点用;可设置性因 app 而异)。
+    pub const MAIN: &str = "AXMain";
+    pub const FOCUSED: &str = "AXFocused";
     pub const POSITION: &str = "AXPosition";
     pub const SIZE: &str = "AXSize";
     /// 非公开常量(不在公开 HIServices 头),存在性待 M0 实机验证;
@@ -304,6 +307,21 @@ pub fn set_attr(el: &AXRef, attr: &str, value: &CFStr) -> Result<(), AXError> {
     let a = CFStr::new(attr);
     // SAFETY:value 为调用方借用,生命周期覆盖调用;常量属性名合法。
     let err = unsafe { AXUIElementSetAttributeValue(el.raw(), a.raw(), value.raw()) };
+    if err == AX_ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// 以 AX 元素作为属性值写属性(如 `app.AXFocusedWindow = window`):
+/// 点击浮层使自身成为前台后,宿主虽被激活,保存面板 sheet 未回到 key;
+/// 用本函数把 sheet 设回焦点窗口,后续合成键才会送进面板。
+pub fn set_attr_element(el: &AXRef, attr: &str, value: &AXRef) -> Result<(), AXError> {
+    let a = CFStr::new(attr);
+    // SAFETY:两个 AXRef 均为调用方保活的 +1 对象;AXUIElement 是 CFTypeRef。
+    let err =
+        unsafe { AXUIElementSetAttributeValue(el.raw(), a.raw(), value.raw() as *const c_void) };
     if err == AX_ERROR_SUCCESS {
         Ok(())
     } else {

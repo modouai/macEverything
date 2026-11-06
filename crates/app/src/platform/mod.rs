@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 pub mod ax_ffi;
 #[cfg(target_os = "macos")]
 pub mod cg_events;
-// 保存面板跳转状态机 + 平台执行层(Task 11;执行层动作→AX/合成键/剪贴板)。
 #[cfg(target_os = "macos")]
 pub mod dialog_navigator;
 #[cfg(target_os = "macos")]
@@ -386,6 +385,19 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> anyhow::Result<()> {
     }
 }
 
+/// 跳转完成后的被动复现:定位 + 置前但不 makeKey(键盘焦点留在宿主面板)。
+pub fn overlay_show_passive(ax_frame: [f64; 4]) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_show_passive(ax_frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ax_frame;
+        Err(anyhow::anyhow!("非 macOS:浮层原生唤起不可用"))
+    }
+}
+
 /// 浮层窗当前原生可见性(诊断用;未创建/非主线程 → None)。
 pub fn overlay_visible() -> Option<bool> {
     #[cfg(target_os = "macos")]
@@ -709,6 +721,20 @@ pub fn open_accessibility_settings() {
     {}
 }
 
+/// 把指定 pid 的 app 激活为前台(跳转前恢复宿主键盘焦点)。
+/// 非 macOS 恒 false。
+pub fn activate_app(pid: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::activate_app(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// 读剪贴板纯文本(None = 无文本/非文本)。navigator 策略 B 的 save。
 /// 非 macOS 恒 None。
 pub fn clipboard_text() -> Option<String> {
@@ -749,19 +775,54 @@ pub fn clipboard_restore(saved: Option<&str>) -> bool {
     }
 }
 
+/// 跳转基线:宿主 app 的窗口快照 + 可写输入框快照。
+///
+/// 作用:区分「Go-to 路径框」与「保存面板文件名框」——Go-to 候选必须落在
+/// **基线之后新出现的窗口**里(AX sheet 是独立窗口),旧窗口(保存面板)内的
+/// 输入框一律排除。只比输入框引用不够:用户点击面板/切换目录后 AX 子树可能
+/// 重建,旧字段引用全部失效,会把新的文件名框误当候选。
+#[cfg(target_os = "macos")]
+pub struct PanelBaseline {
+    /// 宿主 app 当前全部窗口引用(快照时存在)。
+    pub windows: Vec<ax_ffi::AXRef>,
+    /// 宿主 app 当前全部可写输入框引用(文件名框等排除集)。
+    pub fields: Vec<ax_ffi::AXRef>,
+}
+/// 非 macOS stub(交付面仅 macOS;空 Vec 可构造且 Send,保持接线层可编译)。
+#[cfg(not(target_os = "macos"))]
+pub struct PanelBaseline {
+    pub windows: Vec<std::convert::Infallible>,
+    pub fields: Vec<std::convert::Infallible>,
+}
+
+/// 采集跳转基线(阻塞;调用方在后台线程执行)。
+#[cfg(target_os = "macos")]
+pub fn panel_baseline_collect(pid: i32) -> PanelBaseline {
+    dialog_navigator::baseline_for(pid)
+}
+#[cfg(not(target_os = "macos"))]
+pub fn panel_baseline_collect(pid: i32) -> PanelBaseline {
+    let _ = pid;
+    PanelBaseline {
+        windows: Vec::new(),
+        fields: Vec::new(),
+    }
+}
+
 /// 把保存面板跳转到指定目录(阻塞;调用方在后台线程执行)。
 ///
+/// `baseline` 为浮层唤起期预采集的基线;None/空时跳转线程同步采集(兜底)。
 /// 状态机驱动策略 A(AX 直设)/策略 B(剪贴板 + ⌘V)降级,收尾恢复剪贴板;
 /// 返回终态供浮层接线层决定后续提示(design §5)。
 /// 非 macOS 恒 `Aborted`(交付面仅 macOS,stub 只为保持 facade 可编译)。
-pub fn navigate_panel(pid: i32, path: &str) -> NavigateOutcome {
+pub fn navigate_panel(pid: i32, path: &str, baseline: Option<PanelBaseline>) -> NavigateOutcome {
     #[cfg(target_os = "macos")]
     {
-        dialog_navigator::run_navigate(pid, path)
+        dialog_navigator::run_navigate(pid, path, baseline)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (pid, path);
+        let _ = (pid, path, baseline);
         NavigateOutcome::Aborted
     }
 }

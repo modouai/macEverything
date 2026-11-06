@@ -194,7 +194,13 @@ fn init_logger() {
 
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
-                let line = format!("[{}] {}", record.level(), record.args());
+                // 进程启动相对时刻:跨视口/跨线程日志可对时(排「步骤感」类延迟)。
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let elapsed = START
+                    .get_or_init(std::time::Instant::now)
+                    .elapsed()
+                    .as_millis();
+                let line = format!("[{} +{elapsed}ms] {}", record.level(), record.args());
                 eprintln!("{line}");
                 if let Some(f) = &self.file {
                     use std::io::Write;

@@ -46,14 +46,15 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSBezierPath, NSBitmapImageRep, NSColor, NSCompositingOperation,
-    NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext,
-    NSImage, NSMenu, NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
-    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
-    NSScreen, NSView, NSViewLayerContentsPlacement, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication,
+    NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBackingStoreType,
+    NSBezierPath, NSBitmapImageRep, NSColor, NSCompositingOperation, NSDeviceRGBColorSpace,
+    NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext, NSImage, NSMenu,
+    NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel,
+    NSPanel, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
+    NSRunningApplication, NSScreen, NSView, NSViewLayerContentsPlacement,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceActiveSpaceDidChangeNotification, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
@@ -994,6 +995,16 @@ fn ax_frame_to_appkit(ax: [f64; 4], primary: NSRect) -> [f64; 4] {
 /// 顺序照 [`show_palette`]:定位先于显示;不激活 app、不切 Space。
 /// `ax_frame` 为检测器上报的 AX 屏幕坐标(左上原点、y 向下)。
 pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
+    overlay_show_inner(ax_frame, true)
+}
+
+/// 跳转完成后的被动复现:定位 + 置前,但**不 makeKey**——键盘焦点留在宿主
+/// 保存面板,用户可继续输入文件名/保存;点浮层再进入搜索。
+pub fn overlay_show_passive(ax_frame: [f64; 4]) -> Result<()> {
+    overlay_show_inner(ax_frame, false)
+}
+
+fn overlay_show_inner(ax_frame: [f64; 4], make_key: bool) -> Result<()> {
     ensure_overlay_patched()?;
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(anyhow!("overlay_show 非主线程调用"));
@@ -1035,9 +1046,11 @@ pub fn overlay_show(ax_frame: [f64; 4]) -> Result<()> {
     win.setFrameOrigin(NSPoint::new(frame[0], frame[1]));
     let responder_ok = restore_first_responder(&win);
     win.orderFrontRegardless();
-    win.makeKeyWindow();
+    if make_key {
+        win.makeKeyWindow();
+    }
     log::info!(
-        "浮层唤起:window_number={} origin=({:.0}, {:.0}) 尺寸 {:.0}×{:.0};first_responder={responder_ok} isKeyWindow={} isVisible={}",
+        "浮层唤起:window_number={} origin=({:.0}, {:.0}) 尺寸 {:.0}×{:.0};first_responder={responder_ok} make_key={make_key} isKeyWindow={} isVisible={}",
         win.windowNumber(),
         frame[0],
         frame[1],
@@ -2467,6 +2480,25 @@ unsafe fn handle_fetch_result(
 /// AX 授权查询(ax_ffi 转发;mac.rs 为平台层 unsafe 集中点,故经此转出)。
 pub fn ax_trusted() -> bool {
     super::ax_ffi::is_process_trusted()
+}
+
+/// 把指定 pid 的 app 激活为前台(跳转前恢复宿主键盘焦点)。
+///
+/// 点击非 key 的浮层会让本进程成为前台(见 `notify_frontmost` 的自身过滤
+/// 注释);此后全局合成的 ⌘⇧G 会落进浮层而不是宿主保存面板。跳转线程发现
+/// 前台不是宿主时调用本函数,再轮询 frontmost 恢复后继续。
+/// NSRunningApplication 线程安全,允许后台跳转线程直接调用。
+///
+/// 选项用空集(只前置 main/key 窗口,即保存面板);`IgnoringOtherApps` 在
+/// macOS 14+ 已无效果且被 binding 标记 deprecated。
+pub fn activate_app(pid: i32) -> bool {
+    match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+        Some(app) => app.activateWithOptions(NSApplicationActivationOptions::empty()),
+        None => {
+            log::warn!("激活宿主失败:进程不存在 pid={pid}");
+            false
+        }
+    }
 }
 
 /// 打开系统设置的辅助功能授权面板(深链;非关键路径——面板未装/链接失效时无害)。
