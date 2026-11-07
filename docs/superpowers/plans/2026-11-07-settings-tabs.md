@@ -1012,7 +1012,8 @@ cargo test -p macEverything-app general_page_has_five_rows
 
 ```bash
 cargo fmt --check && cargo clippy -p macEverything-app --all-targets -- -D warnings
-cargo test -p macEverything-app ui::settings_view
+cargo test -p macEverything-app general_page_has_five_rows
+# 其余 settings_view 坐标测试在 Task 7 按页统一重构；本 Task 不要求 ui::settings_view 全绿。
 git add crates/app/src/ui/settings_view.rs
 git commit -m "refactor(app): 设置页标签分发与通用页"
 ```
@@ -1078,7 +1079,8 @@ cargo test -p macEverything-app index_page_has_exclusions
 
 ```bash
 cargo fmt --check && cargo clippy -p macEverything-app --all-targets -- -D warnings
-cargo test -p macEverything-app ui::settings_view
+cargo test -p macEverything-app index_page_has_exclusions
+# 其余 settings_view 坐标测试在 Task 7 按页统一重构；本 Task 不要求全绿。
 git add crates/app/src/ui/settings_view.rs crates/app/src/i18n/catalog.rs
 git commit -m "refactor(app): 设置页索引标签页"
 ```
@@ -1151,7 +1153,10 @@ cargo test -p macEverything-app advanced_page_only_has_cli_row experimental_page
 
 ```bash
 cargo fmt --check && cargo clippy -p macEverything-app --all-targets -- -D warnings
-cargo test -p macEverything-app ui::settings_view
+cargo test -p macEverything-app advanced_page_only_has_cli_row
+cargo test -p macEverything-app experimental_page_has_panel_assist_row_only
+cargo test -p macEverything-app about_page_has_version_and_auto_check_only
+# 其余 settings_view 坐标测试在 Task 7 按页统一重构；本 Task 不要求全绿。
 git add crates/app/src/ui/settings_view.rs
 git commit -m "refactor(app): 设置页高级/实验/关于标签页"
 ```
