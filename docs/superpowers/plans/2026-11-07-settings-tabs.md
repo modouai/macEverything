@@ -1002,6 +1002,7 @@ cargo test -p macEverything-app general_page_has_five_rows
 - [ ] **Step 8: 清理临时 allow 与废弃标题 key**
 
 - 删除 `SettingsTab`/`impl SettingsTab` 上剩余的 scoped `#[allow(dead_code)]`（`draw_body` 已调用 `draw_tab_bar`）。
+- 删除 `SettingsAction::SelectTab` 变体上的临时 `#[allow(dead_code)]`（`draw_body` 点击标签时会构造该动作）。
 - 删除 `group_shortcuts` 的字段级 allow（`draw_shortcuts_page` 已消费）。
 - 从 `catalog!` 删除 `group_general`（通用页不再画顶层标题）；更新所有引用它的测试断言（例如把「不得包含 group_general」改为断言新的子分组标题）。
 - `group_index` / `group_about` 暂留到 Task 5/6 删除。
