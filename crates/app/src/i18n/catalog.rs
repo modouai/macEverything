@@ -3,10 +3,10 @@
 //! 宏保证两套表都填满 `Strings` 的全部字段——漏翻编译期报错。
 
 macro_rules! catalog {
-    ($( $(#[$meta:meta])* $field:ident : $zh:literal / $en:literal ),* $(,)?) => {
+    ($( $field:ident : $zh:literal / $en:literal ),* $(,)?) => {
         #[derive(Debug, Clone, Copy)]
         pub struct Strings {
-            $( $(#[$meta])* pub $field: &'static str, )*
+            $( pub $field: &'static str, )*
         }
 
         static ZH_HANS: Strings = Strings { $( $field: $zh, )* };
