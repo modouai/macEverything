@@ -868,6 +868,13 @@ mod match_tests {
         assert!(i.entry(sub).is_dir(), "存活项必须是目录");
     }
 
+    /// 候选行保持 16B:置顶位与分数共享首个字段。rows 是每查询的命中全集,
+    /// 字段膨胀会放大百万命中时的临时分配。
+    #[test]
+    fn candidate_row_stays_16_bytes() {
+        assert_eq!(std::mem::size_of::<(u32, usize, u32)>(), 16);
+    }
+
     fn names(i: &Index, hits: &[u32]) -> Vec<String> {
         hits.iter()
             .map(|&h| String::from_utf8_lossy(i.display_name_of(h)).into_owned())

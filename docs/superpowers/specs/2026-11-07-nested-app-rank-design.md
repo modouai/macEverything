@@ -67,12 +67,11 @@ pub const BUNDLE_EXTENSIONS: [&str; 9] = [...];
 
 /// 条目名是否以 bundle 扩展名结尾（ASCII 大小写不敏感）。
 pub fn is_bundle_name(display: &[u8]) -> bool;
-
-/// 路径任一组件是否以 bundle 扩展名结尾（逐组件复用 is_bundle_name）。
-pub fn is_bundle_path(p: &Path) -> bool;
 ```
 
 独立成模块而非塞进 `scanner`：判定同时被查询排序消费，且剪枝若日后实施可直接复用。`lib.rs` 导出。
+
+`is_bundle_path` / `is_inside_bundle` 属于 O1 包内剪枝的范围，本期不实现；本修复的祖先判定在 `ranks_first` 内按路径段完成。
 
 ### 4.2 查询候选行携带置顶位
 
@@ -118,7 +117,7 @@ fn ranks_first(view: &dyn IndexView, idx: u32, is_dir: bool) -> bool {
 5. 大小写：`Tools.APP` 在 `Outer.app` 内不置顶。
 6. `case:` 查询下行为一致。
 7. top-limit 截断：低分非包内 `.app` 仍先于高分包内 `.app` 入选。
-8. bundle.rs 单元：扩展名表逐项命中；`notes.app.txt`、`应用.app备份`、`Contents` 不命中；`/a/X.app/Contents` 路径命中。
+8. bundle.rs 单元：扩展名表逐项命中（期望清单硬编码，不由被测常量自取）；`notes.app.txt`、`应用.app备份`、`Contents`、`.application`、`X.apps`、空名、短名不命中；裸 `.app` 命中。
 9. 剪枝开关打开（全量索引）时回归：索引中同时存在 `Outer.app` 与 `Outer.app/Contents/Inner.app`，`Inner.app` 仍不置顶。这条在剪枝实施后防止「开关恢复旧缺陷」。
 
 ## 6. 文档同步

@@ -90,6 +90,7 @@ macEverything/
 │   │       ├── lib.rs           # 公开 API:Engine 句柄(start/stop/query/status)
 │   │       ├── entry.rs         # Entry 结构、flags(墓碑/目录位)、repr(C) 常量
 │   │       ├── arena.rs         # 双 arena(display/match)构建与 NFC+小写折叠
+│   │       ├── bundle.rs        # bundle 扩展名判定(排序置顶与包内剪枝共用)
 │   │       ├── index.rs         # 内存索引:构建/增删改/目录 diff/子树级联/墓碑整理/目录路径池
 │   │       ├── scanner.rs       # 并行遍历:work-stealing 目录队列/排除/符号链接跳过/缺口收集
 │   │       ├── query.rs         # 语法解析(词法)→ 计划 → 匹配(memmem)→ 打分排序(path: 走目录路径池)

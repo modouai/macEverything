@@ -4,7 +4,7 @@
 
 **Goal:** 默认相关度排序只置顶「不在任何 bundle 内部」的 `.app` 目录，消除包内 Helper / 嵌套子应用抢占首屏。
 
-**Architecture:** 新增 `engine/src/bundle.rs` 承载 bundle 扩展名判定；`query.rs` 在候选收集阶段对命中的 `.app` 条目上溯父链算出置顶位，编进行元组的高 8 位；比较器退化为单次整数比较。索引、扫描、增量、持久化均不改动。
+**Architecture:** 新增 `engine/src/bundle.rs` 承载 bundle 扩展名判定；`query.rs` 在候选收集阶段读取命中的 `.app` 条目完整路径，按祖先路径段判定是否在 bundle 内，算出置顶位并编进行元组的高 8 位；比较器退化为单次整数比较。索引、扫描、增量、持久化均不改动。
 
 **Tech Stack:** Rust workspace（`engine` crate），rayon 并行分块，现有 `IndexView` 抽象与 `Index` 测试夹具。
 
@@ -468,18 +468,21 @@ bash scripts/bench.sh /tmp/mce-bench 1000000
 
 Expected: 查询 P99 与改动前同档（规格红线 < 10ms）。重点看「查询」一项；候选行仍是 16B，比较器从多次函数调用降为单次整数比较，理论上不劣于改动前。把改动前后的查询数字记录到提交说明或验收记录。
 
-- [ ] **Step 3: 实机冒烟**
+- [ ] **Step 3: 隔离环境冒烟**
 
 ```bash
-bash scripts/bundle.sh
-open release/macEverything.app
+ROOT=$(mktemp -d /tmp/mce-smoke.XXXXXX)
+DATA=$(mktemp -d /tmp/mce-smoke-home.XXXXXX)
+mkdir -p "$ROOT/Applications/Outer.app/Contents/SharedSupport/Inner.app" "$ROOT/Applications/Normal.app"
+touch "$ROOT/Applications/alpha.txt"
+MCE_ROOTS="$ROOT" target/release/macEverything --data-dir "$DATA" start
+MCE_ROOTS="$ROOT" target/release/macEverything --data-dir "$DATA" query "a"
+target/release/macEverything --data-dir "$DATA" stop
 ```
 
-在完整结果窗口搜索 `ai`，确认：
+Expected：`Outer.app`、`Normal.app` 置顶；`alpha.txt` 其后；`Inner.app` 不置顶（落在普通条目组）。
 
-1. `BaiduNetdisk_mac.app`、`智谱AI开放平台.app`、`AI_Excel_Processor.app` 等非包内应用仍置顶。
-2. `kaideployserver.app`、`WorkBuddy Repair.app`、`BaiduNetdisk_mac Helper*.app` 不再出现在置顶组（它们仍在结果集中，按普通条目排序）。
-3. 列头按名称排序时行为不变。
+GUI 级人工确认（构建 `.app` 后在完整窗口搜 `ai`，核对真实应用置顶、包内 Helper 下沉）作为合并后的可选步骤，不作为本计划的自动验收项——CLI 与 GUI 共用 `query::execute`，排序路径一致。
 
 - [ ] **Step 4: 记录基准数字（仅当任务要求留痕）**
 
