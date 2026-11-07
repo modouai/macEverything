@@ -1,83 +1,128 @@
 # 包内剪枝（bundle prune）设计
 
-- 日期：2026-11-07
-- 状态：暂缓（2026-11-07 复评：截图症状的直接成因是排序把嵌套 `.app` 一并置顶，属独立缺陷，先行修复；本方案待观察排序修复后的实际噪声再决定）
+- 日期：2026-11-07（2026-11-07 复核修订）
+- 状态：已确认，排在嵌套 App 排序修复（`2026-11-07-nested-app-rank-design.md`）之后实施
 - 范围：engine 扫描/增量/持久化 + cli daemon 增量入口 + 配置；查询排序与 GUI 无改动
 - 功能代号：bundle-prune
 
-> **复评记录（2026-11-07）**：本文档初稿把「搜 `ai` 首屏 16 条中 11 条来自包内」当作剪枝的动机证据，这个归因不成立。首屏污染的成因是 product §4「App 包整体置顶」把嵌套 `.app` 也抬到最前；排序修复（`2026-11-07-nested-app-rank-design.md`）以零格式变更、零重扫、零召回损失解决该症状。剪枝仍可能因「包内文件本身无搜索价值、索引更小」而成立，但那是另一个动机，需重新论证后再实施。若实施，本文 §3.4 的「开关打开时完全恢复旧行为」同样需要改为「恢复全量索引，但排序仍不置顶包内 `.app`」。
+## 1. 背景与立论
 
-## 1. 背景
+索引语义目前是「磁盘上每个非符号链接条目一条」。`.app` 是目录，扫描器整棵遍历进去，包内的 Framework、Helper、嵌套子应用全部成为条目。
 
-`.app` 在索引里是普通目录，扫描器整棵遍历进去。结果是搜索结果里混入大量应用包内的实现细节：
+首屏污染的直接成因是排序把嵌套 `.app` 一并置顶，已由排序修复独立解决（O3）。剪枝的立论不建立在「首屏被污染」或「包内条目无搜索价值」这类判断上——后者不可验证，容易在评审中被顶回来。
 
-- `/Applications/WPS Office.app/Contents/SharedSupport/.../kaideployserver.app`（嵌套子应用，出现两次）
-- `/Applications/BaiduNetdisk_mac.app/Contents/Frameworks/.../BaiduNetdisk_mac Helper.app`（多个 Helper 变体）
-- `/Applications/WorkBuddy.app/Contents/Frameworks/.../WorkBuddy Repair.app`
+**立论：索引粒度 = Finder 可见单位。**
 
-排序规则（product §4「App 包整体置顶」）让这些嵌套 `.app` 排在最前，正常应用反而被挤到后面。用户搜 `ai` 时首屏 16 条里 11 条来自包内。
+product.md 问题陈述第 1 条把产品基线定为「Finder 里看得到的文件，Spotlight 搜不到」。Finder 中 bundle 是单个不可进入的项目：双击打开整个应用，不能浏览其内部。包内的 `Contents/`、`Frameworks/`、`MacOS/` 不是「Finder 里看得到的文件」，是应用的实现细节。把它们逐条索引进搜索面，等于把索引粒度定得比产品基线更细。
 
-规格里目前没有任何针对包内内容的策略，索引语义就是「磁盘上每个非符号链接条目一条」。
+按这条立论，剪枝不是对搜索内容的取舍，而是把索引粒度校准到与 Finder 一致。它同时解决两件事：
 
-## 2. 目标与非目标
+- **体积与首扫**：包内条目通常占 `/Applications` 条目数的绝大部分，剪掉直接减少条目数、首扫时间与常驻内存。这是这套产品少有的同时改善「快」和内存的改动。
+- **规则可解释**：判定原则是「Finder 双击打开整体、不进入」，而不是一份凭经验拟定的扩展名清单。
+
+现有证据（2026-11-07 实机确认）：
+
+```
+/Applications/WPS Office.app/Contents/SharedSupport/kaideployserver.app
+/Applications/WPS Office.app/Contents/SharedSupport/wpsbackend.app/Contents/SharedSupport/kaideployserver.app
+```
+
+两条是**不同路径**（顶层一份 + `wpsbackend.app` 内一份），不是重复条目。§1 初稿写的「出现两次」是同一产品两份拷贝，排除重复条目缺陷。
+
+## 2. 方案谱系
+
+| 方案 | 首屏污染 | 召回损失 | 索引体积/首扫 | 规则可解释性 |
+|---|---|---|---|---|
+| O3 只修排序（置顶只对非包内 `.app` 生效） | 解决 | 无 | 无收益 | 好 |
+| O2 只剪「包中包」 | 解决 | 小 | 几乎无收益（包内文件大头在顶层 app 的 `Contents`） | 差（「包能进、包中包不行」） |
+| O1 全局剪枝（本设计） | 解决 | 大 | 有收益 | 好 |
+
+O3 先行且独立提交（见排序设计），解决首屏症状且零召回损失。O1 在 O3 之后按「粒度一致 + 体积收益」实施。O2 不单独实施：它同时丢失 O1 的体积收益和 O3 的语义清晰度。
+
+**O1 与 O3 是叠加关系，不是替代。** O1 实施后，O3 仍然有效且必要：开关打开时索引恢复全量，排序修复保证包内 `.app` 不进置顶组。设计初稿写的「开关打开时完全恢复旧行为」不成立——那是恢复已知的排序缺陷。开关打开的正确语义是「恢复全量索引，排序仍不置顶包内 `.app`」。
+
+## 3. 目标与非目标
 
 ### 目标
 
-1. `.app` 等 bundle 目录本身仍作为条目收录（可被搜到、可被列目录、可执行「打开」）。
-2. bundle 目录内部不产生任何索引条目：首扫不进入，增量事件不追加。
-3. 默认生效；配置项 `index_bundle_contents` 可恢复旧行为。
-4. 三条写入路径（首扫 / 增量 diff / 补链）共用同一判定，不出现语义分叉。
+1. bundle 目录本身仍作为条目收录（可被搜到、可被列目录、可执行「打开」）。
+2. bundle 目录内部不产生索引条目：首扫不进入，增量事件不追加。
+3. 默认生效；配置项 `index_bundle_contents` 可恢复全量索引。
+4. 所有写入路径共用同一判定：首扫（主根与卷扫描）、增量 diff、补链。
 5. 旧索引在升级后自动重建，不残留包内条目。
+6. 剪枝收益可量化：bench 受控树记录条目数、首扫时间、常驻内存的前后差。
 
 ### 非目标
 
 - 不改变查询排序、结果上限、搜索语法。
-- 不新增 GUI 设置项（本期只走 `config.toml`）。
+- 本期不新增 GUI 开关（设置页「索引」标签只加常驻说明，开关排入后续迭代）。
 - 不按 `Contents/Info.plist` 探测（需额外出 stat，首扫成本上升）。
-- 不处理 `.xcworkspace` / `.xcodeproj` 这类「看起来像包、实际是用户工程目录」的扩展名（见 §3.1 清单，刻意不含）。
+- 不处理 `.xcworkspace` / `.xcodeproj` 这类「看起来像包、实际是用户工程目录」的扩展名（见 §4.1 清单）。
 
-## 3. 行为契约
+## 4. 行为契约
 
-### 3.1 判定规则
+### 4.1 判定规则
 
-路径的**任一组件**满足「以 `BUNDLE_EXTENSIONS` 中某项结尾（ASCII 大小写不敏感）」，即视为 bundle 内路径。
-
-`BUNDLE_EXTENSIONS`：
+路径的**任一组件**以 `BUNDLE_EXTENSIONS` 中某项结尾（ASCII 大小写不敏感），即视为 bundle 路径。
 
 ```
 .app  .framework  .bundle  .plugin  .appex  .xpc  .kext  .prefpane  .qlgenerator
 ```
 
-有意不含：`.xcworkspace`、`.xcodeproj`、`.playground`、`.docset`、`.scnassets`——这些是用户工程/资料目录，经常需要搜内部文件。
+扩展名清单的判定原则：Finder 把它当单个项目、双击打开整体、不能浏览内部。清单按此原则一次定稿，后续新增按同一原则评审，不再逐项讨论。
 
-判定函数（engine）：
+有意不含：`.xcworkspace`、`.xcodeproj`、`.playground`、`.docset`、`.scnassets`——Finder 会按普通文件夹展开，内部文件可见。
+
+判定函数（`engine/src/bundle.rs`，与排序修复共用）：
 
 ```rust
-/// 目录名是否为 bundle（ASCII 大小写不敏感后缀匹配）。
-pub fn is_bundle_name(name: &str) -> bool;
+/// 条目名是否以 bundle 扩展名结尾（ASCII 大小写不敏感）。
+pub fn is_bundle_name(display: &[u8]) -> bool;
 
-/// 路径是否位于 bundle 内部或自身即 bundle（逐组件调用 is_bundle_name）。
+/// 路径自身或任一祖先是否 bundle。
 pub fn is_bundle_path(p: &Path) -> bool;
+
+/// 路径的**严格祖先**是否 bundle（不含自身）。区分「bundle 本身」与「bundle 内部」。
+pub fn is_inside_bundle(p: &Path) -> bool;
 ```
 
-`is_bundle_path` 对 `.app` 自身返回 `true`。语义区分由调用点决定：判断「是否进入」用 `is_bundle_path(dir)`，判断「是否是 bundle 条目」用 `is_bundle_name(条目名)`。
+三个函数的职责边界：
 
-### 3.2 首扫
+| 判定 | 函数 | 用途 |
+|---|---|---|
+| 这个目录是 bundle 吗 | `is_bundle_name` | 首扫决定是否入队；增量决定事件归属 |
+| 这个路径在包内（含自身）吗 | `is_bundle_path` | 排序置顶判定 |
+| 这个路径在包内（不含自身）吗 | `is_inside_bundle` | 增量 diff 拦截、补链终止 |
 
-- `classify_entry` 对目录新增分支：`is_bundle_name` 命中时返回 `Step::LeafDir { path, name }`（形态与 `Step::Dir` 相同，语义区别只在调用方不入队）。
+### 4.2 首扫
+
+- `classify_entry` 对目录新增分支：`is_bundle_name` 命中时返回 `Step::LeafDir { path, name }`（形态与 `Step::Dir` 相同，区别只在调用方不入队）。
 - 串行臂：`index.insert(&name, parent_idx, true)`，**不** `queue.push_back`。
 - 并行臂：与 `Step::Dir` 相同地登记 `DirTable` 取得自身 `dir_seq`、push `Rec::Dir`，**只是不 `queue.push_back`**。必须登记自身 seq：`apply_records` 用 `table.get(dir_seq)` 取自身原始路径来定位父目录并写 `dir_map` 键，沿用父 seq 会把 bundle 条目的路径写成父目录。
 - 结果：bundle 目录条目在索引中，其子项全部缺席。
 
-### 3.3 增量
+**显式扫描根豁免**：`scan_roots` 从根开始遍历，根自身不经过 `classify_entry`。用户通过 `MCE_ROOTS=/Applications/Safari.app` 显式指定 bundle 为根时，其内容照常索引；根之下再遇到的嵌套 bundle 仍剪枝。语义：显式指定根就是声明「我要这里面的内容」，比默认策略优先。
 
-- `read_dir_listing` 不变：bundle 是父目录的普通子项（`is_dir = true`），父目录 diff 时照常增删该条目。
-- `diff_one` 入口（`crates/cli/src/daemon.rs`）：canonical 化后 `is_bundle_path(&base)` 为真时直接 `return 0`。理由：FSEvents 会在包内任意深度上报事件（后台应用的日志写入、自动更新），这些路径没有索引条目，走补链会把 bundle 内部重新拉回索引。
-- 补链循环：`is_excluded(next, &excludes)` 的同点加 `is_bundle_path(next)` 检查，命中即终止补链。补链从 bundle 内的目标向上找到 `.app` 的父目录时，chain 会包含 `.app` 自身，此时必须停止，否则下一轮 `apply_and_track` 会 diff `.app` 并收录 `Contents`。
-- 新建 `.app`：父目录 diff 收录 bundle 条目；随后到达的包内事件被 `diff_one` 入口丢弃。
-- 删除/改名/移动 `.app`：父目录 diff 处理条目增删，bundle 内部无条目需清理。
+### 4.3 增量
 
-### 3.4 配置
+三条规则，覆盖所有事件目标形态：
+
+**R1 目标是普通目录**（`is_bundle_path(&base) == false`）：正常 diff。
+
+**R2 目标是 bundle 自身**（`is_bundle_name(base 的文件名)`）：不 diff 自身（否则会把 `Contents` 收进索引），改 **diff 其父目录**。父目录的 listing 会正确增删该 bundle 条目，同时覆盖新建、删除、改名。
+
+**R3 目标在 bundle 内部**（`is_inside_bundle(&base)`）：
+
+- 若该 bundle 的条目在 `dir_map` 中存在 → `return 0`（稳态零成本）。后台应用的日志写入、自动更新会在包内任意深度产生事件，这些路径没有索引条目，走补链会把包内重新拉回索引。
+- 若条目缺失 → diff 该 bundle 的父目录补录。这是自愈路径，不依赖父目录事件一定先到。
+
+**补链终止**：补链循环在 `is_excluded(next, &excludes)` 的同点加 `is_inside_bundle(next)` 检查，命中即终止。`next` 是 bundle 自身时**不终止**——它的条目正是本级要收录的对象；终止条件针对「进入 bundle 内部」。
+
+**listing 语义不变**：`read_dir_listing` 不感知 bundle。bundle 是父目录的普通子项（`is_dir = true`），父目录 diff 时照常增删该条目。增量本身不递归，不会因为 listing 中出现 bundle 就进入它。
+
+**删除/改名/移动 bundle**：父目录 diff 处理条目增删，包内无条目需清理。
+
+### 4.4 配置
 
 `config.toml` 新增：
 
@@ -87,49 +132,74 @@ index_bundle_contents = false
 ```
 
 - `serde(default)`，缺省 `false`。
-- `true` 时完全恢复旧行为：`is_bundle_name` 判定在扫描/增量两侧被整体跳过。
-- 配置在 daemon 启动时读取；修改需 `stop && start`。daemon 启动时与上次落盘索引的策略值比对，不一致触发全量重扫（见 §3.5）。
+- `true` 时扫描/增量两侧跳过 bundle 判定，恢复全量索引。排序仍不置顶包内 `.app`（O3 独立生效）。
+- **配置不热加载。修改前必须先 `macEverything stop`。** 排除目录命令（`exclude add/remove`、`reset_excludes`）会把内存中的 Config 整份回写落盘；运行中手改 `config.toml` 后执行任何排除操作，手改内容会被覆盖，表现为「改了没生效，还丢了」。usage 与设置页文案写清这条。
 
-### 3.5 索引格式与升级
+### 4.5 索引格式与升级
 
 bundle 剪枝改变了「索引内容 = 磁盘条目全集」这一前提，旧索引里的包内条目不会自行消失。
 
 - `persist::FORMAT_VERSION`：`1 → 2`。
 - header 在 `excluded` 段之后新增 `bundle_prune: u8`（1 = 剪枝生效，0 = 未生效）。
 - 读侧：版本 ≠ 2 → `LoadError::BadVersion` → daemon 弃用重建（既有路径）。
-- 版本 = 2 但 `meta.bundle_prune` 与当前配置不符 → 同样触发全量重扫。这条覆盖「用户翻转开关后重启 daemon」的场景。
-- 升级代价：一次全量重扫。24k 条目约 1 秒；百万级十几秒。状态显示「重扫中」，旧索引在扫完前不可用（既有冷启动语义）。
+- `IndexMeta::default()` 改为手写实现，`bundle_prune = true`，与产品默认一致。测试夹具大量用 `IndexMeta::default()` 落盘，若沿用 `bool` 的 `false` 默认，任何走 `cold_start` 的测试都会撞上「落盘值 false ≠ 生产默认 true」的误判。
 
-## 4. 实现接入点
+### 4.6 启动策略比对
+
+版本相符但剪枝开关被翻转时，索引内容与配置不一致。判定做成纯函数，与 `needs_full_rescan`、`rescan_fire_allowed` 同形，放在 `engine` 侧便于单测：
+
+```rust
+/// 落盘索引的剪枝策略与当前配置是否不一致（不一致 → 需全量重扫）。
+pub fn needs_policy_rescan(meta: &IndexMeta, cfg: &Config) -> bool {
+    meta.bundle_prune != !cfg.index_bundle_contents
+}
+```
+
+**比对范围只含 `bundle_prune`。**
+
+- 不比 `scan_roots`：它是上次落盘时的根集合（含当时挂载的外接卷），启动时的 roots 由当前挂载状态重建。拔过盘就判「不同」，每次启动白跑全量重扫。
+- 不比 `excluded`：排除列表的启动比对是另一个既有缺口（`meta.excluded` 全仓只写不读），本期不顺带修，单独立项。
+
+调用点在 `cold_start` 加载索引成功的分支内，与索引健全性抽检并列：命中则记日志、置 `DEGRADED`、`spawn_rescan`，旧 Base 在重扫期间仍可查（既有语义）。`cold_start` 自身无单测，判定逻辑全部落在纯函数上。
+
+### 4.7 升级代价
+
+一次全量重扫。具体时长以 bench 实测为准，本文不引用未标注测量环境的数字。状态显示「重扫中」，旧索引在扫完前不可读（既有冷启动语义：格式版本不符时不挂载）。
+
+## 5. 实现接入点
 
 | 文件 | 改动 |
 |---|---|
-| `crates/engine/src/scanner.rs` | 新增 `BUNDLE_EXTENSIONS`、`is_bundle_name`、`is_bundle_path`；`Step` 增加 `LeafDir`；串行/并行两臂的 match 各加分支；`scan_roots` / `collect_records` / `full_rescan` 接受 `prune_bundles: bool` |
-| `crates/engine/src/watcher.rs` | 无改动（listing 语义不变）；`read_dir_listing` 的文档注释补一句 bundle 条目如常列出 |
-| `crates/engine/src/reconcile.rs` | `full_rescan` 透传开关 |
+| `crates/engine/src/bundle.rs` | 新增：`BUNDLE_EXTENSIONS`、`is_bundle_name`、`is_bundle_path`、`is_inside_bundle`（排序修复已先落地，剪枝复用） |
+| `crates/engine/src/scanner.rs` | `Step` 增加 `LeafDir`；串行/并行两臂各加分支；`scan_roots` / `collect_records` 接受 `prune_bundles: bool` |
+| `crates/engine/src/reconcile.rs` | `full_rescan` 透传开关；新增 `needs_policy_rescan` |
 | `crates/engine/src/config.rs` | 新增 `index_bundle_contents`，`default_config` 与往返测试同步 |
-| `crates/engine/src/persist.rs` | `FORMAT_VERSION = 2`；`IndexMeta` 加 `bundle_prune: bool`；header 读写各一处 |
-| `crates/cli/src/daemon.rs` | `diff_one` 入口拦截；补链循环加 bundle 检查；首扫/重扫调用传开关；启动时比对 `meta.bundle_prune` |
-| `crates/engine/tests/parity.rs` | 参考枚举同步剪枝语义，受控树加入 `.app`/`.framework` |
+| `crates/engine/src/persist.rs` | `FORMAT_VERSION = 2`；`IndexMeta` 加 `bundle_prune: bool`、手写 `Default`；header 读写各一处 |
+| `crates/cli/src/daemon.rs` | `diff_one` 按 R1/R2/R3 分支；补链终止加 `is_inside_bundle`；首扫/重扫调用传开关；`cold_start` 调用 `needs_policy_rescan` |
+| `crates/cli/src/daemon/volumes.rs` | `scan_volume_into` 的 `collect_records` 传开关（初稿漏掉的扫描入口） |
+| `crates/engine/tests/parity.rs` | 参考枚举同步剪枝语义，受控树加入 `.app`/`.framework`/`.kext` |
 
-传参方式：`scan_roots(roots, excludes, threads, prune_bundles)` 增加一个 `bool`。改动面最小的形态是让 `prune_bundles` 与 `excludes` 一起打包成一个 `ScanPolicy` 结构，但当前只有 4 个调用点，直接加参数即可；若后续再出现第二个策略位，再收敛。
+传参方式：`scan_roots(roots, excludes, threads, prune_bundles)` 增加一个 `bool`。当前调用点少，直接加参数；若后续再出现第二个策略位，再收敛为 `ScanPolicy`。
 
-## 5. 测试计划
+## 6. 测试计划
 
 全部做突变验证（改坏实现确认测试变红）。
 
 ### 单元（engine）
 
 1. `is_bundle_name`：`.app` / `.APP` / `.framework` 命中；`notes.app.txt`、`应用.app备份`、`Contents` 不命中。
-2. `is_bundle_path`：bundle 自身、内部深层路径命中；同前缀的非 bundle 目录（`MyApp.appdata/x`）不命中。
+2. `is_bundle_path` 与 `is_inside_bundle` 的分界：`/a/X.app` 前者 true 后者 false；`/a/X.app/Contents` 两者 true；`MyApp.appdata/x` 均 false。
 3. 首扫：受控树 `t/X.app/Contents/Info.plist` → 索引含 `X.app`，不含 `Contents`、`Info.plist`。
 4. 首扫开关：`prune_bundles = false` → 内部条目全部收录。
-5. 串行/并行一致：同一棵树两臂条目集相等（既有 parity 的串行-并行对照扩展到含 bundle 的树）。
-6. 增量：索引中已有 bundle 条目；`diff_one` 对 `.app/Contents` 返回 0，索引条目数不变。
-7. 增量新建：父目录 diff 收录 `Y.app`，随后 bundle 内 diff 不产生条目。
-8. 补链：索引中只有 `/Applications`，事件目标 `/Applications/Z.app/Contents/MacOS` → 补链止于 `Z.app` 的父目录，索引增加 `Z.app` 一条，不增加内部条目。
-9. 持久化：`bundle_prune = true` 落盘 → 读回 `meta.bundle_prune == true`；版本 1 文件 → `BadVersion`。
-10. 配置：缺省 false；往返保留。
+5. 显式根豁免：`scan_roots([t/X.app])` → 包内条目收录。
+6. 串行/并行一致：同一棵树两臂条目集相等（扩展到含 bundle 的树）。
+7. 增量 R2：目标为 `.app` 自身 → 父目录被 diff，bundle 条目增删正确，包内无条目。
+8. 增量 R3：索引中已有 bundle 条目，目标为 `.app/Contents` → 返回 0，条目数不变。
+9. 增量 R3 自愈：索引缺 bundle 条目，目标为 `.app/Contents` → diff 父目录补录条目。
+10. 补链：索引中只有 `/Applications`，事件目标 `/Applications/Z.app/Contents/MacOS` → 补链收录 `Z.app`，止于包内，不收录内部条目。
+11. 持久化：`bundle_prune = true` 落盘 → 读回为 true；版本 1 文件 → `BadVersion`。
+12. `needs_policy_rescan`：策略一致 → false；翻转 → true；`scan_roots` 不同但策略一致 → false（突变「把 scan_roots 加进比对」此测必红）。
+13. 配置：缺省 false；往返保留。
 
 ### 对拍（parity）
 
@@ -139,18 +209,29 @@ bundle 剪枝改变了「索引内容 = 磁盘条目全集」这一前提，旧�
 
 `HOME=/tmp/mce-dev MCE_ROOTS=...` 隔离环境下造 `A.app/Contents/B.app`，`start` → `query "B.app"` 应只命中 `A.app` 不命中内部；`status` 条目数符合预期。
 
-## 6. 文档同步
+### 量化验收
+
+`scripts/bench.sh` 受控树加入一棵真实形态的 `.app`（`Contents/Frameworks/.../Helper.app` 多层）。记录剪枝前后的索引条目数、首扫时间、常驻内存，写进验收报告——这是本方案的主要正面收益，需要数字而不是断言。
+
+## 7. 文档同步
 
 | 文档 | 改动 |
 |---|---|
-| `docs/specs/v1-core/product.md` §1 | 排除语义补一条：bundle 内部默认不索引，配置可开 |
-| `docs/usage.md` | 配置字段说明、搜索范围的已知边界 |
-| `CLAUDE.md` 关键约定 | 「排除判定三条路径共用 `is_excluded`」补 bundle 判定同点共用 |
-| `docs/architecture.md` | 扫描器一节补一句 bundle 剪枝 |
+| `docs/specs/v1-core/product.md` 问题陈述 §1 | 补「索引粒度 = Finder 可见单位」：bundle 在 Finder 中是单个项目，内部不单独收录 |
+| `docs/specs/v1-core/product.md` 目标 7 | 对拍零差异的范围改为「同扫描根、同排除、同 bundle 规则」 |
+| `docs/specs/v1-core/product.md` 目标 10 | 「100% 递归覆盖」改为「扫描根内所有 Finder 可见单位 100% 覆盖」 |
+| `docs/specs/v1-core/product.md` 目标 12 | 实时性覆盖补一句：包内变更不产生索引条目，bundle 条目的增删改仍 ≤ 500 毫秒可见 |
+| `docs/specs/v1-core/tech.md` | 扫描器与增量两节同步判定规则与三条增量规则 |
+| `docs/usage.md` | 配置字段、改 config 前先 stop、已知边界（包内不可搜，开关可放开） |
+| `crates/app/src/ui/settings_view.rs`（索引标签） | 常驻说明一句：「应用包（.app 等）内部不单独收录」；开关排入后续迭代 |
+| `CLAUDE.md` 关键约定 | 「排除判定三条路径共用 `is_excluded`」补 bundle 判定同点共用；增补「卷扫描是第四条写入路径」 |
+| `docs/architecture.md` | 扫描器一节补 bundle 剪枝与粒度立论 |
 
-## 7. 风险与已定取舍
+## 8. 风险与已定取舍
 
-- **旧索引重建**：升级后首次启动有一次全量重扫。可接受，且格式版本本来就承担这类语义变更。
-- **用户想搜包内文件**：开关是唯一退路，且翻转后必须重启 daemon（配置不热加载）。文档写明。
-- **`.bundle` 误伤**：非标准目录也可能叫 `*.bundle`，但其内部条目通常同样无搜索价值；开关可恢复。
-- **bundle 目录的 `dir_map` 键**：仍会登记（父目录 diff 时插入），但 `diff_one` 入口拦截保证它不会被 diff。登记本身无害，且删除/改名事件依赖父目录 diff 兜底。
+- **旧索引重建**：升级后首次启动有一次全量重扫。格式版本本来就承担这类语义变更。
+- **混装窗口的离线读**：格式升到 2 后，旧 GUI 在 daemon 未运行时离线直读新索引会得到 `index_unreadable`（`client/src/lib.rs` 的 `load_mmap` 失败路径）；在线不受影响（`engine_launcher.rs` 已有版本偏差检测并自动重启引擎）。不额外处理，风险表留痕。
+- **用户想搜包内文件**：两个逃生口——开关（需重启 daemon）与显式扫描根。文档写明。
+- **`.bundle` 误伤**：非标准目录也可能叫 `*.bundle`，但 Finder 同样按包处理；开关可恢复。
+- **bundle 目录的 `dir_map` 键**：父目录 diff 时登记，`diff_one` 按 R2/R3 拦截保证不 diff 内部。登记本身用于包内事件的自愈判定。
+- **config.toml 手改与排除命令互相覆盖**：见 §4.4，文档与设置页文案双重提示。

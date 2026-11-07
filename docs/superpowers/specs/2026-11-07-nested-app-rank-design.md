@@ -37,6 +37,8 @@ is_dir
 && 从父条目到根的任一祖先，其 display 名不以任何 bundle 扩展名结尾
 ```
 
+本修复独立于包内剪枝，且必须独立成立：即使将来 `index_bundle_contents = true` 让全量索引回来，包内 `.app` 也不得进入置顶组。剪枝解决「包内条目在不在索引里」，本修复解决「在索引里的包内条目排在哪」。两者叠加，不互相替代。
+
 bundle 扩展名集合与剪枝设计共用：
 
 ```
@@ -121,6 +123,7 @@ fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
 6. `case:` 查询下行为一致。
 7. top-limit 截断：低分非包内 `.app` 仍先于高分包内 `.app` 入选。
 8. bundle.rs 单元：扩展名表逐项命中；`notes.app.txt`、`应用.app备份`、`Contents` 不命中；`/a/X.app/Contents` 路径命中。
+9. 剪枝开关打开（全量索引）时回归：索引中同时存在 `Outer.app` 与 `Outer.app/Contents/Inner.app`，`Inner.app` 仍不置顶。这条在剪枝实施后防止「开关恢复旧缺陷」。
 
 ## 6. 文档同步
 
