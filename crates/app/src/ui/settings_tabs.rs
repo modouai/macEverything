@@ -70,7 +70,8 @@ pub fn tab_item_rects(bar: egui::Rect) -> [egui::Rect; 5] {
 }
 
 /// 命中测试：坐标落在哪个标签项内（标签栏外返回 `None`）。
-#[allow(dead_code)] // Task 4 接线后删除。
+#[allow(dead_code)] // Task 4 只接线 `draw_tab_bar`；本函数收口时仍无生产消费方，
+                    // 必须改为消费或删除并移除此 allow。
 pub fn hit_test(bar: egui::Rect, pos: egui::Pos2) -> Option<SettingsTab> {
     tab_item_rects(bar)
         .iter()
@@ -221,7 +222,7 @@ fn draw_tab_icon(
 mod tests {
     use super::*;
     use crate::i18n::Lang;
-    use crate::ui::settings_tokens::{TABBAR_H, TAB_GAP, TAB_ITEM_W};
+    use crate::ui::settings_tokens::{TABBAR_H, TAB_GAP, TAB_ITEM_H, TAB_ITEM_W};
 
     #[test]
     fn item_rects_are_centered_and_evenly_spaced() {
@@ -231,6 +232,12 @@ mod tests {
         let total = TAB_ITEM_W * 5.0 + TAB_GAP * 4.0;
         let expected_left = bar.center().x - total / 2.0;
         assert!((rects[0].left() - expected_left).abs() < 0.01);
+        let expected_top = bar.center().y - TAB_ITEM_H / 2.0;
+        for rect in &rects {
+            assert!((rect.top() - expected_top).abs() < 0.01);
+            assert!((rect.width() - TAB_ITEM_W).abs() < 0.01);
+            assert!((rect.height() - TAB_ITEM_H).abs() < 0.01);
+        }
         for pair in rects.windows(2) {
             assert!((pair[1].left() - pair[0].right() - TAB_GAP).abs() < 0.01);
         }
@@ -279,13 +286,17 @@ mod tests {
                 tab.label()
             );
         }
-        // 选中项底：Index 的浅蓝底必须画在标签项矩形上（防选中态漏画）。
+        // 选中项底：Index 的浅蓝底必须精确落在 Index 的标签项矩形上
+        // （防选中态漏画或画错项）。
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(620.0, TABBAR_H));
+        let active_rect = tab_item_rects(bar)[SettingsTab::Index as usize];
         let selected = out
             .shapes
             .iter()
             .flat_map(|clipped| rect_shapes(&clipped.shape))
             .find(|rect| rect.fill == palette.tab_selected_fill);
         let selected = selected.expect("缺少选中标签背景");
+        assert_eq!(selected.rect, active_rect);
         assert_eq!(
             (selected.rect.width(), selected.rect.height()),
             (TAB_ITEM_W, TAB_ITEM_H)

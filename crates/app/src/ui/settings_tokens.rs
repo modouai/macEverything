@@ -181,7 +181,7 @@ pub const TAB_ITEM_H: f32 = 52.0;
 pub const TAB_GAP: f32 = 4.0;
 pub const TAB_ICON: f32 = 26.0;
 pub const TAB_FONT: f32 = 11.0;
-#[allow(dead_code)] // Task 4 接线后删除：标签栏左右内边距暂无边栏绘制消费。
+#[allow(dead_code)] // Task 7 多语言标签宽度测试接入后删除：当前无边栏绘制消费。
 pub const TAB_PAD_X: f32 = 10.0;
 pub const TAB_RADIUS: u8 = 9;
 
