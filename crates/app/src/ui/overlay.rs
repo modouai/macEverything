@@ -502,30 +502,18 @@ pub fn show_overlay(ui: &mut egui::Ui, st: &mut OverlayState) {
                 ui.add_space(2.0);
             }
             if st.results.is_empty() {
-                // 空输入 = 引导态;有输入无匹配 = 无匹配态。居中 ghost + 文案。
+                // 空输入 = 引导态;有输入无匹配 = 无匹配态。居中提示文案。
                 ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(14.0);
-                        let (ghost, _) =
-                            ui.allocate_exact_size(egui::vec2(40.0, 26.0), egui::Sense::hover());
-                        ui.painter().rect_stroke(
-                            ghost,
-                            6.0,
-                            egui::Stroke::new(1.5, t.empty_text),
-                            egui::StrokeKind::Middle,
-                        );
-                        ui.add_space(8.0);
-                        let text = if st.input.is_empty() {
-                            strings.overlay_hint
-                        } else {
-                            strings.empty_no_match
-                        };
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(text)
-                                .font(crate::ui::font::id(FONT_META))
-                                .color(t.empty_text),
-                        ));
-                    });
+                    let text = if st.input.is_empty() {
+                        strings.overlay_hint
+                    } else {
+                        strings.empty_no_match
+                    };
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(text)
+                            .font(crate::ui::font::id(FONT_META))
+                            .color(t.empty_text),
+                    ));
                 });
                 return;
             }
