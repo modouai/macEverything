@@ -1034,13 +1034,25 @@ git commit -m "refactor(app): 设置页标签分发与通用页"
         data.active_tab = SettingsTab::Index;
         data.excluded = vec!["~/Library".into()];
         let out = run_body(&data);
-        let labels: Vec<&str> = all_texts(&out)
-            .iter()
-            .map(|text| text.galley.text())
-            .collect();
-        assert!(labels.contains(&i18n::s().row_excluded));
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == i18n::s().row_excluded)
+                .count(),
+            1,
+            "排除目录子分组标签只出现一次（行头；不再加卡片子标题）"
+        );
         assert!(labels.contains(&i18n::s().group_volumes));
-        assert!(!labels.contains(&i18n::s().group_index));
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == i18n::s().settings_tab_index)
+                .count(),
+            1,
+            "索引页不得再画顶层「索引」标题（唯一出现应来自标签栏）"
+        );
     }
 ```
 
