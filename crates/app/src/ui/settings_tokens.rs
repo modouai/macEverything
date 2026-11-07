@@ -60,7 +60,6 @@ pub struct SettingsPalette {
     /// 字号分段：未选中段文字（未选中段无独立底色，透出控件底）。
     pub segment_unselected_text: egui::Color32,
     /// 选中标签的浅色底（系统蓝低透明度）。
-    #[allow(dead_code)] // Task 2 标签栏绘制接入前暂不读取。
     pub tab_selected_fill: egui::Color32,
     /// 开关开态（系统蓝；后续若跟随 macOS 强调色则由系统提供）。
     pub switch_on: egui::Color32,
@@ -176,23 +175,14 @@ pub const TRAFFIC_LIGHT_GAP: f32 = 8.0;
 pub const TITLEBAR_RIGHT_SPACER: f32 = TRAFFIC_LIGHT_SIZE * 3.0 + TRAFFIC_LIGHT_GAP * 2.0;
 
 // —— 顶部标签栏 ——
-// 本 Task 只建表，标签栏绘制（Task 2）与页面分发（Task 4）接入前逐项 allow，
-// 与既有「规格对账」参考值同规；接入后删除。
-#[allow(dead_code)]
 pub const TABBAR_H: f32 = 68.0;
-#[allow(dead_code)]
 pub const TAB_ITEM_W: f32 = 96.0;
-#[allow(dead_code)]
 pub const TAB_ITEM_H: f32 = 52.0;
-#[allow(dead_code)]
 pub const TAB_GAP: f32 = 4.0;
-#[allow(dead_code)]
 pub const TAB_ICON: f32 = 26.0;
-#[allow(dead_code)]
 pub const TAB_FONT: f32 = 11.0;
-#[allow(dead_code)]
+#[allow(dead_code)] // Task 4 接线后删除：标签栏左右内边距暂无边栏绘制消费。
 pub const TAB_PAD_X: f32 = 10.0;
-#[allow(dead_code)]
 pub const TAB_RADIUS: u8 = 9;
 
 // —— 内容 / 分组 / 卡片（§2.1 / §2.3）——
