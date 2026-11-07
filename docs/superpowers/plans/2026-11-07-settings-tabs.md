@@ -503,7 +503,11 @@ cargo test -p macEverything-app ui::settings_tabs
 
 预期：5 个测试通过。
 
-- [ ] **Step 9: 门禁 + 提交**
+- [ ] **Step 9: 清理已消费的临时 allow**
+
+逐一删除 `settings_tokens.rs` 中 8 个 `TAB_*` 常量与 `tab_selected_fill` 的 `#[allow(dead_code)]`（Task 2 的 `draw_tab_bar`/`draw_tab_icon` 已引用）。同时尝试删除 `SettingsTab`/`impl SettingsTab` 上的 scoped allow；若生产 bin 仍判定未接入（调用方要到 Task 4 才出现），保留 scoped allow 并在 Task 4 删除。`group_shortcuts` 的 allow 保留到 Task 4。每删一项跑一次 `cargo clippy -p macEverything-app --all-targets -- -D warnings`，以编译器为准。
+
+- [ ] **Step 10: 门禁 + 提交**
 
 ```bash
 cargo fmt --check && cargo clippy -p macEverything-app --all-targets -- -D warnings
@@ -995,7 +999,15 @@ fn draw_panel_assist_page(
 cargo test -p macEverything-app general_page_has_five_rows
 ```
 
-- [ ] **Step 8: 门禁 + 提交**
+- [ ] **Step 8: 清理临时 allow 与废弃标题 key**
+
+- 删除 `SettingsTab`/`impl SettingsTab` 上剩余的 scoped `#[allow(dead_code)]`（`draw_body` 已调用 `draw_tab_bar`）。
+- 删除 `group_shortcuts` 的字段级 allow（`draw_shortcuts_page` 已消费）。
+- 从 `catalog!` 删除 `group_general`（通用页不再画顶层标题）；更新所有引用它的测试断言（例如把「不得包含 group_general」改为断言新的子分组标题）。
+- `group_index` / `group_about` 暂留到 Task 5/6 删除。
+- 跑 `cargo clippy -p macEverything-app --all-targets -- -D warnings` 确认没有遗留 `allow(dead_code)` 掩盖漏接。
+
+- [ ] **Step 9: 门禁 + 提交**
 
 ```bash
 cargo fmt --check && cargo clippy -p macEverything-app --all-targets -- -D warnings
@@ -1053,7 +1065,7 @@ fn draw_index_page(
 }
 ```
 
-把 `draw_index_group` 的 `draw_card` 标题从 `i18n::s().group_index` 改为 `Some(i18n::s().row_excluded)`（子分组「排除目录」）；`draw_volumes_group` 保持 `Some(i18n::s().group_volumes)`。
+把 `draw_index_group` 的 `draw_card` 标题从 `i18n::s().group_index` 改为 `Some(i18n::s().row_excluded)`（子分组「排除目录」）；`draw_volumes_group` 保持 `Some(i18n::s().group_volumes)`。从 `catalog!` 删除 `group_index`，并更新引用它的测试断言。
 
 - [ ] **Step 4: 跑测试**
 
@@ -1066,7 +1078,7 @@ cargo test -p macEverything-app index_page_has_exclusions
 ```bash
 cargo fmt --check && cargo clippy -p macEverything-app --all-targets -- -D warnings
 cargo test -p macEverything-app ui::settings_view
-git add crates/app/src/ui/settings_view.rs
+git add crates/app/src/ui/settings_view.rs crates/app/src/i18n/catalog.rs
 git commit -m "refactor(app): 设置页索引标签页"
 ```
 
