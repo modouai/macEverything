@@ -649,7 +649,7 @@ fn draw_experimental_page(
     draw_panel_assist_page(ui, full_w, data, palette, extra_h, actions);
 }
 
-/// 保存面板目录助手行（无页内顶层标题）；错误行 + 常驻说明 + 重启提示。
+/// 保存面板目录助手行（无页内顶层标题）；保存失败错误行 + 常驻说明。
 fn draw_panel_assist_page(
     ui: &mut egui::Ui,
     full_w: f32,
@@ -676,7 +676,7 @@ fn draw_panel_assist_page(
 ///
 /// 已授权只画开关；未授权在开关左侧显示单条「当前未授权，点击授权。」链接
 /// （点击 → [`SettingsAction::OpenPanelAssistAuth`]，设置 pass 注册并打开
-/// 设备控制/数据访问页）。行下方常驻描述 + 权限变更需重启提示。
+/// 设备控制/数据访问页）。行下方常驻描述。
 fn draw_panel_assist_row(
     ui: &mut egui::Ui,
     body: egui::Rect,
@@ -2846,6 +2846,25 @@ mod tests {
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(labels.contains(&i18n::s().row_panel_assist));
         assert!(!labels.contains(&i18n::s().row_excluded));
+    }
+
+    /// 实验页保存失败错误行与常驻说明必须各占一行；突变让错误行不计 extra
+    /// 高度 → 两条消息各分半行，测试红。
+    #[test]
+    fn experimental_page_error_and_description_do_not_overlap() {
+        let mut data = with_tab(layout_test_data(), SettingsTab::Experimental);
+        data.panel_assist_error = Some(SettingsError::SaveFailed);
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let error_text = SettingsError::SaveFailed.text();
+        let err = find_text(&texts, &error_text);
+        let desc = find_text(&texts, i18n::s().row_panel_assist_desc);
+        let dy = (text_center(err).y - text_center(desc).y).abs();
+        assert!(
+            dy >= desc.galley.size().y * 0.9,
+            "错误行与说明行重叠: dy={dy}, 行高={}",
+            desc.galley.size().y
+        );
     }
 
     #[test]

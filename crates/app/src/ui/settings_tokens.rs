@@ -543,6 +543,21 @@ mod tests {
             ),
             (13.0, 16.0, 12.0, 2.0, 4.0)
         );
+        assert_eq!(
+            (
+                TABBAR_H,
+                TAB_ITEM_W,
+                TAB_ITEM_H,
+                TAB_GAP,
+                TAB_ICON,
+                TAB_ICON_TOP_GAP,
+                TAB_LABEL_BOTTOM_GAP,
+                TAB_FONT,
+                TAB_PAD_X,
+                TAB_RADIUS
+            ),
+            (68.0, 96.0, 52.0, 4.0, 26.0, 8.0, 12.0, 11.0, 10.0, 9)
+        );
 
         assert_eq!(
             (
