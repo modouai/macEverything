@@ -52,10 +52,12 @@ pub const FLAG_HISTORY_DONE: EventFlags = fs::kFSEventStreamEventFlagHistoryDone
 /// 仅测试/示例使用:生产增量管线只要目录级事件(见 [`DIR_EVENTS`])。
 pub const FILE_EVENTS: fs::FSEventStreamCreateFlags = fs::kFSEventStreamCreateFlagFileEvents;
 
-/// 目录级事件(不请求 FileEvents):`path` 是变更所在的目录,一条事件代表该
-/// 目录内的一次/多次变更。目录 diff 管线只需要这个粒度;文件级事件在解压、
-/// 拉代码等风暴下会让事件量放大到数万条,实测触发 `user_dropped|must_scan`,
-/// 进而全量重扫、再丢事件的正反馈。
+/// 目录级事件(不请求 FileEvents):`path` 是变更所在的目录,正是目录 diff
+/// 管线需要的粒度。
+///
+/// 注意它**不减少事件条数**:实测 8 万次文件操作仍产生约 8 万条事件(每条
+/// path 都指向所在目录)。风暴下的丢事件要靠消费侧兜底——回调热路径复用缓冲、
+/// 丢弃标记去抖重扫;不要指望换 flag 降低事件量。
 pub const DIR_EVENTS: fs::FSEventStreamCreateFlags = 0;
 
 /// 事件是否携带历史重放结束标记。
@@ -170,6 +172,11 @@ extern "C" fn on_events(
         // SAFETY:eventPaths 为 CFArrayRef(创建流恒设 UseCFTypes,见模块头)、
         // eventFlags/eventIds 为长度 num_events 的 C 数组(框架契约),
         // i < num_events 时索引合法;CFArrayGetValueAtIndex 借出的值在本次回调内有效。
+        //
+        // `s` 是由 eventPaths 借出的 CFStringRef,归属该数组、回调期间不会被释放。
+        // `CFStringGetCStringPtr` 返回的指针归 `s` 所有、NUL 结尾,在 `s` 生命周期内
+        // 有效;仅在 `!is_null()` 分支解引用并立即拷贝。`CFStringGetCString` 失败时
+        // 缓冲区内容不可读,故只在返回 true 的分支读 `buf`。
         let (path, flags, id) = unsafe {
             let value = cf::CFArrayGetValueAtIndex(paths, i as cf::CFIndex);
             let s = value as cf::CFStringRef;

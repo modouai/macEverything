@@ -170,11 +170,7 @@ fn live_dir_event_volume_and_drops() {
                     file_paths += 1;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if writer.is_finished() && events == 0 {
-                    continue;
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
