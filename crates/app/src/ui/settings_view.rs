@@ -649,13 +649,12 @@ fn draw_panel_assist_page(
     actions: &mut Vec<SettingsAction>,
 ) {
     let panel_error = data.panel_assist_error.as_ref().map(SettingsError::text);
+    // 三条支持行：保存失败错误 + 常驻说明 + 重启提示。`with_extra` 是覆盖
+    // 而非累加，必须一次性把行高求和，否则两条常驻行会各分到半行而重叠。
+    let extra = extra_for(panel_error.is_some(), extra_h) + 2.0 * extra_h;
     let rows = [GroupRow {
         kind: RowKind::PanelAssist,
-        // 错误行(保存失败) + 常驻说明行,两者都计入卡片高度。
-        spec: RowSpec::new(ROW_H)
-            .with_extra(extra_for(panel_error.is_some(), extra_h))
-            .with_extra(extra_h)
-            .with_extra(extra_h),
+        spec: RowSpec::new(ROW_H).with_extra(extra),
         error: panel_error.as_deref(),
         note: Some(i18n::s().row_panel_assist_desc),
         note2: None,
@@ -2824,6 +2823,23 @@ mod tests {
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(labels.contains(&i18n::s().row_panel_assist));
         assert!(!labels.contains(&i18n::s().row_excluded));
+    }
+
+    /// 实验页常驻两条支持行（说明 + 重启提示）必须各占一行，不得重叠。
+    /// 突变：把两条 extra 改回覆盖（只留 1×extra_h）→ dy 小于行高，测试红。
+    #[test]
+    fn experimental_page_support_lines_do_not_overlap() {
+        let data = with_tab(layout_test_data(), SettingsTab::Experimental);
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let desc = find_text(&texts, i18n::s().row_panel_assist_desc);
+        let hint = find_text(&texts, i18n::s().panel_assist_restart_hint);
+        let dy = (text_center(desc).y - text_center(hint).y).abs();
+        assert!(
+            dy >= desc.galley.size().y * 0.9,
+            "支持行重叠: dy={dy}, 行高={}",
+            desc.galley.size().y
+        );
     }
 
     #[test]
