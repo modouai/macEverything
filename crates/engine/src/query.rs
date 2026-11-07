@@ -204,12 +204,14 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
             .collect()
     };
 
-    // 候选行:(分数, 名长, 条目号)。case: 候选名 = NFC(display)(不折叠);
+    // 候选行:((置顶位 | 分数) 组合键, 名长, 条目号)。置顶位占高 8 位,
+    // 低 8 位为 score(1..3)——单次整数比较即完成两级排序,行大小不变(16B)。
+    // case: 候选名 = NFC(display)(不折叠);
     // 否则 = match 名(arena 已折叠,零拷贝借用)。
     // entry_valid 为 T3 合成视图的屏蔽判定挂点(tech.md §4.2):Base 命中经
     // 条目号链上溯屏蔽陈旧子树,Overlay 命中抑制 base 背书 anchor 的双份;
     // 单源视图默认恒真,零开销。
-    let mut rows: Vec<(u8, usize, u32)> = blocks
+    let mut rows: Vec<(u16, usize, u32)> = blocks
         .par_iter()
         .flat_map_iter(|&(start, chunk)| {
             (start..).zip(chunk.iter()).filter_map(|(idx, e)| {
@@ -264,7 +266,11 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                 if plan.whole_word && !all_parts_word_bounded(&target, &c_name) {
                     return None;
                 }
-                Some((score_of(&target, &c_name), target.len(), idx))
+                Some((
+                    ((ranks_first(view, idx) as u16) << 8) | u16::from(score_of(&target, &c_name)),
+                    target.len(),
+                    idx,
+                ))
             })
         })
         .collect();
@@ -273,17 +279,10 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // top-limit 选择而非全量排序:select_nth O(n) 划出前 limit 段,再对 k ≤ limit 排序;
     // 全量 sort O(n log n) 计入 elapsed_ms,百万命中时单独击穿 P99 <10ms。
     // 比较子含 idx 决胜成全序,截断集与稳定排序一致(确定性不受不稳定划分影响)。
-    // APP 包置顶为最高维度(spec v1-core):候选行不携带额外字段,比较时按条目
-    // 判定(display 名 `.app` 后缀,4 字节比较,O(log n) 次比较开销可忽略)。
-    let cmp = |a: &(u8, usize, u32), b: &(u8, usize, u32)| {
-        let app = |row: &(u8, usize, u32)| {
-            is_app_entry(view.entry(row.2).is_dir(), view.display_name(row.2))
-        };
-        app(b)
-            .cmp(&app(a))
-            .then(b.0.cmp(&a.0))
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
+    // 置顶位为最高维度（候选收集时已编入高 8 位），组内按 score 降序、
+    // 名长升序、条目号决胜。
+    let cmp = |a: &(u16, usize, u32), b: &(u16, usize, u32)| {
+        b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
     };
     if limit == 0 {
         rows.clear();
@@ -307,6 +306,26 @@ fn is_app_entry(is_dir: bool, display: &[u8]) -> bool {
     is_dir
         && display.len() >= SUFFIX.len()
         && display[display.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+}
+
+/// 默认相关度排序的最高维度：非包内的 `.app` 目录置顶。
+/// 判定 = 目录 + display 名 `.app` 后缀 + 祖先链无 bundle 组件。
+/// 只看命中的 `.app` 条目（数量小），父链上溯在候选收集阶段完成一次，
+/// 比较器只读编好的位，不做路径解析。
+fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
+    let e = view.entry(idx);
+    if !is_app_entry(e.is_dir(), view.display_name(idx)) {
+        return false;
+    }
+    // 用 parent_idx 而非 entry(idx).parent：合成视图需要全局合成号。
+    let mut p = view.parent_idx(idx);
+    while p != NO_PARENT {
+        if crate::bundle::is_bundle_name(view.display_name(p)) {
+            return false;
+        }
+        p = view.parent_idx(p);
+    }
+    true
 }
 
 /// 列排序键(完整窗口列头):Relevance = v1 质量序(委托 execute),
@@ -909,6 +928,106 @@ mod match_tests {
         let _ = i.insert("alpha.txt", d, false);
         let out = execute(&i, &parse("a").unwrap(), 1);
         assert_eq!(names(&i, &out.hits), vec!["zeta.app"]);
+    }
+
+    /// 嵌套在另一个 .app 内的 .app 不置顶：外层应用照常置顶，
+    /// 包内 Helper 回到普通条目组按打分排序。
+    /// 突变「ranks_first 去掉祖先循环」时必红。
+    #[test]
+    fn nested_app_inside_app_does_not_rank_first() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let outer = i.insert("Outer.app", d, true);
+        let contents = i.insert("Contents", outer, true);
+        let _ = i.insert("Inner.app", contents, true);
+        let _ = i.insert("alpha.txt", d, false); // 前缀命中(score 3)
+        let out = execute(&i, &parse("a").unwrap(), 100);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["Outer.app", "alpha.txt", "Inner.app"],
+            "包内 .app 不得置顶"
+        );
+    }
+
+    /// 祖先为 .framework 的 .app 同样不置顶（判定用全 bundle 扩展名集合）。
+    #[test]
+    fn app_inside_framework_does_not_rank_first() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let fw = i.insert("Chromium.framework", d, true);
+        let helpers = i.insert("Helpers", fw, true);
+        let _ = i.insert("X.app", helpers, true);
+        let _ = i.insert("alpha.txt", d, false);
+        let out = execute(&i, &parse("a").unwrap(), 100);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["alpha.txt", "X.app", "Chromium.framework"],
+            ".framework 内的 .app 不得置顶"
+        );
+    }
+
+    /// 祖先名只是包含 .app 子串、并非 bundle 后缀：子 .app 仍置顶。
+    #[test]
+    fn app_under_non_bundle_lookalike_still_ranks_first() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let lookalike = i.insert("notes.app.txt", d, true);
+        let _ = i.insert("Z.app", lookalike, true);
+        let out = execute(&i, &parse("a").unwrap(), 100);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["Z.app", "notes.app.txt"],
+            "祖先不是 bundle 时仍置顶"
+        );
+    }
+
+    /// 祖先后缀大写同样识别为 bundle。
+    #[test]
+    fn nested_uppercase_app_does_not_rank_first() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let outer = i.insert("Outer.app", d, true);
+        let _ = i.insert("Inner.APP", outer, true);
+        let _ = i.insert("alpha.txt", d, false);
+        let out = execute(&i, &parse("a").unwrap(), 100);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["Outer.app", "alpha.txt", "Inner.APP"],
+            "大写 bundle 后缀的祖先同样生效"
+        );
+    }
+
+    /// top-limit 截断使用同一比较子：包内 .app 不得挤掉普通高分条目。
+    #[test]
+    fn nested_app_does_not_survive_top_limit() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let outer = i.insert("Outer.app", d, true);
+        let contents = i.insert("Contents", outer, true);
+        let _ = i.insert("Inner.app", contents, true);
+        let _ = i.insert("alpha.txt", d, false);
+        let out = execute(&i, &parse("a").unwrap(), 2);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["Outer.app", "alpha.txt"],
+            "截断集不得包含包内 .app"
+        );
+    }
+
+    /// case: 查询下置顶判定读 display 原形态，嵌套判定同样生效。
+    #[test]
+    fn nested_app_does_not_rank_first_under_case_sensitive_query() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        let outer = i.insert("Outer.app", d, true);
+        let _ = i.insert("InnerA.app", outer, true); // 含大写 A，子串命中(score 1)
+        let _ = i.insert("Another.txt", d, false); // 大写 A 前缀命中(score 3)
+        let out = execute(&i, &parse("case:A").unwrap(), 100);
+        assert_eq!(
+            names(&i, &out.hits),
+            vec!["Another.txt", "InnerA.app"],
+            "case: 下包内 .app 仍不置顶"
+        );
     }
 
     /// 双段合成视图测试替身(tech.md §4.3 接口改造的核心契约钉):
