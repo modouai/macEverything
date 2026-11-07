@@ -3021,6 +3021,7 @@ mod tests {
             assert_labels(
                 &cli_labels,
                 &[
+                    i18n::s().row_cli_tool,
                     i18n::s().cli_state_absent,
                     i18n::s().cli_install_button,
                     i18n::s().cli_fda_hint,

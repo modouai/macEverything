@@ -479,43 +479,49 @@ mod tests {
 
     /// 标签文案在中英双语下都不得超出标签项可用宽度（扣左右内边距）。
     /// 默认测试字体可能缺 CJK 字形，中文宽度是 tofu 近似；真实设备由 SF Pro 保证。
+    /// 同时覆盖 Large 字号档（1.15 倍，生产中最紧的宽度预算）。
     #[test]
     fn labels_fit_item_width_in_both_languages() {
         let ctx = egui::Context::default();
-        for lang in [Lang::ZhHans, Lang::En] {
-            crate::i18n::with_lang(lang, || {
-                let mut out = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(620.0, TABBAR_H),
-                        )),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        for tab in SettingsTab::ALL {
-                            let width = ui
-                                .painter()
-                                .layout_no_wrap(
-                                    tab.label().to_owned(),
-                                    crate::ui::font::id(TAB_FONT),
-                                    egui::Color32::PLACEHOLDER,
-                                )
-                                .size()
-                                .x;
-                            assert!(
-                                width <= TAB_ITEM_W - 2.0 * crate::ui::settings_tokens::TAB_PAD_X,
-                                "{:?} 标签 {:?} 超宽: {width}",
-                                lang,
-                                tab.label()
-                            );
-                        }
-                    },
-                );
-                // headless：不做纹理上传，先清增量免得 Drop debug_assert 二次 panic。
-                out.textures_delta.clear();
-            });
-        }
+        let assert_widths = || {
+            for lang in [Lang::ZhHans, Lang::En] {
+                crate::i18n::with_lang(lang, || {
+                    let mut out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(620.0, TABBAR_H),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            for tab in SettingsTab::ALL {
+                                let width = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        tab.label().to_owned(),
+                                        crate::ui::font::id(TAB_FONT),
+                                        egui::Color32::PLACEHOLDER,
+                                    )
+                                    .size()
+                                    .x;
+                                assert!(
+                                    width
+                                        <= TAB_ITEM_W - 2.0 * crate::ui::settings_tokens::TAB_PAD_X,
+                                    "{:?} 标签 {:?} 超宽: {width}",
+                                    lang,
+                                    tab.label()
+                                );
+                            }
+                        },
+                    );
+                    // headless：不做纹理上传，先清增量免得 Drop debug_assert 二次 panic。
+                    out.textures_delta.clear();
+                });
+            }
+        };
+        assert_widths();
+        crate::ui::font::with_test_scale(1.15, assert_widths);
     }
 
     #[test]

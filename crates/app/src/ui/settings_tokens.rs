@@ -185,7 +185,7 @@ pub const TAB_ICON_TOP_GAP: f32 = 8.0;
 /// 标签文字中心距标签项底边的距离。
 pub const TAB_LABEL_BOTTOM_GAP: f32 = 12.0;
 pub const TAB_FONT: f32 = 11.0;
-#[allow(dead_code)] // Task 7 多语言标签宽度测试接入后删除：当前无标签栏绘制消费。
+#[allow(dead_code)] // 规格 token：仅标签宽度预算测试读取；生产绘制不读，保留 allow。
 pub const TAB_PAD_X: f32 = 10.0;
 pub const TAB_RADIUS: u8 = 9;
 
