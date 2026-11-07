@@ -16,3 +16,6 @@ target/
 
 # cargo vendor 标记(本地补丁目录,不随仓库分发)
 vendor/epaint/.cargo-ok
+
+# 视觉原型工作区（brainstorm 本地产物，不随仓库分发）
+/.superpowers/
