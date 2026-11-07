@@ -2768,6 +2768,15 @@ mod tests {
             labels.contains(&i18n::s().group_shortcuts),
             "缺少快捷键子分组"
         );
+        // 标签栏「通用」标签是唯一合法出现；页面内再画顶层标题会变成 2。
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == i18n::s().settings_tab_general)
+                .count(),
+            1,
+            "通用页不得再画顶层「通用」标题（唯一出现应来自标签栏）"
+        );
     }
 
     /// 布局:五组标题、行标签、字号三段、语言、命令行工具行、添加按钮与
