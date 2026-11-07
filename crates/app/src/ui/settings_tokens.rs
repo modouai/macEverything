@@ -215,7 +215,7 @@ pub const LABEL_FONT: f32 = 13.0;
 /// 标签与右侧控件间距（§2.3：16）。
 pub const LABEL_CONTROL_GAP: f32 = 16.0;
 /// 辅助说明/行内错误字号（§2.3：11pt）。
-pub const SUPPORT_FONT: f32 = 11.0;
+pub const SUPPORT_FONT: f32 = 12.0;
 /// 辅助说明/行内错误与标签间距（§2.3：2）。
 pub const LABEL_SUPPORT_GAP: f32 = 2.0;
 
@@ -538,7 +538,7 @@ mod tests {
                 SUPPORT_FONT,
                 LABEL_SUPPORT_GAP
             ),
-            (13.0, 16.0, 11.0, 2.0)
+            (13.0, 16.0, 12.0, 2.0)
         );
 
         assert_eq!(
