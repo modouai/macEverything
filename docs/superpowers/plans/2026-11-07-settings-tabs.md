@@ -1192,6 +1192,9 @@ git commit -m "refactor(app): 设置页高级/实验/关于标签页"
 | `cli_row_*` / `cli_error_row_adds_card_height` | Advanced |
 | `empty_excluded_list_shows_placeholder_row` / `add_button_click_emits_add_exclude` / `reset_button_click_emits_reset_action` / `busy_disables_reset_action` / `remove_click_emits_exact_path` / `busy_disables_add_and_remove_actions` / `busy_support_line_distinguishes_list_and_rescan` / `exclude_error_and_busy_draw_with_empty_state` | Index |
 | `auto_check_click_emits_toggle_action` / `update_action_button_emits_phase_specific_action` / `website_link_click_emits_open_website` | About |
+| `english_rows_fit_fixed_controls` | Index（“Excluded Folders”在索引页） |
+| `english_settings_page_covers_all_sections` | 逐页遍历 5 个标签，按页断言英文标签 |
+| `hotkey_notes_add_height_and_are_drawn_per_slot` | General；不能再用「索引」标题作垂直锚（该文字现在只在标签栏），改为测量快捷键卡片自身高度/底部，或按页比较 shortcuts card rect |
 | 字号/自启/语言/快捷键/键帽/录制相关测试 | General |
 
 `settings_layout_has_all_rows` 改成逐页遍历：
