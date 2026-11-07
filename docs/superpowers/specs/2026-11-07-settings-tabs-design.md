@@ -28,6 +28,8 @@
 | 4 | 实验 | 烧瓶 | 保存面板目录助手（实验标识、开关、授权链接、重启提示） |
 | 5 | 关于 | 信息圆 | 版本、检查更新、启动时自动检查更新、官网 |
 
+英文标签：General / Index / Advanced / Experimental / About。
+
 要点：
 
 - 标签栏是唯一顶层导航；页面内不再重复「通用 / 索引 / 关于」大标题，只保留子分组标题（快捷键、排除目录、外接磁盘）。
@@ -41,8 +43,8 @@
 
 - 窗口维持 620×600；标题栏 44pt 不变。
 - 标题栏下方为标签栏，高 68pt；内容区约 488pt。
-- 5 个标签水平居中；单项 96×52pt，间距 4pt；左右留白约 60pt。
-- 图标 26pt，线性描边 1.7，圆头端点；标签文字 11pt（受全局字号倍率影响）。
+- 5 个标签水平居中；单项 96×52pt，间距 4pt；左右留白约 60pt。96pt 以最长英文标签（Experimental）为基准，单行不截断。
+- 图标 26pt，线性描边 1.7，圆头端点；标签文字 11pt（受全局字号倍率影响）；文字左右内边距 10pt。
 - 标签栏背景与窗口同色（`window_fill`），底边 1px `divider`；不使用毛玻璃。
 
 ### 3.2 选中 / 悬停
@@ -50,7 +52,7 @@
 - 选中：图标与文字使用系统蓝 `switch_on`；底为 10% 蓝色圆角块（圆角 9）。
 - 未选中：图标/文字 `text_secondary`；悬停底 `control_fill`。
 - 点击整块 96×52 区域即切换，不要求点中图标。
-- 新增 token：`TABBAR_H=68`、`TAB_ITEM_W=96`、`TAB_ICON=26`、`TAB_FONT=11`、`TAB_RADIUS=9`、`tab_selected_fill`（深浅两套，系统蓝低透明度）。
+- 新增 token：`TABBAR_H=68`、`TAB_ITEM_W=96`、`TAB_ICON=26`、`TAB_FONT=11`、`TAB_PAD_X=10`、`TAB_RADIUS=9`、`tab_selected_fill`（深浅两套，系统蓝低透明度）。
 
 ### 3.3 图标
 
@@ -80,6 +82,8 @@
 - 设置窗关闭 / ⌘W / 红点行为不变。
 - 暂不加快捷键（⌘1–⌘5）切页，避免与录制冲突。
 - 外部入口（托盘「待授权」等）暂不指定标签，打开设置时沿用上次标签。
+- 多语言：标签文本与页面文案全部经 `i18n` catalog，禁止硬编码；切换语言立即刷新标签与当前页，`active_tab` 与各页滚动位置保持不变。
+- 中英文标签都必须单行不截断；以英文最长标签 `Experimental` 为宽度基准（96pt − 2×10pt 内边距）。
 
 ## 5. 实现结构
 
@@ -97,7 +101,7 @@
   - `SettingsState.active_tab`、快照、动作分发；
   - 标签点击与快捷键取消的顺序。
 - `crates/app/src/ui/settings_tokens.rs`：新增标签 token 与 `tab_selected_fill` 深浅两套。
-- `crates/app/src/i18n/catalog.rs`：5 个标签中英文；高级/实验页不新增说明文案，页面留白按现有卡片风格处理。
+- `crates/app/src/i18n/catalog.rs`：新增 `settings_tab_general/index/advanced/experimental/about` 中英成对文案（通用/索引/高级/实验/关于；General/Index/Advanced/Experimental/About）；页面其余文案沿用现有 i18n key；高级/实验页不新增说明文案，页面留白按现有卡片风格处理。
 
 职责边界：`settings_tabs` 只管标签栏视觉与命中；`settings_view` 只管页面绘制；`settings.rs` 只管状态与动作编排。
 
@@ -105,7 +109,8 @@
 
 纯逻辑/视图（headless egui）：
 
-- 标签栏：5 项顺序、单项 96×52 命中、选中态颜色、悬停、英文标签。
+- 标签栏：5 项顺序、单项 96×52 命中、选中态颜色、悬停、中英标签。
+- 多语言：中英两套都覆盖 5 个 `settings_tab_*` key；两种语言下每个标签实测文字宽 ≤ `TAB_ITEM_W − 2×TAB_PAD_X`；切换语言后重绘标签文字更新，`active_tab` 不变。
 - 页面映射：每个标签只渲染自己的行；同一行不在两页重复；`active_tab` 控制内容。
 - 状态：默认 General；`SelectTab` 更新状态；关闭重开保留；重启回 General。
 - 录制取消：录制中点击标签产生 `CancelHotkeyRecord` 后再 `SelectTab`。
@@ -128,7 +133,8 @@
 | 现有 `settings_view` 大量坐标点击测试依赖整页布局 | 引入 `open_tab` 辅助，按页重构；逐页跑测试 |
 | 标签点击与快捷键录制取消顺序错误 | 固定 `CancelHotkeyRecord → SelectTab`，加钉住测试 |
 | 每页滚动区 id 串页 | 统一 `settings-page-<tab>`，测试覆盖切页后滚动位置 |
-| 5 个标签在 620 宽下拥挤 | 96pt 单项、26pt 图标、11pt 文字；实机截图确认 |
+| 5 个标签在 620 宽下拥挤 | 96pt 单项、26pt 图标、11pt 文字；中英标签宽度测试；实机截图确认 |
+| 英文标签更长导致截断 | 以 `Experimental` 为宽度基准；文字宽度测试失败时调 `TAB_ITEM_W`/`TAB_FONT`，不缩字到不可读 |
 | 高级页只有 CLI，内容偏空 | 接受取舍；页内可加一句说明，不塞无关项 |
 
 ## 8. 文档同步
@@ -153,4 +159,5 @@
 4. 标签切换保留各自滚动位置；关闭重开保留上次标签；App 重启回通用。
 5. 录制快捷键时点击标签先取消录制。
 6. 深浅主题、字号倍率下标签栏与页面布局正常。
-7. `fmt --check` / `clippy -D warnings` / `cargo test --workspace` 全绿。
+7. 运行期切换中英文：标签与当前页立即刷新，当前标签与滚动位置保持；英文标签（含 Experimental）单行不截断。
+8. `fmt --check` / `clippy -D warnings` / `cargo test --workspace` 全绿。
