@@ -1111,15 +1111,7 @@ fn draw_about_group(
             hint: None,
         },
     ];
-    draw_card(
-        ui,
-        full_w,
-        Some(i18n::s().group_about),
-        &rows,
-        data,
-        palette,
-        actions,
-    );
+    draw_card(ui, full_w, None, &rows, data, palette, actions);
 }
 
 /// 版本行：左侧「版本」，右侧「版本号 · 状态说明 · 操作按钮」。
@@ -2802,6 +2794,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn advanced_page_only_has_cli_row() {
+        let mut data = layout_test_data();
+        data.active_tab = SettingsTab::Advanced;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        assert!(
+            labels.contains(&i18n::s().row_cli_tool),
+            "高级页缺少命令行工具行: {labels:?}"
+        );
+        assert!(!labels.contains(&i18n::s().row_font_size));
+    }
+
+    #[test]
+    fn experimental_page_has_panel_assist_row_only() {
+        let mut data = layout_test_data();
+        data.active_tab = SettingsTab::Experimental;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        assert!(labels.contains(&i18n::s().row_panel_assist));
+        assert!(!labels.contains(&i18n::s().row_excluded));
+    }
+
+    #[test]
+    fn about_page_has_version_and_auto_check_only() {
+        let mut data = layout_test_data();
+        data.active_tab = SettingsTab::About;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        let version = format!("v{}", crate::update::CURRENT_VERSION);
+        assert!(labels.iter().any(|label| label.contains(&version)));
+        assert!(labels.contains(&i18n::s().row_auto_check));
+        assert!(!labels.contains(&i18n::s().row_language));
+        // 页面级「关于」标题已移除；唯一出现应来自标签栏。
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == i18n::s().settings_tab_about)
+                .count(),
+            1,
+            "关于页不得再画顶层「关于」标题（唯一出现应来自标签栏）"
+        );
+    }
+
     /// 布局:五组标题、行标签、字号三段、语言、命令行工具行、添加按钮与
     /// 目录行齐全;内容自标题栏下起排,分组顺序固定,超出 620×600 的部分
     /// 由整页滚动承载(无首屏预算约束)。
@@ -2868,7 +2907,7 @@ mod tests {
         );
         // 分组顺序固定:关于组在索引组之后;页面超出 620×600 时由滚动区承载,
         // 断言只锁定相对顺序,不约束首屏。
-        let about_y = find_text(&texts, i18n::s().group_about).pos.y;
+        let about_y = find_text(&texts, i18n::s().row_version).pos.y;
         let index_y = find_text(&texts, i18n::s().row_excluded).pos.y;
         assert!(
             about_y > index_y,

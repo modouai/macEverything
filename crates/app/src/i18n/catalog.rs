@@ -76,7 +76,6 @@ catalog! {
     cli_hint_add_path: "PATH 中没有可用目录；先把 {dir} 加入 PATH（勿由 App 修改 shell 配置），然后重试安装" / "No usable directory in PATH; add {dir} to PATH (the app won't edit your shell config), then retry installation",
     cli_fda_hint: "首次在终端运行可能需要完全磁盘访问权限" / "The first terminal run may need Full Disk Access",
     // 关于 / 更新
-    group_about: "关于" / "About",
     row_version: "版本" / "Version",
     row_website_link: "官网" / "Website",
     row_auto_check: "启动时自动检查更新" / "Check for Updates at Launch",
