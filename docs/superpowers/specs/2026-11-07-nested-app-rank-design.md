@@ -132,5 +132,22 @@ fn ranks_first(view: &dyn IndexView, idx: u32, is_dir: bool) -> bool {
 ## 7. 取舍
 
 - **召回不变**：包内 `.app` 与包内文件仍出现在结果集，只是不置顶。若实际使用中包内文件仍是噪声，再议剪枝。
-- **路径解析成本**：仅对命中的 `.app` 目录条目读取一次 `dir_path` 并按 `/` 切分路径段；百万命中下 `.app` 命中数很小，不计入 P99 风险。实现后跑既有基准确认。
+- **路径解析成本**：仅对命中的 `.app` 目录条目读取一次 `dir_path` 并按 `/` 切分路径段；百万命中下 `.app` 命中数很小，不计入 P99 风险。
 - **不缓存置顶判定**：一次查询内同一 `.app` 条目只判定一次（候选收集时），无需跨查询缓存。
+
+## 8. 验收结果（2026-11-07）
+
+三门禁（`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`）通过。
+
+基准（`scripts/bench.sh /tmp/mce-bench 1000000`，Apple Silicon，隔离 HOME 与 `MCE_ROOTS`）：
+
+| 项目 | 结果 | 红线 |
+|---|---|---|
+| 首扫到就绪 | 0.83s | ≤ 5s |
+| 查询 P99（200 次随机关键词） | 2.1ms | < 10ms |
+| 增量可搜 | 0.25s | ≤ 500ms |
+| stop + 落盘 | 0.07s | — |
+| 冷启动到就绪（含重放） | 0.03s | ≤ 2s |
+
+隔离冒烟（`--data-dir` 独立目录，树内含 `Applications/Outer.app/Contents/SharedSupport/Inner.app`）：查询 `a` 的顺序为 `Outer.app`、`Normal.app`、`alpha.txt`、`Applications`、`Inner.app`——包内 `Inner.app` 不再置顶。
+
