@@ -548,8 +548,18 @@ extern "C" fn on_ax_event(
         }
         return;
     }
-    // 同一 app 内的焦点变化:只扫描，不据未命中发 Closed（不做跨 app 收敛）。
-    let _ = scan_focused(pid);
+    // 同一 app 内的焦点/窗口变化:扫描后确认无面板也要收敛归因
+    // (2026-11-07 QuickTime 打开面板实机)。面板关闭时宿主只发
+    // FOCUSED_WINDOW_CHANGED、不发 UI_ELEMENT_DESTROYED;原先「只扫描不
+    // 关闭」让归因与 UI 侧的 handled_pids 抑制残留,同 pid 的下一个面板
+    // 永远不再弹浮层(第一次正常、再次打开无浮层)。NoPanel 是「读取成功
+    // 且确认不是面板」的确定态;Unknown(读取失败/跳转期子 sheet)不解除
+    // ——与扫描三态纪律一致。
+    let outcome = scan_focused(pid);
+    if outcome == ScanOutcome::NoPanel && PANEL_PID.load(Ordering::SeqCst) == pid {
+        PANEL_PID.store(0, Ordering::SeqCst);
+        send(PanelEvent::Closed { pid });
+    }
 }
 
 /// 标记「本助手正在执行一次跳转」:子 sheet 出现后的瞬态 NoPanel 只在
@@ -744,6 +754,7 @@ extern "C" fn on_retry_tick(_info: *mut std::ffi::c_void) {
 }
 
 fn send(ev: PanelEvent) {
+    log::info!("detector: 发送事件 {ev:?}");
     TX.with(|c| {
         if let Some(tx) = c.borrow().as_ref() {
             if tx.send(ev).is_err() && !SEND_FAILED.swap(true, Ordering::SeqCst) {

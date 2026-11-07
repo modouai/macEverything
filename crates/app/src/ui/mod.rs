@@ -1211,6 +1211,7 @@ impl App {
                     engine_launcher::daemon_online(),
                 )
             };
+            log::info!("[panel-event] {ev:?} → {decision:?}");
             match decision {
                 platform::Decision::Ignore => {}
                 platform::Decision::Show => {
@@ -1253,6 +1254,8 @@ impl App {
                     // 锁外调用(原生 orderOut 可被 winit 同步派发)。
                     if let Err(err) = platform::overlay_hide() {
                         log::warn!("浮层隐藏失败(宿主切换): {err}");
+                    } else {
+                        log::info!("[panel-event] HideKeepBlock:浮层已隐藏");
                     }
                 }
                 platform::Decision::HideAndClear { pid } => {
@@ -1276,6 +1279,8 @@ impl App {
                     }
                     if let Err(err) = platform::overlay_hide() {
                         log::warn!("浮层隐藏失败(面板关闭 pid={pid}): {err}");
+                    } else {
+                        log::info!("[panel-event] HideAndClear:浮层已隐藏 pid={pid}");
                     }
                 }
             }

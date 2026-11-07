@@ -451,6 +451,40 @@ fn outcome_of(step: Step, has_saved: bool) -> (NavigateOutcome, bool) {
     }
 }
 
+/// 发键前焦点诊断:前台 app 的 `AXFocusedWindow` 是否就是保存面板。
+/// ⌘⇧G 落空的常见原因是浮层隐藏后键盘焦点没回到面板(合成键被送到宿主
+/// 其它窗口),该日志用于区分「焦点错位」与「面板不响应」。
+fn log_focus_diag(pid: i32) {
+    let Some(app) = ax_ffi::app_element(pid) else {
+        log::warn!("[navigator] 焦点诊断:app_element 读取失败 pid={pid}");
+        return;
+    };
+    let focused = ax_ffi::copy_attr(&app, attr::FOCUSED_WINDOW);
+    let panel = find_save_panel_window(&app);
+    let focused_is_panel = match (&focused, &panel) {
+        (Some(f), Some(p)) => ax_ffi::cf_equal(f, p),
+        _ => false,
+    };
+    let title_of = |w: &Option<AXRef>| {
+        w.as_ref().map(|w| {
+            let role = ax_ffi::attr_string(w, attr::ROLE).unwrap_or_default();
+            let title = ax_ffi::attr_string(w, attr::TITLE).unwrap_or_default();
+            format!("{role} {title:?}")
+        })
+    };
+    let panel_state = panel.as_ref().map(|p| {
+        (
+            ax_ffi::attr_bool(p, attr::FOCUSED),
+            ax_ffi::attr_bool(p, attr::MAIN),
+        )
+    });
+    log::info!(
+        "[navigator] 焦点诊断:focused_window={:?} 保存面板={:?} 焦点即面板={focused_is_panel} 面板 focused/main={panel_state:?}",
+        title_of(&focused),
+        title_of(&panel),
+    );
+}
+
 /// 发 ⌘⇧G 并等待 Go-to 输入框出现(调用方已确认前台是宿主)。
 fn send_goto_and_wait(pid: i32, baseline: &super::PanelBaseline, t_start: Instant) -> Obs {
     // 子 sheet 会让保存面板暂时从 AXWindows 消失:在跳转窗口内标记 detector,
@@ -494,6 +528,9 @@ fn send_goto_and_wait(pid: i32, baseline: &super::PanelBaseline, t_start: Instan
             );
         }
         log::warn!("[navigator] 3s 内未定位 Go-to 输入框(⌘⇧G 未生效或 post 目标错误)");
+        // 超时后的焦点快照:区分「焦点不在面板」与「焦点在面板但面板不响应
+        // 合成键」(2026-11-07 QuickTime 打开面板实机排障入口)。
+        log_focus_diag(pid);
         Obs::Timeout
     }
 }

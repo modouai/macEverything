@@ -98,6 +98,8 @@ extern "C" {
     /// CFBoolean true 单例(CoreFoundation 导出常量;跨进程 AX 布尔属性写值)。
     static kCFBooleanTrue: CFTypeRef;
     fn CFGetTypeID(cf: CFTypeRef) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(b: CFTypeRef) -> u8;
     fn CFStringGetTypeID() -> usize;
     fn CFArrayGetTypeID() -> usize;
     fn CFArrayGetCount(arr: CFTypeRef) -> isize;
@@ -401,6 +403,18 @@ pub fn perform_action(el: &AXRef, action: &str) -> bool {
     // SAFETY:CFStr 生命周期覆盖调用;无指针出参。
     let err = unsafe { AXUIElementPerformAction(el.raw(), a.raw()) };
     err == AX_ERROR_SUCCESS
+}
+
+/// 读布尔属性(AXFocused/AXMain 等;用于诊断窗口是否真是 key/main)。
+pub fn attr_bool(el: &AXRef, attr: &str) -> Option<bool> {
+    let v = copy_attr(el, attr)?;
+    // SAFETY:先比对 CFTypeID 确认是 CFBoolean 再取值。
+    unsafe {
+        if CFGetTypeID(v.raw()) != CFBooleanGetTypeID() {
+            return None;
+        }
+        Some(CFBooleanGetValue(v.raw()) != 0)
+    }
 }
 
 /// 读字符串属性。
