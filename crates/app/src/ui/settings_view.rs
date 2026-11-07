@@ -787,7 +787,7 @@ fn draw_index_group(
     draw_card(
         ui,
         full_w,
-        Some(i18n::s().group_index),
+        Some(i18n::s().row_excluded),
         &rows,
         data,
         palette,
@@ -2779,6 +2779,28 @@ mod tests {
         );
     }
 
+    /// 索引页：排除目录 + 外接磁盘两个子分组；页面内不再画顶层「索引」标题。
+    #[test]
+    fn index_page_has_exclusions_and_volumes_without_page_header() {
+        let mut data = layout_test_data();
+        data.active_tab = SettingsTab::Index;
+        data.excluded = vec!["~/Library".into()];
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        assert!(labels.contains(&i18n::s().row_excluded));
+        assert!(labels.contains(&i18n::s().group_volumes));
+        // 用出现次数钉住「页面内没有第二个『索引』」：唯一出现来自标签栏。
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == i18n::s().settings_tab_index)
+                .count(),
+            1,
+            "索引页不得再画顶层「索引」标题（唯一出现应来自标签栏）"
+        );
+    }
+
     /// 布局:五组标题、行标签、字号三段、语言、命令行工具行、添加按钮与
     /// 目录行齐全;内容自标题栏下起排,分组顺序固定,超出 620×600 的部分
     /// 由整页滚动承载(无首屏预算约束)。
@@ -2846,7 +2868,7 @@ mod tests {
         // 分组顺序固定:关于组在索引组之后;页面超出 620×600 时由滚动区承载,
         // 断言只锁定相对顺序,不约束首屏。
         let about_y = find_text(&texts, i18n::s().group_about).pos.y;
-        let index_y = find_text(&texts, i18n::s().group_index).pos.y;
+        let index_y = find_text(&texts, i18n::s().row_excluded).pos.y;
         assert!(
             about_y > index_y,
             "关于组须排在索引组之后(索引 y={index_y}, 关于 y={about_y})"
@@ -3516,17 +3538,18 @@ mod tests {
         }
     }
 
-    /// 内联错误行:增高通用卡片(「索引」标题下移),错误文案实际绘制。
+    /// 内联错误行:增高通用卡片(「排除目录」标题下移),错误文案实际绘制。
     #[test]
     fn cli_error_row_adds_card_height() {
         let baseline = run_body(&layout_test_data());
-        let baseline_index = text_center(find_text(&all_texts(&baseline), i18n::s().group_index)).y;
+        let baseline_index =
+            text_center(find_text(&all_texts(&baseline), i18n::s().row_excluded)).y;
 
         let mut data = layout_test_data();
         data.cli_install.error = Some("手动命令: sudo ln -s …".into());
         let with_error = run_body(&data);
         let texts = all_texts(&with_error);
-        let error_index = text_center(find_text(&texts, i18n::s().group_index)).y;
+        let error_index = text_center(find_text(&texts, i18n::s().row_excluded)).y;
         assert!(
             error_index > baseline_index + 10.0,
             "CLI 错误行必须增高通用卡片:基线 {baseline_index},错误 {error_index}"

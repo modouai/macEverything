@@ -40,7 +40,6 @@ catalog! {
     settings_tab_experimental: "实验" / "Experimental",
     settings_tab_about: "关于" / "About",
     group_shortcuts: "快捷键" / "Shortcuts",
-    group_index: "索引" / "Index",
     row_font_size: "字号" / "Text Size",
     row_autostart: "开机自启" / "Launch at Login",
     row_language: "语言" / "Language",
