@@ -1996,6 +1996,21 @@ mod tests {
         assert_eq!(state.active_tab, SettingsTab::Advanced);
     }
 
+    /// 语言切换只动语言字段：运行期标签页不变，快照仍渲染切换前那一页。
+    /// 突变：`set_language_result` 里顺手 `active_tab = General` → 测试红。
+    #[test]
+    fn language_switch_keeps_active_tab() {
+        let mut state = test_state();
+        state.active_tab = SettingsTab::Index;
+        state.set_language_result(LanguageSetting::En, None);
+        assert_eq!(state.file.language, LanguageSetting::En);
+        assert_eq!(state.active_tab, SettingsTab::Index);
+        assert_eq!(
+            SettingsData::from_state(&state, &crate::update::UpdateState::new()).active_tab,
+            SettingsTab::Index
+        );
+    }
+
     /// 关闭→打开才挂起一次列表刷新；已打开/重复 request_open 不重复挂起。
     #[test]
     fn exclude_refresh_pending_set_only_on_open_transition() {

@@ -2823,6 +2823,85 @@ mod tests {
         );
     }
 
+    /// 索引页滚动位置在切到通用页再切回时保持（每标签独立 ScrollArea id）。
+    /// 突变：所有标签共用同一 id_salt → 通用页短内容把 offset 夹到 0，切回后
+    /// 路径 y 回到未滚动位置，测试红。
+    #[test]
+    fn index_scroll_offset_survives_tab_switch() {
+        let mut data = with_tab(layout_test_data(), SettingsTab::Index);
+        data.excluded = (0..60).map(|i| format!("/tmp/path{i}")).collect();
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        // 滚轮偏移有惯性衰减，逐帧收敛；收敛后的 y 才是稳定滚动位置。
+        let settle_y = |data: &SettingsData| {
+            let mut last = f32::NAN;
+            for _ in 0..200 {
+                let (out, _) = run_frame(&ctx, data, Vec::new());
+                let y = text_center(find_text(&all_texts(&out), "/tmp/path15")).y;
+                if (y - last).abs() < 0.01 {
+                    return y;
+                }
+                last = y;
+            }
+            panic!("滚动未收敛: y={last}");
+        };
+        let y_before = settle_y(&data);
+        let pos = egui::pos2(310.0, 300.0);
+        let events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -300.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let _ = run_frame(&ctx, &data, events);
+        let y_scrolled = settle_y(&data);
+        assert!(
+            y_before - y_scrolled > 50.0,
+            "滚轮未生效: before={y_before}, scrolled={y_scrolled}"
+        );
+        let mut general = data.clone();
+        general.active_tab = SettingsTab::General;
+        let _ = run_frame(&ctx, &general, Vec::new());
+        let y_back = settle_y(&data);
+        // 切页回来首帧会重算 max_offset，惯性尾部可能再走 1px 量级；共享 id
+        // 时 offset 被通用页短内容夹回 0，差异是几百像素量级。
+        assert!(
+            (y_scrolled - y_back).abs() < 2.0,
+            "切页后滚动位置丢失: scrolled={y_scrolled}, back={y_back}"
+        );
+    }
+
+    /// 切换语言只刷新文案，不换页：实验页在两种语言下都渲染自身的行，
+    /// 通用页专属行始终缺席。
+    #[test]
+    fn language_switch_keeps_page_and_relabels() {
+        let data = with_tab(layout_test_data(), SettingsTab::Experimental);
+        let labels_under = |lang: crate::i18n::Lang| {
+            crate::i18n::with_lang(lang, || {
+                let out = run_body(&data);
+                let texts = all_texts(&out);
+                let labels: Vec<String> = texts
+                    .iter()
+                    .map(|text| text.galley.text().to_owned())
+                    .collect();
+                let row = i18n::s().row_panel_assist.to_owned();
+                let font = i18n::s().row_font_size.to_owned();
+                (labels, row, font)
+            })
+        };
+        let (zh, zh_row, zh_font) = labels_under(crate::i18n::Lang::ZhHans);
+        let (en, en_row, en_font) = labels_under(crate::i18n::Lang::En);
+        assert_ne!(zh_row, en_row, "测试前提：中英文案不同");
+        assert!(zh.contains(&zh_row), "中文页缺少实验页行: {zh:?}");
+        assert!(en.contains(&en_row), "英文页缺少实验页行: {en:?}");
+        assert!(!zh.contains(&zh_font), "语言切换后串到通用页");
+        assert!(!en.contains(&en_font), "语言切换后串到通用页");
+    }
+
     #[test]
     fn advanced_page_only_has_cli_row() {
         let mut data = layout_test_data();

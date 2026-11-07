@@ -478,11 +478,12 @@ mod tests {
     }
 
     /// 标签文案在中英双语下都不得超出标签项可用宽度（扣左右内边距）。
-    /// 默认测试字体可能缺 CJK 字形，中文宽度是 tofu 近似；真实设备由 SF Pro 保证。
+    /// 安装生产字体链（SF Pro + 内置 Noto），按真实字体测量，而不是默认测试字体。
     /// 同时覆盖 Large 字号档（1.15 倍，生产中最紧的宽度预算）。
     #[test]
     fn labels_fit_item_width_in_both_languages() {
         let ctx = egui::Context::default();
+        crate::ui::install_ui_fonts(&ctx, true);
         let assert_widths = || {
             for lang in [Lang::ZhHans, Lang::En] {
                 crate::i18n::with_lang(lang, || {
