@@ -3,10 +3,10 @@
 //! 宏保证两套表都填满 `Strings` 的全部字段——漏翻编译期报错。
 
 macro_rules! catalog {
-    ($( $field:ident : $zh:literal / $en:literal ),* $(,)?) => {
+    ($( $(#[$meta:meta])* $field:ident : $zh:literal / $en:literal ),* $(,)?) => {
         #[derive(Debug, Clone, Copy)]
         pub struct Strings {
-            $( pub $field: &'static str, )*
+            $( $(#[$meta])* pub $field: &'static str, )*
         }
 
         static ZH_HANS: Strings = Strings { $( $field: $zh, )* };
@@ -35,6 +35,14 @@ catalog! {
     settings_title: "设置" / "Settings",
     // 分组 / 行
     group_general: "通用" / "General",
+    settings_tab_general: "通用" / "General",
+    settings_tab_index: "索引" / "Index",
+    settings_tab_advanced: "高级" / "Advanced",
+    settings_tab_experimental: "实验" / "Experimental",
+    settings_tab_about: "关于" / "About",
+    // Task 4 通用页快捷键子分组接入前暂不读取。
+    #[allow(dead_code)]
+    group_shortcuts: "快捷键" / "Shortcuts",
     group_index: "索引" / "Index",
     row_font_size: "字号" / "Text Size",
     row_autostart: "开机自启" / "Launch at Login",
