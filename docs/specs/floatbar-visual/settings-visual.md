@@ -48,6 +48,9 @@
 
 ### 2.2 结构树
 
+> 2026-11-07 起窗口内容改为 5 个顶部图标标签；以下三分组结构树保留为历史记录，
+> 标签栏规格见 §2.2.1。
+
 ```
 Settings Window (620×600, 纵向)
 ├── Title Bar (44)
@@ -62,6 +65,25 @@ Settings Window (620×600, 纵向)
         ├── Header 12pt
         └── Card → 排除目录 Header + 3 × Excluded Dir Row
 ```
+
+### 2.2.1 顶部标签栏（2026-11-07 修订）
+
+| 属性 | 值 |
+|---|---|
+| 标签栏高 | `TABBAR_H` 68 |
+| 标签项 | `TAB_ITEM_W` 96 × `TAB_ITEM_H` 52，`TAB_GAP` 4；5 项整体居中 |
+| 图标 | `TAB_ICON` 26 |
+| 标签文字 | `TAB_FONT` 11 |
+| 水平内边距 / 圆角 | `TAB_PAD_X` 10 / `TAB_RADIUS` 9 |
+
+- 标签顺序：通用（sliders）/ 索引（folder + magnifier）/ 高级（terminal）/
+  实验（flask）/ 关于（info）。
+- 选中：图标与文字 `switch_on`，底 `tab_selected_fill`（深 `#0A84FF1A` / 浅 `#007AFF1A`）。
+- 未选中：图标与文字 `text_secondary`；悬停底 `control_fill`。
+- 标签栏底 `window_fill`，无模糊；底部 1px `divider`。
+- 标签栏固定在页面内容上方（标题栏之下）；页面内容不再有顶层分组标题，页内子分组
+  （如「快捷键」「外接磁盘」）与卡片保留。
+- 标签单行；英文最长「Experimental」须落在 76pt 文本预算内（96 − 2 × 10）。
 
 ### 2.3 分组卡片与行
 
