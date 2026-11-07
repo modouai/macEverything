@@ -2,12 +2,13 @@
 //!
 //! 只负责标签栏本身；页面绘制在 `settings_view`，状态编排在 `settings`。
 //!
-//! Task 2/3/4 接入绘制与页面分发前，本模块尚无生产消费方；整模块 allow
-//! dead_code，接线完成后删除（同 `settings_tokens` 分 Task 建表的旧规）。
-#![allow(dead_code)]
+//! Task 2/4 完成绘制与页面分发接线前，本模块尚无生产消费方：枚举与 `impl`
+//! 上的 `#[allow(dead_code)]` 是临时接线标记，必须在接线后删除；后续新增
+//! allow 也须窄作用域，不得恢复整模块 allow（`settings_tokens` 已按此收敛）。
 
 use crate::i18n;
 
+#[allow(dead_code)] // Task 3/4 接线前暂未消费。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsTab {
     #[default]
@@ -18,6 +19,7 @@ pub enum SettingsTab {
     About,
 }
 
+#[allow(dead_code)] // Task 2/4 接线前暂未消费。
 impl SettingsTab {
     pub const ALL: [Self; 5] = [
         Self::General,
@@ -68,6 +70,11 @@ mod tests {
     }
 
     #[test]
+    fn default_is_general() {
+        assert_eq!(SettingsTab::default(), SettingsTab::General);
+    }
+
+    #[test]
     fn labels_cover_both_languages() {
         for (lang, expected) in [
             (Lang::ZhHans, ["通用", "索引", "高级", "实验", "关于"]),
@@ -86,6 +93,7 @@ mod tests {
     #[test]
     fn scroll_ids_are_unique() {
         let ids: Vec<&str> = SettingsTab::ALL.iter().map(|tab| tab.scroll_id()).collect();
+        assert!(ids.iter().all(|id| id.starts_with("settings-page-")));
         let mut dedup = ids.clone();
         dedup.sort_unstable();
         dedup.dedup();
