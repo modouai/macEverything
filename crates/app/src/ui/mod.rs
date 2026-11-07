@@ -82,6 +82,7 @@ pub mod palette;
 pub mod results;
 pub mod settings;
 pub mod settings_layout;
+pub mod settings_tabs;
 pub mod settings_tokens;
 pub mod settings_view;
 pub mod theme;

@@ -59,6 +59,8 @@ pub struct SettingsPalette {
     pub segment_selected_text: egui::Color32,
     /// 字号分段：未选中段文字（未选中段无独立底色，透出控件底）。
     pub segment_unselected_text: egui::Color32,
+    /// 选中标签的浅色底（系统蓝低透明度）。
+    pub tab_selected_fill: egui::Color32,
     /// 开关开态（系统蓝；后续若跟随 macOS 强调色则由系统提供）。
     pub switch_on: egui::Color32,
     /// 开关钮（两主题均为白色）。
@@ -98,6 +100,7 @@ pub fn dark() -> SettingsPalette {
         segment_selected_fill: c(0xFFFFFF29),
         segment_selected_text: c(0xFFFFFFFF),
         segment_unselected_text: c(0x8B929AFF),
+        tab_selected_fill: c(0x0A84FF1A),
         switch_on: c(0x0A84FFFF),
         switch_knob: c(0xFFFFFFFF),
         switch_knob_shadow: c(0x00000033),
@@ -125,6 +128,7 @@ pub fn light() -> SettingsPalette {
         segment_selected_fill: c(0xFFFFFFFF),
         segment_selected_text: c(0x1F242BFF),
         segment_unselected_text: c(0x6B7280FF),
+        tab_selected_fill: c(0x007AFF1A),
         switch_on: c(0x007AFFFF),
         switch_knob: c(0xFFFFFFFF),
         switch_knob_shadow: c(0x00000033),
@@ -170,6 +174,21 @@ pub const TRAFFIC_LIGHT_GAP: f32 = 8.0;
 #[allow(dead_code)]
 pub const TITLEBAR_RIGHT_SPACER: f32 = TRAFFIC_LIGHT_SIZE * 3.0 + TRAFFIC_LIGHT_GAP * 2.0;
 
+// —— 顶部标签栏 ——
+pub const TABBAR_H: f32 = 68.0;
+pub const TAB_ITEM_W: f32 = 96.0;
+pub const TAB_ITEM_H: f32 = 52.0;
+pub const TAB_GAP: f32 = 4.0;
+pub const TAB_ICON: f32 = 26.0;
+/// 图标区顶边距标签项顶边的距离。
+pub const TAB_ICON_TOP_GAP: f32 = 8.0;
+/// 标签文字中心距标签项底边的距离。
+pub const TAB_LABEL_BOTTOM_GAP: f32 = 12.0;
+pub const TAB_FONT: f32 = 11.0;
+#[allow(dead_code)] // 规格 token：仅标签宽度预算测试读取；生产绘制不读，保留 allow。
+pub const TAB_PAD_X: f32 = 10.0;
+pub const TAB_RADIUS: u8 = 9;
+
 // —— 内容 / 分组 / 卡片（§2.1 / §2.3）——
 /// 内容区内边距：上下 / 左右（§2.1「左右 24，上下 20」）。
 pub const CONTENT_PAD: (f32, f32) = (20.0, 24.0);
@@ -195,10 +214,12 @@ pub const DIVIDER_H: f32 = 1.0;
 pub const LABEL_FONT: f32 = 13.0;
 /// 标签与右侧控件间距（§2.3：16）。
 pub const LABEL_CONTROL_GAP: f32 = 16.0;
-/// 辅助说明/行内错误字号（§2.3：11pt）。
-pub const SUPPORT_FONT: f32 = 11.0;
+/// 辅助说明/行内错误字号（§2.3：12pt）。
+pub const SUPPORT_FONT: f32 = 12.0;
 /// 辅助说明/行内错误与标签间距（§2.3：2）。
 pub const LABEL_SUPPORT_GAP: f32 = 2.0;
+/// 支持行文字底部与卡片底边的留白（避免说明文字贴边）。
+pub const SUPPORT_BOTTOM_GAP: f32 = 4.0;
 
 // —— 关于 / 版本行（更新检查）——
 /// 「关于」版本行右侧集群内，版本号 / 分隔线 / 状态说明 / 按钮的间距。
@@ -282,7 +303,7 @@ mod tests {
     /// 钉住：深/浅两套颜色与 §2.5 表逐项相等。
     #[test]
     fn settings_palette_matches_spec_table() {
-        let rows: [(egui::Color32, egui::Color32, u32, u32, &str); 20] = [
+        let rows: [(egui::Color32, egui::Color32, u32, u32, &str); 21] = [
             (
                 dark().window_fill,
                 light().window_fill,
@@ -423,6 +444,13 @@ mod tests {
                 0x6B7280FF,
                 "移除图标",
             ),
+            (
+                dark().tab_selected_fill,
+                light().tab_selected_fill,
+                0x0A84FF1A,
+                0x007AFF1A,
+                "标签选中底",
+            ),
         ];
         for (dark_val, light_val, dark_hex, light_hex, name) in rows {
             assert_eq!(
@@ -510,9 +538,25 @@ mod tests {
                 LABEL_FONT,
                 LABEL_CONTROL_GAP,
                 SUPPORT_FONT,
-                LABEL_SUPPORT_GAP
+                LABEL_SUPPORT_GAP,
+                SUPPORT_BOTTOM_GAP
             ),
-            (13.0, 16.0, 11.0, 2.0)
+            (13.0, 16.0, 12.0, 2.0, 4.0)
+        );
+        assert_eq!(
+            (
+                TABBAR_H,
+                TAB_ITEM_W,
+                TAB_ITEM_H,
+                TAB_GAP,
+                TAB_ICON,
+                TAB_ICON_TOP_GAP,
+                TAB_LABEL_BOTTOM_GAP,
+                TAB_FONT,
+                TAB_PAD_X,
+                TAB_RADIUS
+            ),
+            (68.0, 96.0, 52.0, 4.0, 26.0, 8.0, 12.0, 11.0, 10.0, 9)
         );
 
         assert_eq!(

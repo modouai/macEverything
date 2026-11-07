@@ -27,6 +27,7 @@ use crate::hotkey::{HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::platform;
 use crate::settings::{self as store, FontSize, SettingsFile};
+use crate::ui::settings_tabs::SettingsTab;
 use crate::ui::{
     font as ui_font, install_base_text_styles, lock_shared,
     settings_tokens::{
@@ -367,6 +368,8 @@ impl CliInstallUi {
 /// 后台操作同一时刻至多一个。
 pub struct SettingsState {
     pub(crate) open: bool,
+    /// 设置页当前标签（运行期；重启回 General，不写入 settings.toml）。
+    pub(crate) active_tab: SettingsTab,
     /// 已加载的 `settings.toml` 快照（字号/快捷键写入在此更新）。
     pub(crate) file: SettingsFile,
     /// 设置文件所在数据目录（保存字号/快捷键用）。
@@ -447,6 +450,7 @@ impl SettingsState {
     ) -> Self {
         Self {
             open: false,
+            active_tab: SettingsTab::General,
             file,
             data_dir,
             autostart: None,
@@ -965,6 +969,7 @@ impl SettingsData {
     /// 放在行为模块：视图只依赖 `SettingsData`，构造真源仍在 `SettingsState`。
     pub(crate) fn from_state(state: &SettingsState, update: &crate::update::UpdateState) -> Self {
         Self {
+            active_tab: state.active_tab,
             font_size: state.file.font_size,
             autostart: state.autostart.unwrap_or(false),
             autostart_approval: state.autostart_approval,
@@ -1178,6 +1183,10 @@ fn consume_close_shortcut(ctx: &egui::Context) -> bool {
 /// 落地一条设置动作（已出共享锁）。
 fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: SettingsAction) {
     match action {
+        SettingsAction::SelectTab(tab) => {
+            lock_shared(shared).settings.active_tab = tab;
+            ctx.request_repaint_of(viewport_id());
+        }
         SettingsAction::SetFontSize(size) => apply_font_size(shared, ctx, size),
         SettingsAction::SetAutostart(enabled) => apply_autostart(shared, ctx, enabled),
         SettingsAction::SetLanguage(setting) => apply_language(shared, ctx, setting),
@@ -1969,6 +1978,37 @@ mod tests {
         assert!(state.cli_install.error.is_none());
         assert!(state.cli_rx.is_none());
         assert!(!state.cli_refresh_pending);
+    }
+
+    #[test]
+    fn settings_default_tab_is_general_and_survives_reopen() {
+        let mut state = test_state();
+        assert_eq!(state.active_tab, SettingsTab::General);
+        state.active_tab = SettingsTab::Advanced;
+        // 快照必须携带运行期标签（绘制层读 `SettingsData.active_tab`）。
+        assert_eq!(
+            SettingsData::from_state(&state, &crate::update::UpdateState::new()).active_tab,
+            SettingsTab::Advanced
+        );
+        // 真实的关闭/打开只改 open；active_tab 是运行期字段，不随开合复位。
+        state.request_open();
+        state.mark_hidden();
+        assert_eq!(state.active_tab, SettingsTab::Advanced);
+    }
+
+    /// 语言切换只动语言字段：运行期标签页不变，快照仍渲染切换前那一页。
+    /// 突变：`set_language_result` 里顺手 `active_tab = General` → 测试红。
+    #[test]
+    fn language_switch_keeps_active_tab() {
+        let mut state = test_state();
+        state.active_tab = SettingsTab::Index;
+        state.set_language_result(LanguageSetting::En, None);
+        assert_eq!(state.file.language, LanguageSetting::En);
+        assert_eq!(state.active_tab, SettingsTab::Index);
+        assert_eq!(
+            SettingsData::from_state(&state, &crate::update::UpdateState::new()).active_tab,
+            SettingsTab::Index
+        );
     }
 
     /// 关闭→打开才挂起一次列表刷新；已打开/重复 request_open 不重复挂起。
