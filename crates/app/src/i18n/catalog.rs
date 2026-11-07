@@ -81,12 +81,10 @@ catalog! {
     row_website_link: "官网" / "Website",
     row_auto_check: "启动时自动检查更新" / "Check for Updates at Launch",
     // 保存面板目录助手(设置行 + 授权引导 + 托盘待授权项)
-    row_panel_assist: "保存面板目录助手（实验）" / "Save-Panel Directory Assist (Experimental)",
+    row_panel_assist: "目录助手" / "Directory Assist",
     row_panel_assist_desc: "在其他应用保存或打开文件时，浮出目录搜索并跳转。"
         / "Show directory search over save/open panels and jump to the selected directory.",
     panel_assist_unauthorized: "当前未授权，点击授权。" / "Not authorized — click to authorize.",
-    panel_assist_restart_hint: "修改「设备控制和数据访问」权限后，需退出并重新打开 App 生效。"
-        / "Restart the app after changing the permission.",
     panel_assist_enable_title: "开启保存面板目录助手？" / "Enable Save-Panel Directory Assist?",
     panel_assist_enable_message: "该功能目前为实验功能，请谨慎开启。开启后需要「设备控制和数据访问」权限，用于读取保存/打开面板的结构与路径，你可以在系统设置 → 隐私与安全性 → 设备控制和数据访问中随时关闭。"
         / "This is an experimental feature. It requires \"Device Control and Data Access\" permission to read the save/open panel structure and paths. You can disable it anytime in System Settings → Privacy & Security → Device Control and Data Access.",

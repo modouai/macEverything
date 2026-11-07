@@ -659,16 +659,15 @@ fn draw_panel_assist_page(
     actions: &mut Vec<SettingsAction>,
 ) {
     let panel_error = data.panel_assist_error.as_ref().map(SettingsError::text);
-    // 三条支持行：保存失败错误 + 常驻说明 + 重启提示。`with_extra` 是覆盖
-    // 而非累加，必须一次性把行高求和，否则两条常驻行会各分到半行而重叠。
-    let extra = extra_for(panel_error.is_some(), extra_h) + 2.0 * extra_h;
+    // 支持行：保存失败错误（可选）+ 常驻说明，各占一行。
+    let extra = extra_for(panel_error.is_some(), extra_h) + extra_h;
     let rows = [GroupRow {
         kind: RowKind::PanelAssist,
         spec: RowSpec::new(ROW_H).with_extra(extra),
         error: panel_error.as_deref(),
         note: Some(i18n::s().row_panel_assist_desc),
         note2: None,
-        hint: Some(i18n::s().panel_assist_restart_hint),
+        hint: None,
     }];
     draw_card(ui, full_w, None, &rows, data, palette, actions);
 }
@@ -2849,23 +2848,6 @@ mod tests {
         assert!(!labels.contains(&i18n::s().row_excluded));
     }
 
-    /// 实验页常驻两条支持行（说明 + 重启提示）必须各占一行，不得重叠。
-    /// 突变：把两条 extra 改回覆盖（只留 1×extra_h）→ dy 小于行高，测试红。
-    #[test]
-    fn experimental_page_support_lines_do_not_overlap() {
-        let data = with_tab(layout_test_data(), SettingsTab::Experimental);
-        let out = run_body(&data);
-        let texts = all_texts(&out);
-        let desc = find_text(&texts, i18n::s().row_panel_assist_desc);
-        let hint = find_text(&texts, i18n::s().panel_assist_restart_hint);
-        let dy = (text_center(desc).y - text_center(hint).y).abs();
-        assert!(
-            dy >= desc.galley.size().y * 0.9,
-            "支持行重叠: dy={dy}, 行高={}",
-            desc.galley.size().y
-        );
-    }
-
     #[test]
     fn about_page_has_version_and_auto_check_only() {
         let mut data = layout_test_data();
@@ -3852,8 +3834,8 @@ mod tests {
             "说明行常驻可见"
         );
         assert!(
-            labels.contains(&i18n::s().panel_assist_restart_hint),
-            "权限变更重启提示常驻可见"
+            !labels.iter().any(|label| label.contains("重新打开 App")),
+            "不再显示权限变更重启提示"
         );
         let link = text_center(find_text(&texts, i18n::s().panel_assist_unauthorized));
         let output = click_at(&ctx, &data, link);
