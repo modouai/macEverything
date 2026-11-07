@@ -147,6 +147,7 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 公证凭据：优先 keychain profile（默认 `maceverything-notary`；先执行 `xcrun notarytool store-credentials`），钥匙串锁定时回落到 `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_SPECIFIC_PASSWORD`。
 - 产物：`release/macEverything-<version>.dmg`（+ `.sha256`）与 `.zip`（公证中间产物）。
 - 验收：`spctl --assess --type execute`（App）、`spctl --assess --type open --context context:primary-signature`（DMG）、`xcrun stapler validate`、`hdiutil verify`。
+- 完整发版清单（含官网版本信息、部署与验收）见 `CLAUDE.md`「发版流程」。
 
 ## 官网(site/)
 
@@ -159,6 +160,7 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 | Spotlight 搜不到文件 | `/spotlight-not-finding-files/` | `/en/spotlight-not-finding-files/` |
 | Mac 文件搜索指南 | `/mac-file-search-guide/` | `/en/mac-file-search-guide/` |
 | 交流与反馈 | `/community/` | `/en/community/` |
+| 更新日志 | `/changelog/` | `/en/changelog/` |
 
 - 语言：`/` 固定中文，`/en/` 固定英文；语言切换是普通链接，不再依赖 `localStorage`。
 - 共享资源：`site/assets/`（CSS、首页 JS、图标、吉祥物、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
@@ -170,6 +172,7 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
 - 发布前必须运行 `python3 scripts/site/check_seo.py`，退出码 0 才能部署。检查项包括 canonical/hreflang、sitemap 覆盖、JSON-LD、字体引用、站内链接、版本与 DMG 一致性。
 - `scripts/release.sh` 生成 DMG 后会同步写入 `site/version.json`；`check_seo.py` 会校验它与 Cargo 版本一致。该文件随 `site/` 一起部署，`_headers` 为它设置 `Cache-Control: no-cache`。
+- 更新日志：每次发版在 `/changelog/` 与 `/en/changelog/` 顶部追加一节（版本号、日期、2–4 条用户可感知的改动），并同步首页下载区的「最近更新」摘要。`check_seo.py` 强制每个页面包含当前版本号，漏更新会直接报错。
 - 分享图源文件：`scripts/site/og-image.html`，渲染为 `site/assets/og-image.png`（1200×630）。
 - 官网不写源码构建、终端安装和开发文档入口，只提供成品 DMG。
 
