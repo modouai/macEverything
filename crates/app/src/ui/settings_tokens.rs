@@ -214,10 +214,12 @@ pub const DIVIDER_H: f32 = 1.0;
 pub const LABEL_FONT: f32 = 13.0;
 /// 标签与右侧控件间距（§2.3：16）。
 pub const LABEL_CONTROL_GAP: f32 = 16.0;
-/// 辅助说明/行内错误字号（§2.3：11pt）。
+/// 辅助说明/行内错误字号（§2.3：12pt）。
 pub const SUPPORT_FONT: f32 = 12.0;
 /// 辅助说明/行内错误与标签间距（§2.3：2）。
 pub const LABEL_SUPPORT_GAP: f32 = 2.0;
+/// 支持行文字底部与卡片底边的留白（避免说明文字贴边）。
+pub const SUPPORT_BOTTOM_GAP: f32 = 4.0;
 
 // —— 关于 / 版本行（更新检查）——
 /// 「关于」版本行右侧集群内，版本号 / 分隔线 / 状态说明 / 按钮的间距。
@@ -536,9 +538,10 @@ mod tests {
                 LABEL_FONT,
                 LABEL_CONTROL_GAP,
                 SUPPORT_FONT,
-                LABEL_SUPPORT_GAP
+                LABEL_SUPPORT_GAP,
+                SUPPORT_BOTTOM_GAP
             ),
-            (13.0, 16.0, 12.0, 2.0)
+            (13.0, 16.0, 12.0, 2.0, 4.0)
         );
 
         assert_eq!(

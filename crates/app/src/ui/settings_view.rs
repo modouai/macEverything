@@ -30,8 +30,9 @@ use crate::ui::{
         KEYCAP_PAD_X, KEYCAP_RADIUS, LABEL_CONTROL_GAP, LABEL_FONT, LABEL_SUPPORT_GAP, REMOVE_ICON,
         REMOVE_ICON_STROKE, RESET_BUTTON_GAP, RESET_BUTTON_PAD_X, RESET_BUTTON_RADIUS, ROW_H,
         ROW_PAD_X, SEG_FONT, SEG_GAP, SEG_H, SEG_ITEM_RADIUS, SEG_PAD, SEG_RADIUS, SEG_W,
-        SUPPORT_FONT, SWITCH_KNOB, SWITCH_KNOB_SHADOW_OFFSET, SWITCH_KNOB_SHADOW_SIZE,
-        SWITCH_RADIUS, SWITCH_SIZE, TABBAR_H, TITLEBAR_H, UPDATE_CLUSTER_GAP, UPDATE_SEP_H,
+        SUPPORT_BOTTOM_GAP, SUPPORT_FONT, SWITCH_KNOB, SWITCH_KNOB_SHADOW_OFFSET,
+        SWITCH_KNOB_SHADOW_SIZE, SWITCH_RADIUS, SWITCH_SIZE, TABBAR_H, TITLEBAR_H,
+        UPDATE_CLUSTER_GAP, UPDATE_SEP_H,
     },
 };
 use crate::update::{self, UpdatePhase};
@@ -343,7 +344,9 @@ fn draw_panel_assist_enable_modal(
 
 /// 内联错误行占用的额外高 = 辅助字号行高 + 标签间距。
 fn support_extra_height(ui: &egui::Ui) -> f32 {
-    LABEL_SUPPORT_GAP + ui.fonts_mut(|fonts| fonts.row_height(&ui_font::id(SUPPORT_FONT)))
+    LABEL_SUPPORT_GAP
+        + ui.fonts_mut(|fonts| fonts.row_height(&ui_font::id(SUPPORT_FONT)))
+        + SUPPORT_BOTTOM_GAP
 }
 
 fn extra_for(has_message: bool, extra_h: f32) -> f32 {
@@ -577,9 +580,9 @@ fn draw_index_page(
     extra_h: f32,
     actions: &mut Vec<SettingsAction>,
 ) {
-    draw_index_group(ui, full_w, data, palette, extra_h, actions);
-    ui.add_space(GROUP_GAP);
     draw_volumes_group(ui, full_w, data, palette, extra_h, actions);
+    ui.add_space(GROUP_GAP);
+    draw_index_group(ui, full_w, data, palette, extra_h, actions);
 }
 
 /// 关于页：版本行 + 自动检查更新。
@@ -1563,7 +1566,10 @@ fn draw_support_lines(
         );
         let rect = egui::Rect::from_min_max(
             egui::pos2(line.left() + ROW_PAD_X, line.top() + LABEL_SUPPORT_GAP),
-            egui::pos2(line.right() - ROW_PAD_X, line.bottom()),
+            egui::pos2(
+                line.right() - ROW_PAD_X,
+                (line.bottom() - SUPPORT_BOTTOM_GAP).max(line.top() + LABEL_SUPPORT_GAP),
+            ),
         );
         draw_text(
             ui,
@@ -2809,6 +2815,13 @@ mod tests {
             1,
             "索引页不得再画顶层「索引」标题（唯一出现应来自标签栏）"
         );
+        // 页面顺序：外接磁盘在前，排除目录在后。
+        let volumes_y = text_center(find_text(&texts, i18n::s().group_volumes)).y;
+        let excluded_y = text_center(find_text(&texts, i18n::s().row_excluded)).y;
+        assert!(
+            volumes_y < excluded_y,
+            "外接磁盘应在排除目录之前: volumes_y={volumes_y}, excluded_y={excluded_y}"
+        );
     }
 
     #[test]
@@ -2891,7 +2904,7 @@ mod tests {
                     i18n::s().row_palette_hotkey,
                     i18n::s().row_window_hotkey,
                 ],
-                SettingsTab::Index => &[i18n::s().row_excluded, i18n::s().group_volumes],
+                SettingsTab::Index => &[i18n::s().group_volumes, i18n::s().row_excluded],
                 SettingsTab::Advanced => &[i18n::s().row_cli_tool],
                 SettingsTab::Experimental => &[i18n::s().row_panel_assist],
                 SettingsTab::About => &[i18n::s().row_version, i18n::s().row_auto_check],
