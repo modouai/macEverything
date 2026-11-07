@@ -2409,7 +2409,8 @@ mod tests {
     use super::*;
     use crate::hotkey::{HotkeyNote, HotkeySlot, HotkeySnapshot};
     use crate::ui::font as ui_font_module;
-    use crate::ui::settings_tokens::{SETTINGS_H, SETTINGS_W};
+    use crate::ui::settings_tabs::tab_item_rects;
+    use crate::ui::settings_tokens::{SETTINGS_H, SETTINGS_W, TABBAR_H, TITLEBAR_H};
     use global_hotkey::hotkey::{Code, Modifiers};
 
     /// 关于组在默认 600px 窗口下需滚动才能命中；交互测试用该画布高让整页可见。
@@ -2454,6 +2455,12 @@ mod tests {
             volumes: VolumesData::default(),
             cli_install: CliInstallData::default(),
         }
+    }
+
+    /// 切换 `layout_test_data` 的活动标签页。
+    fn with_tab(mut data: SettingsData, tab: SettingsTab) -> SettingsData {
+        data.active_tab = tab;
+        data
     }
 
     /// Ready 态观测样例:LoginInteractive + 随包 CLI 就绪,命中与生效下标
@@ -2517,7 +2524,7 @@ mod tests {
     fn panel_assist_enable_prompt_modal_renders() {
         let data = SettingsData {
             panel_assist_enable_prompt: true,
-            ..layout_test_data()
+            ..with_tab(layout_test_data(), SettingsTab::Experimental)
         };
         // 模态 Area 首帧注册、次帧出图;生产侧置位后显式 repaint,故两帧后必现。
         let ctx = egui::Context::default();
@@ -2841,91 +2848,63 @@ mod tests {
         );
     }
 
-    /// 布局:五组标题、行标签、字号三段、语言、命令行工具行、添加按钮与
-    /// 目录行齐全;内容自标题栏下起排,分组顺序固定,超出 620×600 的部分
-    /// 由整页滚动承载(无首屏预算约束)。
+    /// 布局:逐标签页断言本页应有的行/分组齐全；页面内不再画顶层页标题。
     #[test]
     fn settings_layout_has_all_rows() {
-        let data = layout_test_data();
-        let out = run_body(&data);
-        let texts = all_texts(&out);
-        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
-
-        for expected in [
-            "通用",
-            "索引",
-            "字号",
-            "开机自启",
-            "语言",
-            "唤起快捷键",
-            "完整窗口快捷键",
-            "命令行工具",
-            i18n::s().cli_checking,
-            "排除目录",
-            "恢复默认",
-            "小",
-            "标准",
-            "大",
-            "跟随系统",
-            "＋ 添加目录…",
-            "关于",
-            "版本",
-            "启动时自动检查更新",
-            i18n::s().row_panel_assist,
-            i18n::s().row_panel_assist_desc,
-        ] {
+        for tab in SettingsTab::ALL {
+            let data = with_tab(layout_test_data(), tab);
+            let out = run_body(&data);
+            let texts = all_texts(&out);
+            let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+            let expected: &[&str] = match tab {
+                SettingsTab::General => &[
+                    i18n::s().row_font_size,
+                    i18n::s().row_autostart,
+                    i18n::s().row_language,
+                    i18n::s().row_palette_hotkey,
+                    i18n::s().row_window_hotkey,
+                ],
+                SettingsTab::Index => &[i18n::s().row_excluded, i18n::s().group_volumes],
+                SettingsTab::Advanced => &[i18n::s().row_cli_tool],
+                SettingsTab::Experimental => &[i18n::s().row_panel_assist],
+                SettingsTab::About => &[i18n::s().row_version, i18n::s().row_auto_check],
+            };
+            for label in expected {
+                assert!(
+                    labels.contains(label),
+                    "{tab:?} 缺少 {label:?};实际 {labels:?}"
+                );
+            }
+            if tab == SettingsTab::Index {
+                for path in &data.excluded {
+                    assert!(
+                        labels.contains(&path.as_str()),
+                        "索引页缺少目录行 {path:?};实际 {labels:?}"
+                    );
+                }
+            }
+            // 页面内不得再画顶层页标题：唯一出现应来自标签栏。
+            let tab_label = tab.label();
+            assert_eq!(
+                labels.iter().filter(|label| **label == tab_label).count(),
+                1,
+                "{tab:?} 页不得再画顶层页标题（唯一出现应来自标签栏）"
+            );
+            let min_top = texts
+                .iter()
+                .map(|text| text.pos.y)
+                .fold(f32::INFINITY, f32::min);
             assert!(
-                labels.contains(&expected),
-                "缺少文本 {expected:?};实际 {labels:?}"
+                min_top >= TITLEBAR_H,
+                "{tab:?} 内容不得侵入固定标题栏(最早文本 y={min_top})"
             );
         }
-        let version = format!("v{}", update::CURRENT_VERSION);
-        for expected in [
-            version.as_str(),
-            i18n::s().update_status_idle,
-            i18n::s().update_action_check,
-        ] {
-            assert!(
-                labels.contains(&expected),
-                "缺少更新文案 {expected:?};实际 {labels:?}"
-            );
-        }
-        for path in &data.excluded {
-            assert!(
-                labels.contains(&path.as_str()),
-                "缺少目录行 {path:?};实际 {labels:?}"
-            );
-        }
-
-        let min_top = texts
-            .iter()
-            .map(|text| text.pos.y)
-            .fold(f32::INFINITY, f32::min);
-        assert!(
-            min_top >= TITLEBAR_H,
-            "内容不得侵入固定标题栏(最早文本 y={min_top})"
-        );
-        // 分组顺序固定:关于组在索引组之后;页面超出 620×600 时由滚动区承载,
-        // 断言只锁定相对顺序,不约束首屏。
-        let about_y = find_text(&texts, i18n::s().row_version).pos.y;
-        let index_y = find_text(&texts, i18n::s().row_excluded).pos.y;
-        assert!(
-            about_y > index_y,
-            "关于组须排在索引组之后(索引 y={index_y}, 关于 y={about_y})"
-        );
-        // 分组顺序固定:命令行工具行在通用组(快捷键行之后),不越组。
-        let cli_y = find_text(&texts, "命令行工具").pos.y;
-        let window_y = find_text(&texts, "完整窗口快捷键").pos.y;
-        assert!(
-            cli_y > window_y,
-            "命令行工具行须在快捷键行之后(cli {cli_y}, window {window_y})"
-        );
     }
 
     /// 空排除列表:仍显示目录头，并给出「未排除任何目录」空态行。
     #[test]
     fn empty_excluded_list_shows_placeholder_row() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Index);
         data.excluded.clear();
         let out = run_body(&data);
         let texts = all_texts(&out);
@@ -2938,133 +2917,158 @@ mod tests {
         );
     }
 
-    /// 英文设置页：分组/行/字号段/语言值/按钮/空态/busy/录制/下拉全部可见。
+    /// 英文设置页：逐标签页断言各页可见的分组/行/控件文案。
     #[test]
     fn english_settings_page_covers_all_sections() {
         i18n::with_lang(i18n::Lang::En, || {
-            let data = layout_test_data();
-            let out = run_body(&data);
-            let texts = all_texts(&out);
-            let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
-
-            for expected in [
-                // 分组标题
-                "General",
-                "Index",
-                // 行标签
-                "Text Size",
-                "Launch at Login",
-                "Language",
-                "Quick Search Shortcut",
-                "Full Window Shortcut",
-                "Command-Line Tool",
-                "Save-Panel Directory Assist (Experimental)",
-                // 字号段
-                "Small",
-                "Standard",
-                "Large",
-                // 语言当前值
-                "System Default",
-                // 按钮
-                "Add Folder…",
-                "Restore Defaults",
-            ] {
-                assert!(
-                    labels.contains(&expected),
-                    "缺少英文文案 {expected:?};实际 {labels:?}"
-                );
-            }
-
-            // 命令行工具行(未安装态):状态、FDA 提示与安装按钮齐全。
-            let mut cli_ready = layout_test_data();
-            cli_ready.cli_install.observation = Some(cli_ready_obs(vec![], None));
-            let cli_out = run_body(&cli_ready);
-            let cli_texts = all_texts(&cli_out);
-            let cli_labels: Vec<&str> = cli_texts.iter().map(|text| text.galley.text()).collect();
-            for expected in [
-                i18n::s().cli_state_absent,
-                i18n::s().cli_install_button,
-                i18n::s().cli_fda_hint,
-            ] {
-                assert!(
-                    cli_labels.contains(&expected),
-                    "缺少英文 CLI 文案 {expected:?};实际 {cli_labels:?}"
-                );
-            }
-
-            // 空态
-            let empty = SettingsData {
-                excluded: vec![],
-                ..layout_test_data()
+            let labels_of = |data: &SettingsData| -> Vec<String> {
+                let out = run_body(data);
+                all_texts(&out)
+                    .iter()
+                    .map(|text| text.galley.text().to_owned())
+                    .collect()
             };
-            let empty_out = run_body(&empty);
-            let empty_texts = all_texts(&empty_out);
-            let empty_labels: Vec<&str> =
-                empty_texts.iter().map(|text| text.galley.text()).collect();
+            let assert_labels = |labels: &[String], expected: &[&str], page: &str| {
+                for expected in expected {
+                    assert!(
+                        labels.iter().any(|label| label == expected),
+                        "{page} 缺少英文文案 {expected:?};实际 {labels:?}"
+                    );
+                }
+            };
+
+            // 通用页:字号段、自启、语言当前值与快捷键行。
+            let general = labels_of(&with_tab(layout_test_data(), SettingsTab::General));
+            assert_labels(
+                &general,
+                &[
+                    "Text Size",
+                    "Small",
+                    "Standard",
+                    "Large",
+                    "Launch at Login",
+                    "Language",
+                    "System Default",
+                    "Shortcuts",
+                    "Quick Search Shortcut",
+                    "Full Window Shortcut",
+                ],
+                "General",
+            );
+
+            // 索引页:排除目录行、外接磁盘、添加/恢复默认按钮。
+            let index = labels_of(&with_tab(layout_test_data(), SettingsTab::Index));
+            assert_labels(
+                &index,
+                &[
+                    "Excluded Folders",
+                    "External Disks",
+                    "Add Folder…",
+                    "Restore Defaults",
+                ],
+                "Index",
+            );
+
+            // 空态。
+            let mut empty = with_tab(layout_test_data(), SettingsTab::Index);
+            empty.excluded.clear();
+            let empty_labels = labels_of(&empty);
             assert!(
-                empty_labels.contains(&"No excluded folders"),
+                empty_labels
+                    .iter()
+                    .any(|label| label == "No excluded folders"),
                 "空列表须显示英文空态;实际 {empty_labels:?}"
             );
 
             // busy：list → Loading…；变更 → Rescanning…
-            let mut busy = layout_test_data();
+            let mut busy = with_tab(layout_test_data(), SettingsTab::Index);
             busy.exclude_busy = true;
             busy.exclude_busy_list = true;
-            let list_out = run_body(&busy);
-            let list_texts = all_texts(&list_out);
-            let list_labels: Vec<&str> = list_texts.iter().map(|text| text.galley.text()).collect();
+            let list_labels = labels_of(&busy);
             assert!(
-                list_labels.contains(&"Loading…"),
+                list_labels.iter().any(|label| label == "Loading…"),
                 "list 在途须显示 Loading…;实际 {list_labels:?}"
             );
-            assert!(!list_labels.contains(&"Rescanning…"));
+            assert!(!list_labels.iter().any(|label| label == "Rescanning…"));
 
             busy.exclude_busy_list = false;
-            let rescan_out = run_body(&busy);
-            let rescan_texts = all_texts(&rescan_out);
-            let rescan_labels: Vec<&str> =
-                rescan_texts.iter().map(|text| text.galley.text()).collect();
+            let rescan_labels = labels_of(&busy);
             assert!(
-                rescan_labels.contains(&"Rescanning…"),
+                rescan_labels.iter().any(|label| label == "Rescanning…"),
                 "变更在途须显示 Rescanning…;实际 {rescan_labels:?}"
             );
-            assert!(!rescan_labels.contains(&"Loading…"));
+            assert!(!rescan_labels.iter().any(|label| label == "Loading…"));
 
-            // 录制中：字段提示 + 行下 Esc/Backspace 可见提示
-            let recording = SettingsData {
-                recording: Some(HotkeySlot::Palette),
-                ..layout_test_data()
-            };
-            let rec_out = run_body(&recording);
-            let rec_texts = all_texts(&rec_out);
-            let rec_labels: Vec<&str> = rec_texts.iter().map(|text| text.galley.text()).collect();
+            // 录制中：字段提示 + 行下 Esc/Backspace 可见提示（通用页）。
+            let mut recording = with_tab(layout_test_data(), SettingsTab::General);
+            recording.recording = Some(HotkeySlot::Palette);
+            let rec_labels = labels_of(&recording);
             assert!(
-                rec_labels.contains(&"Press shortcut…"),
+                rec_labels.iter().any(|label| label == "Press shortcut…"),
                 "录制中须显示英文提示;实际 {rec_labels:?}"
             );
             assert!(
-                rec_labels.contains(
-                    &"Press Esc or click elsewhere to cancel recording; \
-                      Backspace restores the default"
-                ),
+                rec_labels.iter().any(|label| label
+                    == "Press Esc or click elsewhere to cancel recording; \
+                        Backspace restores the default"),
                 "录制提示须完整可见;实际 {rec_labels:?}"
             );
 
-            // 语言下拉：展开后三个选项全可见
+            // 命令行工具页(未安装态):状态、FDA 提示与安装按钮齐全。
+            let mut cli_ready = with_tab(layout_test_data(), SettingsTab::Advanced);
+            cli_ready.cli_install.observation = Some(cli_ready_obs(vec![], None));
+            let cli_labels = labels_of(&cli_ready);
+            assert_labels(
+                &cli_labels,
+                &[
+                    i18n::s().cli_state_absent,
+                    i18n::s().cli_install_button,
+                    i18n::s().cli_fda_hint,
+                ],
+                "Advanced",
+            );
+
+            // 实验页:功能行与常驻说明。
+            let experimental = labels_of(&with_tab(layout_test_data(), SettingsTab::Experimental));
+            assert_labels(
+                &experimental,
+                &[i18n::s().row_panel_assist, i18n::s().row_panel_assist_desc],
+                "Experimental",
+            );
+
+            // 关于页:版本、自动检查、更新状态与官网链接。
+            let about = labels_of(&with_tab(layout_test_data(), SettingsTab::About));
+            let version = format!("v{}", update::CURRENT_VERSION);
+            assert!(
+                about.iter().any(|label| label.contains(&version)),
+                "关于页缺少版本 {version:?};实际 {about:?}"
+            );
+            assert_labels(
+                &about,
+                &[
+                    i18n::s().row_auto_check,
+                    i18n::s().update_status_idle,
+                    i18n::s().update_action_check,
+                    i18n::s().row_website_link,
+                ],
+                "About",
+            );
+
+            // 语言下拉：展开后三个选项全可见（通用页）。
+            let data = with_tab(layout_test_data(), SettingsTab::General);
             let ctx = egui::Context::default();
             ctx.set_visuals(egui::Visuals::dark());
             let (out, _) = run_frame(&ctx, &data, Vec::new());
             let field = keycap_field_center(&out, "Language");
             let _ = click_at(&ctx, &data, field);
             let (out, _) = run_frame(&ctx, &data, Vec::new());
-            let options_texts = all_texts(&out);
-            let options: Vec<&str> = options_texts
+            let options: Vec<String> = all_texts(&out)
                 .iter()
-                .map(|text| text.galley.text())
+                .map(|text| text.galley.text().to_owned())
                 .collect();
             for expected in ["System Default", "简体中文", "English"] {
                 assert!(
-                    options.contains(&expected),
+                    options.iter().any(|option| option == expected),
                     "语言下拉缺少 {expected:?};实际 {options:?}"
                 );
             }
@@ -3095,7 +3099,7 @@ mod tests {
     fn add_button_click_emits_add_exclude() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let data = layout_test_data();
+        let data = with_tab(layout_test_data(), SettingsTab::Index);
         let (out, _) = run_frame(&ctx, &data, Vec::new());
         let pos = add_button_center(&out);
         let output = click_at(&ctx, &data, pos);
@@ -3108,7 +3112,7 @@ mod tests {
     fn reset_button_click_emits_reset_action() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let data = layout_test_data();
+        let data = with_tab(layout_test_data(), SettingsTab::Index);
         let (out, _) = run_frame(&ctx, &data, Vec::new());
         let reset = text_button_center(&out, i18n::s().restore_defaults);
         let add = add_button_center(&out);
@@ -3138,7 +3142,7 @@ mod tests {
     fn busy_disables_reset_action() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Index);
         data.exclude_busy = true;
         let (out, _) = run_frame(&ctx, &data, Vec::new());
         let reset = text_button_center(&out, i18n::s().restore_defaults);
@@ -3155,7 +3159,7 @@ mod tests {
     fn remove_click_emits_exact_path() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let data = layout_test_data();
+        let data = with_tab(layout_test_data(), SettingsTab::Index);
         let (out, _) = run_frame(&ctx, &data, Vec::new());
         let pos = remove_button_center(&out, "node_modules");
         let output = click_at(&ctx, &data, pos);
@@ -3168,7 +3172,7 @@ mod tests {
     /// busy 时添加/移除均禁点（无动作；视觉置灰/NotAllowed 由绘制分支保证）。
     #[test]
     fn busy_disables_add_and_remove_actions() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Index);
         data.exclude_busy = true;
 
         let ctx = egui::Context::default();
@@ -3194,10 +3198,10 @@ mod tests {
     /// 加载/重扫提示：list →「加载中…」，add/remove →「重扫中…」；均增高 Header。
     #[test]
     fn busy_support_line_distinguishes_list_and_rescan() {
-        let baseline = run_body(&layout_test_data());
+        let baseline = run_body(&with_tab(layout_test_data(), SettingsTab::Index));
         let baseline_dir = text_center(find_text(&all_texts(&baseline), "~/Library")).y;
 
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Index);
         data.exclude_busy = true;
         data.exclude_busy_list = true;
         let out = run_body(&data);
@@ -3235,7 +3239,7 @@ mod tests {
     /// 两行提示均计入 Header 高度（空态行下移）。
     #[test]
     fn exclude_error_and_busy_draw_with_empty_state() {
-        let mut baseline = layout_test_data();
+        let mut baseline = with_tab(layout_test_data(), SettingsTab::Index);
         baseline.excluded.clear();
         let baseline_out = run_body(&baseline);
         let baseline_empty = text_center(find_text(
@@ -3244,7 +3248,7 @@ mod tests {
         ))
         .y;
 
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Index);
         data.excluded.clear();
         data.exclude_busy = true;
         data.exclude_busy_list = false;
@@ -3314,7 +3318,7 @@ mod tests {
     /// 未安装:状态「未安装」+ FDA 提示,安装按钮点击 → CliInstallInstall。
     #[test]
     fn cli_row_absent_shows_install_and_emits_action() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.observation = Some(cli_ready_obs(vec![], None));
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
@@ -3334,7 +3338,7 @@ mod tests {
     #[test]
     fn cli_row_ours_shows_path_and_uninstall() {
         const OURS: &str = "/opt/homebrew/bin/macEverything";
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.observation = Some(cli_ready_obs(
             vec![EntryState::Ours {
                 path: OURS.into(),
@@ -3359,7 +3363,7 @@ mod tests {
     /// 断链且卷未挂载:旧目标与「目标卷未挂载」可见,修复按钮禁点。
     #[test]
     fn cli_row_broken_unmounted_disables_repair() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.observation = Some(cli_ready_obs(
             vec![EntryState::BrokenApp {
                 path: "/opt/homebrew/bin/macEverything".into(),
@@ -3389,7 +3393,7 @@ mod tests {
     #[test]
     fn cli_row_shadowed_targets_first_ours() {
         const OURS: &str = "/home/u/.local/bin/macEverything";
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.observation = Some(cli_ready_obs(
             vec![
                 EntryState::Foreign {
@@ -3421,7 +3425,7 @@ mod tests {
     /// 其他来源(OtherApp):显示路径与「不覆盖」,不给任何按钮。
     #[test]
     fn cli_row_other_app_shows_path_without_buttons() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.observation = Some(cli_ready_obs(
             vec![EntryState::OtherApp {
                 path: "/opt/homebrew/bin/macEverything".into(),
@@ -3450,7 +3454,7 @@ mod tests {
     /// PATH 不可信(来源非登录交互 shell):「无法读取 PATH」+ 重试按钮。
     #[test]
     fn cli_row_unknown_path_shows_retry() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         let mut obs = cli_ready_obs(vec![], None);
         obs.path_source = PathSource::ProcessEnv;
         data.cli_install.observation = Some(obs);
@@ -3471,7 +3475,7 @@ mod tests {
     /// 安装/卸载/修复仍不得出现(设计 §5.0-C)。
     #[test]
     fn cli_row_devbuild_shows_reason_and_retry() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         let mut obs = cli_ready_obs(vec![], None);
         obs.availability = Availability::DevBuild;
         data.cli_install.observation = Some(obs);
@@ -3516,7 +3520,7 @@ mod tests {
             }],
         ];
         for hits in junk {
-            let mut data = layout_test_data();
+            let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
             data.cli_install.observation = Some(cli_ready_obs(hits, None));
             let ctx = egui::Context::default();
             ctx.set_visuals(egui::Visuals::dark());
@@ -3538,7 +3542,7 @@ mod tests {
     /// 不给安装(设计 §5.1:Absent 要求无有效可执行命中)。
     #[test]
     fn cli_row_executable_foreign_blocks_install() {
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.observation = Some(cli_ready_obs(
             vec![EntryState::Foreign {
                 path: "/opt/homebrew/bin/macEverything".into(),
@@ -3561,7 +3565,7 @@ mod tests {
     #[test]
     fn cli_row_busy_and_idle_show_checking_without_buttons() {
         for label in ["busy", "idle"] {
-            let mut data = layout_test_data();
+            let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
             match label {
                 "busy" => data.cli_install.busy = true,
                 _ => data.cli_install.observation = None,
@@ -3578,21 +3582,30 @@ mod tests {
         }
     }
 
-    /// 内联错误行:增高通用卡片(「排除目录」标题下移),错误文案实际绘制。
+    /// 命令行工具卡片矩形（高级页唯一卡片，位于标签栏下方）。
+    fn cli_card_rect(out: &egui::FullOutput) -> egui::Rect {
+        let fill = settings_tokens::dark().card_fill;
+        all_rects(out)
+            .into_iter()
+            .find(|rect| rect.fill == fill && rect.rect.top() >= TITLEBAR_H + TABBAR_H)
+            .expect("缺少命令行工具卡片底")
+            .rect
+    }
+
+    /// 内联错误行:增高命令行工具卡片,错误文案实际绘制。
     #[test]
     fn cli_error_row_adds_card_height() {
-        let baseline = run_body(&layout_test_data());
-        let baseline_index =
-            text_center(find_text(&all_texts(&baseline), i18n::s().row_excluded)).y;
+        let baseline = run_body(&with_tab(layout_test_data(), SettingsTab::Advanced));
+        let baseline_bottom = cli_card_rect(&baseline).bottom();
 
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Advanced);
         data.cli_install.error = Some("手动命令: sudo ln -s …".into());
         let with_error = run_body(&data);
         let texts = all_texts(&with_error);
-        let error_index = text_center(find_text(&texts, i18n::s().row_excluded)).y;
+        let error_bottom = cli_card_rect(&with_error).bottom();
         assert!(
-            error_index > baseline_index + 10.0,
-            "CLI 错误行必须增高通用卡片:基线 {baseline_index},错误 {error_index}"
+            error_bottom > baseline_bottom + 10.0,
+            "CLI 错误行必须增高卡片:基线底 {baseline_bottom},错误底 {error_bottom}"
         );
         find_text(&texts, "手动命令: sudo ln -s …");
     }
@@ -3738,7 +3751,7 @@ mod tests {
         for (current, expected) in [(true, false), (false, true)] {
             let ctx = egui::Context::default();
             ctx.set_visuals(egui::Visuals::dark());
-            let mut data = layout_test_data();
+            let mut data = with_tab(layout_test_data(), SettingsTab::About);
             data.check_updates = current;
             let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
             let output = click_at_sized(&ctx, &data, auto_check_switch_center(&out), TALL_TEST_H);
@@ -3765,7 +3778,7 @@ mod tests {
         for (current, expected) in [(true, false), (false, true)] {
             let ctx = egui::Context::default();
             ctx.set_visuals(egui::Visuals::dark());
-            let mut data = layout_test_data();
+            let mut data = with_tab(layout_test_data(), SettingsTab::Experimental);
             data.panel_assist = current;
             let (out, _) = run_frame(&ctx, &data, Vec::new());
             let output = click_at(&ctx, &data, panel_assist_switch_center(&out));
@@ -3783,7 +3796,7 @@ mod tests {
     fn panel_assist_untrusted_shows_auth_link() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Experimental);
         data.panel_assist_trusted = false;
         let (out, _) = run_frame(&ctx, &data, Vec::new());
         let texts = all_texts(&out);
@@ -3811,7 +3824,7 @@ mod tests {
         // 已授权:链接不绘制。
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let data = layout_test_data();
+        let data = with_tab(layout_test_data(), SettingsTab::Experimental);
         let out = run_body(&data);
         let trusted_texts = all_texts(&out);
         let labels: Vec<&str> = trusted_texts
@@ -3826,7 +3839,7 @@ mod tests {
         // 功能关闭 + 未授权:不显示授权链接(避免为未开启的功能引导授权)。
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        let mut data = layout_test_data();
+        let mut data = with_tab(layout_test_data(), SettingsTab::Experimental);
         data.panel_assist = false;
         data.panel_assist_trusted = false;
         let out = run_body(&data);
@@ -3854,7 +3867,7 @@ mod tests {
         for (phase, expected) in cases {
             let ctx = egui::Context::default();
             ctx.set_visuals(egui::Visuals::dark());
-            let mut data = layout_test_data();
+            let mut data = with_tab(layout_test_data(), SettingsTab::About);
             data.update = phase.clone();
             let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
             // 按钮文案在按钮矩形内居中，文本中心即点击点。
@@ -3878,7 +3891,7 @@ mod tests {
             i18n::with_lang(lang, || {
                 let ctx = egui::Context::default();
                 ctx.set_visuals(egui::Visuals::dark());
-                let data = layout_test_data();
+                let data = with_tab(layout_test_data(), SettingsTab::About);
                 let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
                 // 链接文本在可点矩形内居中，文本中心即点击点。
                 let pos = text_center(find_text(&all_texts(&out), i18n::s().row_website_link));
@@ -4016,6 +4029,36 @@ mod tests {
             click_keycap(&ctx, &data, "完整窗口快捷键").actions,
             vec![SettingsAction::BeginHotkeyRecord(HotkeySlot::Window)],
             "另一字段点击应开始该槽录制（取消由设置 pass 补入队）"
+        );
+    }
+
+    /// 录制中点标签：按下帧先取消录制，释放帧才切换页，
+    /// 保证取消动作先于切页动作发生。
+    #[test]
+    fn tab_click_cancels_recording_before_selecting() {
+        let mut data = layout_test_data();
+        data.recording = Some(HotkeySlot::Palette);
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::light());
+        // 预热帧让键帽字段矩形进入 widget 记忆。
+        let _ = run_frame(&ctx, &data, Vec::new());
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(0.0, TITLEBAR_H),
+            egui::vec2(SETTINGS_W, TABBAR_H),
+        );
+        let target = tab_item_rects(bar)[1].center();
+        let (_, press) = run_frame(&ctx, &data, vec![pointer_button(target, true)]);
+        assert_eq!(
+            press.actions.first(),
+            Some(&SettingsAction::CancelHotkeyRecord),
+            "按下标签应先取消录制: {:?}",
+            press.actions
+        );
+        let (_, release) = run_frame(&ctx, &data, vec![pointer_button(target, false)]);
+        assert_eq!(
+            release.actions,
+            vec![SettingsAction::SelectTab(SettingsTab::Index)],
+            "释放标签应切换页"
         );
     }
 
@@ -4309,12 +4352,23 @@ mod tests {
         );
     }
 
+    /// 快捷键卡片底（通用页最下方的卡片）；以卡片自身底边为纵向锚点。
+    fn shortcuts_card_bottom(out: &egui::FullOutput) -> f32 {
+        let fill = settings_tokens::dark().card_fill;
+        all_rects(out)
+            .into_iter()
+            .filter(|rect| rect.fill == fill && rect.rect.top() >= TITLEBAR_H + TABBAR_H)
+            .map(|rect| rect.rect.bottom())
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
     /// 回落提示按槽绘制：`note` 增高唤起行，`window_note` 增高完整窗口行；
-    /// 错误与提示同时存在时各占一行。
+    /// 错误与提示同时存在时各占一行。以快捷键卡片自身的底边为锚点
+    /// （页内不再有「索引」标题，不能用它衡量纵向位移）。
     #[test]
     fn hotkey_notes_add_height_and_are_drawn_per_slot() {
         let baseline = run_body(&layout_test_data());
-        let baseline_index = text_center(find_text(&all_texts(&baseline), "索引")).y;
+        let baseline_bottom = shortcuts_card_bottom(&baseline);
 
         let mut data = layout_test_data();
         data.hotkeys.note = Some(HotkeyNote::Unavailable);
@@ -4323,10 +4377,10 @@ mod tests {
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         let palette_note = HotkeyNote::Unavailable.text();
         assert!(labels.iter().any(|text| text == &palette_note));
-        let with_note_index = text_center(find_text(&texts, "索引")).y;
+        let with_note_bottom = shortcuts_card_bottom(&out);
         assert!(
-            with_note_index > baseline_index + 10.0,
-            "唤起槽提示必须增高行:基线 {baseline_index},提示 {with_note_index}"
+            with_note_bottom > baseline_bottom + 10.0,
+            "唤起槽提示必须增高行:基线底 {baseline_bottom},提示底 {with_note_bottom}"
         );
 
         data.hotkeys.window_note = Some(HotkeyNote::ResumeFailed);
@@ -4335,10 +4389,10 @@ mod tests {
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         let window_note = HotkeyNote::ResumeFailed.text();
         assert!(labels.iter().any(|text| text == &window_note));
-        let both_index = text_center(find_text(&texts, "索引")).y;
+        let both_bottom = shortcuts_card_bottom(&out);
         assert!(
-            both_index > with_note_index + 10.0,
-            "窗口槽提示必须再增高一行:单提示 {with_note_index},双提示 {both_index}"
+            both_bottom > with_note_bottom + 10.0,
+            "窗口槽提示必须再增高一行:单提示底 {with_note_bottom},双提示底 {both_bottom}"
         );
 
         let mut data = layout_test_data();
@@ -4349,14 +4403,14 @@ mod tests {
         let labels: Vec<String> = texts.iter().map(|t| t.galley.text().to_owned()).collect();
         assert!(labels.iter().any(|text| text == "错误行"));
         assert!(labels.iter().any(|text| text == &palette_note));
-        let error_note_index = text_center(find_text(&texts, "索引")).y;
+        let error_note_bottom = shortcuts_card_bottom(&out);
         let mut error_only = layout_test_data();
         error_only.hotkey_error = Some((HotkeySlot::Palette, "错误行".into()));
         let out = run_body(&error_only);
-        let error_only_index = text_center(find_text(&all_texts(&out), "索引")).y;
+        let error_only_bottom = shortcuts_card_bottom(&out);
         assert!(
-            error_note_index > error_only_index + 10.0,
-            "错误 + 提示须各占一行:仅错误 {error_only_index},两者 {error_note_index}"
+            error_note_bottom > error_only_bottom + 10.0,
+            "错误 + 提示须各占一行:仅错误底 {error_only_bottom},两者底 {error_note_bottom}"
         );
     }
 
@@ -4370,20 +4424,20 @@ mod tests {
     fn english_rows_fit_fixed_controls() {
         use crate::i18n;
         i18n::with_lang(i18n::Lang::En, || {
-            let data = layout_test_data();
-            let out = run_body(&data);
-            let texts = all_texts(&out);
-            for label in [
-                "Launch at Login",
-                "Quick Search Shortcut",
-                "Full Window Shortcut",
-                "Excluded Folders",
+            for (tab, label) in [
+                (SettingsTab::General, "Launch at Login"),
+                (SettingsTab::General, "Quick Search Shortcut"),
+                (SettingsTab::General, "Full Window Shortcut"),
+                (SettingsTab::Index, "Excluded Folders"),
             ] {
+                let data = with_tab(layout_test_data(), tab);
+                let out = run_body(&data);
+                let texts = all_texts(&out);
                 let text = find_text(&texts, label);
-                assert!(!text.galley.elided, "{label} 被截断");
+                assert!(!text.galley.elided, "{label} 在 {tab:?} 被截断");
                 assert!(
                     text.galley.size().x <= 372.0,
-                    "{label} 超宽: {:?}",
+                    "{label} 在 {tab:?} 超宽: {:?}",
                     text.galley.size()
                 );
             }
