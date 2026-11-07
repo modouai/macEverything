@@ -70,14 +70,14 @@ pub(crate) struct SettingsData {
     pub(crate) exclude_error: Option<ExcludeError>,
     /// 启动时自动检查更新开关。
     pub(crate) check_updates: bool,
-    /// 保存面板目录助手开关(settings.toml;默认开启)。
+    /// 保存面板目录助手开关(实验功能,settings.toml;默认关闭)。
     pub(crate) panel_assist: bool,
     /// 辅助功能授权状态(false = 行尾显示「需授权」徽标 +「去授权…」按钮)。
     pub(crate) panel_assist_trusted: bool,
     /// 保存面板助手开关保存失败的内联错误。
     pub(crate) panel_assist_error: Option<SettingsError>,
-    /// 未授权时开启助手 → 设置窗内授权提示模态。
-    pub(crate) panel_assist_auth_prompt: bool,
+    /// 未授权时开启助手 → 设置窗内确认模态（实验提示 + 权限说明）。
+    pub(crate) panel_assist_enable_prompt: bool,
     /// 当前更新阶段。
     pub(crate) update: crate::update::UpdatePhase,
     /// 关于分组内联错误。
@@ -148,12 +148,14 @@ pub(crate) enum SettingsAction {
     ResetExcludes,
     /// 切换「启动时自动检查更新」。
     SetAutoCheck(bool),
-    /// 切换「保存面板目录助手」(立即落盘)。
+    /// 切换「保存面板目录助手」:关→开先弹实验确认模态(确认后才落盘)。
     SetPanelAssist(bool),
-    /// 「去授权…」点击:设置 pass 打开系统设置辅助功能面板(失败静默)。
+    /// 「当前未授权，点击授权。」:设置 pass 注册并打开设备控制/数据访问设置页。
     OpenPanelAssistAuth,
-    /// 授权提示模态「稍后」:仅关闭提示。
-    DismissPanelAssistAuthPrompt,
+    /// 实验功能确认模态「取消」:仅关闭提示,开关保持关。
+    DismissPanelAssistEnable,
+    /// 实验功能确认模态「启用」:落盘并启动授权/检测流程。
+    ConfirmPanelAssistEnable,
     /// 切换「自动索引外接磁盘」主开关。
     SetVolumesAuto(bool),
     /// 切换单卷索引开关(卷名;开 = 移出排除集[主开关随之开],关 = 加入排除集)。
@@ -224,40 +226,88 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             draw_volumes_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(CONTENT_PAD.0);
         });
-    // 未授权开启助手的授权提示:应用内模态。不能用原生 NSAlert.runModal——
-    // 在 egui pass 内同步 runModal 会重入 runloop,实机表现为整窗假死。
-    if data.panel_assist_auth_prompt {
-        draw_panel_assist_auth_modal(ui, &mut actions);
+    // 实验功能开启确认:应用内模态。不能用原生 NSAlert.runModal——在 egui pass
+    // 内同步 runModal 会重入 runloop,实机表现为整窗假死。
+    if data.panel_assist_enable_prompt {
+        draw_panel_assist_enable_modal(ui, &palette, &mut actions);
     }
     BodyOutput { actions }
 }
 
-/// 授权提示模态(「稍后」/「打开系统设置」)。首按钮「稍后」,回车不误跳设置。
-fn draw_panel_assist_auth_modal(ui: &egui::Ui, actions: &mut Vec<SettingsAction>) {
+/// 实验功能开启确认模态(「取消」/「启用」)。首按钮「取消」,回车不误开启。
+///
+/// 视觉沿用设置页 token:卡片底 + 1px 窗描边 + 10 圆角,标题 15pt、正文 12pt
+/// 次要色、按钮 13pt(主按钮系统蓝)。不使用 egui 默认 heading/button 样式,
+/// 与设置页其余部分保持同一设计语言。
+fn draw_panel_assist_enable_modal(
+    ui: &egui::Ui,
+    palette: &SettingsPalette,
+    actions: &mut Vec<SettingsAction>,
+) {
     let strings = i18n::s();
     let mut dismiss = false;
-    let mut open_settings = false;
-    let _ = egui::Modal::new(egui::Id::unique("panel-assist-auth-prompt")).show(ui.ctx(), |ui| {
-        ui.set_max_width(420.0);
-        ui.heading(strings.panel_assist_auth_title);
-        ui.add_space(8.0);
-        ui.label(strings.panel_assist_auth_message);
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            if ui.button(strings.panel_assist_auth_later).clicked() {
-                dismiss = true;
-            }
-            if ui.button(strings.panel_assist_auth_open).clicked() {
-                open_settings = true;
-            }
+    let mut enable = false;
+    let frame = egui::Frame::popup(ui.style())
+        // card_fill 是「叠在窗口底上的 2% 半透明」,做模态底会透出下层文字;
+        // 模态必须用不透明的 window_fill(浅色纯白/深色窗底)。
+        .fill(palette.window_fill)
+        .stroke(egui::Stroke::new(1.0, palette.window_stroke))
+        .inner_margin(egui::Margin::same(20))
+        .corner_radius(egui::CornerRadius::same(CARD_RADIUS));
+    let _ = egui::Modal::new(egui::Id::unique("panel-assist-enable-prompt"))
+        .frame(frame)
+        .backdrop_color(egui::Color32::from_black_alpha(80))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(380.0);
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(
+                egui::RichText::new(strings.panel_assist_enable_title)
+                    .font(ui_font::id(15.0))
+                    .color(palette.text_primary),
+            );
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(strings.panel_assist_enable_message)
+                        .font(ui_font::id(12.0))
+                        .color(palette.text_secondary),
+                )
+                .wrap(),
+            );
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let enable_button = egui::Button::new(
+                    egui::RichText::new(strings.panel_assist_enable_confirm)
+                        .font(ui_font::id(13.0))
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(palette.switch_on)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(egui::CornerRadius::same(SEG_RADIUS))
+                .min_size(egui::vec2(84.0, 30.0));
+                if ui.add(enable_button).clicked() {
+                    enable = true;
+                }
+                ui.add_space(8.0);
+                let cancel_button = egui::Button::new(
+                    egui::RichText::new(strings.panel_assist_enable_cancel)
+                        .font(ui_font::id(13.0))
+                        .color(palette.control_text),
+                )
+                .fill(palette.control_fill)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(egui::CornerRadius::same(SEG_RADIUS))
+                .min_size(egui::vec2(84.0, 30.0));
+                if ui.add(cancel_button).clicked() {
+                    dismiss = true;
+                }
+            });
         });
-    });
     if dismiss {
-        actions.push(SettingsAction::DismissPanelAssistAuthPrompt);
+        actions.push(SettingsAction::DismissPanelAssistEnable);
     }
-    if open_settings {
-        actions.push(SettingsAction::DismissPanelAssistAuthPrompt);
-        actions.push(SettingsAction::OpenPanelAssistAuth);
+    if enable {
+        actions.push(SettingsAction::ConfirmPanelAssistEnable);
     }
 }
 
@@ -318,7 +368,7 @@ enum RowKind<'a> {
     ExcludedEmpty,
     Version,
     AutoCheck,
-    /// 保存面板目录助手行(开关 + 常驻说明;未授权时行尾带徽标与授权按钮)。
+    /// 保存面板目录助手行(开关 + 常驻说明;未授权时行尾带授权链接)。
     PanelAssist,
     /// 卷主开关行(自动索引外接磁盘)。
     VolumesAuto,
@@ -443,11 +493,12 @@ fn draw_general_group(
             // 错误行(保存失败) + 常驻说明行,两者都计入卡片高度。
             spec: RowSpec::new(ROW_H)
                 .with_extra(extra_for(panel_error.is_some(), extra_h))
+                .with_extra(extra_h)
                 .with_extra(extra_h),
             error: panel_error.as_deref(),
-            note: None,
+            note: Some(i18n::s().row_panel_assist_desc),
             note2: None,
-            hint: Some(i18n::s().row_panel_assist_desc),
+            hint: Some(i18n::s().panel_assist_restart_hint),
         },
         GroupRow {
             kind: RowKind::PaletteKeys,
@@ -495,11 +546,11 @@ fn draw_general_group(
     );
 }
 
-/// 保存面板目录助手行：左标签 + 右簇「[去授权…] [需授权] [开关]」。
+/// 保存面板目录助手行：左标签 + 右簇「[授权链接] [开关]」。
 ///
-/// 已授权只画开关；未授权在开关左侧追加「需授权」徽标（辅助字号、弱化色）与
-/// 「去授权…」文字按钮（点击 → [`SettingsAction::OpenPanelAssistAuth`]，
-/// 系统设置由设置 pass 打开）。行下方常驻一句话说明（`hint` 行模型）。
+/// 已授权只画开关；未授权在开关左侧显示单条「当前未授权，点击授权。」链接
+/// （点击 → [`SettingsAction::OpenPanelAssistAuth`]，设置 pass 注册并打开
+/// 设备控制/数据访问页）。行下方常驻描述 + 权限变更需重启提示。
 fn draw_panel_assist_row(
     ui: &mut egui::Ui,
     body: egui::Rect,
@@ -509,20 +560,13 @@ fn draw_panel_assist_row(
 ) {
     let switch_size = egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1);
     let trusted = data.panel_assist_trusted;
-    let button = (!trusted).then_some(i18n::s().panel_assist_grant);
-    let badge = (!trusted).then_some(i18n::s().panel_assist_need_auth);
-    let button_w = button
-        .map(|label| text_width(ui, label, ADD_BUTTON_FONT) + 2.0 * ADD_BUTTON_PAD_X)
-        .unwrap_or(0.0);
-    let badge_w = badge
-        .map(|label| text_width(ui, label, SUPPORT_FONT))
+    let auth_link = (data.panel_assist && !trusted).then_some(i18n::s().panel_assist_unauthorized);
+    let link_w = auth_link
+        .map(|label| text_width(ui, label, ADD_BUTTON_FONT))
         .unwrap_or(0.0);
     let mut cluster_w = switch_size.x;
-    if badge.is_some() {
-        cluster_w += LABEL_CONTROL_GAP + badge_w;
-    }
-    if button.is_some() {
-        cluster_w += LABEL_CONTROL_GAP + button_w;
+    if auth_link.is_some() {
+        cluster_w += LABEL_CONTROL_GAP + link_w;
     }
     let control = draw_row_label(
         ui,
@@ -538,37 +582,20 @@ fn draw_panel_assist_row(
         ),
         switch_size,
     );
-    let badge_rect = badge.map(|_| {
-        egui::Rect::from_center_size(
-            egui::pos2(
-                switch.left() - LABEL_CONTROL_GAP - badge_w / 2.0,
-                control.center().y,
-            ),
-            egui::vec2(badge_w, control.height()),
-        )
-    });
-    let button_rect = button.map(|_| {
-        let right = switch.left() - LABEL_CONTROL_GAP - badge_w - LABEL_CONTROL_GAP;
+    let link_rect = auth_link.map(|_| {
         egui::Rect::from_min_size(
-            egui::pos2(right - button_w, control.center().y - ADD_BUTTON_H / 2.0),
-            egui::vec2(button_w, ADD_BUTTON_H),
+            egui::pos2(
+                switch.left() - LABEL_CONTROL_GAP - link_w,
+                control.center().y - ADD_BUTTON_H / 2.0,
+            ),
+            egui::vec2(link_w, ADD_BUTTON_H),
         )
     });
-    if let (Some(label), Some(rect)) = (badge, badge_rect) {
-        draw_text(
-            ui,
-            rect,
-            label,
-            SUPPORT_FONT,
-            palette.text_secondary,
-            egui::Align2::CENTER_CENTER,
-        );
-    }
-    if let (Some(label), Some(rect)) = (button, button_rect) {
+    if let (Some(label), Some(rect)) = (auth_link, link_rect) {
         if draw_reset_text_button(
             ui,
             rect,
-            "settings-panel-assist-grant",
+            "settings-panel-assist-auth",
             label,
             palette.text_secondary,
             palette.text_primary,
@@ -2316,7 +2343,7 @@ mod tests {
             panel_assist: true,
             panel_assist_trusted: true,
             panel_assist_error: None,
-            panel_assist_auth_prompt: false,
+            panel_assist_enable_prompt: false,
             update: crate::update::UpdatePhase::Idle,
             update_error: None,
             volumes: VolumesData::default(),
@@ -2379,12 +2406,12 @@ mod tests {
         find_text(&texts, "语言已切换,但设置保存失败");
     }
 
-    /// 未授权开启助手的提示模态:渲染标题/说明/两个按钮文案。
-    /// 突变把 `panel_assist_auth_prompt` 分支删掉 → 断言必红。
+    /// 实验功能开启确认模态:渲染标题/取消/启用。
+    /// 突变把 `panel_assist_enable_prompt` 分支删掉 → 断言必红。
     #[test]
-    fn panel_assist_auth_prompt_modal_renders() {
+    fn panel_assist_enable_prompt_modal_renders() {
         let data = SettingsData {
-            panel_assist_auth_prompt: true,
+            panel_assist_enable_prompt: true,
             ..layout_test_data()
         };
         // 模态 Area 首帧注册、次帧出图;生产侧置位后显式 repaint,故两帧后必现。
@@ -2394,9 +2421,9 @@ mod tests {
         let out = run_frame(&ctx, &data, Vec::new()).0;
         let texts = all_texts(&out);
         let strings = i18n::s();
-        find_text(&texts, strings.panel_assist_auth_title);
-        find_text(&texts, strings.panel_assist_auth_open);
-        find_text(&texts, strings.panel_assist_auth_later);
+        find_text(&texts, strings.panel_assist_enable_title);
+        find_text(&texts, strings.panel_assist_enable_confirm);
+        find_text(&texts, strings.panel_assist_enable_cancel);
     }
 
     /// 递归收集一帧里的全部文本形状(含 Shape::Vec 内的嵌套形状)。
@@ -2628,7 +2655,7 @@ mod tests {
             "关于",
             "版本",
             "启动时自动检查更新",
-            "保存面板目录助手",
+            i18n::s().row_panel_assist,
             i18n::s().row_panel_assist_desc,
         ] {
             assert!(
@@ -2715,7 +2742,7 @@ mod tests {
                 "Quick Search Shortcut",
                 "Full Window Shortcut",
                 "Command-Line Tool",
-                "Save-Panel Directory Assist",
+                "Save-Panel Directory Assist (Experimental)",
                 // 字号段
                 "Small",
                 "Standard",
@@ -3533,11 +3560,10 @@ mod tests {
         }
     }
 
-    /// 未授权态:行尾「需授权」徽标 +「去授权…」按钮齐全;点击按钮 →
-    /// OpenPanelAssistAuth(系统设置由设置 pass 打开)。已授权态两者都不绘制。
+    /// 未授权态:行尾单条「当前未授权，点击授权。」链接;点击 →
+    /// OpenPanelAssistAuth。已授权态不绘制链接。
     #[test]
-    fn panel_assist_untrusted_shows_badge_and_grant_button() {
-        // 未授权:徽标 + 按钮可见,点击产生动作。
+    fn panel_assist_untrusted_shows_auth_link() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
         let mut data = layout_test_data();
@@ -3546,22 +3572,26 @@ mod tests {
         let texts = all_texts(&out);
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(
-            labels.contains(&i18n::s().panel_assist_need_auth),
-            "未授权须显示「需授权」徽标:{labels:?}"
+            labels.contains(&i18n::s().panel_assist_unauthorized),
+            "未授权须显示授权链接:{labels:?}"
         );
         assert!(
             labels.contains(&i18n::s().row_panel_assist_desc),
             "说明行常驻可见"
         );
-        let grant = text_center(find_text(&texts, i18n::s().panel_assist_grant));
-        let output = click_at(&ctx, &data, grant);
+        assert!(
+            labels.contains(&i18n::s().panel_assist_restart_hint),
+            "权限变更重启提示常驻可见"
+        );
+        let link = text_center(find_text(&texts, i18n::s().panel_assist_unauthorized));
+        let output = click_at(&ctx, &data, link);
         assert_eq!(
             output.actions,
             vec![SettingsAction::OpenPanelAssistAuth],
-            "点击「去授权…」须请求打开系统设置"
+            "点击授权链接须请求注册并打开设置"
         );
 
-        // 已授权:徽标与按钮都不绘制(避免残留授权入口)。
+        // 已授权:链接不绘制。
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
         let data = layout_test_data();
@@ -3572,12 +3602,22 @@ mod tests {
             .map(|text| text.galley.text())
             .collect();
         assert!(
-            !labels.contains(&i18n::s().panel_assist_need_auth),
-            "已授权不得显示徽标"
+            !labels.contains(&i18n::s().panel_assist_unauthorized),
+            "已授权不得显示授权链接"
         );
+
+        // 功能关闭 + 未授权:不显示授权链接(避免为未开启的功能引导授权)。
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut data = layout_test_data();
+        data.panel_assist = false;
+        data.panel_assist_trusted = false;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(
-            !labels.contains(&i18n::s().panel_assist_grant),
-            "已授权不得显示授权按钮"
+            !labels.contains(&i18n::s().panel_assist_unauthorized),
+            "功能关闭时不得显示授权链接"
         );
     }
 

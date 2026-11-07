@@ -58,9 +58,10 @@ pub struct SettingsFile {
     /// 启动时自动检查官网版本清单（默认开启）。
     #[serde(default = "default_true")]
     pub check_updates: bool,
-    /// 保存面板目录助手（检测保存/打开面板浮出目录搜索；默认开启）。
-    /// 依赖辅助功能权限，未授权时静默不生效（design §3.2）。
-    #[serde(default = "default_true")]
+    /// 保存面板目录助手（实验功能，默认关闭）。
+    /// 依赖「设备控制和数据访问」权限，未授权时静默不生效（design §3.2）。
+    /// 无旧用户，缺字段直接按关闭处理。
+    #[serde(default)]
     pub save_panel_assist: bool,
 }
 
@@ -77,7 +78,7 @@ impl Default for SettingsFile {
             palette_hotkey: None,
             window_hotkey: None,
             check_updates: true,
-            save_panel_assist: true,
+            save_panel_assist: false,
         }
     }
 }
@@ -157,7 +158,7 @@ mod tests {
                 Code::KeyF,
             )),
             check_updates: true,
-            save_panel_assist: true,
+            save_panel_assist: false,
         };
         save(dir.path(), &custom).unwrap();
         assert_eq!(load(dir.path()), custom);
@@ -197,7 +198,7 @@ mod tests {
             palette_hotkey: Some("Alt+Space".parse().unwrap()),
             window_hotkey: Some("Alt+Shift+F".parse().unwrap()),
             check_updates: true,
-            save_panel_assist: true,
+            save_panel_assist: false,
         };
         let text = toml::to_string(&f).unwrap();
         assert!(text.contains("palette_hotkey = \"alt+Space\""), "{text}");
@@ -311,30 +312,30 @@ mod tests {
         assert_eq!(loaded, f, "显式 false 完整往返");
     }
 
-    /// 保存面板助手默认开启；缺字段读为 true（前向兼容），显式 false 往返保持。
+    /// 保存面板助手为实验功能：默认关闭；缺字段读为 false；显式 true 往返保持。
     #[test]
-    fn save_panel_assist_defaults_true_and_roundtrips() {
+    fn save_panel_assist_defaults_false_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            SettingsFile::default().save_panel_assist,
-            "Default 必须为 true"
+            !SettingsFile::default().save_panel_assist,
+            "Default 必须为 false"
         );
-        assert!(load(dir.path()).save_panel_assist, "无文件 = 默认开启");
+        assert!(!load(dir.path()).save_panel_assist, "无文件 = 默认关闭");
 
-        // 旧文件缺字段 → true(前向兼容)。
+        // 缺字段 → false(无旧用户,不做保留兼容)。
         std::fs::write(path(dir.path()), "font_size = \"large\"\n").unwrap();
         let loaded = load(dir.path());
-        assert!(loaded.save_panel_assist, "缺字段必须默认开启");
+        assert!(!loaded.save_panel_assist, "缺字段必须默认关闭");
         assert_eq!(loaded.font_size, FontSize::Large);
 
-        // 显式 false 往返。
+        // 显式 true 往返。
         let f = SettingsFile {
-            save_panel_assist: false,
+            save_panel_assist: true,
             ..SettingsFile::default()
         };
         save(dir.path(), &f).unwrap();
         let loaded = load(dir.path());
-        assert!(!loaded.save_panel_assist, "显式 false 保持");
-        assert_eq!(loaded, f, "显式 false 完整往返");
+        assert!(loaded.save_panel_assist, "显式 true 保持");
+        assert_eq!(loaded, f, "显式 true 完整往返");
     }
 }

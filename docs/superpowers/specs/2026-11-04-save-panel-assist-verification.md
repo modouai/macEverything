@@ -38,7 +38,7 @@
 
 1. 关闭旧实例与 daemon（托盘退出；必要时 `pkill -f macEverything`）。
 2. `cargo build --release && bash scripts/bundle.sh`，`open release/macEverything.app`。
-3. `./target/release/macEverything status` 确认 daemon 在线；`save_panel_assist` 默认 true。
+3. `./target/release/macEverything status` 确认 daemon 在线；`save_panel_assist` 默认 false（实验功能，需手动开启）。
 4. 系统设置 → 隐私与安全性 → 辅助功能，授权 **release/macEverything.app**（ad-hoc 重打包会改变签名身份，每次重打包需重新确认授权）。
 5. 日志：`log stream --predicate 'process == "macEverything-app"' --info`。
 
@@ -66,7 +66,7 @@
 
 **回填**：`probe-findings.md` 结论表 + 「对 M1 的影响」段（策略 A/B 默认值、检测通知选型、post 目标、按钮本地化形态）。
 
-## 2. 产品链路冒烟（默认开启 + 已授权）
+## 2. 产品链路冒烟（手动开启 + 已授权）
 
 | # | 操作 | 预期 |
 |---|---|---|
@@ -109,11 +109,11 @@
 
 | # | 操作 | 预期 |
 |---|---|---|
-| 4.1 | 首次启动未授权 | 设置页「需授权」+「去授权…」；托盘出现待授权项；启动时不弹窗、不浮层 |
-| 4.1b | 未授权状态在设置中开启开关 | 弹出应用内提示（「稍后」/「打开系统设置」）；点后者直达辅助功能页；授权后自动生效，无需重启 |
-| 4.2 | 设置页点「去授权…」→ 授权 → 回 App | 徽标消失；打开保存面板出现浮层 |
+| 4.1 | 首次启动未授权且开关关闭（默认） | 设置行显示实验功能、开关关；无授权链接、无托盘待授权项；打开保存面板不出浮层 |
+| 4.1b | 未授权状态在设置中开启开关 | 先弹实验确认模态（取消/启用），确认前开关保持关；点「启用」后落盘并注册 TCC，打开「设备控制和数据访问」页；行尾显示「当前未授权，点击授权。」；授权后自动生效，无需重启 |
+| 4.2 | 设置页点「当前未授权，点击授权。」→ 授权 → 回 App | 链接消失；打开保存面板出现浮层 |
 | 4.3 | **撤销授权 → 重启 App → 托盘待授权项授权 → 直接回 TextEdit → ⌘⇧S** | 浮层应出现（阻塞 2 托盘闭环） |
-| 4.4 | 同一流程改从设置页「去授权…」进入 | 浮层应出现（设置页闭环） |
+| 4.4 | 同一流程改从设置页「当前未授权，点击授权。」进入 | 浮层应出现（设置页闭环） |
 | 4.5 | 设置开关关 → 开保存面板 | 无浮层 |
 | 4.6 | 设置开关开 → 开保存面板 | 浮层恢复（detector 常驻，无需重启） |
 | 4.7 | 浮层显示期间关闭设置开关 → Enter | 浮层关闭且不跳转（N3） |
@@ -189,8 +189,8 @@ VS Code / Pages / Numbers 形态取证（同 §8）。
 
 | 项 | 结果 |
 |---|---|
-| 未授权时开启开关 → 应用内提示 | **通过**：设置窗中央 egui 模态（标题/说明/「稍后」/「打开系统设置」）；应用内绘制，不用原生 `NSAlert.runModal`（pass 内 runModal 重入 runloop，实机假死） |
-| 点「打开系统设置」→ 应用加入辅助功能列表 | **通过**：先 `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt=true)` 注册（日志 `real_trusted_before=false after_prompt=false`），系统授权请求出现，列表出现 macEverything |
+| 未授权时开启开关 → 实验确认模态 | **通过**：设置窗中央 egui 模态（实验警告 + 权限说明 + 「取消」/「启用」）；确认前开关保持关；应用内绘制，不用原生 `NSAlert.runModal`（pass 内 runModal 重入 runloop，实机假死） |
+| 点「启用」→ 应用加入辅助功能列表 | **通过**：先 `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt=true)` 注册（日志 `real_trusted_before=false after_prompt=false`），系统授权请求出现，列表出现 macEverything；行尾显示「当前未授权，点击授权。」 |
 | 授权后无需重启 | **通过**：日志 `辅助功能授权完成 → 授权状态变化(false→true) → detector: 运行`，全程未重启 |
 
 诊断：`MCE_FORCE_UNTRUSTED=1` 可强制未授权路径；仅影响本功能的信任判定。
