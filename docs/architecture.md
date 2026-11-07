@@ -75,8 +75,12 @@ path_offsets:  [(u32,u32)] 按条目号全量对齐(目录真值,其余占位)
 `notify` 封装不暴露 `sinceWhen`,engine 直调 FSEvents C API(unsafe 集中于 `fsevents.rs`,17 处全配 SAFETY):
 
 - **事件语义不可信**(改名可能只报单边、事件可被合并丢弃)——收到任何事件只当「门铃」,重读该目录与索引 diff,以磁盘为唯一真相。
+- **目录级事件**:建流不设 `FileEvents`(`fsevents::DIR_EVENTS`);FSEvents 仍按文件操作逐条上报,但 `path` 是变更所在目录,正是 diff 管线需要的粒度。实测该 flag 不减少事件量(8 万次文件操作 ≈ 8 万条事件),减少事件量不可依赖它;事件路径到 diff 目标的解析见 `daemon::event_dir`(非目录路径退回父目录)。
+- **回调热路径**:风暴期回调按事件计费。转换缓冲必须提到循环外复用并优先走 `CFStringGetCStringPtr` 零拷贝——旧实现每条事件在栈上开 4KB 并清零,10 万事件即 320MB memset,实测 10 万事件压力下丢弃标记从 2 条降为 0。
+- **丢弃归因**:`drop_reason()` 拆出 `must_scan`/`user_dropped`/`kernel_dropped`/`ids_wrapped`;每次触发记录 flag、事件 ID、路径与流来源。60s 汇总一行 `事件统计: events/drops`(按位分列),空闲窗口不出行。
 - **停机重放(mac 版 USN)**:落盘记录 `last_event_id`;重启以它为 `sinceWhen` 从系统事件日志位置重放停机窗口事件,秒级补齐。
 - **兜底**:spike 实证「过旧 sinceWhen 无可观测信号」——重放零事件且停机 >48h(可配)一律转全量重扫(保守判定器,不赌信号);收到丢弃类标记或流断开同样降级。
+- **丢弃去抖**:丢弃标记不再当场触发重扫——风暴期间重扫会与事件风暴互相加剧(重扫占 CPU/IO → 更多事件被丢 → 又一次重扫)。登记待命,事件安静 2s 后执行一次;持续风暴超过 60s 强制执行;触发后仍有 30s 冷却。重复丢弃不刷新待命起点。实测 8 万次文件操作的风暴:旧行为在风暴开始 1s 内就重扫,新行为只在风暴结束后重扫一次。
 - 拆除序列(Stop/Invalidate/Release)全部在流所属 runloop 线程执行(跨线程 Invalidate 实测 SIGTRAP)。
 
 ### 5. 并行扫描:work-sharing + 分片聚合
@@ -187,7 +191,7 @@ load_mmap 校验 → Shared 视图(立即可查)→ 后台物化(拷贝为可变
 
 - 单实例:socket 绑定 `EADDRINUSE` → connect 探测——连得上 = 已在运行;拒连 = 崩溃残留 stale socket,unlink 重绑。
 - `start` 后台化(spawn 自身脱离终端);`stop` 经 socket 消息触发,**最终落盘完成后才响应**。
-- 日志:stderr + 数据目录 `daemon.log`;空闲 CPU 0%(纯事件驱动,无定时器)。
+- 日志:stderr + 数据目录 `daemon.log`;每行带本地时间戳(`YYYY-MM-DD HH:MM:SS.mmm`);文件超 5MB 轮转,保留 3 份;完全相同的消息 10s 内折叠计数,目录级/连接级错误按 60s 键控限频;每次启动写一行会话边界(pid/版本/数据目录/根/水位),事件流每 60s 汇总一行 events/drops(按丢弃位分列)。空闲 CPU 0%(纯事件驱动,无定时器)。
 
 ### IPC 契约
 

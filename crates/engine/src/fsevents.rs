@@ -49,7 +49,14 @@ pub const SINCE_NOW: EventId = fs::kFSEventStreamEventIdSinceNow;
 pub const FLAG_HISTORY_DONE: EventFlags = fs::kFSEventStreamEventFlagHistoryDone;
 
 /// 便捷组合:文件级事件 + 使用 CFTypes 路径数组(本封装恒设 UseCFTypes)。
+/// 仅测试/示例使用:生产增量管线只要目录级事件(见 [`DIR_EVENTS`])。
 pub const FILE_EVENTS: fs::FSEventStreamCreateFlags = fs::kFSEventStreamCreateFlagFileEvents;
+
+/// 目录级事件(不请求 FileEvents):`path` 是变更所在的目录,一条事件代表该
+/// 目录内的一次/多次变更。目录 diff 管线只需要这个粒度;文件级事件在解压、
+/// 拉代码等风暴下会让事件量放大到数万条,实测触发 `user_dropped|must_scan`,
+/// 进而全量重扫、再丢事件的正反馈。
+pub const DIR_EVENTS: fs::FSEventStreamCreateFlags = 0;
 
 /// 事件是否携带历史重放结束标记。
 #[must_use]
@@ -61,12 +68,58 @@ pub fn is_history_done(flags: EventFlags) -> bool {
 /// 位组合见 `fsevent_sys`:MustScanSubDirs/UserDropped/KernelDropped/EventIdsWrapped。
 #[must_use]
 pub fn is_dropped(flags: EventFlags) -> bool {
-    flags
-        & (fs::kFSEventStreamEventFlagMustScanSubDirs
-            | fs::kFSEventStreamEventFlagUserDropped
-            | fs::kFSEventStreamEventFlagKernelDropped
-            | fs::kFSEventStreamEventFlagEventIdsWrapped)
-        != 0
+    flags & DROP_MASK != 0
+}
+
+const DROP_MASK: EventFlags = fs::kFSEventStreamEventFlagMustScanSubDirs
+    | fs::kFSEventStreamEventFlagUserDropped
+    | fs::kFSEventStreamEventFlagKernelDropped
+    | fs::kFSEventStreamEventFlagEventIdsWrapped;
+
+/// 丢弃类标记的逐位拆解(诊断/计数用)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropBits {
+    pub must_scan: bool,
+    pub user_dropped: bool,
+    pub kernel_dropped: bool,
+    pub ids_wrapped: bool,
+}
+
+/// 拆出四种丢弃位。处置相同(全量重扫),区分是为了归因:
+/// `must_scan` 多为系统合并、`kernel_dropped` 指向事件缓冲溢出(事件量超过流
+/// 消费速度),两者混在一起时无法判断该调事件粒度还是调消费能力。
+#[must_use]
+pub fn drop_bits(flags: EventFlags) -> DropBits {
+    DropBits {
+        must_scan: flags & fs::kFSEventStreamEventFlagMustScanSubDirs != 0,
+        user_dropped: flags & fs::kFSEventStreamEventFlagUserDropped != 0,
+        kernel_dropped: flags & fs::kFSEventStreamEventFlagKernelDropped != 0,
+        ids_wrapped: flags & fs::kFSEventStreamEventFlagEventIdsWrapped != 0,
+    }
+}
+
+/// 丢弃类标记的位名组成:见 [`drop_bits`];无丢弃位返回 `<none>`。
+#[must_use]
+pub fn drop_reason(flags: EventFlags) -> String {
+    let b = drop_bits(flags);
+    let mut names = Vec::new();
+    if b.must_scan {
+        names.push("must_scan");
+    }
+    if b.user_dropped {
+        names.push("user_dropped");
+    }
+    if b.kernel_dropped {
+        names.push("kernel_dropped");
+    }
+    if b.ids_wrapped {
+        names.push("ids_wrapped");
+    }
+    if names.is_empty() {
+        "<none>".to_string()
+    } else {
+        names.join("|")
+    }
 }
 
 /// 最近一条已生成的全局事件 ID(`FSEventsGetCurrentEventId`)。
@@ -92,6 +145,10 @@ unsafe impl Send for SendPtr {}
 
 /// 回调:批量取事件逐条发往通道。字符串提取失败(理论不可达)以空路径留痕,
 /// 不让单条事件异常中断整批。
+///
+/// 性能约束:这条路径在风暴期按事件计费(实测 10 万次文件操作 ≈ 10 万次回调
+/// 迭代)。转换缓冲必须**提到循环外**复用——旧实现每个事件在栈上开 4KB 并清零,
+/// 单批 8 万事件即 320MB memset,直接拖慢消费速度并触发 `user_dropped`。
 extern "C" fn on_events(
     // fsevent-sys 的回调 typedef 首参为 FSEventStreamRef(*mut),C 头文件的
     // ConstFSEventStreamRef 在该 crate 里同指 c_void,随 crate 签名。
@@ -107,20 +164,26 @@ extern "C" fn on_events(
     // 与属主线程回收 ctx 的时间窗被「Stop+Invalidate 完毕 → join」隔开,无别名冲突。
     let ctx = unsafe { &*(info as *const CallbackCtx) };
     let paths = event_paths as cf::CFArrayRef;
+    // 回调串行执行(CF runloop 线程),循环外复用的栈缓冲不会跨线程共享。
+    let mut buf = [0 as c_char; 4096];
     for i in 0..num_events {
         // SAFETY:eventPaths 为 CFArrayRef(创建流恒设 UseCFTypes,见模块头)、
         // eventFlags/eventIds 为长度 num_events 的 C 数组(框架契约),
         // i < num_events 时索引合法;CFArrayGetValueAtIndex 借出的值在本次回调内有效。
         let (path, flags, id) = unsafe {
             let value = cf::CFArrayGetValueAtIndex(paths, i as cf::CFIndex);
-            let mut buf = [0 as c_char; 4096];
-            let decoded = cf::CFStringGetCString(
-                value as cf::CFStringRef,
+            let s = value as cf::CFStringRef;
+            // 快路径:CFString 内部已是 UTF-8 时直接借用指针(零拷贝);
+            // 失败再走定长缓冲(路径长度上限 4095,超长截断留痕为空串)。
+            let ptr = cf::CFStringGetCStringPtr(s, cf::kCFStringEncodingUTF8);
+            let path = if !ptr.is_null() {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            } else if cf::CFStringGetCString(
+                s,
                 buf.as_mut_ptr(),
                 buf.len() as cf::CFIndex,
                 cf::kCFStringEncodingUTF8,
-            );
-            let path = if decoded {
+            ) {
                 CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
             } else {
                 String::new()
@@ -356,5 +419,65 @@ impl FseStream {
 impl Drop for FseStream {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 单一位取值钉:每个丢弃位单独喂入时只报自己;多位组合按固定顺序拼接。
+    /// 突变「少判一位」或「顺序改变」时必红——诊断字段的用途就是区分
+    /// must_scan(系统合并)与 kernel_dropped(缓冲溢出)。
+    #[test]
+    fn drop_reason_names_each_bit() {
+        assert_eq!(
+            drop_reason(fs::kFSEventStreamEventFlagMustScanSubDirs),
+            "must_scan"
+        );
+        assert_eq!(
+            drop_reason(fs::kFSEventStreamEventFlagUserDropped),
+            "user_dropped"
+        );
+        assert_eq!(
+            drop_reason(fs::kFSEventStreamEventFlagKernelDropped),
+            "kernel_dropped"
+        );
+        assert_eq!(
+            drop_reason(fs::kFSEventStreamEventFlagEventIdsWrapped),
+            "ids_wrapped"
+        );
+        assert_eq!(
+            drop_reason(
+                fs::kFSEventStreamEventFlagKernelDropped
+                    | fs::kFSEventStreamEventFlagMustScanSubDirs
+            ),
+            "must_scan|kernel_dropped"
+        );
+    }
+
+    /// 非丢弃位(如 ItemCreated)不得被误报;空集返回 `<none>`。
+    #[test]
+    fn drop_reason_ignores_non_drop_bits() {
+        assert_eq!(
+            drop_reason(fs::kFSEventStreamEventFlagItemCreated),
+            "<none>"
+        );
+        assert_eq!(drop_reason(0), "<none>");
+        assert!(!is_dropped(fs::kFSEventStreamEventFlagItemCreated));
+        assert!(is_dropped(fs::kFSEventStreamEventFlagKernelDropped));
+    }
+
+    /// 逐位拆解与字符串归因一致:计数与日志必须同源。
+    #[test]
+    fn drop_bits_matches_reason() {
+        let flags =
+            fs::kFSEventStreamEventFlagKernelDropped | fs::kFSEventStreamEventFlagUserDropped;
+        let b = drop_bits(flags);
+        assert!(!b.must_scan);
+        assert!(b.user_dropped);
+        assert!(b.kernel_dropped);
+        assert!(!b.ids_wrapped);
+        assert_eq!(drop_reason(flags), "user_dropped|kernel_dropped");
     }
 }

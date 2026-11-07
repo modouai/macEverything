@@ -189,7 +189,8 @@ fn mount_volume(state: &Arc<EngineState>, paths: &DaemonPaths, vol: &Path) {
         &[vol_str.as_str()],
         fsevents::SINCE_NOW,
         0.1,
-        fsevents::FILE_EVENTS,
+        // 与主流一致:目录级事件(见 daemon::event_dir 的说明)。
+        fsevents::DIR_EVENTS,
     ) {
         Ok((stream, rx)) => {
             state

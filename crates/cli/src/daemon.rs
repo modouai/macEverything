@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // —— 锁中毒策略 ——
@@ -66,6 +66,22 @@ fn fatal_lock_poison(what: &str) -> ! {
         );
     });
     std::process::exit(1);
+}
+
+/// 同一键在窗口内只出一条,并在恢复时注明期间抑制了多少条。
+/// 用途:记录目录级错误与连接错误——单个坏目录不配刷满整个日志窗口。
+/// 定义置于文件前部:macro_rules 按文本顺序生效,consume_events 等早于
+/// 日志实现段落使用它。
+macro_rules! log_throttled {
+    ($lvl:ident, $key:literal, $window:expr, $($arg:tt)*) => {{
+        if let Some(suppressed) = $crate::daemon::throttle_allow($key, $window) {
+            if suppressed == 0 {
+                log::$lvl!($($arg)*);
+            } else {
+                log::$lvl!("{} [窗口内抑制 {suppressed} 条同类]", format_args!($($arg)*));
+            }
+        }
+    }};
 }
 
 pub(crate) trait LockRecover<T> {
@@ -190,6 +206,12 @@ const SCAN_CHUNK: usize = 50_000;
 /// 重扫冷却:两次全量重扫的最小间隔(防「重扫→新 dropped→重扫」退化振荡;
 /// 实测真实实例曾 420 次重复重扫,索引永在重扫、日志刷屏)。
 const RESCAN_COOLDOWN: Duration = Duration::from_secs(30);
+/// 丢弃标记触发的重扫去抖:事件流安静这么久才真正重扫。风暴期间重扫会与事件
+/// 风暴互相加剧(重扫占 CPU/IO → 更多事件被丢 → 又一次重扫),实测这是
+/// 「丢弃连刷 + 重扫振荡」的主因;先登记、等安静再跑。
+const RESCAN_QUIET: Duration = Duration::from_secs(2);
+/// 持续风暴下强制重扫的上限等待:事件一直不安静也必须收敛,不能无限待命。
+const RESCAN_MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// 事件是否已被全量重扫覆盖(≤ 重扫开始时刻的全局水位)。独立成函数便于单测
 /// 钉住比较语义:覆盖点是「小于等于」——floor 本身的事件同属历史。
@@ -402,12 +424,125 @@ pub struct EngineState {
     spare_overlay: Mutex<Option<engine::overlay::Overlay>>,
     /// 卷全量扫描闸门(C1,见 [`VolumeScanGate`])。
     volume_scan_gate: Mutex<VolumeScanGate>,
+    /// 事件流运行计数(保留窗口内的增量,日志每 60s 汇总一次)。
+    /// 计数本身不是业务状态,中毒与否不影响索引,取 recover。
+    run_stats: Mutex<RunStats>,
+    /// 丢弃触发的重扫去抖(见 [`RescanDebounce`])。
+    rescan_debounce: Mutex<RescanDebounce>,
+}
+
+/// 事件流运行计数。只用于日志归因:区分「事件量本身很大」与「系统在丢事件」,
+/// 以及丢的是哪一类标记——这决定该调事件粒度还是调消费能力。
+#[derive(Default)]
+struct RunStats {
+    events: u64,
+    drops: u64,
+    must_scan: u64,
+    user_dropped: u64,
+    kernel_dropped: u64,
+    ids_wrapped: u64,
+    last_report: Option<Instant>,
+    reported_events: u64,
+    reported_drops: u64,
+    reported_must: u64,
+    reported_user: u64,
+    reported_kernel: u64,
+    reported_wrapped: u64,
+}
+
+/// 记一条事件(含丢弃标记),供周期性汇总。
+fn record_event_stats(state: &EngineState, ev: &fsevents::FseEvent) {
+    let mut s = state.run_stats.lock_recover();
+    s.events = s.events.saturating_add(1);
+    let b = fsevents::drop_bits(ev.flags);
+    if b.must_scan || b.user_dropped || b.kernel_dropped || b.ids_wrapped {
+        s.drops = s.drops.saturating_add(1);
+        s.must_scan += u64::from(b.must_scan);
+        s.user_dropped += u64::from(b.user_dropped);
+        s.kernel_dropped += u64::from(b.kernel_dropped);
+        s.ids_wrapped += u64::from(b.ids_wrapped);
+    }
+}
+
+/// 每 60s 汇总一次事件/丢弃增量;窗口内无事件则不出行(空闲日志保持安静)。
+/// 只由主流消费线程调用(卷流计数并入同一份总计,避免每流各报一遍)。
+fn maybe_log_stats(state: &EngineState) {
+    let mut s = state.run_stats.lock_recover();
+    let now = Instant::now();
+    let due = s
+        .last_report
+        .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
+    if !due {
+        return;
+    }
+    let events = s.events - s.reported_events;
+    let drops = s.drops - s.reported_drops;
+    let must = s.must_scan - s.reported_must;
+    let user = s.user_dropped - s.reported_user;
+    let kernel = s.kernel_dropped - s.reported_kernel;
+    let wrapped = s.ids_wrapped - s.reported_wrapped;
+    s.last_report = Some(now);
+    s.reported_events = s.events;
+    s.reported_drops = s.drops;
+    s.reported_must = s.must_scan;
+    s.reported_user = s.user_dropped;
+    s.reported_kernel = s.kernel_dropped;
+    s.reported_wrapped = s.ids_wrapped;
+    drop(s);
+    if events == 0 && drops == 0 {
+        return;
+    }
+    log::info!(
+        "事件统计(60s): events={events} drops={drops} [must_scan={must} user_dropped={user} kernel_dropped={kernel} ids_wrapped={wrapped}]"
+    );
 }
 
 #[derive(Default)]
 struct MergeScratch {
     base_remap: Vec<u32>,
     new_dirs: Vec<(u32, Vec<u8>)>,
+}
+
+/// 丢弃触发的重扫去抖状态。语义见 [`RESCAN_QUIET`]/[`RESCAN_MAX_WAIT`]:
+/// - `request`:首次丢弃登记待命(重复丢弃不刷新起点,否则持续风暴永不触发);
+/// - `note_event`:每条事件刷新安静窗的起点;
+/// - `due`:安静期满或待命超过上限 → 应重扫;`take` 在真正触发时清待命。
+#[derive(Default)]
+struct RescanDebounce {
+    pending_since: Option<Instant>,
+    last_event_at: Option<Instant>,
+}
+
+impl RescanDebounce {
+    /// 返回是否首次登记(调用方据此决定是否留日志,避免连刷)。
+    fn request(&mut self, now: Instant) -> bool {
+        if self.pending_since.is_some() {
+            return false;
+        }
+        self.pending_since = Some(now);
+        true
+    }
+
+    fn note_event(&mut self, now: Instant) {
+        self.last_event_at = Some(now);
+    }
+
+    fn due(&self, now: Instant, quiet: Duration, max_wait: Duration) -> bool {
+        let Some(since) = self.pending_since else {
+            return false;
+        };
+        if now.duration_since(since) >= max_wait {
+            return true;
+        }
+        match self.last_event_at {
+            Some(t) => now.duration_since(t) >= quiet,
+            None => true,
+        }
+    }
+
+    fn take(&mut self) {
+        self.pending_since = None;
+    }
 }
 
 /// 卷全量扫描闸门(C1)。卷扫描线程把卷内条目**直写 Base**;若同窗口内卷流
@@ -496,6 +631,8 @@ impl EngineState {
             merge_scratch: Mutex::new(MergeScratch::default()),
             spare_overlay: Mutex::new(None),
             volume_scan_gate: Mutex::new(VolumeScanGate::default()),
+            run_stats: Mutex::new(RunStats::default()),
+            rescan_debounce: Mutex::new(RescanDebounce::default()),
         }
     }
 
@@ -1516,6 +1653,22 @@ fn maybe_compact(state: &EngineState) {
     engine::malloc_pressure::release_heap_pressure();
 }
 
+/// 事件路径 → 需要 diff 的目录。
+///
+/// 事件流**不设** `FileEvents`(见建流调用):FSEvents 按目录合批上报,`path`
+/// 就是变更所在目录。设为文件级会让一次解压/拉代码产生数万条事件,实机
+/// 80k 文件增删即触发 `user_dropped|must_scan` → 全量重扫 → 又一批丢弃。
+///
+/// 防御:若系统给出的是文件路径(旧行为/异常),退回其父目录——`diff_one` 对
+/// 文件路径的 `read_dir` 会 ENOTDIR,不能直接喂。一次 stat,事件已按目录合批。
+fn event_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().map(Path::to_path_buf)
+    }
+}
+
 /// 事件消费循环(重放与增量共用):批量 diff + 落盘节流 + 降级判定。
 /// 水位语义:接收(`seen_event_id`)与已应用(`applied_event_id`)分离,
 /// 落盘只取已应用水位(见 EngineState 字段注释)。
@@ -1539,8 +1692,15 @@ fn consume_events(
         if state.stopping.load(Ordering::Relaxed) {
             break;
         }
+        // 丢弃去抖的触发点:每轮(≤150ms)检查一次,事件安静且冷却已过才真正重扫。
+        maybe_fire_debounced_rescan(&state, &paths);
         match rx.recv_timeout(Duration::from_millis(150)) {
             Ok(ev) => {
+                record_event_stats(&state, &ev);
+                state
+                    .rescan_debounce
+                    .lock_recover()
+                    .note_event(Instant::now());
                 // 已被全量重扫覆盖的陈旧事件直接跳过。必须先于一切语义判定——
                 // 重扫期间消费停摆、内核缓冲溢出产生的 dropped 标记就在其中,
                 // 它们正是「重扫 → 又一批 dropped → 又重扫」死循环的燃料。
@@ -1592,25 +1752,35 @@ fn consume_events(
                     if state.rescanning.load(Ordering::SeqCst) {
                         continue;
                     }
-                    // 冷却双保险:rescan_floor 兜住重扫期间积压的旧标记,但重扫**之后**
-                    // 新产生的 dropped(重扫自身引起的缓冲溢出)仍需限频,防退化振荡。
-                    // 重扫已异步化(后台线程),消费不再停摆,本分支应趋于绝迹。
-                    if let Some(t) = *state.last_rescan.lock_recover() {
-                        if t.elapsed() < RESCAN_COOLDOWN {
-                            log::warn!(
-                                "重扫冷却期内再收丢弃标记({:.0}s 前刚重扫过),已忽略",
-                                t.elapsed().as_secs_f64()
-                            );
-                            continue;
-                        }
+                    // 不再当场全量重扫:风暴期间重扫会与事件风暴互相加剧
+                    // (重扫占 CPU/IO → 更多事件被丢 → 又一次重扫)。先登记待命,
+                    // 由 maybe_fire_debounced_rescan 在「事件安静 / 待命超上限 /
+                    // 冷却已过」时触发一次。重复丢弃不刷新待命起点。
+                    let newly = state.rescan_debounce.lock_recover().request(Instant::now());
+                    if newly {
+                        log::warn!(
+                            "收到丢弃类标记({}, id={}, path={}, stream={}),登记去抖重扫(事件安静 {}s 后执行)",
+                            fsevents::drop_reason(ev.flags),
+                            ev.id,
+                            ev.path,
+                            if volume_owned { "volume" } else { "main" },
+                            RESCAN_QUIET.as_secs()
+                        );
+                    } else {
+                        log_throttled!(
+                            warn,
+                            "drop-pending",
+                            RESCAN_COOLDOWN,
+                            "丢弃标记持续,重扫已在待命(安静 {}s 或待命 {}s 后执行)",
+                            RESCAN_QUIET.as_secs(),
+                            RESCAN_MAX_WAIT.as_secs()
+                        );
                     }
-                    log::warn!("收到丢弃类标记,转全量重扫兜底");
-                    spawn_rescan(&state, &paths); // 后台重扫,消费循环继续 diff 旧索引
                     continue;
                 }
                 replay_events += 1;
-                if let Some(parent) = Path::new(&ev.path).parent() {
-                    batcher.push(parent.to_string_lossy().into_owned());
+                if let Some(dir) = event_dir(Path::new(&ev.path)) {
+                    batcher.push(dir.to_string_lossy().into_owned());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1626,6 +1796,10 @@ fn consume_events(
         if state.heal_requested.swap(false, Ordering::SeqCst) {
             log::warn!("账本腐化自愈:触发降级全量重扫(重扫=最终一致性闸门)");
             spawn_rescan(&state, &paths);
+        }
+        if !volume_owned {
+            // 卷流计数并入同一份总计;汇总只由主流出一次(见 maybe_log_stats)。
+            maybe_log_stats(&state);
         }
         if should_flush(&state) {
             flush(&state, &paths);
@@ -1982,6 +2156,30 @@ fn collapse_empty_overlay(state: &EngineState) {
 }
 
 /// 自动源的重扫入口:后台线程执行(不阻塞消费循环);锁被占用即放弃。
+/// 丢弃去抖的触发判定:待命 + 事件安静(或待命超上限)+ 冷却已过 + 无在途重扫。
+/// 每轮消费循环调用一次(≤150ms),风暴期间只登记不执行。
+fn maybe_fire_debounced_rescan(state: &Arc<EngineState>, paths: &DaemonPaths) {
+    if state.rescanning.load(Ordering::SeqCst) {
+        return;
+    }
+    let now = Instant::now();
+    let cooldown_ok = state
+        .last_rescan
+        .lock_recover()
+        .is_none_or(|t| now.duration_since(t) >= RESCAN_COOLDOWN);
+    if !cooldown_ok {
+        return;
+    }
+    let mut d = state.rescan_debounce.lock_recover();
+    if !d.due(now, RESCAN_QUIET, RESCAN_MAX_WAIT) {
+        return;
+    }
+    d.take();
+    drop(d);
+    log::info!("丢弃后事件已安静(或待命超上限),执行去抖重扫");
+    spawn_rescan(state, paths);
+}
+
 fn spawn_rescan(state: &Arc<EngineState>, paths: &DaemonPaths) {
     let st = state.clone();
     let p = paths.clone();
@@ -2118,7 +2316,15 @@ fn handle_diff_error(
                 abs_dir,
                 "权限拒绝(如无完全磁盘访问权限),已停止重试;重启后自动重新索引",
             ) {
-                log::warn!("目录 diff 权限拒绝 {},入负缓存", abs_dir.display());
+                // 每目录只入负缓存一次,但 TCC 保护目录可能一次事件风暴扫出成百个
+                // 子目录(实机 Photos Library);按 60s 窗口合并,保留一个样本路径。
+                log_throttled!(
+                    warn,
+                    "diff-perm",
+                    Duration::from_secs(60),
+                    "目录 diff 权限拒绝 {},入负缓存",
+                    abs_dir.display()
+                );
             }
         }
         _ => {
@@ -2239,11 +2445,24 @@ fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
+    // 会话边界行:日志带时间戳后,靠这一行切分「哪段属于哪次启动、重放自哪个水位」。
+    log::info!(
+        "daemon 启动: pid={} version={} data_dir={} roots={:?} since={} replayed_from_disk={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+        paths.data_dir.display(),
+        roots_str,
+        last_event_id,
+        replayed_from_disk,
+    );
     let (stream, rx) = match fsevents::start_stream(
         &roots_str.iter().map(String::as_str).collect::<Vec<_>>(),
         last_event_id.max(1),
         0.1,
-        fsevents::FILE_EVENTS,
+        // 目录级事件(不设 FileEvents):增量管线只需要「哪个目录变了」,文件级
+        // 事件在大风暴下会把内核/用户缓冲打爆(user_dropped → 全量重扫)。
+        // 事件路径处理见 event_dir()。
+        fsevents::DIR_EVENTS,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -2703,37 +2922,211 @@ pub fn serve(paths: DaemonPaths) -> Result<()> {
                     std::process::exit(0);
                 }
             }
-            Err(e) => log::warn!("连接处理失败: {e:#}"),
+            Err(e) => log_throttled!(
+                warn,
+                "conn-error",
+                Duration::from_secs(60),
+                "连接处理失败: {e:#}"
+            ),
         });
     }
     Ok(())
 }
 
-/// 极简日志:stderr + 数据目录 daemon.log(避免引入日志框架依赖)。
+/// 日志文件上限与备份数:daemon.log + daemon.log.1..3。5MB × 4 是取证够用的
+/// 窗口——旧实现无轮转,实机跑出 28MB 单文件且无时间戳,无法区分会话与阶段。
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_BACKUPS: usize = 3;
+/// 相同消息的去重窗口:窗口内重复只计数,窗口到期或换消息时补一行「重复 N 次」。
+/// 只对**完全相同**的消息生效;带路径/计数的消息由调用点用 `log_throttled!` 限频。
+const LOG_DEDUP_WINDOW: Duration = Duration::from_secs(10);
+
+/// 日志行时间戳(本地时区,毫秒)。`localtime_r` 线程安全;调用频率与日志量同级,
+/// 不在热路径。
+fn now_stamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // SAFETY:localtime_r 只写调用方提供的 tm,不返回内部指针;tm 全零初始化,
+    // 失败时保持零值(格式仍合法,只是年份为 1900)。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY:同上;`secs` 为 time_t 可表示范围内的当前秒数。
+    unsafe { libc::localtime_r(&(now.as_secs() as libc::time_t), &mut tm) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        now.subsec_millis()
+    )
+}
+
+/// 相同消息折叠器:窗口内重复消息只计数;放下一条不同消息时返回累计抑制数。
+#[derive(Default)]
+struct RepeatFilter {
+    last: Option<(String, Instant)>,
+    suppressed: u32,
+}
+
+enum Emit {
+    /// 本行被折叠,不写。
+    Skip,
+    /// 写出本行;`suppressed` > 0 表示上一条消息被折叠过这么多次。
+    Write { suppressed: u32 },
+}
+
+impl RepeatFilter {
+    fn observe(&mut self, body: &str, now: Instant) -> Emit {
+        if let Some((prev, at)) = &self.last {
+            if prev == body && now.duration_since(*at) < LOG_DEDUP_WINDOW {
+                self.suppressed = self.suppressed.saturating_add(1);
+                return Emit::Skip;
+            }
+        }
+        let suppressed = std::mem::take(&mut self.suppressed);
+        self.last = Some((body.to_string(), now));
+        Emit::Write { suppressed }
+    }
+}
+
+/// 日志文件写侧:按大小轮转;打开失败降级为 stderr-only(不致命)。
+struct FileSink {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    bytes: u64,
+    repeat: RepeatFilter,
+}
+
+impl FileSink {
+    fn new(path: PathBuf) -> Self {
+        let file = open_log_file(&path);
+        let bytes = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map_or(0, |m| m.len());
+        Self {
+            path,
+            file,
+            bytes,
+            repeat: RepeatFilter::default(),
+        }
+    }
+
+    fn append(&mut self, line: &str) {
+        if self.bytes >= LOG_MAX_BYTES {
+            // 先关句柄再改名,避免 Windows 式语义差异(本仓仅 macOS,习惯而已);
+            // 轮转失败不丢当前行:重开原文件继续追加。
+            self.file = None;
+            let _ = rotate_log(&self.path);
+            self.file = open_log_file(&self.path);
+            self.bytes = 0;
+        }
+        if let Some(f) = &mut self.file {
+            if f.write_all(line.as_bytes()).is_ok() {
+                self.bytes = self.bytes.saturating_add(line.len() as u64);
+            }
+        }
+    }
+}
+
+/// 备份路径:daemon.log → daemon.log.1(整体追加后缀,不替换扩展名)。
+fn backup_path(path: &Path, index: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{index}"));
+    PathBuf::from(name)
+}
+
+/// 滚动:daemon.log.2 → .3、.1 → .2、daemon.log → .1,最老的丢弃。
+fn rotate_log(path: &Path) -> std::io::Result<()> {
+    for i in (1..LOG_BACKUPS).rev() {
+        let from = backup_path(path, i);
+        let to = backup_path(path, i + 1);
+        if from.exists() {
+            let _ = std::fs::remove_file(&to);
+            std::fs::rename(&from, &to)?;
+        }
+    }
+    let first = backup_path(path, 1);
+    let _ = std::fs::remove_file(&first);
+    if path.exists() {
+        std::fs::rename(path, &first)?;
+    }
+    Ok(())
+}
+
+/// 键控限频:同一键在窗口内只放行一次,放行时返回窗口内累计抑制数。
+struct ThrottleMap {
+    entries: HashMap<&'static str, (Instant, u32)>,
+}
+
+impl ThrottleMap {
+    fn allow(&mut self, key: &'static str, window: Duration, now: Instant) -> Option<u32> {
+        match self.entries.get_mut(key) {
+            Some((last, suppressed)) if now.duration_since(*last) < window => {
+                *suppressed = suppressed.saturating_add(1);
+                None
+            }
+            Some((last, suppressed)) => {
+                let n = std::mem::take(suppressed);
+                *last = now;
+                Some(n)
+            }
+            None => {
+                self.entries.insert(key, (now, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+fn throttle_allow(key: &'static str, window: Duration) -> Option<u32> {
+    static THROTTLES: OnceLock<Mutex<ThrottleMap>> = OnceLock::new();
+    let m = THROTTLES.get_or_init(|| {
+        Mutex::new(ThrottleMap {
+            entries: HashMap::new(),
+        })
+    });
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.allow(key, window, Instant::now())
+}
+
+/// 极简日志:stderr + 数据目录 daemon.log(不引日志框架)。每行带本地时间戳;
+/// 文件超 5MB 轮转保留 3 份;完全相同的消息 10s 内折叠计数。
 fn init_logger(paths: &DaemonPaths) {
-    struct Dual(log::LevelFilter, Option<std::fs::File>);
+    struct Dual(Mutex<FileSink>);
     impl log::Log for Dual {
         fn enabled(&self, m: &log::Metadata) -> bool {
-            m.level() <= self.0
+            m.level() <= log::max_level()
         }
         fn log(&self, r: &log::Record) {
             if !self.enabled(r.metadata()) {
                 return;
             }
-            let line = format!("[{}] {}\n", r.level(), r.args());
-            eprint!("{line}");
-            if let Some(f) = &self.1 {
-                let _ = (&*f).write_all(line.as_bytes());
+            let body = format!("{}", r.args());
+            let mut sink = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let Emit::Write { suppressed } = sink.repeat.observe(&body, Instant::now()) else {
+                return;
+            };
+            if suppressed > 0 {
+                let note = format!(
+                    "{} [{}] (上条消息在 {}s 内重复 {suppressed} 次)\n",
+                    now_stamp(),
+                    r.level(),
+                    LOG_DEDUP_WINDOW.as_secs()
+                );
+                eprint!("{note}");
+                sink.append(&note);
             }
+            let line = format!("{} [{}] {body}\n", now_stamp(), r.level());
+            eprint!("{line}");
+            sink.append(&line);
         }
         fn flush(&self) {}
     }
-    if log::set_boxed_logger(Box::new(Dual(
-        log::LevelFilter::Info,
-        open_log_file(&paths.log_file()),
-    )))
-    .is_ok()
-    {
+    if log::set_boxed_logger(Box::new(Dual(Mutex::new(FileSink::new(paths.log_file()))))).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
 }
@@ -5038,5 +5431,213 @@ mod tests {
         );
         assert_eq!(state.flush_failures.load(Ordering::Relaxed), 1);
         assert!(!should_flush(&state), "Mutable 写失败同样必须退避");
+    }
+
+    /// 相同消息在窗口内折叠:连续 3 条重复只出首条,计数留待下一条不同消息。
+    /// 突变「窗口内不折叠」时实机日志会恢复刷屏,此测必红。
+    #[test]
+    fn repeat_filter_folds_identical_messages_within_window() {
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            f.observe("boom", t0),
+            Emit::Write { suppressed: 0 }
+        ));
+        assert!(matches!(
+            f.observe("boom", t0 + Duration::from_secs(1)),
+            Emit::Skip
+        ));
+        assert!(matches!(
+            f.observe("boom", t0 + Duration::from_secs(2)),
+            Emit::Skip
+        ));
+        match f.observe("other", t0 + Duration::from_secs(3)) {
+            Emit::Write { suppressed } => assert_eq!(suppressed, 2, "补报累计折叠数"),
+            Emit::Skip => panic!("不同消息必须写出"),
+        }
+    }
+
+    /// 窗口到期后同一条消息重新放行(否则长期只出一条,丢失持续性证据);
+    /// 放行时补报窗口内被折叠的次数。
+    #[test]
+    fn repeat_filter_reemits_after_window() {
+        let mut f = RepeatFilter::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            f.observe("boom", t0),
+            Emit::Write { suppressed: 0 }
+        ));
+        assert!(matches!(
+            f.observe("boom", t0 + Duration::from_secs(1)),
+            Emit::Skip
+        ));
+        match f.observe("boom", t0 + LOG_DEDUP_WINDOW + Duration::from_secs(1)) {
+            Emit::Write { suppressed } => assert_eq!(suppressed, 1, "补报窗口内折叠数"),
+            Emit::Skip => panic!("窗口外必须放行"),
+        }
+    }
+
+    /// 轮转保留 3 份:daemon.log → .1 → .2 → .3,第 4 次轮转丢弃最老的 .3。
+    /// 突变「备份数少一」或「不删最老」时此测必红。
+    #[test]
+    fn rotate_log_keeps_configured_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        for generation in 0..5 {
+            std::fs::write(&log, format!("gen{generation}")).unwrap();
+            rotate_log(&log).unwrap();
+        }
+        assert!(!log.exists(), "轮转后原文件被改名");
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&log, 1)).unwrap(),
+            "gen4"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&log, 2)).unwrap(),
+            "gen3"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&log, 3)).unwrap(),
+            "gen2"
+        );
+        assert!(!backup_path(&log, 4).exists(), "只保留 3 份备份");
+    }
+
+    /// 键控限频:窗口内只放行首条,放行时报告期间抑制数。
+    #[test]
+    fn throttle_map_allows_once_per_window() {
+        let mut m = ThrottleMap {
+            entries: HashMap::new(),
+        };
+        let t0 = Instant::now();
+        assert_eq!(m.allow("k", Duration::from_secs(60), t0), Some(0));
+        assert_eq!(
+            m.allow("k", Duration::from_secs(60), t0 + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            m.allow("k", Duration::from_secs(60), t0 + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            m.allow("k", Duration::from_secs(60), t0 + Duration::from_secs(61)),
+            Some(2),
+            "窗口到期放行并回报抑制数"
+        );
+        assert_eq!(
+            m.allow(
+                "other",
+                Duration::from_secs(60),
+                t0 + Duration::from_secs(62)
+            ),
+            Some(0),
+            "不同键互不影响"
+        );
+    }
+
+    /// 时间戳形状固定(毫秒 3 位):排序/机器解析依赖定宽。
+    #[test]
+    fn now_stamp_is_fixed_width() {
+        let s = now_stamp();
+        assert_eq!(s.len(), 23, "YYYY-MM-DD HH:MM:SS.mmm:{s}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], " ");
+        assert_eq!(&s[19..20], ".");
+    }
+
+    /// 事件路径解析:目录级事件直接用路径;文件/已删除路径退回父目录。
+    /// 突变「恒用 path」会让 diff_one 对文件 read_dir(ENOTDIR),此测必红。
+    #[test]
+    fn event_dir_resolves_directory_and_falls_back_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(event_dir(&sub).unwrap(), sub);
+
+        let file = sub.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(event_dir(&file).unwrap(), sub, "文件路径退回父目录");
+
+        let gone = sub.join("ghost.txt");
+        assert_eq!(event_dir(&gone).unwrap(), sub, "已删除路径退回父目录");
+    }
+
+    /// 丢弃去抖:持续事件期间不触发,安静满窗口才触发。
+    /// 突变「不检查 last_event_at」会让风暴中被立即重扫,此测必红。
+    #[test]
+    fn rescan_debounce_waits_for_quiet() {
+        let mut d = RescanDebounce::default();
+        let t0 = Instant::now();
+        let quiet = Duration::from_secs(2);
+        assert!(d.request(t0), "首次登记");
+        d.note_event(t0 + Duration::from_millis(500));
+        assert!(!d.due(
+            t0 + Duration::from_millis(1500),
+            quiet,
+            Duration::from_secs(60)
+        ));
+        d.note_event(t0 + Duration::from_millis(2500));
+        assert!(!d.due(
+            t0 + Duration::from_millis(3000),
+            quiet,
+            Duration::from_secs(60)
+        ));
+        assert!(
+            d.due(
+                t0 + Duration::from_millis(4600),
+                quiet,
+                Duration::from_secs(60)
+            ),
+            "安静满 2s 后触发"
+        );
+    }
+
+    /// 重复丢弃不刷新待命起点(否则持续风暴永不触发;上限等待是另一道闸)。
+    #[test]
+    fn rescan_debounce_repeated_requests_keep_first_instant() {
+        let mut d = RescanDebounce::default();
+        let t0 = Instant::now();
+        assert!(d.request(t0));
+        assert!(
+            !d.request(t0 + Duration::from_secs(1)),
+            "重复登记返回 false"
+        );
+        assert!(d.due(
+            t0 + Duration::from_secs(3),
+            Duration::from_secs(2),
+            Duration::from_secs(60)
+        ));
+    }
+
+    /// 持续风暴:事件不断刷新安静窗,但待命超过上限必须强制触发。
+    /// 突变「去掉上限分支」会让索引在长风暴中永不收敛,此测必红。
+    #[test]
+    fn rescan_debounce_forces_after_max_wait() {
+        let mut d = RescanDebounce::default();
+        let t0 = Instant::now();
+        let quiet = Duration::from_secs(2);
+        let max = Duration::from_secs(60);
+        d.request(t0);
+        d.note_event(t0 + Duration::from_secs(59));
+        assert!(
+            !d.due(t0 + Duration::from_secs(59), quiet, max),
+            "未到上限且刚有事件"
+        );
+        assert!(d.due(t0 + max, quiet, max), "待命满上限强制触发");
+    }
+
+    /// 触发后清待命;未登记时任何时刻都不触发。
+    #[test]
+    fn rescan_debounce_take_and_idle() {
+        let mut d = RescanDebounce::default();
+        let t0 = Instant::now();
+        assert!(!d.due(t0, Duration::from_secs(2), Duration::from_secs(60)));
+        d.request(t0);
+        d.take();
+        assert!(!d.due(
+            t0 + Duration::from_secs(100),
+            Duration::from_secs(2),
+            Duration::from_secs(60)
+        ));
     }
 }
