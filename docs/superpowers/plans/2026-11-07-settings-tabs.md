@@ -1067,7 +1067,7 @@ fn draw_index_page(
 }
 ```
 
-把 `draw_index_group` 的 `draw_card` 标题从 `i18n::s().group_index` 改为 `Some(i18n::s().row_excluded)`（子分组「排除目录」）；`draw_volumes_group` 保持 `Some(i18n::s().group_volumes)`。从 `catalog!` 删除 `group_index`，并更新引用它的测试断言。
+`draw_index_group` 的 `draw_card` 标题用 `None`：行内 ExcludeHeader 已经以 `row_excluded`（「排除目录」）作子分组标签，另加卡片子标题会重复同一文案；标签栏已提供页面级上下文。`draw_volumes_group` 保持 `Some(i18n::s().group_volumes)`。从 `catalog!` 删除 `group_index`，并更新引用它的测试断言。
 
 - [ ] **Step 4: 跑测试**
 

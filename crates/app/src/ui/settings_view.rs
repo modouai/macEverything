@@ -784,15 +784,7 @@ fn draw_index_group(
                 }),
         );
     }
-    draw_card(
-        ui,
-        full_w,
-        Some(i18n::s().row_excluded),
-        &rows,
-        data,
-        palette,
-        actions,
-    );
+    draw_card(ui, full_w, None, &rows, data, palette, actions);
 }
 
 /// 外接磁盘组(external-volumes):主开关行 + 挂载卷行(开关)+ 未挂载排除卷行 +
@@ -2790,6 +2782,15 @@ mod tests {
         let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
         assert!(labels.contains(&i18n::s().row_excluded));
         assert!(labels.contains(&i18n::s().group_volumes));
+        // 行内 Header 已是子分组标签；卡片不再另画「排除目录」标题，避免重复。
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == i18n::s().row_excluded)
+                .count(),
+            1,
+            "索引卡片不得再画「排除目录」子标题（唯一出现应来自行内 Header）"
+        );
         // 用出现次数钉住「页面内没有第二个『索引』」：唯一出现来自标签栏。
         assert_eq!(
             labels
