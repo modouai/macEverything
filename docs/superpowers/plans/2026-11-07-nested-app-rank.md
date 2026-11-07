@@ -157,7 +157,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```rust
     /// 嵌套在另一个 .app 内的 .app 不置顶：外层应用照常置顶，
     /// 包内 Helper 回到普通条目组按打分排序。
-    /// 突变「ranks_first 去掉祖先循环」时必红。
+    /// 突变「ranks_first 去掉路径祖先判定」时必红。
     #[test]
     fn nested_app_inside_app_does_not_rank_first() {
         let mut i = Index::new();
@@ -258,10 +258,10 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p engine query::tests::nested`
+Run: `cargo test -p engine query::match_tests::nested`
 Expected: FAIL，至少 `nested_app_inside_app_does_not_rank_first` 的实际顺序把 `Inner.app` 排到了最前。
 
-Run: `cargo test -p engine query::tests::app_inside_framework_does_not_rank_first`
+Run: `cargo test -p engine query::match_tests::app_inside_framework_does_not_rank_first`
 Expected: FAIL，`X.app` 被置顶。
 
 - [ ] **Step 3: 实现置顶位**
@@ -270,23 +270,22 @@ Expected: FAIL，`X.app` 被置顶。
 
 ```rust
 /// 默认相关度排序的最高维度：非包内的 `.app` 目录置顶。
-/// 判定 = 目录 + display 名 `.app` 后缀 + 祖先链无 bundle 组件。
-/// 只看命中的 `.app` 条目（数量小），父链上溯在候选收集阶段完成一次，
-/// 比较器只读编好的位，不做路径解析。
-fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
-    let e = view.entry(idx);
-    if !is_app_entry(e.is_dir(), view.display_name(idx)) {
+/// 判定 = 目录 + display 名 `.app` 后缀 + 完整路径的祖先段无 bundle 组件。
+///
+/// 用 `dir_path` 而不是父链上溯：`CompositeView` 的桥接 anchor 父号是
+/// `NO_PARENT`，`anchor_base` 才承载回 base 链的链接，按 `parent_idx` 上溯会在
+/// 桥处断开——增量新建的深层 `.app` 会因此误判为非包内。写侧
+/// `rewrite_dir_path` 已把两段路径拼进路径池，`dir_path` 是对合成视图正确的
+/// 单一真相。仅对命中的 `.app` 目录调用，普通条目零额外成本。
+fn ranks_first(view: &dyn IndexView, idx: u32, is_dir: bool) -> bool {
+    if !is_app_entry(is_dir, view.display_name(idx)) {
         return false;
     }
-    // 用 parent_idx 而非 entry(idx).parent：合成视图需要全局合成号。
-    let mut p = view.parent_idx(idx);
-    while p != NO_PARENT {
-        if crate::bundle::is_bundle_name(view.display_name(p)) {
-            return false;
-        }
-        p = view.parent_idx(p);
+    let path = view.dir_path(idx);
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(pos) => !path[..pos].split(|&b| b == b'/').any(is_bundle_name),
+        None => true,
     }
-    true
 }
 ```
 
@@ -303,7 +302,7 @@ fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
 ```rust
     // 候选行：(置顶位 | 分数) 组合键, 名长, 条目号。置顶位占高 8 位,
     // 低 8 位为 score(1..3)——单次整数比较即完成两级排序,行大小不变(16B)。
-    let mut rows: Vec<(u16, usize, u32)> = blocks
+    let mut rows: Vec<(u32, usize, u32)> = blocks
 ```
 
 把收集处
@@ -316,8 +315,8 @@ fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
 
 ```rust
                 Some((
-                    ((ranks_first(view, idx) as u16) << 8)
-                        | u16::from(score_of(&target, &c_name)),
+                    ((ranks_first(view, idx, e.is_dir()) as u32) << 8)
+                        | u32::from(score_of(&target, &c_name)),
                     target.len(),
                     idx,
                 ))
@@ -347,7 +346,7 @@ fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
 ```rust
     // 置顶位为最高维度（候选收集时已编入高 8 位），组内按 score 降序、
     // 名长升序、条目号决胜。
-    let cmp = |a: &(u16, usize, u32), b: &(u16, usize, u32)| {
+    let cmp = |a: &(u32, usize, u32), b: &(u32, usize, u32)| {
         b.0.cmp(&a.0)
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
@@ -363,10 +362,10 @@ Expected: PASS，既有 4 条 APP 置顶测试与新增 6 条嵌套测试全部�
 
 - [ ] **Step 7: 突变验证**
 
-临时把 `ranks_first` 的祖先循环整段删掉（只保留 `is_app_entry` 判定），重跑：
+临时把 `ranks_first` 的路径祖先判定去掉（只保留 `is_app_entry` 判定），重跑：
 
 ```bash
-cargo test -p engine query::tests::nested
+cargo test -p engine query::match_tests::nested
 ```
 
 Expected: `nested_app_inside_app_does_not_rank_first`、`app_inside_framework_does_not_rank_first`、`nested_uppercase_app_does_not_rank_first`、`nested_app_does_not_survive_top_limit` 均失败。改回后重跑确认全绿。

@@ -1,4 +1,5 @@
 //! 查询计划:解析(product.md §4 契约)→ 匹配内核与打分。
+use crate::bundle::is_bundle_name;
 use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, Entry, NO_PARENT};
 use crate::index::IndexView;
 use memchr::memmem::Finder;
@@ -211,7 +212,7 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // entry_valid 为 T3 合成视图的屏蔽判定挂点(tech.md §4.2):Base 命中经
     // 条目号链上溯屏蔽陈旧子树,Overlay 命中抑制 base 背书 anchor 的双份;
     // 单源视图默认恒真,零开销。
-    let mut rows: Vec<(u16, usize, u32)> = blocks
+    let mut rows: Vec<(u32, usize, u32)> = blocks
         .par_iter()
         .flat_map_iter(|&(start, chunk)| {
             (start..).zip(chunk.iter()).filter_map(|(idx, e)| {
@@ -267,7 +268,8 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                     return None;
                 }
                 Some((
-                    ((ranks_first(view, idx) as u16) << 8) | u16::from(score_of(&target, &c_name)),
+                    ((ranks_first(view, idx, e.is_dir()) as u32) << 8)
+                        | u32::from(score_of(&target, &c_name)),
                     target.len(),
                     idx,
                 ))
@@ -281,7 +283,7 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     // 比较子含 idx 决胜成全序,截断集与稳定排序一致(确定性不受不稳定划分影响)。
     // 置顶位为最高维度（候选收集时已编入高 8 位），组内按 score 降序、
     // 名长升序、条目号决胜。
-    let cmp = |a: &(u16, usize, u32), b: &(u16, usize, u32)| {
+    let cmp = |a: &(u32, usize, u32), b: &(u32, usize, u32)| {
         b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
     };
     if limit == 0 {
@@ -299,8 +301,8 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
     }
 }
 
-/// 候选行全序比较的最高维度:App 包(spec「匹配排序」= 目录且 display 名以
-/// `.app` 结尾,ASCII 大小写不敏感,`case:` 的原大小写候选同判)。
+/// 名字判定：目录且 display 名以 `.app` 结尾（ASCII 大小写不敏感，`case:` 的
+/// 原大小写候选同判）。置顶与否还取决于祖先路径，见 `ranks_first`。
 fn is_app_entry(is_dir: bool, display: &[u8]) -> bool {
     const SUFFIX: &[u8] = b".app";
     is_dir
@@ -309,23 +311,23 @@ fn is_app_entry(is_dir: bool, display: &[u8]) -> bool {
 }
 
 /// 默认相关度排序的最高维度：非包内的 `.app` 目录置顶。
-/// 判定 = 目录 + display 名 `.app` 后缀 + 祖先链无 bundle 组件。
-/// 只看命中的 `.app` 条目（数量小），父链上溯在候选收集阶段完成一次，
-/// 比较器只读编好的位，不做路径解析。
-fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
-    let e = view.entry(idx);
-    if !is_app_entry(e.is_dir(), view.display_name(idx)) {
+/// 判定 = 目录 + display 名 `.app` 后缀 + 完整路径的祖先段无 bundle 组件。
+///
+/// 用 `dir_path` 而不是父链上溯：`CompositeView` 的桥接 anchor 父号是
+/// `NO_PARENT`，`anchor_base` 才承载回 base 链的链接，按 `parent_idx` 上溯会在
+/// 桥处断开——增量新建的深层 `.app` 会因此误判为非包内。写侧
+/// `rewrite_dir_path` 已把两段路径拼进路径池，`dir_path` 是对合成视图正确的
+/// 单一真相。路径解析仅对 `.app` 目录命中发生：非目录在 `is_dir` 处短路，
+/// 普通条目零额外成本。
+fn ranks_first(view: &dyn IndexView, idx: u32, is_dir: bool) -> bool {
+    if !is_dir || !is_app_entry(is_dir, view.display_name(idx)) {
         return false;
     }
-    // 用 parent_idx 而非 entry(idx).parent：合成视图需要全局合成号。
-    let mut p = view.parent_idx(idx);
-    while p != NO_PARENT {
-        if crate::bundle::is_bundle_name(view.display_name(p)) {
-            return false;
-        }
-        p = view.parent_idx(p);
+    let path = view.dir_path(idx);
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(pos) => !path[..pos].split(|&b| b == b'/').any(is_bundle_name),
+        None => true,
     }
-    true
 }
 
 /// 列排序键(完整窗口列头):Relevance = v1 质量序(委托 execute),
@@ -932,7 +934,7 @@ mod match_tests {
 
     /// 嵌套在另一个 .app 内的 .app 不置顶：外层应用照常置顶，
     /// 包内 Helper 回到普通条目组按打分排序。
-    /// 突变「ranks_first 去掉祖先循环」时必红。
+    /// 突变「ranks_first 去掉路径祖先判定」时必红。
     #[test]
     fn nested_app_inside_app_does_not_rank_first() {
         let mut i = Index::new();

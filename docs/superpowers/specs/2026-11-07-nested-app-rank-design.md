@@ -76,36 +76,32 @@ pub fn is_bundle_path(p: &Path) -> bool;
 
 ### 4.2 查询候选行携带置顶位
 
-`crates/engine/src/query.rs` 的候选行从 `(u8, usize, u32)` 改为 `(u16, usize, u32)`：
+`crates/engine/src/query.rs` 的候选行从 `(u8, usize, u32)` 改为 `(u32, usize, u32)`：
 
-- 第一字段 = `(ranks_first as u16) << 8 | score as u16`。
-- 元组大小不变（u16 + usize + u32 对齐后仍为 16B），百万命中的临时内存不增长。
+- 第一字段 = `(ranks_first as u32) << 8 | score as u32`。
+- 元组大小不变（u32 + usize + u32 对齐后仍为 16B），百万命中的临时内存不增长。
 - 比较器退化为单次 `b.0.cmp(&a.0)` 再按名长、条目号决胜；置顶组（高 8 位为 1）整体优先，组内仍按 score 降序。
 
 `ranks_first` 在候选收集阶段计算（只对命中的 `.app` 目录条目调用，数量小）：
 
 ```rust
-fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
-    let e = view.entry(idx);
-    if !is_app_entry(e.is_dir(), view.display_name(idx)) {
+fn ranks_first(view: &dyn IndexView, idx: u32, is_dir: bool) -> bool {
+    if !is_app_entry(is_dir, view.display_name(idx)) {
         return false;
     }
-    let mut p = view.parent_idx(idx);
-    while p != NO_PARENT {
-        if is_bundle_name(view.display_name(p)) {
-            return false;
-        }
-        p = view.parent_idx(p);
+    let path = view.dir_path(idx);
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(pos) => !path[..pos].split(|&b| b == b'/').any(is_bundle_name),
+        None => true,
     }
-    true
 }
 ```
 
 要点：
 
-- 用 `view.parent_idx` 而非 `entry(idx).parent`：合成视图（base + overlay）需要全局合成号，直接读父号会跨空间取错。
-- 上溯在候选收集的并行块内完成，`IndexView: Sync` 已满足。
-- 候选收集是 `filter_map`，`ranks_first` 只在「目录且名以 `.app` 结尾」时触发父链，普通条目零额外成本。
+- 用 `dir_path` 而不是父链上溯：`CompositeView` 的桥接 anchor 父号是 `NO_PARENT`，`anchor_base` 才承载回 base 链的链接，按 `parent_idx` 上溯会在桥处断开——增量新建的深层 `.app` 会因此误判为非包内。写侧 `rewrite_dir_path` 已把两段路径拼进路径池，`dir_path` 是对合成视图正确的单一真相。
+- 路径解析在候选收集的并行块内完成，`IndexView: Sync` 已满足。
+- 候选收集是 `filter_map`，`ranks_first` 只在「目录且名以 `.app` 结尾」时解析路径，普通条目零额外成本。
 
 ### 4.3 保留现有判定
 
@@ -136,5 +132,5 @@ fn ranks_first(view: &dyn IndexView, idx: u32) -> bool {
 ## 7. 取舍
 
 - **召回不变**：包内 `.app` 与包内文件仍出现在结果集，只是不置顶。若实际使用中包内文件仍是噪声，再议剪枝。
-- **父链上溯成本**：仅对命中的 `.app` 目录条目，深度通常 ≤ 6；百万命中下 `.app` 命中数很小，不计入 P99 风险。实现后跑既有基准确认。
-- **不缓存父链判定**：一次查询内同一 `.app` 条目只判定一次（候选收集时），无需跨查询缓存。
+- **路径解析成本**：仅对命中的 `.app` 目录条目读取一次 `dir_path` 并按 `/` 切分路径段；百万命中下 `.app` 命中数很小，不计入 P99 风险。实现后跑既有基准确认。
+- **不缓存置顶判定**：一次查询内同一 `.app` 条目只判定一次（候选收集时），无需跨查询缓存。
