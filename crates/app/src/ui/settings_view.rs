@@ -17,7 +17,7 @@ use crate::cli_install::{Availability, EntryState, Observation, PathSource};
 use crate::hotkey::{HotkeyNote, HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
-use crate::ui::settings_tabs::SettingsTab;
+use crate::ui::settings_tabs::{draw_tab_bar, SettingsTab};
 use crate::ui::{
     font as ui_font, hotkey_keys,
     settings::{AutostartError, ExcludeError, LanguageError, SettingsError, UpdateError},
@@ -31,7 +31,7 @@ use crate::ui::{
         REMOVE_ICON_STROKE, RESET_BUTTON_GAP, RESET_BUTTON_PAD_X, RESET_BUTTON_RADIUS, ROW_H,
         ROW_PAD_X, SEG_FONT, SEG_GAP, SEG_H, SEG_ITEM_RADIUS, SEG_PAD, SEG_RADIUS, SEG_W,
         SUPPORT_FONT, SWITCH_KNOB, SWITCH_KNOB_SHADOW_OFFSET, SWITCH_KNOB_SHADOW_SIZE,
-        SWITCH_RADIUS, SWITCH_SIZE, TITLEBAR_H, UPDATE_CLUSTER_GAP, UPDATE_SEP_H,
+        SWITCH_RADIUS, SWITCH_SIZE, TABBAR_H, TITLEBAR_H, UPDATE_CLUSTER_GAP, UPDATE_SEP_H,
     },
 };
 use crate::update::{self, UpdatePhase};
@@ -127,7 +127,6 @@ pub(crate) struct CliInstallData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SettingsAction {
     /// 切换设置页标签。
-    #[allow(dead_code)] // Task 4 接线后删除（标签栏点击产出）。
     SelectTab(SettingsTab),
     /// 字号分段点击（立即应用 + 落盘）。
     SetFontSize(FontSize),
@@ -187,17 +186,39 @@ pub(crate) struct BodyOutput {
     pub(crate) actions: Vec<SettingsAction>,
 }
 
-/// 绘制标题栏以下的内容（纯绘制：数据来自 [`SettingsData`]，动作回传调用方）。
+/// 绘制标题栏以下的标签栏与当前标签页内容（纯绘制：数据来自
+/// [`SettingsData`]，动作回传调用方）。
 ///
-/// 标题栏固定；内容区自带 (20,24) 内边距，超出可视高时整页纵向滚动
-/// （不做卡片内独立滚动，排除目录列表同样随整页滚动）。
+/// 标题栏固定；标签栏紧接其下，内容区从标签栏底边开始，自带 (20,24)
+/// 内边距，超出可视高时当前页纵向滚动（不做卡片内独立滚动，排除目录列表
+/// 同样随整页滚动）。每个标签页有独立滚动位置（`id_salt` 按标签区分）。
 pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
     let window = ui.max_rect();
-    let content_rect = egui::Rect::from_min_max(
-        egui::pos2(window.left(), window.top() + TITLEBAR_H),
-        window.max,
+    let tab_top = window.top() + TITLEBAR_H;
+    let tab_rect = egui::Rect::from_min_max(
+        egui::pos2(window.left(), tab_top),
+        egui::pos2(window.right(), tab_top + TABBAR_H),
     );
+    let content_rect =
+        egui::Rect::from_min_max(egui::pos2(window.left(), tab_rect.bottom()), window.max);
     let palette = settings_tokens::palette(ui.visuals().dark_mode);
+    let mut actions = Vec::new();
+    // 点击别处取消录制：按下帧先于所有控件动作入列，保证「取消旧录制 → 开始新槽」
+    // 的顺序；点击录制字段本身由字段在抬起时取消（避免按下/抬起跨帧重复开始）。
+    // 先取消录制，再处理标签点击：保证同一帧内动作顺序为 Cancel → SelectTab。
+    if click_away_cancels_recording(ui, data) {
+        actions.push(SettingsAction::CancelHotkeyRecord);
+    }
+
+    let mut tab_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(tab_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    if let Some(tab) = draw_tab_bar(&mut tab_ui, data.active_tab, &palette) {
+        actions.push(SettingsAction::SelectTab(tab));
+    }
+
     let mut body = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(content_rect)
@@ -207,33 +228,36 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
     // 浮动滚动条不占内容宽（内容宽恒为窗宽，卡片对齐不随滚动条出现而跳动）。
     body.spacing_mut().scroll.floating = true;
 
-    let mut actions = Vec::new();
-    // 点击别处取消录制：按下帧先于所有控件动作入列，保证「取消旧录制 → 开始新槽」
-    // 的顺序；点击录制字段本身由字段在抬起时取消（避免按下/抬起跨帧重复开始）。
-    if click_away_cancels_recording(ui, data) {
-        actions.push(SettingsAction::CancelHotkeyRecord);
-    }
     egui::ScrollArea::vertical()
-        .id_salt("settings-body")
+        .id_salt(data.active_tab.scroll_id())
         .auto_shrink([false, false])
         .show(&mut body, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             let full_w = ui.available_width();
             let extra_h = support_extra_height(ui);
             ui.add_space(CONTENT_PAD.0);
-            draw_general_group(ui, full_w, data, &palette, extra_h, &mut actions);
-            ui.add_space(GROUP_GAP);
-            draw_index_group(ui, full_w, data, &palette, extra_h, &mut actions);
-            ui.add_space(GROUP_GAP);
-            draw_about_group(ui, full_w, data, &palette, extra_h, &mut actions);
-            ui.add_space(GROUP_GAP);
-            // 外接磁盘组固定排在末位(分组顺序由本函数与
-            // settings_layout_has_all_rows 钉住);内容超高整页滚动,不约束首屏。
-            draw_volumes_group(ui, full_w, data, &palette, extra_h, &mut actions);
+            match data.active_tab {
+                SettingsTab::General => {
+                    draw_general_page(ui, full_w, data, &palette, extra_h, &mut actions);
+                }
+                SettingsTab::Index => {
+                    draw_index_page(ui, full_w, data, &palette, extra_h, &mut actions);
+                }
+                SettingsTab::Advanced => {
+                    draw_advanced_page(ui, full_w, data, &palette, extra_h, &mut actions);
+                }
+                SettingsTab::Experimental => {
+                    draw_experimental_page(ui, full_w, data, &palette, extra_h, &mut actions);
+                }
+                SettingsTab::About => {
+                    draw_about_page(ui, full_w, data, &palette, extra_h, &mut actions);
+                }
+            }
             ui.add_space(CONTENT_PAD.0);
         });
     // 实验功能开启确认:应用内模态。不能用原生 NSAlert.runModal——在 egui pass
-    // 内同步 runModal 会重入 runloop,实机表现为整窗假死。
+    // 内同步 runModal 会重入 runloop,实机表现为整窗假死。必须画在滚动区之外，
+    // 否则会随页面滚动。
     if data.panel_assist_enable_prompt {
         draw_panel_assist_enable_modal(ui, &palette, &mut actions);
     }
@@ -429,8 +453,8 @@ impl CliRow {
     }
 }
 
-/// 通用组：七行卡片（字号 / 自启 / 语言 / 保存面板助手 / 两个快捷键 / 命令行工具）。
-fn draw_general_group(
+/// 通用页：三行卡片（字号 / 自启 / 语言）+ 快捷键子分组。
+fn draw_general_page(
     ui: &mut egui::Ui,
     full_w: f32,
     data: &SettingsData,
@@ -441,33 +465,12 @@ fn draw_general_group(
     let font_error = data.font_error.as_ref().map(SettingsError::text);
     let autostart_error = data.autostart_error.as_ref().map(AutostartError::text);
     let language_error = data.language_error.as_ref().map(LanguageError::text);
-    let panel_error = data.panel_assist_error.as_ref().map(SettingsError::text);
     let autostart_note = if autostart_error.is_none() && data.autostart_approval {
         Some(i18n::s().autostart_approval_note)
     } else {
         None
     };
     let has_message = autostart_error.is_some() || autostart_note.is_some();
-
-    // 快捷键行：内联错误（校验/重复/注册/保存）+ 运行时回落提示（按槽拆分）
-    // + 录制中的可见 Esc/点击别处提示（plan §H3 Step 2）。
-    let palette_error = hotkey_error_for(data, HotkeySlot::Palette);
-    let palette_note = data.hotkeys.note.as_ref().map(HotkeyNote::text);
-    let palette_hint =
-        (data.recording == Some(HotkeySlot::Palette)).then_some(i18n::s().recording_hint);
-    let window_error = hotkey_error_for(data, HotkeySlot::Window);
-    let window_note = data.hotkeys.window_note.as_ref().map(HotkeyNote::text);
-    let window_hint =
-        (data.recording == Some(HotkeySlot::Window)).then_some(i18n::s().recording_hint);
-
-    // 命令行工具行:支持行(错误/路径/遮蔽或卷未挂载/FDA)计入行高;
-    // CliRow 整体搬进行模型,支持行先克隆/拷出(短字符串,每帧一次)。
-    let cli = cli_row(data);
-    let cli_extra = extra_h * cli.line_count() as f32;
-    let cli_error = cli.error.clone();
-    let cli_note = cli.note.clone();
-    let cli_note2 = cli.note2.clone();
-    let cli_hint = cli.hint;
 
     let rows = [
         GroupRow {
@@ -494,18 +497,32 @@ fn draw_general_group(
             note2: None,
             hint: None,
         },
-        GroupRow {
-            kind: RowKind::PanelAssist,
-            // 错误行(保存失败) + 常驻说明行,两者都计入卡片高度。
-            spec: RowSpec::new(ROW_H)
-                .with_extra(extra_for(panel_error.is_some(), extra_h))
-                .with_extra(extra_h)
-                .with_extra(extra_h),
-            error: panel_error.as_deref(),
-            note: Some(i18n::s().row_panel_assist_desc),
-            note2: None,
-            hint: Some(i18n::s().panel_assist_restart_hint),
-        },
+    ];
+    draw_card(ui, full_w, None, &rows, data, palette, actions);
+
+    ui.add_space(GROUP_GAP);
+    draw_shortcuts_page(ui, full_w, data, palette, extra_h, actions);
+}
+
+/// 「快捷键」子分组：两个快捷键行（内联错误 / 回落提示 / 录制提示可并存）。
+fn draw_shortcuts_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let palette_error = hotkey_error_for(data, HotkeySlot::Palette);
+    let palette_note = data.hotkeys.note.as_ref().map(HotkeyNote::text);
+    let palette_hint =
+        (data.recording == Some(HotkeySlot::Palette)).then_some(i18n::s().recording_hint);
+    let window_error = hotkey_error_for(data, HotkeySlot::Window);
+    let window_note = data.hotkeys.window_note.as_ref().map(HotkeyNote::text);
+    let window_hint =
+        (data.recording == Some(HotkeySlot::Window)).then_some(i18n::s().recording_hint);
+
+    let rows = [
         GroupRow {
             kind: RowKind::PaletteKeys,
             spec: RowSpec::new(ROW_H).with_extra(hotkey_messages_extra(
@@ -532,24 +549,119 @@ fn draw_general_group(
             note2: None,
             hint: window_hint,
         },
-        GroupRow {
-            kind: RowKind::CliInstall(cli),
-            spec: RowSpec::new(ROW_H).with_extra(cli_extra),
-            error: cli_error.as_deref(),
-            note: cli_note.as_deref(),
-            note2: cli_note2.as_deref(),
-            hint: cli_hint,
-        },
     ];
     draw_card(
         ui,
         full_w,
-        i18n::s().group_general,
+        Some(i18n::s().group_shortcuts),
         &rows,
         data,
         palette,
         actions,
     );
+}
+
+/// 索引页：排除目录 + 外接磁盘两个子分组。
+fn draw_index_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    draw_index_group(ui, full_w, data, palette, extra_h, actions);
+    ui.add_space(GROUP_GAP);
+    draw_volumes_group(ui, full_w, data, palette, extra_h, actions);
+}
+
+/// 关于页：版本行 + 自动检查更新。
+fn draw_about_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    draw_about_group(ui, full_w, data, palette, extra_h, actions);
+}
+
+/// 高级页：命令行工具安装器。
+fn draw_advanced_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    draw_cli_page(ui, full_w, data, palette, extra_h, actions);
+}
+
+/// 命令行工具行（无页内顶层标题）。
+fn draw_cli_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    // 支持行(错误/路径/遮蔽或卷未挂载/FDA)计入行高;
+    // CliRow 整体搬进行模型,支持行先克隆/拷出(短字符串,每帧一次)。
+    let cli = cli_row(data);
+    let cli_extra = extra_h * cli.line_count() as f32;
+    let cli_error = cli.error.clone();
+    let cli_note = cli.note.clone();
+    let cli_note2 = cli.note2.clone();
+    let cli_hint = cli.hint;
+    let rows = [GroupRow {
+        kind: RowKind::CliInstall(cli),
+        spec: RowSpec::new(ROW_H).with_extra(cli_extra),
+        error: cli_error.as_deref(),
+        note: cli_note.as_deref(),
+        note2: cli_note2.as_deref(),
+        hint: cli_hint,
+    }];
+    draw_card(ui, full_w, None, &rows, data, palette, actions);
+}
+
+/// 实验页：保存面板目录助手。
+fn draw_experimental_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    draw_panel_assist_page(ui, full_w, data, palette, extra_h, actions);
+}
+
+/// 保存面板目录助手行（无页内顶层标题）；错误行 + 常驻说明 + 重启提示。
+fn draw_panel_assist_page(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let panel_error = data.panel_assist_error.as_ref().map(SettingsError::text);
+    let rows = [GroupRow {
+        kind: RowKind::PanelAssist,
+        // 错误行(保存失败) + 常驻说明行,两者都计入卡片高度。
+        spec: RowSpec::new(ROW_H)
+            .with_extra(extra_for(panel_error.is_some(), extra_h))
+            .with_extra(extra_h)
+            .with_extra(extra_h),
+        error: panel_error.as_deref(),
+        note: Some(i18n::s().row_panel_assist_desc),
+        note2: None,
+        hint: Some(i18n::s().panel_assist_restart_hint),
+    }];
+    draw_card(ui, full_w, None, &rows, data, palette, actions);
 }
 
 /// 保存面板目录助手行：左标签 + 右簇「[授权链接] [开关]」。
@@ -675,7 +787,7 @@ fn draw_index_group(
     draw_card(
         ui,
         full_w,
-        i18n::s().group_index,
+        Some(i18n::s().group_index),
         &rows,
         data,
         palette,
@@ -756,7 +868,7 @@ fn draw_volumes_group(
     draw_card(
         ui,
         full_w,
-        i18n::s().group_volumes,
+        Some(i18n::s().group_volumes),
         &rows,
         data,
         palette,
@@ -1010,7 +1122,7 @@ fn draw_about_group(
     draw_card(
         ui,
         full_w,
-        i18n::s().group_about,
+        Some(i18n::s().group_about),
         &rows,
         data,
         palette,
@@ -1199,11 +1311,11 @@ fn draw_update_button(
     }
 }
 
-/// 卡片：分组标题 + 底色；行高度与绘制共用同一行模型，末尾校对游标。
+/// 卡片：可选分组标题 + 底色；行高度与绘制共用同一行模型，末尾校对游标。
 fn draw_card(
     ui: &mut egui::Ui,
     full_w: f32,
-    title: &str,
+    title: Option<&str>,
     rows: &[GroupRow<'_>],
     data: &SettingsData,
     palette: &SettingsPalette,
@@ -1238,31 +1350,33 @@ fn draw_card(
 }
 
 /// 分组标题（12pt 次要色）+ 8 + 卡片（圆角 10、卡片底、行间 1px 分隔线）。
+/// `title = None` 时跳过标题，卡片从当前游标开始（页内无顶层标题）。
 fn draw_group_frame(
     ui: &mut egui::Ui,
     full_w: f32,
-    title: &str,
+    title: Option<&str>,
     rows: &[RowSpec],
     palette: &SettingsPalette,
 ) -> egui::Rect {
-    let header_h = ui.fonts_mut(|fonts| fonts.row_height(&ui_font::id(GROUP_HEADER_FONT)));
-    let (header_slot, _) =
-        ui.allocate_exact_size(egui::vec2(full_w, header_h), egui::Sense::hover());
     let inner_w = (full_w - 2.0 * CONTENT_PAD.1).max(0.0);
-    let header = egui::Rect::from_min_size(
-        egui::pos2(header_slot.left() + CONTENT_PAD.1, header_slot.top()),
-        egui::vec2(inner_w, header_h),
-    );
-    draw_text(
-        ui,
-        header,
-        title,
-        GROUP_HEADER_FONT,
-        palette.text_secondary,
-        egui::Align2::LEFT_CENTER,
-    );
-
-    ui.add_space(GROUP_HEADER_GAP);
+    if let Some(title) = title {
+        let header_h = ui.fonts_mut(|fonts| fonts.row_height(&ui_font::id(GROUP_HEADER_FONT)));
+        let (header_slot, _) =
+            ui.allocate_exact_size(egui::vec2(full_w, header_h), egui::Sense::hover());
+        let header = egui::Rect::from_min_size(
+            egui::pos2(header_slot.left() + CONTENT_PAD.1, header_slot.top()),
+            egui::vec2(inner_w, header_h),
+        );
+        draw_text(
+            ui,
+            header,
+            title,
+            GROUP_HEADER_FONT,
+            palette.text_secondary,
+            egui::Align2::LEFT_CENTER,
+        );
+        ui.add_space(GROUP_HEADER_GAP);
+    }
     let card_h = card_height(rows);
     let (card_slot, _) = ui.allocate_exact_size(egui::vec2(full_w, card_h), egui::Sense::hover());
     let card = egui::Rect::from_min_size(
@@ -2630,6 +2744,30 @@ mod tests {
             .iter()
             .find(|text| text.galley.text() == needle)
             .unwrap_or_else(|| panic!("缺少文本 {needle:?}"))
+    }
+
+    /// 通用页只显示三行设置 + 「快捷键」子分组；页面内不再画顶层「通用」标题。
+    /// 标签栏仍有「通用」标签（同文案），故改为断言唯一的页内子分组标题。
+    #[test]
+    fn general_page_has_five_rows_and_no_top_level_header() {
+        let mut data = layout_test_data();
+        data.active_tab = SettingsTab::General;
+        let out = run_body(&data);
+        let texts = all_texts(&out);
+        let labels: Vec<&str> = texts.iter().map(|text| text.galley.text()).collect();
+        for expected in [
+            i18n::s().row_font_size,
+            i18n::s().row_autostart,
+            i18n::s().row_language,
+            i18n::s().row_palette_hotkey,
+            i18n::s().row_window_hotkey,
+        ] {
+            assert!(labels.contains(&expected), "通用页缺少 {expected:?}");
+        }
+        assert!(
+            labels.contains(&i18n::s().group_shortcuts),
+            "缺少快捷键子分组"
+        );
     }
 
     /// 布局:五组标题、行标签、字号三段、语言、命令行工具行、添加按钮与

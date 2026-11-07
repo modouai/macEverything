@@ -34,14 +34,11 @@ macro_rules! catalog {
 catalog! {
     settings_title: "设置" / "Settings",
     // 分组 / 行
-    group_general: "通用" / "General",
     settings_tab_general: "通用" / "General",
     settings_tab_index: "索引" / "Index",
     settings_tab_advanced: "高级" / "Advanced",
     settings_tab_experimental: "实验" / "Experimental",
     settings_tab_about: "关于" / "About",
-    // Task 4 通用页快捷键子分组接入前暂不读取。
-    #[allow(dead_code)]
     group_shortcuts: "快捷键" / "Shortcuts",
     group_index: "索引" / "Index",
     row_font_size: "字号" / "Text Size",

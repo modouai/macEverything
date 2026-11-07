@@ -1,10 +1,7 @@
 //! 设置页顶部标签栏：枚举、几何、命中与自绘图标。
 //!
 //! 只负责标签栏本身；页面绘制在 `settings_view`，状态编排在 `settings`。
-//!
-//! Task 4 完成页面分发接线前，本模块的绘制/几何自由函数尚无生产消费方：
-//! 它们身上的 `#[allow(dead_code)]` 是临时接线标记，必须在接线后删除；后续
-//! 新增 allow 也须窄作用域，不得恢复整模块 allow（`settings_tokens` 已按此收敛）。
+//! 绘制/几何函数由 `settings_view::draw_body` 与命中测试消费。
 
 use eframe::egui;
 
@@ -44,7 +41,6 @@ impl SettingsTab {
         }
     }
 
-    #[allow(dead_code)] // Task 4 接线后删除。
     pub fn scroll_id(self) -> &'static str {
         match self {
             Self::General => "settings-page-general",
@@ -57,7 +53,6 @@ impl SettingsTab {
 }
 
 /// 5 个标签项的矩形（相对标签栏居中）。
-#[allow(dead_code)] // Task 4 接线后删除。
 pub fn tab_item_rects(bar: egui::Rect) -> [egui::Rect; 5] {
     let total_w = TAB_ITEM_W * 5.0 + TAB_GAP * 4.0;
     let start_x = bar.center().x - total_w / 2.0;
@@ -79,7 +74,6 @@ pub fn hit_test(bar: egui::Rect, pos: egui::Pos2) -> Option<SettingsTab> {
 }
 
 /// 绘制顶部标签栏；返回本帧被点击的标签（无点击为 `None`）。
-#[allow(dead_code)] // Task 4 接线后删除。
 pub fn draw_tab_bar(
     ui: &mut egui::Ui,
     active: SettingsTab,
