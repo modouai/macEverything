@@ -76,6 +76,8 @@ pub(crate) struct SettingsData {
     pub(crate) panel_assist_trusted: bool,
     /// 保存面板助手开关保存失败的内联错误。
     pub(crate) panel_assist_error: Option<SettingsError>,
+    /// 未授权时开启助手 → 设置窗内授权提示模态。
+    pub(crate) panel_assist_auth_prompt: bool,
     /// 当前更新阶段。
     pub(crate) update: crate::update::UpdatePhase,
     /// 关于分组内联错误。
@@ -150,6 +152,8 @@ pub(crate) enum SettingsAction {
     SetPanelAssist(bool),
     /// 「去授权…」点击:设置 pass 打开系统设置辅助功能面板(失败静默)。
     OpenPanelAssistAuth,
+    /// 授权提示模态「稍后」:仅关闭提示。
+    DismissPanelAssistAuthPrompt,
     /// 切换「自动索引外接磁盘」主开关。
     SetVolumesAuto(bool),
     /// 切换单卷索引开关(卷名;开 = 移出排除集[主开关随之开],关 = 加入排除集)。
@@ -220,7 +224,41 @@ pub(crate) fn draw_body(ui: &mut egui::Ui, data: &SettingsData) -> BodyOutput {
             draw_volumes_group(ui, full_w, data, &palette, extra_h, &mut actions);
             ui.add_space(CONTENT_PAD.0);
         });
+    // 未授权开启助手的授权提示:应用内模态。不能用原生 NSAlert.runModal——
+    // 在 egui pass 内同步 runModal 会重入 runloop,实机表现为整窗假死。
+    if data.panel_assist_auth_prompt {
+        draw_panel_assist_auth_modal(ui, &mut actions);
+    }
     BodyOutput { actions }
+}
+
+/// 授权提示模态(「稍后」/「打开系统设置」)。首按钮「稍后」,回车不误跳设置。
+fn draw_panel_assist_auth_modal(ui: &egui::Ui, actions: &mut Vec<SettingsAction>) {
+    let strings = i18n::s();
+    let mut dismiss = false;
+    let mut open_settings = false;
+    let _ = egui::Modal::new(egui::Id::unique("panel-assist-auth-prompt")).show(ui.ctx(), |ui| {
+        ui.set_max_width(420.0);
+        ui.heading(strings.panel_assist_auth_title);
+        ui.add_space(8.0);
+        ui.label(strings.panel_assist_auth_message);
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui.button(strings.panel_assist_auth_later).clicked() {
+                dismiss = true;
+            }
+            if ui.button(strings.panel_assist_auth_open).clicked() {
+                open_settings = true;
+            }
+        });
+    });
+    if dismiss {
+        actions.push(SettingsAction::DismissPanelAssistAuthPrompt);
+    }
+    if open_settings {
+        actions.push(SettingsAction::DismissPanelAssistAuthPrompt);
+        actions.push(SettingsAction::OpenPanelAssistAuth);
+    }
 }
 
 /// 内联错误行占用的额外高 = 辅助字号行高 + 标签间距。
@@ -2278,6 +2316,7 @@ mod tests {
             panel_assist: true,
             panel_assist_trusted: true,
             panel_assist_error: None,
+            panel_assist_auth_prompt: false,
             update: crate::update::UpdatePhase::Idle,
             update_error: None,
             volumes: VolumesData::default(),
@@ -2338,6 +2377,26 @@ mod tests {
         let out = run_body(&data);
         let texts = all_texts(&out);
         find_text(&texts, "语言已切换,但设置保存失败");
+    }
+
+    /// 未授权开启助手的提示模态:渲染标题/说明/两个按钮文案。
+    /// 突变把 `panel_assist_auth_prompt` 分支删掉 → 断言必红。
+    #[test]
+    fn panel_assist_auth_prompt_modal_renders() {
+        let data = SettingsData {
+            panel_assist_auth_prompt: true,
+            ..layout_test_data()
+        };
+        // 模态 Area 首帧注册、次帧出图;生产侧置位后显式 repaint,故两帧后必现。
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let _ = run_frame(&ctx, &data, Vec::new());
+        let out = run_frame(&ctx, &data, Vec::new()).0;
+        let texts = all_texts(&out);
+        let strings = i18n::s();
+        find_text(&texts, strings.panel_assist_auth_title);
+        find_text(&texts, strings.panel_assist_auth_open);
+        find_text(&texts, strings.panel_assist_auth_later);
     }
 
     /// 递归收集一帧里的全部文本形状(含 Shape::Vec 内的嵌套形状)。

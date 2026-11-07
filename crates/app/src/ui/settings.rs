@@ -384,6 +384,9 @@ pub struct SettingsState {
     pub(crate) update_error: Option<UpdateError>,
     /// 保存面板助手开关保存失败的内联错误（已应用的开关不因保存失败回退）。
     pub(crate) panel_assist_error: Option<SettingsError>,
+    /// 未授权时开启助手 → 设置窗内弹出授权提示（应用内模态，发原生
+    /// NSAlert.runModal 会在 egui pass 内重入 runloop 导致假死，2026-11-06）。
+    pub(crate) panel_assist_auth_prompt: bool,
     /// 语言切换后待 App 刷新的托盘文案标记。
     pub(crate) tray_relabel_pending: bool,
     /// 排除目录（daemon 响应为唯一真源；首次成功 list 响应前为引擎默认种子，
@@ -454,6 +457,7 @@ impl SettingsState {
             language_error: None,
             update_error: None,
             panel_assist_error: None,
+            panel_assist_auth_prompt: false,
             tray_relabel_pending: false,
             excluded: engine::config::default_config().excluded,
             exclude_busy: false,
@@ -980,6 +984,7 @@ impl SettingsData {
             panel_assist: state.file.save_panel_assist,
             panel_assist_trusted: crate::platform::panel_assist_trusted(),
             panel_assist_error: state.panel_assist_error.clone(),
+            panel_assist_auth_prompt: state.panel_assist_auth_prompt,
             update: update.phase().clone(),
             update_error: state.update_error,
             volumes: state.volumes.clone(),
@@ -1215,9 +1220,13 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
         }
         SettingsAction::SetAutoCheck(enabled) => apply_auto_check(shared, ctx, enabled),
         SettingsAction::SetPanelAssist(enabled) => apply_panel_assist(shared, ctx, enabled),
+        SettingsAction::DismissPanelAssistAuthPrompt => {
+            lock_shared(shared).settings.panel_assist_auth_prompt = false;
+            ctx.request_repaint_of(viewport_id());
+        }
         SettingsAction::OpenPanelAssistAuth => {
             // 授权面板深链属非关键路径:spawn 失败与非零退出由平台层 log 留痕。
-            // 纯外部动作无状态变化,不重绘(OpenWebsite 同例)。
+            lock_shared(shared).settings.panel_assist_auth_prompt = false;
             log::info!("设置页:保存面板助手去授权,打开系统设置");
             platform::open_accessibility_settings();
             // 用户可能授权后直接回到别的 app:起一次性轮询线程唤醒全隐进程。
@@ -1697,6 +1706,12 @@ fn apply_panel_assist(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, enabled:
         }
     }
     log::info!("保存面板目录助手 → {enabled}(已授权 {trusted})");
+    if enabled && !trusted {
+        // 用户明确开启却未授权:设置窗内应用内模态提示(见 settings_view 的
+        // 授权提示模态);同时挂授权监视器,授权后自动生效。
+        lock_shared(shared).settings.panel_assist_auth_prompt = true;
+        crate::ui::spawn_panel_trust_watcher(ctx);
+    }
     ctx.request_repaint_of(viewport_id());
     // pending 由 ROOT 的 logic 消费;设置窗可见时其 pass 也会驱动 logic,
     // 但 ROOT 重绘保证设置窗随后关闭的路径也能及时启动。

@@ -682,6 +682,12 @@ pub fn attached() -> bool {
 
 /// 辅助功能授权状态(保存面板助手;macOS)。
 pub fn panel_assist_trusted() -> bool {
+    // 诊断开关:强制按未授权处理。TCC 撤销对运行中进程不生效,且列表里可能
+    // 存在多份同名副本(按路径/签名区分);实机验证授权提示与降级路径时用
+    // `MCE_FORCE_UNTRUSTED=1` 启动。仅影响保存面板助手,不改其它权限行为。
+    if std::env::var_os("MCE_FORCE_UNTRUSTED").is_some() {
+        return false;
+    }
     #[cfg(target_os = "macos")]
     {
         mac::ax_trusted()
