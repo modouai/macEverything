@@ -81,6 +81,11 @@ catalog! {
     row_panel_assist_desc: "在其他应用保存或打开文件时，浮出目录搜索并自动跳转" / "Search a directory and jump the save/open panel to it",
     panel_assist_need_auth: "需授权" / "Needs Permission",
     panel_assist_grant: "去授权…" / "Grant Permission…",
+    panel_assist_auth_title: "需要辅助功能权限" / "Accessibility Permission Required",
+    panel_assist_auth_message: "保存面板目录助手需要辅助功能权限，才能检测保存/打开面板并跳转到目标目录。请在系统设置 → 隐私与安全性 → 辅助功能中勾选 macEverything。"
+        / "Save-Panel Directory Assist needs Accessibility permission to detect save/open panels and jump to the target directory. Enable macEverything in System Settings → Privacy & Security → Accessibility.",
+    panel_assist_auth_later: "稍后" / "Later",
+    panel_assist_auth_open: "打开系统设置" / "Open System Settings",
     tray_panel_assist_auth: "保存面板助手待授权…" / "Save-Panel Assist Needs Permission…",
     // 保存面板目录助手浮层
     overlay_hint: "输入目录名…" / "Type a directory name…",

@@ -2503,6 +2503,13 @@ pub fn activate_app(pid: i32) -> bool {
 
 /// 打开系统设置的辅助功能授权面板(深链;非关键路径——面板未装/链接失效时无害)。
 pub fn open_accessibility_settings() {
+    // 仅打开面板不会把本应用加入辅助功能列表;先触发系统授权请求完成注册
+    // (kAXTrustedCheckOptionPrompt=true),再深链到设置页,列表里才有本应用。
+    let trusted_before = super::ax_ffi::is_process_trusted();
+    let trusted_after = super::ax_ffi::prompt_for_accessibility();
+    log::info!(
+        "辅助功能注册请求: real_trusted_before={trusted_before} after_prompt={trusted_after}"
+    );
     let url = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
     // spawn 即返回;wait 放后台线程收尾(不 join 会留僵尸进程,update.rs open_url 同款)。
     match std::process::Command::new("open").arg(url).spawn() {

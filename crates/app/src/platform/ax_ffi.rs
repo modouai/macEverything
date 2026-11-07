@@ -20,6 +20,7 @@ type AXObserverRef = *mut c_void;
 type CFAllocatorRef = *mut c_void;
 type CFStringRef = *const c_void;
 type CFTypeRef = *const c_void;
+type CFDictionaryRef = *const c_void;
 type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 
@@ -53,6 +54,20 @@ extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
 
     fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    fn CFDictionaryCreate(
+        alloc: CFAllocatorRef,
+        keys: *const CFTypeRef,
+        values: *const CFTypeRef,
+        num_values: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFDictionaryRef;
+    /// 系统授权提示开关(kAXTrustedCheckOptionPrompt)。
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
+    /// CF 字典的默认 key/value 回调(全局结构体;此处只取地址)。
+    static kCFTypeDictionaryKeyCallBacks: u8;
+    static kCFTypeDictionaryValueCallBacks: u8;
     fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         el: AXUIElementRef,
@@ -271,6 +286,35 @@ impl Drop for AXObserverWrap {
 pub fn is_process_trusted() -> bool {
     // SAFETY:无参无副作用之外的内存访问。
     unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// 请求系统把本进程加入「辅助功能」列表并弹授权提示。
+///
+/// 只打开系统设置面板不会注册应用(列表里没有本应用);必须调用
+/// `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt=true)`。
+/// 返回调用后的信任状态(未授权时系统提示由 macOS 展示;已提示过则可能静默)。
+pub fn prompt_for_accessibility() -> bool {
+    // SAFETY:keys/values 为栈上数组,生命周期覆盖调用;回调结构体为系统全局
+    // 符号,只取地址;返回的字典 +1 引用由本函数 CFRelease。extern static 的
+    // 读取按 Rust 2024 要求置于 unsafe 内。
+    unsafe {
+        let keys: [CFTypeRef; 1] = [kAXTrustedCheckOptionPrompt];
+        let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+        let dict = CFDictionaryCreate(
+            std::ptr::null_mut(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks).cast(),
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks).cast(),
+        );
+        if dict.is_null() {
+            return is_process_trusted();
+        }
+        let trusted = AXIsProcessTrustedWithOptions(dict) != 0;
+        CFRelease(dict);
+        trusted
+    }
 }
 
 /// 前台应用的 AX 元素(pid = 目标应用)。
