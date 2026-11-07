@@ -498,8 +498,15 @@ fn draw_general_page(
             hint: None,
         },
     ];
-    draw_card(ui, full_w, None, &rows, data, palette, actions);
-
+    draw_card(
+        ui,
+        full_w,
+        Some(i18n::s().group_appearance_startup),
+        &rows,
+        data,
+        palette,
+        actions,
+    );
     ui.add_space(GROUP_GAP);
     draw_shortcuts_page(ui, full_w, data, palette, extra_h, actions);
 }
@@ -2758,6 +2765,10 @@ mod tests {
             labels.contains(&i18n::s().group_shortcuts),
             "缺少快捷键子分组"
         );
+        assert!(
+            labels.contains(&i18n::s().group_appearance_startup),
+            "缺少「外观与启动」子分组"
+        );
         // 标签栏「通用」标签是唯一合法出现；页面内再画顶层标题会变成 2。
         assert_eq!(
             labels
@@ -2965,6 +2976,7 @@ mod tests {
                     "Launch at Login",
                     "Language",
                     "System Default",
+                    "Appearance & Startup",
                     "Shortcuts",
                     "Quick Search Shortcut",
                     "Full Window Shortcut",
