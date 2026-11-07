@@ -27,6 +27,7 @@ use crate::hotkey::{HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::platform;
 use crate::settings::{self as store, FontSize, SettingsFile};
+use crate::ui::settings_tabs::SettingsTab;
 use crate::ui::{
     font as ui_font, install_base_text_styles, lock_shared,
     settings_tokens::{
@@ -368,7 +369,7 @@ impl CliInstallUi {
 pub struct SettingsState {
     pub(crate) open: bool,
     /// 设置页当前标签（运行期；重启回 General，不写入 settings.toml）。
-    pub(crate) active_tab: crate::ui::settings_tabs::SettingsTab,
+    pub(crate) active_tab: SettingsTab,
     /// 已加载的 `settings.toml` 快照（字号/快捷键写入在此更新）。
     pub(crate) file: SettingsFile,
     /// 设置文件所在数据目录（保存字号/快捷键用）。
@@ -449,7 +450,7 @@ impl SettingsState {
     ) -> Self {
         Self {
             open: false,
-            active_tab: crate::ui::settings_tabs::SettingsTab::General,
+            active_tab: SettingsTab::General,
             file,
             data_dir,
             autostart: None,
@@ -1982,18 +1983,17 @@ mod tests {
     #[test]
     fn settings_default_tab_is_general_and_survives_reopen() {
         let mut state = test_state();
+        assert_eq!(state.active_tab, SettingsTab::General);
+        state.active_tab = SettingsTab::Advanced;
+        // 快照必须携带运行期标签（绘制层读 `SettingsData.active_tab`）。
         assert_eq!(
-            state.active_tab,
-            crate::ui::settings_tabs::SettingsTab::General
+            SettingsData::from_state(&state, &crate::update::UpdateState::new()).active_tab,
+            SettingsTab::Advanced
         );
-        state.active_tab = crate::ui::settings_tabs::SettingsTab::Advanced;
-        // 关闭/打开只改 open；active_tab 是运行期字段，不随 open 复位。
-        state.open = true;
-        state.open = false;
-        assert_eq!(
-            state.active_tab,
-            crate::ui::settings_tabs::SettingsTab::Advanced
-        );
+        // 真实的关闭/打开只改 open；active_tab 是运行期字段，不随开合复位。
+        state.request_open();
+        state.mark_hidden();
+        assert_eq!(state.active_tab, SettingsTab::Advanced);
     }
 
     /// 关闭→打开才挂起一次列表刷新；已打开/重复 request_open 不重复挂起。
