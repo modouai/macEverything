@@ -17,6 +17,7 @@ use crate::cli_install::{Availability, EntryState, Observation, PathSource};
 use crate::hotkey::{HotkeyNote, HotkeySlot, HotkeySnapshot};
 use crate::i18n::{self, LanguageSetting};
 use crate::settings::FontSize;
+use crate::ui::settings_tabs::SettingsTab;
 use crate::ui::{
     font as ui_font, hotkey_keys,
     settings::{AutostartError, ExcludeError, LanguageError, SettingsError, UpdateError},
@@ -46,6 +47,8 @@ const KNOB_SHADOW_LAYERS: [(f32, f32); 3] = [
 /// 设置页渲染快照（出锁后使用；`SettingsState` 是运行期真源）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SettingsData {
+    /// 当前标签页。
+    pub(crate) active_tab: SettingsTab,
     pub(crate) font_size: FontSize,
     /// 实际自启态（仅 `Status::Enabled`）；未知/待审批按关态显示。
     pub(crate) autostart: bool,
@@ -123,6 +126,9 @@ pub(crate) struct CliInstallData {
 /// 真正的 `suspend`/`resume`/`commit` 由主线程 `App::logic` 执行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SettingsAction {
+    /// 切换设置页标签。
+    #[allow(dead_code)] // Task 4 接线后删除（标签栏点击产出）。
+    SelectTab(SettingsTab),
     /// 字号分段点击（立即应用 + 落盘）。
     SetFontSize(FontSize),
     /// 语言下拉选择（立即应用 + 落盘）。
@@ -2325,6 +2331,7 @@ mod tests {
             window_note: None,
         };
         SettingsData {
+            active_tab: SettingsTab::General,
             font_size: FontSize::Standard,
             autostart: false,
             autostart_approval: false,
