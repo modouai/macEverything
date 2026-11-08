@@ -10,7 +10,7 @@ macEverything — macOS 全盘文件名即时搜索
 用法:
   macEverything [--data-dir <PATH>] start
   macEverything [--data-dir <PATH>] stop
-  macEverything [--data-dir <PATH>] query [--json] [--sort <name|size|mtime|path>] [--desc] [--] <关键词>
+  macEverything [--data-dir <PATH>] query [--json] [--sort <name|size|mtime|path>] [--desc] [--include-hidden] [--] <关键词>
   macEverything [--data-dir <PATH>] status [--json]
   macEverything [--data-dir <PATH>] exclude add|remove|list|reset [路径]";
 
@@ -48,6 +48,7 @@ pub enum Command {
         json: bool,
         sort: Option<SortKey>,
         desc: bool,
+        include_hidden: bool,
         query: String,
     },
     Status {
@@ -257,6 +258,7 @@ fn parse_query<I: Iterator<Item = String>>(mut it: I) -> Result<Command, UsageEr
     let mut json = false;
     let mut sort = None;
     let mut desc = false;
+    let mut include_hidden = false;
     let mut text = Vec::new();
     let mut literal = false;
 
@@ -281,6 +283,7 @@ fn parse_query<I: Iterator<Item = String>>(mut it: I) -> Result<Command, UsageEr
         match a.as_str() {
             "--json" => json = true,
             "--desc" => desc = true,
+            "--include-hidden" => include_hidden = true,
             "--sort" => {
                 if sort.is_some() {
                     return Err(UsageError::DuplicateSort);
@@ -314,6 +317,7 @@ fn parse_query<I: Iterator<Item = String>>(mut it: I) -> Result<Command, UsageEr
         json,
         sort,
         desc,
+        include_hidden,
         query,
     })
 }
@@ -357,9 +361,32 @@ mod tests {
                 json: true,
                 sort: Some(SortKey::Mtime),
                 desc: true,
+                include_hidden: false,
                 query: "quarter report".into()
             }
         );
+    }
+
+    /// --include-hidden 解析为 true；缺省 false；可与排序选项共存。
+    #[test]
+    fn query_include_hidden_flag() {
+        let got = parse(a(&["query", "--include-hidden", "x"])).unwrap();
+        assert_eq!(
+            got.command,
+            Command::Query {
+                json: false,
+                sort: None,
+                desc: false,
+                include_hidden: true,
+                query: "x".into(),
+            }
+        );
+        let got = parse(a(&["query", "x"])).unwrap();
+        match got.command {
+            Command::Query { include_hidden, .. } => assert!(!include_hidden),
+            other => panic!("意外命令: {other:?}"),
+        }
+        assert!(parse(a(&["query", "--include-hidden", "--sort", "size", "x"])).is_ok());
     }
 
     #[test]
@@ -399,6 +426,7 @@ mod tests {
                 json: false,
                 sort: Some(SortKey::Name),
                 desc: false,
+                include_hidden: false,
                 query: "x".into()
             }
         );
@@ -409,6 +437,7 @@ mod tests {
                 json: false,
                 sort: Some(SortKey::Path),
                 desc: false,
+                include_hidden: false,
                 query: "x".into()
             }
         );
@@ -458,6 +487,7 @@ mod tests {
                 json: false,
                 sort: Some(SortKey::Size),
                 desc: false,
+                include_hidden: false,
                 query: "x".into()
             }
         );
@@ -496,6 +526,7 @@ mod tests {
                 json: true,
                 sort: None,
                 desc: false,
+                include_hidden: false,
                 query: "-foo --sort".into()
             }
         );
