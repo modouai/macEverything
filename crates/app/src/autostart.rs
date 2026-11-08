@@ -4,7 +4,7 @@
 //! - ad-hoc 签名 + `SMAppService.mainApp` 可用(无 sudo、无审批);三态
 //!   notFound(3) → register → enabled(1) → unregister → notRegistered(0);
 //! - 坑①:无 bundle 调 register **不报错**且注册出独立条目 —— 产品入口先校验
-//!   bundle 标识(须为 `.app` 内的 `com.example.maceverything`),开发形态拒绝
+//!   bundle 标识(须与构建时 Info.plist 一致),开发形态拒绝
 //!   并提示「未打包」,不静默走这条陷阱;
 //! - 坑②:条目身份键 = bundle 标识(路径、版本不参与);
 //! - 坑③:注册态不进 launchctl 视图 —— 排障走系统设置「登录项」,勿查 launchctl;
@@ -28,8 +28,14 @@ use objc2_service_management::{
     kSMErrorLaunchDeniedByUser, SMAppService, SMAppServiceStatus,
 };
 
-/// 产品 bundle 标识(与 `scripts/bundle.sh` 的 Info.plist 同值;PoC-5 坑②:条目身份键)。
-pub const BUNDLE_ID: &str = "com.example.maceverything";
+/// 产品 bundle 标识(与 `scripts/bundle.sh` 生成的 Info.plist 同值;PoC-5 坑②:条目身份键)。
+///
+/// 发布构建可用环境变量 `MCE_BUNDLE_ID` 覆盖(构建脚本会把它同时写入 Info.plist);
+/// 未设置时使用中性默认值,方便他人二次打包。
+pub const BUNDLE_ID: &str = match option_env!("MCE_BUNDLE_ID") {
+    Some(id) => id,
+    None => "com.example.maceverything",
+};
 
 /// 用户主动关闭自启的标记文件名(数据目录内;存在 = 启动时不再默认注册)。
 pub const OPT_OUT_FILE: &str = "autostart-off";

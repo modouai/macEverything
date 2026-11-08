@@ -23,7 +23,14 @@ ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT"
 
 APP="release/macEverything.app"
-PROFILE="${MACEEVERYTHING_NOTARY_PROFILE:-maceverything-notary}"
+# 本地/发布配置(.env.local 不入库):MCE_NOTARY_PROFILE 等
+if [[ -f "$ROOT/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env.local"
+  set +a
+fi
+PROFILE="${MACEEVERYTHING_NOTARY_PROFILE:-${MCE_NOTARY_PROFILE:-maceverything-notary}}"
 
 VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
   | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"

@@ -29,7 +29,15 @@ ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT"
 
 APP="release/macEverything.app"
-BUNDLE_ID="com.example.maceverything"    # 与 crates/app/src/autostart.rs::BUNDLE_ID 同值
+# 本地/发布配置(.env.local 不入库):MCE_BUNDLE_ID 等
+if [[ -f "$ROOT/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env.local"
+  set +a
+fi
+BUNDLE_ID="${MCE_BUNDLE_ID:-com.example.maceverything}"    # 与 autostart.rs::BUNDLE_ID 同源
+export MCE_BUNDLE_ID="$BUNDLE_ID"                          # 让 rustc 的 option_env! 取到同值
 EXE="macEverything-app"
 CLI="macEverything"
 SIGN_IDENTITY="${MACEEVERYTHING_SIGN_IDENTITY:--}"
