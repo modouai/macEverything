@@ -155,7 +155,7 @@ fn run() -> Result<(), CliError> {
             // `--desc` 是绝对降序;协议位是「反转该键自然方向」,换算后才能得到用户要的方向。
             let sort_str = sort.map(SortKey::as_str);
             let protocol_desc = sort.map(|s| s.protocol_desc(desc)).unwrap_or(false);
-            match client::query(&paths, &query, 1000, sort_str, protocol_desc, false) {
+            match client::query(&paths, &query, 1000, sort_str, protocol_desc, false, None) {
                 Ok(out) if want_json => {
                     println!("{}", json::query_json(&out));
                     Ok(())
