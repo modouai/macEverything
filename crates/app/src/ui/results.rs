@@ -2978,8 +2978,8 @@ mod tests {
         let mut st = ResultsState::new(ctx.clone(), daemon_paths_for_test());
         st.results = (0..1000)
             .map(|i| HitEntry {
-                name: format!("区域B报告-{i:04}.pdf"),
-                path: format!("/tmp/mce-test/区域B报告-{i:04}.pdf"),
+                name: format!("湖北报告-{i:04}.pdf"),
+                path: format!("/tmp/mce-test/湖北报告-{i:04}.pdf"),
                 size: Some(2048),
                 mtime: Some(1_700_000_000),
                 is_dir: i == 0,

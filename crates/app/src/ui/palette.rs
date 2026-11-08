@@ -8,7 +8,7 @@
 //! ## 面板高度(2026-10-17 定案:空态滞后 + 贴合内容 + 平滑动画)
 //!
 //! **空态滞后(主药)**:查询 0 命中且输入仍在进行(距末次输入 < `EMPTY_HOLD`)时
-//! 不切「无匹配项」小态——打字/删除途中经过的 0 命中中间态(如「区域B换」)完全静默,
+//! 不切「无匹配项」小态——打字/删除途中经过的 0 命中中间态(如「湖北换」)完全静默,
 //! 保留上一轮结果与面板高度,停手后仍 0 命中才落定。用户实测「删最后一个字抖动
 //! 严重」的直接来源即「0 命中塌 → 删字弹回」的逐键往返。
 //!
@@ -628,7 +628,7 @@ impl PaletteState {
             } => {
                 // —— 空态滞后(主药;2026-10-17)——
                 // 输入进行中(距末次输入 < EMPTY_HOLD)的 0 命中**不落地**:打字中间态
-                // (如「区域B换」)的 0 命中只静默,保留上一轮非空结果与高度;停手后仍
+                // (如「湖北换」)的 0 命中只静默,保留上一轮非空结果与高度;停手后仍
                 // 0 命中才切「无匹配项」(draw 内复判)。否则「打→0 命中塌→删字弹回→
                 // 再打」逐键往返,即用户实测「删最后一个字抖动严重」的直接来源。
                 let typing = self
@@ -1230,8 +1230,8 @@ impl PaletteState {
             let settled = self
                 .last_input_at
                 .is_none_or(|t| now.saturating_duration_since(t) >= EMPTY_HOLD);
-            // 还须**无在途查询**(防抖窗口内 / 响应未回)才许落定:否则「区域B换」
-            // (0 命中)静默后,刚删回「区域B」的那一帧就会把空态落定,随后 24 行的
+            // 还须**无在途查询**(防抖窗口内 / 响应未回)才许落定:否则「湖北换」
+            // (0 命中)静默后,刚删回「湖北」的那一帧就会把空态落定,随后 24 行的
             // 响应又弹回——实机实测的「塌-弹」往返(2026-10-17 首轮实机暴露)。
             let inflight = self.session.pending_delay(now).is_some() || self.query_sent.is_some();
             if settled && !inflight {
@@ -2449,15 +2449,15 @@ mod tests {
     }
 
     /// 隔离索引实测命中数(2026-10-17,`macEverything query` 于 /tmp/mce-anim 词表):
-    /// 湖=28、区域B=27、区域B报=24、区域B省=3、区域B换=0、zzqqxx=0——覆盖 0 命中与非 0
+    /// 湖=28、湖北=27、湖北报=24、湖北省=3、湖北换=0、zzqqxx=0——覆盖 0 命中与非 0
     /// 命中两类,并含「大波动」(28→3)与「往返穿越」(多↔0)。
     fn real_hits(q: &str) -> usize {
         match q {
             "湖" => 28,
-            "区域B" => 27,
-            "区域B报" => 24,
-            "区域B省" => 3,
-            _ => 0, // 区域B换 / zzqqxx / 空串等:0 命中
+            "湖北" => 27,
+            "湖北报" => 24,
+            "湖北省" => 3,
+            _ => 0, // 湖北换 / zzqqxx / 空串等:0 命中
         }
     }
 
@@ -2547,7 +2547,7 @@ mod tests {
 
         // ================= S2 状态往返穿越(加字链,含 0 命中坠点)=================
         // 预期:28/27/24 行都封顶同高(自然高相同 → 零变化);降到 3 行即时平滑跟随;
-        // 「区域B换」0 命中打字中滞后(结果仍 3、高度不动);停手 → 平滑落到空态。
+        // 「湖北换」0 命中打字中滞后(结果仍 3、高度不动);停手 → 平滑落到空态。
         let (_, f) = type_char(&mut st, &mut seq, "湖"); // 28 行
         assert_smooth(&f, true);
         let h_cap = *f.last().unwrap();
@@ -2556,20 +2556,20 @@ mod tests {
             win_h(466.0),
             "28 行封顶面板高 466（窗高 + 70）:{f:?}"
         );
-        let (_, f) = type_char(&mut st, &mut seq, "北"); // 区域B 27 行
+        let (_, f) = type_char(&mut st, &mut seq, "北"); // 湖北 27 行
         assert!(
             f.iter().all(|h| (h - h_cap).abs() < 0.5),
             "27 行同封顶:{f:?}"
         );
-        let (_, f) = type_char(&mut st, &mut seq, "报"); // 区域B报 24 行
+        let (_, f) = type_char(&mut st, &mut seq, "报"); // 湖北报 24 行
         assert!(
             f.iter().all(|h| (h - h_cap).abs() < 0.5),
             "24 行同封顶:{f:?}"
         );
-        // 删到「区域B」→ 再打「省」:区域B换?不——本链为 区域B报→(退格)区域B→(打)区域B省
+        // 删到「湖北」→ 再打「省」:湖北换?不——本链为 湖北报→(退格)湖北→(打)湖北省
         probe_phase(&ctx, &mut st, &mut seq, "退格 报", backspace());
-        assert_eq!(st.input, "区域B");
-        let (_, f) = type_char(&mut st, &mut seq, "省"); // 区域B省 3 行
+        assert_eq!(st.input, "湖北");
+        let (_, f) = type_char(&mut st, &mut seq, "省"); // 湖北省 3 行
         assert_eq!(st.results.len(), 3, "结果照常替换为 3 行");
         assert_smooth(&f, false);
         let h_3 = *f.last().unwrap();
@@ -2577,7 +2577,7 @@ mod tests {
             (h_3 - h_cap).abs() > 100.0,
             "S2 3 行即时平滑跟到 3 行自然高:{f:?}"
         );
-        // 0 命中坠点:再打「换」(区域B省换 = 0 命中,仍在打字)→ 空态滞后
+        // 0 命中坠点:再打「换」(湖北省换 = 0 命中,仍在打字)→ 空态滞后
         let (_, f) = type_char(&mut st, &mut seq, "换");
         assert!(st.pending_empty, "0 命中打字中 → 空态待决");
         assert_eq!(st.results.len(), 3, "0 命中不落地:保留上一轮 3 行");
@@ -2604,7 +2604,7 @@ mod tests {
         let (_, f) = type_char(&mut st, &mut seq, "湖"); // 28
         assert_eq!(*f.last().unwrap(), h_cap, "28 行封顶");
         let (_, _) = type_char(&mut st, &mut seq, "北");
-        let (_, f) = type_char(&mut st, &mut seq, "省"); // 区域B省 3 行:大波动实时跟
+        let (_, f) = type_char(&mut st, &mut seq, "省"); // 湖北省 3 行:大波动实时跟
         assert_smooth(&f, false);
         let h3b = *f.last().unwrap();
         assert_eq!(h3b, win_h(292.0), "28→3 行即时平滑收拢到 3 行窗高:{f:?}");
@@ -2649,8 +2649,8 @@ mod tests {
         // 预期:删「省」回 27 行 → 实时平滑扩张回封顶(增量即时跟随);再删到 28 行零变化;
         // 删到空 → 清空立即回输入行高。
         probe_phase(&ctx, &mut st, &mut seq, "退格 省", backspace());
-        assert_eq!(st.input, "区域B");
-        probe_respond(&mut st, real_hits("区域B")); // 27 行
+        assert_eq!(st.input, "湖北");
+        probe_respond(&mut st, real_hits("湖北")); // 27 行
         let up = probe_phase(&ctx, &mut st, &mut seq, "删字回 27 行(实时扩张)", vec![]);
         assert_smooth(&up, true);
         assert_eq!(*up.last().unwrap(), h_cap, "27 行回到封顶:{up:?}");
@@ -2675,14 +2675,14 @@ mod tests {
             win_h(176.0),
             win_h(176.0)
         );
-        println!("S2 湖28→区域B27→区域B报24→区域B省3 预期 封顶段零变化/3 行即时收拢   实测 {h_cap:.0}/{h_cap:.0}/{h_cap:.0}/{h_3:.0}");
+        println!("S2 湖28→湖北27→湖北报24→湖北省3 预期 封顶段零变化/3 行即时收拢   实测 {h_cap:.0}/{h_cap:.0}/{h_cap:.0}/{h_3:.0}");
         println!(
-            "S2 区域B省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 面板176 实测 {:.0}",
+            "S2 湖北省换(0 命中,打字中)   预期 结果仍 3、高不动 → 停手落 面板176 实测 {:.0}",
             win_h(176.0)
         );
-        println!("S3 湖28→区域B省3(大波动)     预期 即时平滑收拢(120ms)         实测 {h_3:.1}px");
+        println!("S3 湖28→湖北省3(大波动)     预期 即时平滑收拢(120ms)         实测 {h_3:.1}px");
         println!(
-            "S4 区域B省3→(删)区域B27→湖28    预期 实时平滑扩张回封顶           实测 {h_cap:.0}px"
+            "S4 湖北省3→(删)湖北27→湖28    预期 实时平滑扩张回封顶           实测 {h_cap:.0}px"
         );
         println!(
             "S4 全删(空输入)             预期 落空态面板高 176/窗高{:.0}   实测 {:.0}",
