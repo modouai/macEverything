@@ -559,7 +559,7 @@ dependencies = [
  "rayon",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
  "toml",
  "unicode-normalization",
 ]
