@@ -386,7 +386,31 @@ mod tests {
             Command::Query { include_hidden, .. } => assert!(!include_hidden),
             other => panic!("意外命令: {other:?}"),
         }
-        assert!(parse(a(&["query", "--include-hidden", "--sort", "size", "x"])).is_ok());
+        let both = parse(a(&[
+            "query",
+            "--include-hidden",
+            "--sort",
+            "size",
+            "--desc",
+            "x",
+        ]))
+        .unwrap();
+        assert_eq!(
+            both.command,
+            Command::Query {
+                json: false,
+                sort: Some(SortKey::Size),
+                desc: true,
+                include_hidden: true,
+                query: "x".into(),
+            }
+        );
+        assert!(parse(a(&["query", "--include-hidden", "--include-hidden", "x"])).is_ok());
+        assert_eq!(
+            parse(a(&["query", "x", "--include-hidden"])),
+            Err(UsageError::UnexpectedArg("--include-hidden".into()))
+        );
+        assert!(USAGE.contains("[--include-hidden]"));
     }
 
     #[test]
