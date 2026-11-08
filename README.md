@@ -27,6 +27,14 @@ Coverage: your home directory, `/Applications` and local external volumes (netwo
 - **Directory Assist (experimental)**: when another app opens a save or open dialog, a folder search field appears next to it — ↵ jumps the dialog there (off by default; needs the Device Control and Data Access permission)
 - **Bilingual UI**: English / 简体中文, follows the system by default
 
+## Floating bar (⌥Space)
+
+<p align="center">
+  <img src="docs/screenshots/floating-bar-en.png" alt="The floating search bar: query field, results with name and path, item count and Open hint" width="440">
+</p>
+
+Press ⌥Space anywhere — including over full-screen apps — and type. The list updates as you type (median ~67 ms per keystroke); ↑↓ to select, ↵ to open, ⌘↵ to reveal in Finder, ⌥↵ to continue in the full results window, Esc to hide. The app lives in the menu bar, so the bar never takes over the screen.
+
 ## Why not Spotlight?
 
 Spotlight is a great launcher, but its index is managed by macOS and silently excludes directories: TCC-protected folders, `.noindex` trees, parts of your home directory. You never learn *what* is missing.
