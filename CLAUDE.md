@@ -26,7 +26,7 @@ cargo test -p engine --test fsevents_live -- --ignored    # FSEvents 实机集�
 
 **声明完成前必须全绿**：`fmt --check && clippy -D warnings && test` 三门禁同时通过。改动涉及 daemon/增量逻辑后另跑实机冒烟（`docs/development.md` 有完整脚本，用 `HOME=/tmp/mce-dev MCE_ROOTS=...` 隔离环境，不碰真实数据目录）。
 
-图形界面：`bash scripts/bundle.sh`（构建 + 组装 .app + ad-hoc 签名 → `release/macEverything.app`）；对外分发 `bash scripts/release.sh`（Developer ID 签名 + 公证 + DMG + 同步 `site/version.json`）。
+图形界面：`bash scripts/bundle.sh`（构建 + 组装 .app + ad-hoc 签名 → `release/macEverything.app`）；对外分发 `bash scripts/release.sh`（Developer ID 签名 + 公证 + DMG + 同步站点仓 `version.json`）。
 
 基准：`bash scripts/bench.sh /tmp/mce-bench 1000000`（五项基准，自动隔离环境）。
 
@@ -68,21 +68,21 @@ GUI 平台层（ADR-8，改动前先读 `docs/specs/v2-ui/tech.md`）：悬浮�
 按顺序执行，前一步不通过不进入下一步。版本号唯一来源是 `Cargo.toml` 的 `[workspace.package].version`。
 
 1. **升版**：改 `[workspace.package].version`（严格 `major.minor.patch`）。
-2. **写更新日志**：`site/changelog/` 与 `site/en/changelog/` 顶部各加一节（版本号、日期、2–4 条用户可感知的改动），同步中英首页下载区的「最近更新」摘要。漏写会被 `check_seo.py` 的「每页必须含当前版本号」挡住。
+2. **写更新日志**：`../macEverything-site/changelog/` 与 `../macEverything-site/en/changelog/` 顶部各加一节（版本号、日期、2–4 条用户可感知的改动），同步中英首页下载区的「最近更新」摘要。漏写会被 `check_seo.py` 的「每页必须含当前版本号」挡住。
 3. **三门禁**：`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`。
-4. **出包**：`bash scripts/release.sh` —— Developer ID 签名 + 公证 + staple + DMG + SHA256，并写入 `site/version.json`。
-5. **更新站点版本信息**：`release.sh` 不改页面。逐项更新中英首页与其余页面的 `vX.Y.Z`、首页 JSON-LD 的 `softwareVersion`/`downloadUrl`/`fileSize`、公告条、hero 下载按钮、下载区 lede/meta、`assets/home.js` 的 I18N 字典、页脚版本行；把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`（不入库）。安装包大小变化时同步所有 `X MB`；CSS/JS 有改动时同步 `?v=YYYYMMDD`。
-6. **校验**：`python3 scripts/site/check_seo.py` 退出码 0（版本与 DMG 一致、canonical/hreflang、sitemap、JSON-LD、站内链接）。
-7. **部署**：`cd site && npx wrangler pages deploy . --project-name maceverything --branch main --commit-dirty=true`；国内镜像把同一份 `site/` 同步到阿里云 OSS。
+4. **出包**：`bash scripts/release.sh` —— Developer ID 签名 + 公证 + staple + DMG + SHA256，并写入 `../macEverything-site/version.json`。
+5. **更新站点版本信息**：`release.sh` 不改页面。逐项更新中英首页与其余页面的 `vX.Y.Z`、首页 JSON-LD 的 `softwareVersion`/`downloadUrl`/`fileSize`、公告条、hero 下载按钮、下载区 lede/meta、`assets/home.js` 的 I18N 字典、页脚版本行；把 `release/macEverything-<version>.dmg` 复制到 `../macEverything-site/downloads/`（不入库）。安装包大小变化时同步所有 `X MB`；CSS/JS 有改动时同步 `?v=YYYYMMDD`。
+6. **校验**：`python3 scripts/site/check_seo.py`（默认检查 `../macEverything-site`） 退出码 0（版本与 DMG 一致、canonical/hreflang、sitemap、JSON-LD、站内链接）。
+7. **部署**：在私有站点仓 `../macEverything-site` 执行 `npx wrangler pages deploy . --project-name maceverything --branch main --commit-dirty=true`；国内镜像把同一份内容同步到阿里云 OSS。
 8. **验收**：本机安装新包确认「关于」页版本号；用上一版 App 点「检查更新」确认能发现新版本并跳到下载页。
 
-回滚：只回退 `site/version.json` 与站点页面的版本信息（Cargo 可保持前进）；`check_seo.py` 以 `version.json` 为准，并对版本偏差告警。需要提交时，沿用历史的 `chore(release): bump X.Y.Z` + `chore(site): release X.Y.Z` 两个提交。
+回滚：只回退站点仓的 `version.json` 与页面版本信息（Cargo 可保持前进）；`check_seo.py` 以 `version.json` 为准，并对版本偏差告警。需要提交时：应用仓用 `chore(release): bump X.Y.Z`，站点仓用 `chore(site): release X.Y.Z`。
 
-## 官网（site/，不参与 Rust 构建）
+## 官网（私有站点仓，不参与 Rust 构建）
 
 - 静态多页站：中文根路径 `/`、英文 `/en/`，语言切换是普通链接；部署 Cloudflare Pages（`maceverything.pages.dev`，生产分支 main）。
-- 本地预览：`cd site && python3 -m http.server 8000`。
+- 本地预览：`cd ../macEverything-site && python3 -m http.server 8000`。
 - **发布前必须 `python3 scripts/site/check_seo.py` 退出码 0**（canonical/hreflang、sitemap、JSON-LD、站内链接、版本与 DMG 一致性）。
 - CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新引用。
-- 版本号唯一来源：`Cargo.toml` 的 `[workspace.package].version`（升版写入 Info.plist 与 DMG 文件名，release.sh 同步 `site/version.json`，check_seo 校验一致）。
-- `site/downloads/` 不入库（gitignore）；DMG 由 release.sh 生成后复制进去。
+- 版本号唯一来源：`Cargo.toml` 的 `[workspace.package].version`（升版写入 Info.plist 与 DMG 文件名，release.sh 同步站点仓 `version.json`，check_seo 校验一致）。
+- 站点仓的 `downloads/` 不入库；DMG 由 release.sh 生成后复制进去。

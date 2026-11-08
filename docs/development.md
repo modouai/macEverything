@@ -150,9 +150,9 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 验收：`spctl --assess --type execute`（App）、`spctl --assess --type open --context context:primary-signature`（DMG）、`xcrun stapler validate`、`hdiutil verify`。
 - 完整发版清单（含官网版本信息、部署与验收）见 `CLAUDE.md`「发版流程」。
 
-## 官网(site/)
+## 官网(私有站点仓 `../macEverything-site`)
 
-官网是静态多页站，源文件都在 `site/`，不参与 Rust 构建。页面清单：
+官网是静态多页站，源文件在私有站点仓根目录，不参与 Rust 构建。页面清单：
 
 | 页面 | 中文 | 英文 |
 |---|---|---|
@@ -164,36 +164,22 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 | 更新日志 | `/changelog/` | `/en/changelog/` |
 
 - 语言：`/` 固定中文，`/en/` 固定英文；语言切换是普通链接，不再依赖 `localStorage`。
-- 共享资源：`site/assets/`（CSS、首页 JS、图标、吉祥物、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
+- 共享资源：`assets/`（CSS、首页 JS、图标、吉祥物、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
 - 字体：全站使用系统字体栈（SF Pro / PingFang SC / SF Mono），不加载 Web 字体。
 - 视觉：站点沿用 App 的 token（靛蓝选中色 `#5B6FD9`、深色 `#1A1D22`、12/8/6/4 圆角）；悬浮条演示为 700 宽、结果窗口为 1080×627。
-- 演示图标：`site/assets/file-icons/` 由 macOS `NSWorkspace` 按文件类型渲染为 PNG（与访达一致），不是图标库字形；吉祥物为 `site/assets/mascot.png`（透明 PNG）。
-- SEO：每页包含 canonical、hreflang、Open Graph、Twitter 卡片与 JSON-LD；`site/sitemap.xml` 与页面 hreflang 互指。
-- 本地预览：`cd site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
-- 下载包：把 `release/macEverything-<version>.dmg` 复制到 `site/downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。`site/downloads/` 已加入 `.gitignore`，DMG 不入库。
-- 发布前必须运行 `python3 scripts/site/check_seo.py`，退出码 0 才能部署。检查项包括 canonical/hreflang、sitemap 覆盖、JSON-LD、字体引用、站内链接、版本与 DMG 一致性。
-- `scripts/release.sh` 生成 DMG 后会同步写入 `site/version.json`；`check_seo.py` 会校验它与 Cargo 版本一致。该文件随 `site/` 一起部署，`_headers` 为它设置 `Cache-Control: no-cache`。
+- 演示图标：`assets/file-icons/` 由 macOS `NSWorkspace` 按文件类型渲染为 PNG（与访达一致），不是图标库字形；吉祥物为 `assets/mascot.png`（透明 PNG）。
+- SEO：每页包含 canonical、hreflang、Open Graph、Twitter 卡片与 JSON-LD；`sitemap.xml` 与页面 hreflang 互指。
+- 本地预览：`cd ../macEverything-site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
+- 下载包：把 `release/macEverything-<version>.dmg` 复制到站点仓的 `downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。该目录不入库。
+- 发布前必须运行 `python3 scripts/site/check_seo.py`（默认检查 `../macEverything-site`），退出码 0 才能部署。检查项包括 canonical/hreflang、sitemap 覆盖、JSON-LD、字体引用、站内链接、版本与 DMG 一致性。
+- `scripts/release.sh` 生成 DMG 后会同步写入站点仓的 `version.json`；`check_seo.py` 会校验它与 Cargo 版本一致。`_headers` 为它设置 `Cache-Control: no-cache`。
 - 更新日志：每次发版在 `/changelog/` 与 `/en/changelog/` 顶部追加一节（版本号、日期、2–4 条用户可感知的改动），并同步首页下载区的「最近更新」摘要。`check_seo.py` 强制每个页面包含当前版本号，漏更新会直接报错。
-- 分享图源文件：`scripts/site/og-image.html`，渲染为 `site/assets/og-image.png`（1200×630）。
+- 分享图源文件：站点仓的 `scripts/og-image.html`，渲染为 `assets/og-image.png`（1200×630）。
 - 官网不写源码构建、终端安装和开发文档入口，只提供成品 DMG。
 
-### Cloudflare Pages
+### 站点仓（私有）
 
-- 项目：`maceverything`；生产分支：`main`；地址：`https://maceverything.pages.dev`。
-- 首次创建（新版 Pages 会尝试委派到 Workers，`--force` 使用经典 Pages）：
-  `npx wrangler pages project create maceverything --production-branch main --force`
-- 发布：
-
-  ```bash
-  cd site
-  npx wrangler pages deploy . --project-name maceverything --branch main --commit-dirty=true
-  ```
-
-- 未登录先 `npx wrangler login`。OAuth 凭据可能在登录与部署之间过期，直接串联：
-  `npx wrangler login && npx wrangler pages deploy . --project-name maceverything --branch main --commit-dirty=true`
-- `site/_headers` 给 `/downloads/*` 设置一年缓存。
-- 自定义域名：Cloudflare Pages 控制台 → Custom domains。`pages.dev` 与 Cloudflare 免费节点在国内访问不稳定；国内速度用阿里云 OSS + 已备案二级域名，上传同一份 `site/` 内容，绑定 CNAME 与 HTTPS 证书。
-
+官网内容已拆到私有仓库 `modouai/macEverything-site`；部署与托管配置见该仓 README。应用仓只保留 `scripts/site/` 下的校验与配置生成工具。
 ## v2 方向(未排期)
 
 - 图形界面:悬浮条(全局快捷键唤起)+ 完整窗口 + 设置;菜单栏常驻
