@@ -36,6 +36,9 @@ pub struct QueryPlan {
     /// parse 恒 false;由调用方(engine 外的 daemon/client)按协议位显式置位,
     /// 不在 parse 语法内。
     pub dir_only: bool,
+    /// 隐藏项过滤(查询层):true 保留隐藏项,false 丢弃。parse 恒 true;
+    /// 由调用方(engine 外的 daemon/client)按协议位覆盖。
+    pub include_hidden: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -83,6 +86,7 @@ pub fn parse(query: &str) -> Result<QueryPlan, ParseError> {
         case_sensitive,
         whole_word,
         dir_only: false,
+        include_hidden: true,
     };
     for word in words {
         match word {
@@ -265,6 +269,11 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                     return None;
                 }
                 if plan.whole_word && !all_parts_word_bounded(&target, &c_name) {
+                    return None;
+                }
+                // 隐藏过滤放在匹配之后：只对真正命中的候选做父链判定，
+                // 避免百万条目逐条上溯。total 在 rows 上取，天然同口径。
+                if !plan.include_hidden && view.is_hidden(idx) {
                     return None;
                 }
                 Some((
@@ -1112,6 +1121,7 @@ mod match_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::Index;
 
     #[test]
     fn plain_terms_are_and() {
@@ -1207,6 +1217,35 @@ mod tests {
         assert_eq!(p.path_terms.len(), 1);
         assert_eq!(p.path_terms[0].parts, vec!["合同".as_bytes().to_vec()]);
         assert_eq!(p.name_terms.len(), 1);
+    }
+
+    /// 隐藏过滤：自身或祖先隐藏 → 候选层丢弃，total 同口径。
+    /// 突变「删除 execute 中的 is_hidden 判定」→ 此测必红。
+    #[test]
+    fn hidden_entries_filtered_out_unless_include_hidden() {
+        let mut i = Index::new();
+        let root = i.insert("/tmp/root", NO_PARENT, true);
+        let hidden_dir = i.insert(".config", root, true);
+        i.insert("init.lua", hidden_dir, false);
+        i.insert(".zshrc", root, false);
+        i.insert("notes.txt", root, false);
+
+        let mut plan = parse("*").unwrap();
+        assert_eq!(execute(&i, &plan, 100).total, 5, "parse 默认不过滤");
+
+        plan.include_hidden = false;
+        let out = execute(&i, &plan, 100);
+        assert_eq!(out.total, 2, "仅根与 notes.txt 可见");
+        let mut names: Vec<String> = out
+            .hits
+            .iter()
+            .map(|&h| String::from_utf8_lossy(i.display_name(h)).into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["/tmp/root".to_string(), "notes.txt".to_string()]
+        );
     }
 }
 
