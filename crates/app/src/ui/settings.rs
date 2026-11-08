@@ -1140,6 +1140,8 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             let now = Instant::now();
             s.results.session.on_hidden_change(now);
             s.palette.session.on_hidden_change(now);
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint_of(crate::ui::palette_viewport_id());
         }
         let load_cli = s.settings.advance_cli_install(open);
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
@@ -1603,7 +1605,7 @@ fn spawn_hidden_set(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, include: b
             if let Err(err) = tx.send(result) {
                 log::warn!("隐藏项偏好结果回投失败(设置页可能已退出):{err}");
             }
-            thread_ctx.request_repaint();
+            thread_ctx.request_repaint_of(viewport_id());
         });
     if let Err(err) = spawned {
         lock_shared(shared)
