@@ -3816,6 +3816,22 @@ mod tests {
         assert_eq!(st.advance_hidden(false), (false, false), "结果只消费一次");
     }
 
+    /// 初始加载：应用回显但不触发重查。
+    #[test]
+    fn tick_hidden_load_does_not_signal_changed() {
+        let mut st = test_state();
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: Some(true),
+            error: None,
+            changed: false,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, false));
+        assert!(st.hidden.include && st.hidden.loaded);
+    }
+
     /// 落盘失败但引擎已生效：仍应用新值并触发重查，同时保留内联错误。
     #[test]
     fn tick_hidden_applies_unsaved_write_and_keeps_error() {
