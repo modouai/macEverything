@@ -1,5 +1,9 @@
 # macEverything
 
+<p align="center">
+  <img src="assets/AppIcon.png" alt="macEverything" width="128" />
+</p>
+
 [![Version](https://img.shields.io/github/v/release/modouai/macEverything?label=version&color=blue)](https://github.com/modouai/macEverything/releases/latest)
 [![CI](https://github.com/modouai/macEverything/actions/workflows/ci.yml/badge.svg)](https://github.com/modouai/macEverything/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -10,7 +14,7 @@
 
 **macOS 文件名即时搜索——Windows [Everything](https://www.voidtools.com/zh-cn/support/everything/) 的 Mac 版。**
 
-macEverything 自建索引、不走 Spotlight:Spotlight 静默搜不到的目录(隐私排除、`.noindex`、开发目录),这里全都能搜到;权限缺口永远显式列出。
+macEverything 自建索引、不走 Spotlight:Spotlight 静默搜不到的目录(隐私排除、`.noindex`、索引被关闭的位置),只要不在排除清单里就能搜到;权限缺口永远显式列出。
 
 覆盖范围:用户主目录、`/Applications` 与本地外接磁盘(网络盘暂不索引)。
 
@@ -29,9 +33,18 @@ Spotlight 是出色的启动器,但它的索引由 macOS 管理,并且静默排�
 
 macEverything 的做法:
 
-- **自建索引**:并行遍历文件系统直接建索引。
-- **缺口显式**:目录读不了(比如尚未授予完全磁盘访问权限)时,`status`、托盘菜单、结果窗口都会逐目录列出名字与原因。
-- **Everything 式文件名搜索**:子串/通配匹配 + 质量排序,而非模糊的元数据搜索。
+| | Spotlight | macEverything |
+|---|---|---|
+| 收录哪些文件 | 由系统决定 | 用户主目录 + `/Applications` |
+| 被 Spotlight 排除的目录 | 不收录 | 不在排除清单里就能收录 |
+| 读不了权限的目录 | 不显示 | 逐目录列出名字与原因 |
+| 开发目录 | 可能跳过 | 可搜索;`node_modules`、`.git` 默认排除 |
+| 索引管理 | 由 macOS 管理 | 由应用管理 |
+| 终端 | `mdfind` | `macEverything`(五个子命令,支持 `--json`) |
+
+目录读不了(比如尚未授予完全磁盘访问权限)时,`status`、托盘菜单、结果窗口都会逐目录列出名字与原因——缺口从不静默。文件名搜索是 Everything 式子串/通配匹配 + 质量排序,而不是模糊的元数据搜索。
+
+默认排除:`~/Library`、`node_modules`、`.git`、`~/.Trash` 以及各卷的元数据目录。可在「设置 → 索引」或 `macEverything exclude` 中修改。
 
 <p align="center">
   <img src="docs/screenshots/full-window.png" alt="完整结果窗口:名称 / 大小 / 修改时间 / 路径四列" width="720">
@@ -144,6 +157,7 @@ crates/app/       GUI(eframe/egui):悬浮条 · 完整结果窗口 · 托盘 · 
 ## 已知限制
 
 - 扫描范围:用户主目录 + `/Applications` + 本地外接磁盘(插入即自动索引,拔出即清除,可在设置按卷关闭);网络盘 SMB/NFS 暂不支持
+- 默认排除:`~/Library`、`node_modules`、`.git`、`~/.Trash` 及各卷元数据目录(`.fseventsd`/`.Trashes`/`.Spotlight-V100`/`.DocumentRevisions-V100`);可通过 `macEverything exclude` 或设置 →「索引」调整
 - `case:` 只作用于文件名侧(路径匹配恒不区分大小写)
 - 暂无正则与 `size:`/日期过滤器(v2 候选)
 - 界面进程空闲常驻约 136 MB,eframe/egui + OpenGL 技术栈基线,与窗口使用无关;超出 <100 MB 设计目标,详见[架构总览](docs/architecture.md)
@@ -159,6 +173,7 @@ crates/app/       GUI(eframe/egui):悬浮条 · 完整结果窗口 · 托盘 · 
 | [架构总览](docs/architecture.md) | 引擎架构、核心设计决策与 ADR-7/8、生命周期、性能 |
 | [开发指南](docs/development.md) | 构建/测试/基准、实机冒烟、约定与踩坑 |
 | [规格档案](docs/specs/) | 各特性产品/技术/实现规格 |
+| [官网指南](https://maceverything.modouai.dev/) | Mac 版 Everything、Spotlight 排障、Mac 文件搜索指南 |
 
 ## 参与贡献
 
@@ -178,7 +193,7 @@ cargo test --workspace
 
 ## 环境要求
 
-macOS 13+(Apple Silicon,不支持 Intel,发布的 DMG 仅含 arm64);源码构建需 Rust stable。数据目录 `~/Library/Application Support/macEverything/`。「完全磁盘访问权限」可选授予;不授予时未覆盖目录会显式列出,其余功能不受影响。可选的「目录助手」另行需要「设备控制和数据访问」权限。
+macOS 13+(Apple Silicon,不支持 Intel,发布的 DMG 仅含 arm64);源码构建需 Rust stable。数据目录 `~/Library/Application Support/macEverything/`。「完全磁盘访问权限」可选授予;不授予时未覆盖目录会显式列出,其余功能不受影响。索引文件约每 100 万个文件占 63 MB。可选的「目录助手」另行需要「设备控制和数据访问」权限。
 
 ## 许可证
 

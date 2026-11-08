@@ -1,5 +1,9 @@
 # macEverything
 
+<p align="center">
+  <img src="assets/AppIcon.png" alt="macEverything" width="128" />
+</p>
+
 [![Version](https://img.shields.io/github/v/release/modouai/macEverything?label=version&color=blue)](https://github.com/modouai/macEverything/releases/latest)
 [![CI](https://github.com/modouai/macEverything/actions/workflows/ci.yml/badge.svg)](https://github.com/modouai/macEverything/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -10,7 +14,7 @@ English | [简体中文](README.zh-CN.md)
 
 **Instant filename search for macOS. Everything, for the Mac.**
 
-macEverything builds and maintains its own index instead of relying on Spotlight. Folders that Spotlight silently skips (privacy exclusions, `.noindex` trees, development directories) are all searchable here, and permission gaps are always listed explicitly.
+macEverything builds and maintains its own index instead of relying on Spotlight. Folders that Spotlight silently skips (privacy exclusions, `.noindex` trees, disabled indexing) can be indexed here — unless you exclude them — and permission gaps are always listed explicitly.
 
 Coverage: your home directory, `/Applications` and local external volumes (network volumes are not indexed yet).
 
@@ -29,9 +33,18 @@ Spotlight is a great launcher, but its index is managed by macOS and silently ex
 
 How macEverything differs:
 
-- **Its own index**, built by parallel traversal of the filesystem.
-- **Explicit gaps**: if a directory can't be read (e.g. Full Disk Access not granted yet), it is listed by name and reason in `status`, the tray menu and the results window.
-- **Everything-style filename search**: substring/wildcard matching with quality ranking, not fuzzy metadata search.
+| | Spotlight | macEverything |
+|---|---|---|
+| What gets indexed | Decided by macOS | Your home folder + `/Applications` |
+| Folders excluded from Spotlight | Never indexed | Indexed unless you exclude them |
+| Folders it can't read | Not shown | Listed by name and reason |
+| Development folders | Sometimes skipped | Searchable; `node_modules` and `.git` excluded by default |
+| Index management | Managed by macOS | Managed by the app |
+| Terminal | `mdfind` | `macEverything` (five subcommands, `--json`) |
+
+If a directory can't be read (e.g. Full Disk Access not granted yet), it is listed by name and reason in `status`, the tray menu and the results window — the gap is never silent. Filename search is Everything-style substring/wildcard matching with quality ranking, not fuzzy metadata search.
+
+Default excludes: `~/Library`, `node_modules`, `.git`, `~/.Trash` and per-volume metadata folders. Change them in Settings → Index or with `macEverything exclude`.
 
 <p align="center">
   <img src="docs/screenshots/full-window-en.png" alt="The full results window with columns for name, size, modified time and path" width="720">
@@ -146,6 +159,7 @@ crates/app/       GUI (eframe/egui): floating bar · results window · tray · g
 ## Known limitations
 
 - Scan scope: home directory + `/Applications` + local external volumes (indexed automatically on mount, dropped on eject, per-volume toggle in settings). Network volumes (SMB/NFS) are not indexed yet.
+- Default excludes: `~/Library`, `node_modules`, `.git`, `~/.Trash` and per-volume metadata folders (`.fseventsd`, `.Trashes`, `.Spotlight-V100`, `.DocumentRevisions-V100`). Change them with `macEverything exclude` or in Settings → Index.
 - `case:` applies to the filename side only (path matching is always case-insensitive).
 - No regex, `size:` or date filters yet (on the v2 candidate list).
 - The GUI process idles at ~136 MB, the baseline of the eframe/egui + OpenGL stack, independent of window usage. Above the <100 MB design target; details in the [architecture overview](docs/architecture.md) (Chinese).
@@ -161,6 +175,7 @@ crates/app/       GUI (eframe/egui): floating bar · results window · tray · g
 | [Architecture](docs/architecture.md) | Engine design, core decisions and ADR-7/8, lifecycle, benchmarks (Chinese) |
 | [Development](docs/development.md) | Build, test, bench, conventions and pitfalls (Chinese) |
 | [Specs](docs/specs/) | Product, technical and implementation specs per feature (Chinese) |
+| [Website guides](https://maceverything.modouai.dev/) | Everything for Mac, Spotlight troubleshooting, and a Mac file-search guide |
 
 ## Contributing
 
@@ -180,7 +195,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions, [SECURITY.md](SECURITY.m
 
 ## Requirements
 
-macOS 13 or later on Apple Silicon (Intel Macs are not supported; the released DMG is arm64-only). Rust stable for building from source. Data directory: `~/Library/Application Support/macEverything/`. Full Disk Access is optional; without it, unreadable directories are listed explicitly and everything else works. The optional Directory Assist uses the separate Device Control and Data Access permission.
+macOS 13 or later on Apple Silicon (Intel Macs are not supported; the released DMG is arm64-only). Rust stable for building from source. Data directory: `~/Library/Application Support/macEverything/`. Full Disk Access is optional; without it, unreadable directories are listed explicitly and everything else works. The on-disk index uses about 63 MB per 1 million files. The optional Directory Assist uses the separate Device Control and Data Access permission.
 
 ## License
 
