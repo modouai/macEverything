@@ -2443,8 +2443,8 @@ fn handle_diff_error(
 
 /// 冷启动编排(独立线程):有索引 → 直挂 Shared 秒开(零物化)→ 重放;无/损坏 → 首扫。
 fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
-    let cfg = config::load_migrating(&paths.config_file(), paths.index_file().exists());
-    *state.cfg.lock_recover() = cfg.clone();
+    // serve 已在接受连接前完成加载/迁移；此处只取快照，避免重读覆盖并发偏好写。
+    let cfg = state.cfg.lock_recover().clone();
     // 外接卷(external-volumes):挂载中的期望卷并入初始 roots——落盘索引路径
     // 由此获得流覆盖(停机窗口重放追平卷内漂移);首扫路径一并纳入首扫。
     let desired_volumes = volumes::desired_roots(&cfg);
@@ -2971,28 +2971,31 @@ fn apply_exclude_change(
 ) -> Result<(), String> {
     // 跨连接串行化:校验/内存更新/落盘/重扫期间不允许另一 Exclude 变更穿插。
     let _op = state.exclude_op_lock.lock_recover();
+    let roots = state.roots.lock_recover().clone();
+    if matches!(&op, ExcludeOp::Add) {
+        validate_exclude_in_roots(path, &roots)?;
+    }
+    // 持 cfg 锁跨越内存变更与落盘：HiddenSet/VolumesSet 不得在克隆→保存窗口
+    // 插入并被陈旧副本覆盖（配置写者统一纪律）。
+    let mut cfg = state.cfg.lock_recover();
     match op {
         ExcludeOp::Add => {
-            let roots = state.roots.lock_recover().clone();
-            validate_exclude_in_roots(path, &roots)?;
-            let mut cfg = state.cfg.lock_recover();
             if !cfg.excluded.iter().any(|e| e == path) {
                 cfg.excluded.push(path.to_string());
             }
         }
         ExcludeOp::Remove => {
-            let mut cfg = state.cfg.lock_recover();
             if !cfg.excluded.iter().any(|e| e == path) {
                 return Err(format!("条目不存在: {path}"));
             }
             cfg.excluded.retain(|e| e != path);
         }
     }
-    let cfg = state.cfg.lock_recover().clone();
     if let Err(e) = config::save(&cfg, &paths.config_file()) {
         log::error!("配置保存失败: {e}");
         return Err(format!("配置保存失败({e}),变更未持久化,重启后将丢失"));
     }
+    drop(cfg); // 不放锁调用重扫（重扫内部会取 cfg）
     degrade_and_rescan(state, paths, true); // 同步:响应语义「返回时排除项已生效」
     Ok(())
 }
@@ -3027,6 +3030,10 @@ pub fn serve(paths: DaemonPaths) -> Result<()> {
     }));
     let listener = bind_single_instance(&paths.socket())?;
     let state = Arc::new(EngineState::new());
+    // 接受连接前完成配置读取/迁移：查询与偏好写都依赖 cfg，不能把 None/旧值
+    // 暴露给冷启动窗口，也不能让 HiddenSet/reset 在迁移赋值前落地。
+    *state.cfg.lock_recover() =
+        config::load_migrating(&paths.config_file(), paths.index_file().exists());
     {
         let st = state.clone();
         let p = paths.clone();
