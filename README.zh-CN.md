@@ -1,10 +1,7 @@
 # macEverything
 
-<p align="center">
-  <img src="docs/screenshots/hero-zh.png" alt="macEverything — macOS 文件名即时搜索" width="720">
-</p>
-
-[![Version](https://img.shields.io/badge/version-2.5.0-blue)](https://maceverything.modouai.dev/)
+[![Version](https://img.shields.io/github/v/release/modouai/macEverything?label=version&color=blue)](https://github.com/modouai/macEverything/releases/latest)
+[![CI](https://github.com/modouai/macEverything/actions/workflows/ci.yml/badge.svg)](https://github.com/modouai/macEverything/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B%20·%20Apple%20Silicon-lightgrey)](#环境要求)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust)](https://www.rust-lang.org/)
@@ -20,9 +17,10 @@ macEverything 自建索引、不走 Spotlight:Spotlight 静默搜不到的目录
 - **百万文件约 1 秒建好索引**:首扫 1M 文件 1.0-1.6 s,之后每次启动秒开(读落盘索引)
 - **查询 P99 < 4 ms**:123 万+ 条目上的子串/通配搜索
 - **实时增量**:文件系统变更 ≤ 0.3 s 可搜,空闲 CPU 0%
-- **完整**:与 `find` 零差异
+- **完整**:索引条目集与 `find` 零差异
 - **悬浮条(⌥Space)**:跨全屏应用上方可唤起,输入即搜,键盘全操作
 - **完整结果窗口(⌥⇧F)**:可排序、多选、原生右键菜单、Quick Look
+- **目录助手(实验)**:其他应用弹出保存或打开面板时,旁边浮出目录搜索框,↵ 即让面板跳到该目录(默认关闭;需「设备控制和数据访问」权限)
 - **双语界面**:简体中文 / English,默认跟随系统
 
 ## 为什么不走 Spotlight?
@@ -48,7 +46,7 @@ macEverything 的做法:
 | 首扫 | 百万文件 **1.0-1.6 s** | 并行遍历;之后每次启动秒开(读落盘索引) |
 | 查询 | **P99 2.9-3.6 ms** | 全索引子串/通配匹配 |
 | 增量 | **≤ 0.3 s** 可搜 | FSEvents 实时;空闲 CPU 0% |
-| 完整性 | 与 `find` **零差异** | `find` 能看到的全能搜到 |
+| 完整性 | 与 `find` **零差异** | 相同扫描根与排除规则下;由对拍测试保证 |
 | 停机补齐 | 秒级 | 重启重放关机期间事件,非全量重扫 |
 
 图形界面口径(release 构建):
@@ -94,7 +92,10 @@ ln -sf "$PWD/target/release/macEverything" ~/.cargo/bin/macEverything
 |---|---|
 | 悬浮搜索条 | **⌥Space**:输入即搜,↑↓ 选择,↵ 打开,⌘↵ 访达显示,⌥↵ 带词进完整窗口,Esc 隐藏 |
 | 完整结果窗口 | **⌥⇧F**:四列(名称/大小/修改时间/路径),点列头排序,多选,空格 Quick Look |
-| 菜单栏图标 | 左键切换悬浮条;右键:引擎状态、权限缺口、设置、开机自启、检查更新 |
+| 目录助手 | 保存/打开对话框旁的目录搜索框;设置 → 实验 →「目录助手」开启(默认关闭) |
+| 菜单栏图标 | 左键切换悬浮条;右键:引擎状态、权限缺口、打开搜索/完整窗口、开机自启、设置、检查更新、退出 |
+
+两个快捷键都能在 设置 → 通用 →「快捷键」中重新录制;被其他应用占用时自动降级到 ⌥⇧Space / ⌃⌥⇧Space,并在悬浮条内提示。
 
 命令行:
 
@@ -102,8 +103,10 @@ ln -sf "$PWD/target/release/macEverything" ~/.cargo/bin/macEverything
 macEverything start              # 引擎后台启动
 macEverything query "报告"        # 即输即出
 macEverything query "*.pdf path:Documents 2026"
+macEverything query --sort mtime --desc "发票"   # 最新在前
 macEverything status             # 索引状态 + 权限缺口
 macEverything exclude add ~/Videos
+macEverything exclude list       # add | remove | list | reset
 macEverything stop
 ```
 
@@ -122,7 +125,7 @@ macEverything stop
 | `case:` | 本轮区分大小写 | `case:README` |
 | `whole:` | 本轮整词匹配 | `whole:init` |
 
-大小写折叠覆盖整个 Unicode,NFC/NFD 两种归一形态互搜;排序:文件名前缀命中 > 词边界命中 > 子串命中。完整规则见[使用指南](docs/usage.md)。
+大小写折叠覆盖整个 Unicode,NFC/NFD 两种归一形态互搜。`.app` 应用包整体置顶(嵌套在其它 bundle 内的 `.app` 除外);组内排序:文件名前缀命中 > 词边界命中 > 子串命中,同级名更短优先。完整规则见[使用指南](docs/usage.md)。
 
 ## 工作原理
 
@@ -135,7 +138,7 @@ crates/cli/       daemon(引擎宿主)+ 五子命令客户端(含离线降级)
 crates/protocol/  cli 与 app 共用的协议契约
 crates/client/    cli 与 app 共用的客户端承载层
 crates/app/       GUI(eframe/egui):悬浮条 · 完整结果窗口 · 托盘 · 全局热键 ·
-                  开机自启 · 检查更新
+                  开机自启 · 检查更新 · 目录助手
 ```
 
 ## 已知限制
@@ -146,6 +149,7 @@ crates/app/       GUI(eframe/egui):悬浮条 · 完整结果窗口 · 托盘 · 
 - 界面进程空闲常驻约 136 MB,eframe/egui + OpenGL 技术栈基线,与窗口使用无关;超出 <100 MB 设计目标,详见[架构总览](docs/architecture.md)
 - 悬浮条被其他窗口完全遮挡时,输入到结果退化到 ~500 ms(遮挡视口跳过渲染帧;悬浮条可见时不受影响)
 - 引擎离线时完整窗口列排序不可用:状态栏提示并提供「重启引擎」按钮
+- 目录助手为实验功能,默认关闭;需「设备控制和数据访问」权限,且无法作用于自绘保存/打开面板的应用(部分网页应用与 Electron 应用)
 
 ## 文档
 
@@ -174,7 +178,7 @@ cargo test --workspace
 
 ## 环境要求
 
-macOS 13+(Apple Silicon,不支持 Intel,发布的 DMG 仅含 arm64);源码构建需 Rust stable。数据目录 `~/Library/Application Support/macEverything/`。「完全磁盘访问权限」可选授予;不授予时未覆盖目录会显式列出,其余功能不受影响。
+macOS 13+(Apple Silicon,不支持 Intel,发布的 DMG 仅含 arm64);源码构建需 Rust stable。数据目录 `~/Library/Application Support/macEverything/`。「完全磁盘访问权限」可选授予;不授予时未覆盖目录会显式列出,其余功能不受影响。可选的「目录助手」另行需要「设备控制和数据访问」权限。
 
 ## 许可证
 

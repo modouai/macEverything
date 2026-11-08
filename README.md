@@ -1,10 +1,7 @@
 # macEverything
 
-<p align="center">
-  <img src="docs/screenshots/hero-en.png" alt="macEverything — instant filename search for macOS" width="720">
-</p>
-
-[![Version](https://img.shields.io/badge/version-2.5.0-blue)](https://maceverything.modouai.dev/)
+[![Version](https://img.shields.io/github/v/release/modouai/macEverything?label=version&color=blue)](https://github.com/modouai/macEverything/releases/latest)
+[![CI](https://github.com/modouai/macEverything/actions/workflows/ci.yml/badge.svg)](https://github.com/modouai/macEverything/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B%20·%20Apple%20Silicon-lightgrey)](#requirements)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust)](https://www.rust-lang.org/)
@@ -20,9 +17,10 @@ Coverage: your home directory, `/Applications` and local external volumes (netwo
 - **Million files in ~1 s**: first scan takes 1.0-1.6 s; every later launch opens instantly from the on-disk index
 - **P99 query < 4 ms**: substring/wildcard search across 1.2M+ entries
 - **Live updates**: changes become searchable in ≤ 0.3 s; 0% idle CPU
-- **Complete**: matches `find` exactly
+- **Complete**: the entry set matches `find` exactly
 - **Floating bar (⌥Space)**: appears over full-screen apps, type-to-search, keyboard-driven
 - **Results window (⌥⇧F)**: sortable table, multi-select, native context menus, Quick Look
+- **Directory Assist (experimental)**: when another app opens a save or open dialog, a folder search field appears next to it — ↵ jumps the dialog there (off by default; needs the Device Control and Data Access permission)
 - **Bilingual UI**: English / 简体中文, follows the system by default
 
 ## Why not Spotlight?
@@ -50,7 +48,7 @@ Engine:
 | First scan | **1.0-1.6 s** per million files | Parallel traversal; every later launch is instant (mmap of the on-disk index) |
 | Query | **P99 2.9-3.6 ms** | substring/wildcard over the whole index |
 | Incremental update | **≤ 0.3 s** to searchable | Live FSEvents; 0% idle CPU |
-| Completeness | **zero diff** vs `find` | Anything `find` sees, this finds |
+| Completeness | **zero diff** vs `find` | Same scan roots and excludes; parity test enforces it |
 | Downtime catch-up | seconds | On restart, events from the downtime are replayed, not a full rescan |
 
 GUI (release build):
@@ -96,7 +94,10 @@ After launch the app lives in the menu bar (no Dock icon and no window; that is 
 |---|---|
 | Floating search bar | **⌥Space**: type to search, ↑↓ to select, ↵ open, ⌘↵ reveal in Finder, ⌥↵ continue in the full window, Esc hide |
 | Full results window | **⌥⇧F**: four columns (name / size / modified / path), click headers to sort, multi-select, Space for Quick Look |
-| Menu bar icon | Left-click toggles the floating bar; right-click for engine status, gaps, settings, autostart, updates |
+| Directory Assist | Folder search field next to save/open dialogs; enable under Settings → Experimental → Directory Assist (off by default) |
+| Menu bar icon | Left-click toggles the floating bar; right-click for engine status, gaps, open search / open full window, autostart, settings, update check and quit |
+
+Both shortcuts can be re-recorded in Settings → General → Shortcuts. If a shortcut is taken by another app, the app falls back to ⌥⇧Space / ⌃⌥⇧Space and says so in the floating bar.
 
 CLI:
 
@@ -104,8 +105,10 @@ CLI:
 macEverything start              # launch the engine in the background
 macEverything query "report"     # results as you type
 macEverything query "*.pdf path:Documents 2026"
+macEverything query --sort mtime --desc "invoice"   # newest first
 macEverything status             # index state + permission gaps
 macEverything exclude add ~/Videos
+macEverything exclude list       # add | remove | list | reset
 macEverything stop
 ```
 
@@ -124,7 +127,7 @@ When the engine is offline, `query` falls back to reading the on-disk index dire
 | `case:` | case-sensitive for this query | `case:README` |
 | `whole:` | whole-word match for this query | `whole:init` |
 
-Case folding covers all of Unicode, NFC and NFD spellings match each other, and ranking prefers filename prefix hits, then word-boundary hits, then substrings. The [usage guide](docs/usage.md) has the full rules (Chinese).
+Case folding covers all of Unicode, NFC and NFD spellings match each other. `.app` bundles are pinned to the top (except `.app`s nested inside another bundle); otherwise ranking prefers filename prefix hits, then word-boundary hits, then substrings, with shorter names winning ties. The [usage guide](docs/usage.md) has the full rules (Chinese).
 
 ## How it works
 
@@ -137,7 +140,7 @@ crates/cli/       daemon (engine host) + 5-subcommand client with offline fallba
 crates/protocol/  wire contract shared by cli and app
 crates/client/    client transport layer shared by cli and app
 crates/app/       GUI (eframe/egui): floating bar · results window · tray · global hotkeys ·
-                  autostart · update check
+                  autostart · update check · directory assist
 ```
 
 ## Known limitations
@@ -148,6 +151,7 @@ crates/app/       GUI (eframe/egui): floating bar · results window · tray · g
 - The GUI process idles at ~136 MB, the baseline of the eframe/egui + OpenGL stack, independent of window usage. Above the <100 MB design target; details in the [architecture overview](docs/architecture.md) (Chinese).
 - When the floating bar is fully covered by another window, keystroke→results degrades to ~500 ms (occluded viewports skip render frames; a visible floating bar is unaffected).
 - With the engine offline, column sorting in the results window is unavailable; the status bar says so and offers a "Restart engine" button.
+- Directory Assist is experimental and off by default; it needs the Device Control and Data Access permission and cannot navigate apps that draw their own save/open panels (some web and Electron apps).
 
 ## Documentation
 
@@ -176,7 +180,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions, [SECURITY.md](SECURITY.m
 
 ## Requirements
 
-macOS 13 or later on Apple Silicon (Intel Macs are not supported; the released DMG is arm64-only). Rust stable for building from source. Data directory: `~/Library/Application Support/macEverything/`. Full Disk Access is optional; without it, unreadable directories are listed explicitly and everything else works.
+macOS 13 or later on Apple Silicon (Intel Macs are not supported; the released DMG is arm64-only). Rust stable for building from source. Data directory: `~/Library/Application Support/macEverything/`. Full Disk Access is optional; without it, unreadable directories are listed explicitly and everything else works. The optional Directory Assist uses the separate Device Control and Data Access permission.
 
 ## License
 
