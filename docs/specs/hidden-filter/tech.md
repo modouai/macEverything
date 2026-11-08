@@ -1,7 +1,7 @@
 # 隐藏项搜索过滤（hidden-filter）技术规格
 
 - 日期：2026-11-08
-- 状态：待实现
+- 状态：已实现（2026-11-08）
 - 产品契约：`product.md`
 
 ## 1. 分层与数据流
@@ -174,7 +174,7 @@ Response::HiddenPrefs { include: bool, message: Option<String> },
 | client | 在线透传/覆盖；离线读配置；离线请求覆盖 |
 | daemon | 配置 false 隐藏、`Some(true)` 覆盖；`HiddenSet` 后同连接查询生效；`reset_excludes` 保留 |
 | cli args | `--include-hidden` 解析、与 `--sort/--desc` 共存、USAGE |
-| app | 开关动作发出；回显/失败回滚；`on_hidden_change` 生成重查 Fire；空词不重查 |
+| app | 开关动作发出；回显/传输失败保留旧值；`on_hidden_change` 生成重查 Fire；空词不重查 |
 
 ## 8. 风险与兼容
 

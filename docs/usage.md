@@ -60,9 +60,9 @@ App 与命令行互不依赖:装 App 不要求命令行在 PATH,反之亦然。A
 ### 隐藏项
 
 - 设置 → **索引** →「包含隐藏项」：开启后搜索结果包含名称以 `.` 开头的文件和文件夹
-  （默认关闭；升级用户首次启动保持旧行为，即包含）。
+  （新装默认关闭；升级用户首次启动保持旧行为，即包含）。
 - 过滤在查询层完成，切换即时生效，不重建索引；隐藏目录内的可见文件同样不显示。
-- 新装默认不包含；`macEverything exclude reset` 不会重置该开关。
+- `macEverything exclude reset` 不会重置该开关。
 
 ### 完整结果窗口
 
@@ -193,7 +193,7 @@ macEverything [--data-dir <PATH>] exclude add|remove|list|reset [路径]
 参数规则:
 
 - `--data-dir` 只能出现在子命令之前,空格与 `=` 两种写法均可(`--data-dir /tmp/mce` 等价 `--data-dir=/tmp/mce`);子命令之后出现按意外参数处理。
-- `--json` 只对 `query`/`status` 有效;`--sort`/`--desc` 只对 `query` 有效,其他组合按用法错误处理。
+- `--json` 只对 `query`/`status` 有效;`--sort`/`--desc`/`--include-hidden` 只对 `query` 有效,其他组合按用法错误处理。
 - 退出码:**0** 成功;**1** 运行错误(连不上引擎、索引不可读、`MCE_DATA_DIR` 非法等);**2** 用法错误(未知/缺失选项、重复的 `--data-dir`/`--sort`、空关键词、相对 `--data-dir` 等),错误写 stderr,即使带 `--json` 也不输出 JSON。
 
 ### `macEverything start` — 启动引擎(后台)
@@ -374,7 +374,7 @@ macOS 的 TCC 保护会让部分目录(如 `~/Documents`、`~/Desktop`、邮件�
 | 文件 | 内容 |
 |---|---|
 | `index.bin` | 索引(百万条目 ~63MB;与内存布局同构,mmap 零拷贝加载) |
-| `config.toml` | 排除目录列表(手工编辑后重启生效;运行时改动用 `exclude` 命令) |
+| `config.toml` | 排除目录与搜索偏好(手工编辑后重启生效;运行时改动用 `exclude` 命令/设置页) |
 | `daemon.sock` | 引擎服务套接字(0600;崩溃残留会自动清理重绑) |
 | `app.sock` | App 单实例通道(0600;重复启动经它唤起已有实例的悬浮条) |
 | `autostart-off` | 存在 = 你主动关过开机自启(下次启动不再默认注册);托盘重新勾选即清除 |
@@ -423,7 +423,7 @@ macEverything stop
 | 常驻内存约 136MB | 图形界面进程的技术栈基线(与窗口是否使用无关);超「<100MB」设计红线,如实记录,见[架构总览](architecture.md) |
 | `macEverything: command not found` | 未安装到 PATH——见「安装」 |
 | `start` 报「引擎未启动(退出码)」 | 多半已在运行(`status` 确认);否则看 `daemon.log` |
-| 搜不到明知存在的文件 | ①`status` 看是否「构建中/重扫中」;②确认不在排除目录;③`status` 看权限缺口 |
+| 搜不到明知存在的文件 | ①`status` 看是否「构建中/重扫中」;②确认不在排除目录;③`status` 看权限缺口;④名称为 `.` 开头的隐藏项被过滤:打开 设置 → 索引 →『包含隐藏项』(新装默认关闭) |
 | 索引文件被删/损坏 | 下次 `start` 自动重建,不需手工处理 |
 | 想强制全量重建 | `macEverything stop` 后删除 `index.bin` 再 `start` |
 | 占用空间 | 索引约为主目录条目数 × 55 字节;`stop` 后索引文件仍保留(这是秒开的前提) |
