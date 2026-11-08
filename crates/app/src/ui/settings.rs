@@ -209,6 +209,32 @@ fn volumes_result(outcome: anyhow::Result<client::VolumePrefsOutcome>) -> Volume
     }
 }
 
+/// 隐藏项偏好后台结果（读/写共用）。
+pub(crate) struct HiddenPrefsResult {
+    pub(crate) include: bool,
+    pub(crate) error: Option<String>,
+    /// 是否由 SetHidden 发起（成功时触发视图重查；初始加载不触发）。
+    pub(crate) changed: bool,
+}
+
+fn hidden_result(
+    outcome: anyhow::Result<client::HiddenPrefsOutcome>,
+    changed: bool,
+) -> HiddenPrefsResult {
+    match outcome {
+        Ok(o) => HiddenPrefsResult {
+            include: o.include,
+            error: o.message,
+            changed,
+        },
+        Err(e) => HiddenPrefsResult {
+            include: false,
+            error: Some(format!("{e:#}")),
+            changed,
+        },
+    }
+}
+
 /// `client::exclude` 结果 → UI 结果：仅 ok=true 覆盖列表；失败/离线保留旧列表。
 fn exclude_result(outcome: anyhow::Result<client::ExcludeOutcome>) -> ExcludeResult {
     match outcome {
@@ -416,6 +442,12 @@ pub struct SettingsState {
     pub(crate) volumes_rx: Option<Receiver<VolumePrefsResult>>,
     /// 打开设置时挂起的卷偏好刷新(隐藏期可能被 CLI/其他实例改动)。
     pub(crate) volumes_refresh_pending: bool,
+    /// 隐藏项偏好(daemon 回显)。
+    pub(crate) hidden: settings_view::HiddenData,
+    /// 隐藏项偏好后台结果通道(读/写共用,同一时刻至多一个在途)。
+    pub(crate) hidden_rx: Option<Receiver<HiddenPrefsResult>>,
+    /// 打开设置时挂起的隐藏项偏好刷新。
+    pub(crate) hidden_refresh_pending: bool,
     /// 命令行工具安装器行状态(Task 8;单飞 + generation)。
     pub(crate) cli_install: CliInstallUi,
     /// 安装器后台结果通道(one-op;不跨操作复用)。
@@ -472,6 +504,9 @@ impl SettingsState {
             volumes: settings_view::VolumesData::default(),
             volumes_rx: None,
             volumes_refresh_pending: false,
+            hidden: settings_view::HiddenData::default(),
+            hidden_rx: None,
+            hidden_refresh_pending: false,
             cli_install: CliInstallUi::default(),
             cli_rx: None,
             cli_refresh_pending: false,
@@ -504,6 +539,7 @@ impl SettingsState {
             // 每次真正打开都重取 daemon 列表（隐藏期可能被 CLI 改动）。
             self.exclude_refresh_pending = true;
             self.volumes_refresh_pending = true;
+            self.hidden_refresh_pending = true;
             // 安装器行同步补一次探测(PATH/链接状态在隐藏期可能变化)。
             self.cli_refresh_pending = true;
         }
@@ -646,6 +682,63 @@ impl SettingsState {
         }
         self.volumes.busy = true;
         self.volumes_rx = Some(rx);
+        true
+    }
+
+    /// 设置 pass 的隐藏项推进:非阻塞收结果;返回 (是否应发起加载, 刚应用过写入)。
+    pub(crate) fn advance_hidden(&mut self, open: bool) -> (bool, bool) {
+        let changed = self.tick_hidden();
+        (
+            open && self.hidden_refresh_pending && !self.hidden.busy,
+            changed,
+        )
+    }
+
+    /// 工作线程无法启动：清 busy/通道并落内联错误。
+    pub(crate) fn hidden_spawn_failed(&mut self, detail: String) {
+        log::warn!("隐藏项偏好工作线程启动失败:{detail}");
+        self.hidden.busy = false;
+        self.hidden_rx = None;
+        self.hidden.error = Some(i18n::s().hidden_worker_exited.to_owned());
+    }
+
+    /// 非阻塞收取隐藏项偏好结果；成功覆盖 include 并清错误，失败保留旧值。
+    /// 返回 true = 本次是写入成功（调用方据此触发当前查询重发）。
+    fn tick_hidden(&mut self) -> bool {
+        let Some(rx) = self.hidden_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.hidden.busy = false;
+                if let Some(error) = result.error {
+                    self.hidden.error = Some(error);
+                    false
+                } else {
+                    self.hidden.include = result.include;
+                    self.hidden.loaded = true;
+                    self.hidden.error = None;
+                    result.changed
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.hidden_rx = Some(rx);
+                false
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.hidden.busy = false;
+                self.hidden.error = Some(i18n::s().hidden_worker_exited.to_owned());
+                false
+            }
+        }
+    }
+
+    pub(crate) fn begin_hidden(&mut self, rx: Receiver<HiddenPrefsResult>) -> bool {
+        if self.hidden.busy {
+            return false;
+        }
+        self.hidden.busy = true;
+        self.hidden_rx = Some(rx);
         true
     }
 
@@ -992,6 +1085,7 @@ impl SettingsData {
             update: update.phase().clone(),
             update_error: state.update_error,
             volumes: state.volumes.clone(),
+            hidden: state.hidden.clone(),
             cli_install: settings_view::CliInstallData {
                 // Ready 携带的观测即 last;其余阶段(探测/动作中或失败回退)
                 // 沿用 last,供动作载荷与展示。
@@ -1035,12 +1129,18 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 与 palette/root 同模式——`maybe_apply` 按 CHECK_INTERVAL 节流探测；
     // 应用后本视口立即重绘，并在本 pass 末尾排下一帧（隐藏后不排，守 L4）。
     let focused = ctx.input(|i| i.viewport().focused);
-    let (open, theme_changed, focus_lost, load_exclude, load_volumes, load_cli) = {
+    let (open, theme_changed, focus_lost, load_exclude, load_volumes, load_hidden, load_cli) = {
         let mut s = lock_shared(shared);
         // 排除目录：先收后台结果（非阻塞），再按打开挂起位决定是否补一次 list。
         let open = s.settings.open;
         let load_exclude = s.settings.advance_exclude(open);
         let load_volumes = s.settings.advance_volumes(open);
+        let (load_hidden, hidden_changed) = s.settings.advance_hidden(open);
+        if hidden_changed {
+            let now = Instant::now();
+            s.results.session.on_hidden_change(now);
+            s.palette.session.on_hidden_change(now);
+        }
         let load_cli = s.settings.advance_cli_install(open);
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
         let focus_lost = s.settings.observe_focus(focused, open);
@@ -1050,6 +1150,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             focus_lost,
             load_exclude,
             load_volumes,
+            load_hidden,
             load_cli,
         )
     };
@@ -1075,6 +1176,28 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         };
         if started {
             lock_shared(shared).settings.volumes_refresh_pending = false;
+        }
+        ctx.request_repaint_of(viewport_id());
+    }
+    if load_hidden {
+        let (tx, rx) = mpsc::channel::<HiddenPrefsResult>();
+        let started = {
+            let mut s = lock_shared(shared);
+            if !s.settings.begin_hidden(rx) {
+                false
+            } else {
+                let data_dir = s.settings.data_dir.clone();
+                drop(s);
+                let result = hidden_result(
+                    client::hidden_prefs(&client::DaemonPaths { data_dir }),
+                    false,
+                );
+                let _ = tx.send(result);
+                true
+            }
+        };
+        if started {
+            lock_shared(shared).settings.hidden_refresh_pending = false;
         }
         ctx.request_repaint_of(viewport_id());
     }
@@ -1255,6 +1378,10 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             if save && !platform::panel_assist_trusted() {
                 crate::ui::spawn_panel_trust_watcher(ctx);
             }
+        }
+        SettingsAction::SetHidden(include) => {
+            spawn_hidden_set(ctx, shared, include);
+            ctx.request_repaint_of(viewport_id());
         }
         SettingsAction::SetVolumesAuto(auto) => {
             let excluded = {
@@ -1448,6 +1575,40 @@ fn spawn_volumes(
         lock_shared(shared)
             .settings
             .volumes_spawn_failed(err.to_string());
+        return false;
+    }
+    true
+}
+
+/// 写隐藏项偏好（后台；结果回投后由 tick_hidden 更新回显）。
+fn spawn_hidden_set(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, include: bool) -> bool {
+    let (tx, rx) = mpsc::channel::<HiddenPrefsResult>();
+    let data_dir = {
+        let mut s = lock_shared(shared);
+        if !s.settings.begin_hidden(rx) {
+            log::warn!("隐藏项偏好操作被忽略:已有操作在途");
+            return false;
+        }
+        s.settings.data_dir.clone()
+    };
+    ctx.request_repaint_of(viewport_id());
+    let thread_ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("settings-hidden".to_owned())
+        .spawn(move || {
+            let result = hidden_result(
+                client::set_hidden_prefs(&client::DaemonPaths { data_dir }, include),
+                true,
+            );
+            if let Err(err) = tx.send(result) {
+                log::warn!("隐藏项偏好结果回投失败(设置页可能已退出):{err}");
+            }
+            thread_ctx.request_repaint();
+        });
+    if let Err(err) = spawned {
+        lock_shared(shared)
+            .settings
+            .hidden_spawn_failed(err.to_string());
         return false;
     }
     true
@@ -3601,6 +3762,19 @@ mod tests {
         assert!(!data.check_updates);
         assert_eq!(data.update, crate::update::UpdatePhase::Idle);
         assert_eq!(data.update_error, None);
+    }
+
+    /// 写入结果须标记 changed（触发视图重发）；加载结果不标记。
+    #[test]
+    fn hidden_result_marks_writes_as_changed() {
+        let ok = client::HiddenPrefsOutcome {
+            include: true,
+            message: None,
+        };
+        assert!(hidden_result(Ok(ok), true).changed);
+        let err = hidden_result(Err(anyhow::anyhow!("boom")), true);
+        assert!(err.changed && err.error.is_some(), "失败也要保留写入标记");
+        assert!(!hidden_result(Err(anyhow::anyhow!("boom")), false).changed);
     }
 
     /// 视口 builder：固定尺寸、启动隐藏、无标题/标题栏 + 全尺寸内容视图

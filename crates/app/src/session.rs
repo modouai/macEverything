@@ -91,7 +91,6 @@ impl Session {
     /// 隐藏项开关变化：同串重发（语义同排序变更，但不改排序/方向）。
     /// 窗内有 pending 保持原串、刷新时刻；无 pending 按 last_fired 的串构造；
     /// 两者皆无（空词/从未发起）→ 不动。
-    #[cfg_attr(not(test), expect(dead_code))] // Task 8 设置页开关写入成功后调用两视口会话。
     pub fn on_hidden_change(&mut self, now: Instant) {
         let query = self
             .pending

@@ -53,6 +53,12 @@ catalog! {
     volumes_unmounted: "未挂载" / "Not mounted",
     volumes_loading: "加载中…" / "Loading…",
     volumes_worker_exited: "卷偏好工作线程异常退出" / "Volume preferences worker exited unexpectedly",
+    group_search: "搜索" / "Search",
+    row_include_hidden: "包含隐藏项" / "Include Hidden Items",
+    hidden_desc: "名称以 . 开头的文件和文件夹。关闭后不进入搜索结果。"
+        / "Files and folders whose names start with a dot. Turn off to exclude them from search results.",
+    hidden_loading: "加载中…" / "Loading…",
+    hidden_worker_exited: "隐藏项偏好工作线程异常退出" / "Hidden items preferences worker exited unexpectedly",
     // 命令行工具安装器(v2.5)
     row_cli_tool: "命令行工具" / "Command-Line Tool",
     cli_install_button: "安装到 PATH" / "Install to PATH",
