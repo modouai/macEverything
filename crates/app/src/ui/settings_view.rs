@@ -3153,6 +3153,8 @@ mod tests {
             assert_labels(
                 &index,
                 &[
+                    "Search",
+                    "Include Hidden Items",
                     "Excluded Folders",
                     "External Disks",
                     "Add Folder…",

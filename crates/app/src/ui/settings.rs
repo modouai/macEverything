@@ -211,9 +211,10 @@ fn volumes_result(outcome: anyhow::Result<client::VolumePrefsOutcome>) -> Volume
 
 /// 隐藏项偏好后台结果（读/写共用）。
 pub(crate) struct HiddenPrefsResult {
-    pub(crate) include: bool,
+    /// Some = daemon 已确认的生效值（含落盘失败但内存已生效）；None = 调用本身失败。
+    pub(crate) include: Option<bool>,
     pub(crate) error: Option<String>,
-    /// 是否由 SetHidden 发起（成功时触发视图重查；初始加载不触发）。
+    /// 是否由 SetHidden 发起且 daemon 已确认写入（成功时触发视图重查）。
     pub(crate) changed: bool,
 }
 
@@ -223,14 +224,14 @@ fn hidden_result(
 ) -> HiddenPrefsResult {
     match outcome {
         Ok(o) => HiddenPrefsResult {
-            include: o.include,
+            include: Some(o.include),
             error: o.message,
             changed,
         },
         Err(e) => HiddenPrefsResult {
-            include: false,
+            include: None,
             error: Some(format!("{e:#}")),
-            changed,
+            changed: false,
         },
     }
 }
@@ -711,14 +712,17 @@ impl SettingsState {
         match rx.try_recv() {
             Ok(result) => {
                 self.hidden.busy = false;
-                if let Some(error) = result.error {
-                    self.hidden.error = Some(error);
-                    false
-                } else {
-                    self.hidden.include = result.include;
-                    self.hidden.loaded = true;
-                    self.hidden.error = None;
-                    result.changed
+                match result.include {
+                    Some(include) => {
+                        self.hidden.include = include;
+                        self.hidden.loaded = true;
+                        self.hidden.error = result.error;
+                        result.changed
+                    }
+                    None => {
+                        self.hidden.error = result.error;
+                        false
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {
@@ -3766,17 +3770,101 @@ mod tests {
         assert_eq!(data.update_error, None);
     }
 
-    /// 写入结果须标记 changed（触发视图重发）；加载结果不标记。
+    /// daemon 确认写入（含落盘失败但已生效）都标记 changed；调用失败不标记。
     #[test]
     fn hidden_result_marks_writes_as_changed() {
-        let ok = client::HiddenPrefsOutcome {
-            include: true,
-            message: None,
-        };
-        assert!(hidden_result(Ok(ok), true).changed);
+        let ok = hidden_result(
+            Ok(client::HiddenPrefsOutcome {
+                include: true,
+                message: None,
+            }),
+            true,
+        );
+        assert_eq!(ok.include, Some(true));
+        assert!(ok.changed && ok.error.is_none());
+
+        let unsaved = hidden_result(
+            Ok(client::HiddenPrefsOutcome {
+                include: false,
+                message: Some("disk".into()),
+            }),
+            true,
+        );
+        assert_eq!(unsaved.include, Some(false), "落盘失败但引擎已生效");
+        assert!(unsaved.changed && unsaved.error.is_some());
+
         let err = hidden_result(Err(anyhow::anyhow!("boom")), true);
-        assert!(err.changed && err.error.is_some(), "失败也要保留写入标记");
-        assert!(!hidden_result(Err(anyhow::anyhow!("boom")), false).changed);
+        assert_eq!(err.include, None);
+        assert!(!err.changed && err.error.is_some());
+    }
+
+    /// 写入成功：应用回显、标记 loaded、只触发一次 changed。
+    #[test]
+    fn tick_hidden_applies_write_and_signals_once() {
+        let mut st = test_state();
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: Some(true),
+            error: None,
+            changed: true,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, true));
+        assert!(st.hidden.include && st.hidden.loaded);
+        assert!(st.hidden.error.is_none() && !st.hidden.busy);
+        assert_eq!(st.advance_hidden(false), (false, false), "结果只消费一次");
+    }
+
+    /// 落盘失败但引擎已生效：仍应用新值并触发重查，同时保留内联错误。
+    #[test]
+    fn tick_hidden_applies_unsaved_write_and_keeps_error() {
+        let mut st = test_state();
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: Some(false),
+            error: Some("已临时生效但写入配置失败".into()),
+            changed: true,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, true));
+        assert!(!st.hidden.include && st.hidden.loaded);
+        assert_eq!(st.hidden.error.as_deref(), Some("已临时生效但写入配置失败"));
+    }
+
+    /// 调用失败：保留旧值、不重查、落错误。
+    #[test]
+    fn tick_hidden_transport_error_keeps_old_value() {
+        let mut st = test_state();
+        st.hidden.include = true;
+        st.hidden.loaded = true;
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: None,
+            error: Some("daemon 未在运行".into()),
+            changed: false,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, false));
+        assert!(st.hidden.include, "传输失败不得改开关值");
+        assert_eq!(st.hidden.error.as_deref(), Some("daemon 未在运行"));
+    }
+
+    /// busy 时不发起加载；通道断开清 busy 并落 worker 错误。
+    #[test]
+    fn advance_hidden_respects_busy_and_disconnect() {
+        let mut st = test_state();
+        st.hidden_refresh_pending = true;
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        assert_eq!(st.advance_hidden(true), (false, false), "busy 中不并发加载");
+        drop(tx);
+        let (load, changed) = st.advance_hidden(true);
+        assert!(!changed && !st.hidden.busy);
+        assert!(st.hidden.error.is_some(), "断连须落错误");
+        assert!(load, "断连后下一轮可重试加载");
     }
 
     /// 视口 builder：固定尺寸、启动隐藏、无标题/标题栏 + 全尺寸内容视图
