@@ -149,17 +149,16 @@ Response::HiddenPrefs { include: bool, message: Option<String> },
   - 索引页顶部新增「搜索」分组（单行开关 + 说明），复用 `draw_switch` 与行模型；
     `SettingsAction::SetHidden(bool)`。
 - `settings.rs`：
-  - 打开设置时（`request_open` 挂起位）后台读 `client::hidden_prefs`，模式同 volumes。
-  - `SetHidden`：立即乐观更新 + 后台 `set_hidden_prefs`；失败回滚并落行内错误。
-  - 成功后调用 `results.session.on_hidden_change(now)` 与 `palette.session.on_hidden_change(now)`，
-    并请求全局重绘。
+  - 打开设置时（`request_open` 挂起位）读 `client::hidden_prefs`，模式同 volumes（设置 pass 内调用、锁外执行）。
+  - `SetHidden`：后台 `client::set_hidden_prefs`；以 daemon 回显更新开关（落盘失败但内存已生效时同样应用新值并保留行内错误）；传输失败保留旧值、只落错误。
+  - 成功写入后对 `results.session` 与 `palette.session` 调用 `on_hidden_change`，并 `request_repaint_of(ROOT/palette)` 唤醒两视口；初始读取不触发重查。
   - **旧引擎**：不新增重启逻辑。`engine_launcher::ensure_engine` 已在 App 启动（及存活监控
     拉起）时比对 `Status.daemon_version` 与 App 版本，不一致即 stop → 拉起随包 CLI，
     升级后设置页打开前引擎已换新。本特性只保留既有错误展示：`hidden_prefs` 失败时
     行内报错（含「请重启引擎」兜底文案），开关保持上次回显值。
 - `session.rs`：新增 `on_hidden_change(now)`，语义同 `on_sort_change` 但不改排序：
   有 pending 刷新时刻；否则用 `last_fired` 的串构造 pending；空会话不动。
-- i18n（`catalog.rs`）：`row_include_hidden`、`hidden_desc`、`hidden_engine_outdated`
+- i18n（`catalog.rs`）：`row_include_hidden`、`hidden_desc`
   等中英条目。
 - `client::query` 调用点（`palette.rs` 两条、`main.rs`）补 `None`。
 
