@@ -138,20 +138,88 @@ macEverything stop
 | `case:` | 本轮区分大小写 | `case:README` |
 | `whole:` | 本轮整词匹配 | `whole:init` |
 
-大小写折叠覆盖整个 Unicode,NFC/NFD 两种归一形态互搜。`.app` 应用包整体置顶(嵌套在其它 bundle 内的 `.app` 除外);组内排序:文件名前缀命中 > 词边界命中 > 子串命中,同级名更短优先。完整规则见[使用指南](docs/usage.md)。
+<details>
+<summary><b>完整语法规则与排序</b></summary>
+
+- 默认大小写不敏感覆盖整个 Unicode(`café` 能搜到 `CAFÉ`),NFC/NFD 两种归一形态互搜。
+- `path:` 只作用于紧跟其后的一个词;其余词仍匹配文件名。
+- 语法前缀须小写;`*`/`?` 在词中就是通配符(没有转义)。
+- 整词边界:`_` 与字母数字同属词字符——`whole:init` 命中 `init.rs`,不命中 `__init__.py`。
+- 排序:`.app` 应用包整体置顶(嵌套在其它 bundle 内的 `.app` 除外);组内按文件名前缀命中 > 词边界命中 > 子串命中,同级名更短优先;列头排序不受影响。
+- 组合示例:`path:项目 *.md`、`path:Documents 发票 2026`。
+- 暂不支持:正则、`size:` 与日期过滤(v2 候选)。
+
+完整规则见[使用指南](docs/usage.md)。
+
+</details>
 
 ## 工作原理
 
 FSEvents 事件只是提示:daemon 收到后重读该目录、与索引 diff,始终以磁盘为准。FSEvents 的 coarse semantics(dropped events、coalescing、one-sided renames)因此不会使索引偏离磁盘。
 
 ```
-crates/engine/    纯逻辑库:扁平 Entry 索引 · Finder 预编译匹配 · 并行扫描 ·
-                  mmap 落盘 · FSEvents 直调与停机重放 · 目录级 diff 增量
-crates/cli/       daemon(引擎宿主)+ 五子命令客户端(含离线降级)
-crates/protocol/  cli 与 app 共用的协议契约
-crates/client/    cli 与 app 共用的客户端承载层
-crates/app/       GUI(eframe/egui):悬浮条 · 完整结果窗口 · 托盘 · 全局热键 ·
-                  开机自启 · 检查更新 · 目录助手
+┌────────────────────────────────────────────┐
+│ app · eframe/egui                          │
+│ floating bar · results window · tray       │
+│ hotkeys · autostart · update check         │
+└──────────────────┬─────────────────────────┘
+                   │ Unix socket · length-prefixed JSON
+                   │ crates/protocol + crates/client
+┌──────────────────▼─────────────────────────┐
+│ cli · macEverything start (daemon)         │
+│ ┌────────────────────────────────────────┐ │
+│ │ engine · pure logic library            │ │
+│ │ scan → index → query                   │ │
+│ │ FSEvents → diff → index                │ │
+│ │ mmap persistence (layout mirror)       │ │
+│ └────────────────────────────────────────┘ │
+└────────────────────────────────────────────┘
+```
+
+| crate | 职责 |
+|---|---|
+| `engine` | 全部业务逻辑:扫描、索引、查询、mmap 落盘、FSEvents 与目录 diff |
+| `protocol` | 协议契约:消息、编解码、校验、版本 |
+| `client` | 连接、按需 `stat`、离线降级、状态常量 |
+| `cli` | daemon 宿主 + `start/stop/query/status/exclude`(支持 `--json`) |
+| `app` | GUI:悬浮条、结果窗口、托盘、热键、开机自启、检查更新、目录助手 |
+
+## 开发者
+
+### 核心引擎
+
+| 模块 | 设计 |
+|---|---|
+| 索引布局 | 扁平 `Entry` 数组(24 B/条)+ 双名称池 + 目录路径池;删除用墓碑位 |
+| 查询 | 语法编译为锚定子串序列,每个 needle 预编译为 `memchr` Finder——123 万条目 P99 3.6 ms |
+| 扫描 | work-sharing 并行遍历;首扫、增量、补链共用同一排除判定 |
+| 落盘 | 磁盘文件与内存布局同构,加载即 `mmap` + 转型,零反序列化;tmp + rename 原子替换 |
+| FSEvents | 事件只当提示:重读目录、与索引 diff,始终以磁盘为准 |
+| 停机追平 | 落盘记录 `last_event_id`,重启重放停机窗口事件(秒级);保守兜底全量重扫 |
+
+### 测试
+
+三层;单元与对拍由 `cargo test --workspace` 运行,实机层标注 `#[ignore]`:
+
+| 层 | 位置 | 验证内容 |
+|---|---|---|
+| 单元 | 各模块 `#[cfg(test)]` | 解析、匹配、索引操作、落盘、diff 逻辑;`tempfile` 受控目录树 |
+| 对拍 | `crates/engine/tests/parity.rs` | 索引条目集 vs 独立递归枚举——零差异;串行与并行路径一致 |
+| 实机 | `crates/engine/tests/fsevents_live.rs` | 真实 FSEvents 建流、收事件与停机重放;`#[ignore]`,实机手动运行 |
+
+新增测试须做突变验证(临时改坏实现,确认测试变红)防止「恒绿假钉」,见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+### 仓库结构
+
+```
+crates/
+├── engine/    扫描 · 索引 · 查询 · mmap 落盘 · FSEvents + diff
+├── protocol/  协议契约(消息、编解码、校验、版本)
+├── client/    连接 · 按需 stat · 离线降级
+├── cli/       daemon + start/stop/query/status/exclude(支持 --json)
+└── app/       eframe/egui 界面 · 托盘 · 热键 · 开机自启 · 检查更新
+docs/          架构 · 使用 · 开发 · 规格
+scripts/       打包 · 发布 · 基准 · 对拍 · 内存观测
 ```
 
 ## 已知限制

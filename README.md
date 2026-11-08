@@ -140,20 +140,88 @@ When the engine is offline, `query` falls back to reading the on-disk index dire
 | `case:` | case-sensitive for this query | `case:README` |
 | `whole:` | whole-word match for this query | `whole:init` |
 
-Case folding covers all of Unicode, NFC and NFD spellings match each other. `.app` bundles are pinned to the top (except `.app`s nested inside another bundle); otherwise ranking prefers filename prefix hits, then word-boundary hits, then substrings, with shorter names winning ties. The [usage guide](docs/usage.md) has the full rules (Chinese).
+<details>
+<summary><b>Full syntax rules and ranking</b></summary>
+
+- Case folding covers the whole of Unicode: `café` finds `CAFÉ`, and NFC/NFD spellings match each other.
+- `path:` applies to the single word that follows it; the remaining words still match the filename.
+- Prefixes must be lowercase; `*` and `?` are always wildcards (there is no escaping).
+- Whole-word boundaries: `_` counts as a word character — `whole:init` matches `init.rs` but not `__init__.py`.
+- Ranking: `.app` bundles are pinned to the top (except `.app`s nested inside another bundle); within a group, filename prefix > word-boundary > substring, shorter names winning ties. Sorting by column headers is unaffected.
+- Combination examples: `path:项目 *.md`, `path:Documents 发票 2026`.
+- Not supported yet: regex, `size:` and date filters (on the v2 candidate list).
+
+Full rules: [usage guide](docs/usage.md) (Chinese).
+
+</details>
 
 ## How it works
 
 An FSEvents event is only a hint that something changed. The daemon re-reads that directory and diffs it against the index, so the disk is always authoritative. FSEvents' coarse semantics (dropped events, coalescing, one-sided renames) therefore cannot make the index diverge from disk.
 
 ```
-crates/engine/    pure-logic library: flat Entry index · precompiled query matchers ·
-                  parallel scan · mmap persistence · FSEvents + downtime replay · incremental diff
-crates/cli/       daemon (engine host) + 5-subcommand client with offline fallback
-crates/protocol/  wire contract shared by cli and app
-crates/client/    client transport layer shared by cli and app
-crates/app/       GUI (eframe/egui): floating bar · results window · tray · global hotkeys ·
-                  autostart · update check · directory assist
+┌────────────────────────────────────────────┐
+│ app · eframe/egui                          │
+│ floating bar · results window · tray       │
+│ hotkeys · autostart · update check         │
+└──────────────────┬─────────────────────────┘
+                   │ Unix socket · length-prefixed JSON
+                   │ crates/protocol + crates/client
+┌──────────────────▼─────────────────────────┐
+│ cli · macEverything start (daemon)         │
+│ ┌────────────────────────────────────────┐ │
+│ │ engine · pure logic library            │ │
+│ │ scan → index → query                   │ │
+│ │ FSEvents → diff → index                │ │
+│ │ mmap persistence (layout mirror)       │ │
+│ └────────────────────────────────────────┘ │
+└────────────────────────────────────────────┘
+```
+
+| Crate | Responsibility |
+|---|---|
+| `engine` | All business logic: scan, index, query, mmap persistence, FSEvents + diff |
+| `protocol` | Wire contract: messages, codec, validation, version |
+| `client` | Connection, on-demand `stat`, offline fallback, status constants |
+| `cli` | Daemon host + `start/stop/query/status/exclude` with `--json` |
+| `app` | GUI: floating bar, results window, tray, hotkeys, autostart, update check, Directory Assist |
+
+## For developers
+
+### Core engine
+
+| Area | Design |
+|---|---|
+| Index layout | Flat `Entry` array (24 B per entry) + two name pools + a directory path pool; deletes are tombstones |
+| Query | Each query compiles to anchored substring sequences; every needle becomes a precompiled `memchr` Finder — P99 3.6 ms over 1.2 M entries |
+| Scan | Work-sharing parallel traversal; the same exclusion predicate is used by first scan, incremental updates and link repair |
+| Persistence | The file mirrors the in-memory layout; loading is `mmap` + cast, no deserialization; atomic tmp + rename |
+| FSEvents | Events are hints only — re-read the directory, diff against the index, the disk wins |
+| Downtime | `last_event_id` is persisted; restart replays events since then (seconds), with a conservative full-rescan fallback |
+
+### Testing
+
+Three layers; unit and parity run under `cargo test --workspace`, the live layer is `#[ignore]`:
+
+| Layer | Where | What it proves |
+|---|---|---|
+| Unit | `#[cfg(test)]` per module | Parsing, matching, index ops, persistence and diff logic; controlled `tempfile` trees |
+| Parity | `crates/engine/tests/parity.rs` | Index entry set vs an independent recursive enumeration — zero diff; serial and parallel paths agree |
+| Live | `crates/engine/tests/fsevents_live.rs` | Real FSEvents streams and downtime replay; `#[ignore]`, run manually on a Mac |
+
+New tests are mutation-checked: break the implementation on purpose and confirm the test fails. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Repository layout
+
+```
+crates/
+├── engine/    scan · index · query · mmap persistence · FSEvents + diff
+├── protocol/  wire contract (messages, codec, validation, version)
+├── client/    connection · on-demand stat · offline fallback
+├── cli/       daemon + start/stop/query/status/exclude (+ --json)
+└── app/       eframe/egui UI · tray · hotkeys · autostart · update check
+docs/          architecture · usage · development · specs
+scripts/       bundle · release · bench · parity-check · memory watch
 ```
 
 ## Known limitations
