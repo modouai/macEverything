@@ -670,6 +670,32 @@ impl IndexView for CompositeView<'_> {
             Some(&b) => !self.base.entry(b).is_live(),
         }
     }
+
+    /// 隐藏判定跨 anchor：overlay 条目沿 overlay 父链上溯，到桥接 anchor 后经
+    /// `anchor_base` 切回 base 父链；缺此覆写时 `.config/foo` 下增量新增的文件
+    /// 会在 anchor(foo) 处截断，误判为可见。
+    fn is_hidden(&self, idx: u32) -> bool {
+        if idx < self.base_count {
+            return self.base.is_hidden(idx);
+        }
+        let mut cur = idx - self.base_count;
+        loop {
+            if self.overlay.index.display_name_of(cur).first() == Some(&b'.') {
+                return true;
+            }
+            let e = &self.overlay.index.entries[cur as usize];
+            if e.parent == NO_PARENT {
+                // 写侧不变量:活 anchor 必在 anchor_base 登记;缺失即账本腐化,
+                // 防御性返回 false 而非 panic。
+                let Some(&b) = self.overlay.anchor_base.get(&cur) else {
+                    return false;
+                };
+                let p = self.base.entry(b).parent;
+                return p != NO_PARENT && self.base.is_hidden(p);
+            }
+            cur = e.parent;
+        }
+    }
 }
 
 impl CompositeView<'_> {
@@ -2330,5 +2356,40 @@ mod tests {
         assert!(!ov.is_empty());
         ov.purge_prefix(&base, &root.join("a.txt"));
         assert_eq!(ov.epoch(), 2, "purge_prefix 推进世代");
+    }
+
+    /// 隐藏判定必须穿过桥接 anchor：`.config/foo` 下增量新增的文件，
+    /// overlay 父链在 anchor(foo) 处 NO_PARENT，需经 anchor_base 切回 base
+    /// 父链才能看到祖先 `.config`。突变「删除 CompositeView::is_hidden 覆写」
+    /// → 此测必红。
+    #[test]
+    fn composite_view_hidden_walks_through_anchor_to_base() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let foo = root.join(".config/foo");
+        std::fs::create_dir_all(&foo).unwrap();
+        let base = scan(root);
+        let foo_id = id_of(&base, &foo);
+
+        std::fs::write(foo.join("new.txt"), "").unwrap();
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(foo_id), &foo, &[])
+            .unwrap();
+        let view = ov.composite_view(&base);
+        let out = query::execute(&view, &query::parse("new.txt").unwrap(), 10);
+        assert_eq!(out.total, 1, "增量新增文件应可见（本测只钉隐藏判定）");
+        assert!(
+            view.is_hidden(out.hits[0]),
+            "overlay 条目应经 anchor 链判为隐藏"
+        );
+
+        // 端到端:execute 候选层过滤同样经 CompositeView::is_hidden 生效。
+        let mut plan = query::parse("new.txt").unwrap();
+        plan.include_hidden = false;
+        assert_eq!(
+            query::execute(&view, &plan, 10).total,
+            0,
+            "CompositeView 经 execute 也必须过滤隐藏祖先"
+        );
     }
 }

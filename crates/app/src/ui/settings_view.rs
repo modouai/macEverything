@@ -88,6 +88,8 @@ pub(crate) struct SettingsData {
     pub(crate) update_error: Option<UpdateError>,
     /// 外接磁盘卷偏好(external-volumes):daemon 回显 + App 侧挂载枚举。
     pub(crate) volumes: VolumesData,
+    /// 隐藏项偏好（daemon 回显；设置页开关）。
+    pub(crate) hidden: HiddenData,
     /// 命令行工具安装器行(v2.5):最近观测 + busy + 内联错误。
     pub(crate) cli_install: CliInstallData,
 }
@@ -106,6 +108,19 @@ pub(crate) struct VolumesData {
     /// 后台读/写进行中。
     pub(crate) busy: bool,
     /// 加载/写入失败文案(daemon message 或本地错误)。
+    pub(crate) error: Option<String>,
+}
+
+/// 隐藏项偏好视图数据（整块 Default，测试字面量与状态拷贝共用）。
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct HiddenData {
+    /// daemon 偏好已回显（首次成功 HiddenPrefs 前 false，开关按缺省渲染）。
+    pub(crate) loaded: bool,
+    /// 搜索结果是否包含隐藏项。
+    pub(crate) include: bool,
+    /// 后台读/写进行中。
+    pub(crate) busy: bool,
+    /// 加载/写入失败文案。
     pub(crate) error: Option<String>,
 }
 
@@ -162,6 +177,8 @@ pub(crate) enum SettingsAction {
     DismissPanelAssistEnable,
     /// 实验功能确认模态「启用」:落盘并启动授权/检测流程。
     ConfirmPanelAssistEnable,
+    /// 切换「包含隐藏项」。
+    SetHidden(bool),
     /// 切换「自动索引外接磁盘」主开关。
     SetVolumesAuto(bool),
     /// 切换单卷索引开关(卷名;开 = 移出排除集[主开关随之开],关 = 加入排除集)。
@@ -403,6 +420,8 @@ enum RowKind<'a> {
     AutoCheck,
     /// 保存面板目录助手行(开关 + 常驻说明;未授权时行尾带授权链接)。
     PanelAssist,
+    /// 「包含隐藏项」开关行。
+    IncludeHidden,
     /// 卷主开关行(自动索引外接磁盘)。
     VolumesAuto,
     /// 单卷行:on = 已纳入索引;mounted = 卷当前挂载中(未挂载的排除卷也列出)。
@@ -571,7 +590,7 @@ fn draw_shortcuts_page(
     );
 }
 
-/// 索引页：排除目录 + 外接磁盘两个子分组。
+/// 索引页：搜索开关 + 排除目录 + 外接磁盘三个子分组。
 fn draw_index_page(
     ui: &mut egui::Ui,
     full_w: f32,
@@ -580,6 +599,8 @@ fn draw_index_page(
     extra_h: f32,
     actions: &mut Vec<SettingsAction>,
 ) {
+    draw_search_group(ui, full_w, data, palette, extra_h, actions);
+    ui.add_space(GROUP_GAP);
     draw_volumes_group(ui, full_w, data, palette, extra_h, actions);
     ui.add_space(GROUP_GAP);
     draw_index_group(ui, full_w, data, palette, extra_h, actions);
@@ -793,6 +814,37 @@ fn draw_index_group(
         );
     }
     draw_card(ui, full_w, None, &rows, data, palette, actions);
+}
+
+/// 搜索组：单行「包含隐藏项」开关 + 常驻说明。
+fn draw_search_group(
+    ui: &mut egui::Ui,
+    full_w: f32,
+    data: &SettingsData,
+    palette: &SettingsPalette,
+    extra_h: f32,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let loading = data.hidden.busy && !data.hidden.loaded;
+    let error = data.hidden.error.as_deref();
+    let extra = extra_h + extra_for(error.is_some(), extra_h) + extra_for(loading, extra_h);
+    let rows = [GroupRow {
+        kind: RowKind::IncludeHidden,
+        spec: RowSpec::new(ROW_H).with_extra(extra),
+        error,
+        note: loading.then_some(i18n::s().hidden_loading),
+        note2: Some(i18n::s().hidden_desc),
+        hint: None,
+    }];
+    draw_card(
+        ui,
+        full_w,
+        Some(i18n::s().group_search),
+        &rows,
+        data,
+        palette,
+        actions,
+    );
 }
 
 /// 外接磁盘组(external-volumes):主开关行 + 挂载卷行(开关)+ 未挂载排除卷行 +
@@ -1490,6 +1542,24 @@ fn draw_row_body(
                 palette,
             ) {
                 actions.push(SettingsAction::SetAutoCheck(!data.check_updates));
+            }
+        }
+        RowKind::IncludeHidden => {
+            let control = draw_row_label(
+                ui,
+                body,
+                i18n::s().row_include_hidden,
+                egui::vec2(SWITCH_SIZE.0, SWITCH_SIZE.1),
+                palette,
+            );
+            if draw_switch(
+                ui,
+                control,
+                data.hidden.include,
+                "settings-include-hidden",
+                palette,
+            ) {
+                actions.push(SettingsAction::SetHidden(!data.hidden.include));
             }
         }
         RowKind::VolumesAuto => {
@@ -2464,6 +2534,7 @@ mod tests {
             update: crate::update::UpdatePhase::Idle,
             update_error: None,
             volumes: VolumesData::default(),
+            hidden: HiddenData::default(),
             cli_install: CliInstallData::default(),
         }
     }
@@ -3082,6 +3153,8 @@ mod tests {
             assert_labels(
                 &index,
                 &[
+                    "Search",
+                    "Include Hidden Items",
                     "Excluded Folders",
                     "External Disks",
                     "Add Folder…",
@@ -3907,6 +3980,35 @@ mod tests {
             assert_eq!(
                 output.actions,
                 vec![SettingsAction::SetPanelAssist(expected)],
+                "当前 {current} 应请求 {expected}"
+            );
+        }
+    }
+
+    /// 「包含隐藏项」开关中心（右对齐，几何公式同自启/自动检查/助手开关）。
+    fn include_hidden_switch_center(out: &egui::FullOutput) -> egui::Pos2 {
+        let label = text_center(find_text(&all_texts(out), i18n::s().row_include_hidden));
+        egui::pos2(
+            SETTINGS_W - CONTENT_PAD.1 - ROW_PAD_X - SWITCH_SIZE.0 / 2.0,
+            label.y,
+        )
+    }
+
+    /// 点击「包含隐藏项」→ 回传目标态（开→关、关→开两个方向）。
+    #[test]
+    fn include_hidden_click_emits_toggle_action() {
+        for (current, expected) in [(true, false), (false, true)] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut data = with_tab(layout_test_data(), SettingsTab::Index);
+            data.hidden.include = current;
+            data.hidden.loaded = true;
+            let (out, _) = run_frame_sized(&ctx, &data, Vec::new(), TALL_TEST_H);
+            let output =
+                click_at_sized(&ctx, &data, include_hidden_switch_center(&out), TALL_TEST_H);
+            assert_eq!(
+                output.actions,
+                vec![SettingsAction::SetHidden(expected)],
                 "当前 {current} 应请求 {expected}"
             );
         }

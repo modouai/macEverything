@@ -1519,7 +1519,7 @@ pub(crate) fn spawn_query_worker(
     let sort = sort_str(fire.sort);
     let desc = fire.desc;
     std::thread::spawn(move || {
-        let payload = match client::query(&paths, &fire.query, limit, sort, desc, false) {
+        let payload = match client::query(&paths, &fire.query, limit, sort, desc, false, None) {
             Ok(out) => Payload::Hits {
                 entries: out.entries,
                 total: out.total,
@@ -1569,7 +1569,7 @@ pub(crate) fn spawn_entry_query_worker(
     dir_only: bool,
 ) {
     std::thread::spawn(move || {
-        let entries = match client::query(&paths, &fire.query, limit, None, false, dir_only) {
+        let entries = match client::query(&paths, &fire.query, limit, None, false, dir_only, None) {
             Ok(out) => out.entries,
             Err(err) => {
                 // 浮层不展示错误态:daemon 离线由接线层守门;查询级失败按空结果处理。

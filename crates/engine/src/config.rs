@@ -24,6 +24,17 @@ pub struct Config {
     /// 不自动索引的卷目录名列表(如 ["BackupU"];按 /Volumes/<名> 的名键控)。
     #[serde(default)]
     pub volumes_excluded: Vec<String>,
+    /// 搜索结果是否包含隐藏项（名称以 `.` 开头）。
+    /// None = 旧配置缺字段，等待 [`load_migrating`] 迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_hidden: Option<bool>,
+}
+
+impl Config {
+    /// 生效值；未迁移的纯内存路径将 None 视为不包含。
+    pub fn include_hidden_effective(&self) -> bool {
+        self.include_hidden.unwrap_or(false)
+    }
 }
 
 fn default_true() -> bool {
@@ -47,22 +58,73 @@ pub fn default_config() -> Config {
         ],
         auto_index_volumes: true,
         volumes_excluded: vec![],
+        include_hidden: None,
+    }
+}
+
+/// [`load_detailed`] 的结果:区分「可解析」「缺文件」「失败」,供迁移入口
+/// 判断写回是否安全(失败时不得用默认值覆盖用户文件)。
+enum Loaded {
+    Ok(Config),
+    Missing,
+    Failed,
+}
+
+/// 详细读取:解析/读取失败只告警并归为 [`Loaded::Failed`],不改动用户文件。
+fn load_detailed(path: &Path) -> Loaded {
+    match std::fs::read_to_string(path) {
+        Ok(s) => match toml::from_str(&s) {
+            Ok(c) => Loaded::Ok(c),
+            Err(e) => {
+                log::warn!("{} 解析失败,用默认配置: {e}", path.display());
+                Loaded::Failed
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded::Missing,
+        Err(e) => {
+            log::warn!("{} 读取失败,用默认配置: {e}", path.display());
+            Loaded::Failed
+        }
     }
 }
 
 /// 读配置。缺文件 → 默认;解析失败 → 告警后用默认,不崩溃、不动用户文件(留痕不静默)。
 pub fn load(path: &Path) -> Config {
-    match std::fs::read_to_string(path) {
-        Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("{} 解析失败,用默认配置: {e}", path.display());
-            default_config()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_config(),
-        Err(e) => {
-            log::warn!("{} 读取失败,用默认配置: {e}", path.display());
-            default_config()
+    match load_detailed(path) {
+        Loaded::Ok(c) => c,
+        Loaded::Missing | Loaded::Failed => default_config(),
+    }
+}
+
+/// 读配置并完成旧配置迁移。
+/// `index_present` = 数据目录已有落盘索引（升级信号）：
+/// 字段缺失时写入 `Some(index_present)` 并原子落盘；写失败只告警，内存仍按迁移值。
+///
+/// 仅对「可解析」与「缺文件」迁移；解析/读取失败时不动磁盘，只在内存里按
+/// `index_present` 给出生效值（升级用户保持旧行为：包含隐藏项），
+/// 避免用默认值覆盖用户的损坏/不可读文件（与 [`load`] 的「不动用户文件」契约一致）。
+/// 迁移无跨进程锁：多进程并发写回为 last-writer-wins。
+pub fn load_migrating(path: &Path, index_present: bool) -> Config {
+    let mut cfg = match load_detailed(path) {
+        Loaded::Ok(c) => c,
+        Loaded::Missing => default_config(),
+        Loaded::Failed => {
+            // 损坏/不可读：文件保持原样，内存按升级信号决定是否包含隐藏项。
+            let mut cfg = default_config();
+            cfg.include_hidden = Some(index_present);
+            return cfg;
+        }
+    };
+    if cfg.include_hidden.is_none() {
+        cfg.include_hidden = Some(index_present);
+        if let Err(e) = save(&cfg, path) {
+            log::warn!(
+                "{} 隐藏项偏好迁移写盘失败（内存仍生效）: {e}",
+                path.display()
+            );
         }
     }
+    cfg
 }
 
 /// 原子保存:先建父目录,写 `<目标>.tmp` 后 rename 替换,不留半写文件
@@ -164,5 +226,101 @@ mod tests {
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// 旧配置（缺字段）+ 已有落盘索引 = 升级用户：迁移为包含并写回。
+    #[test]
+    fn load_migrating_legacy_config_with_index_includes_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "excluded = [\"node_modules\"]\n").unwrap();
+        let c = load_migrating(&p, true);
+        assert_eq!(c.include_hidden, Some(true));
+        assert_eq!(c.excluded, vec!["node_modules"], "迁移须保留其它设置");
+        assert_eq!(load(&p).include_hidden, Some(true), "迁移结果须写回");
+    }
+
+    /// 旧配置 + 无落盘索引 = 新装：迁移为不包含并写回。
+    #[test]
+    fn load_migrating_fresh_install_excludes_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let c = load_migrating(&p, false);
+        assert_eq!(c.include_hidden, Some(false));
+        assert_eq!(load(&p).include_hidden, Some(false));
+    }
+
+    /// 显式值不被迁移覆盖（用户已关掉→升级后仍关）。
+    #[test]
+    fn load_migrating_keeps_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "include_hidden = false\n").unwrap();
+        assert_eq!(load_migrating(&p, true).include_hidden, Some(false));
+        assert_eq!(load(&p).include_hidden, Some(false));
+    }
+
+    /// 纯读入口不产生副作用：缺文件时不创建配置。
+    #[test]
+    fn load_does_not_write_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let c = load(&p);
+        assert_eq!(c.include_hidden, None);
+        assert!(!p.exists(), "load 不得写盘");
+    }
+
+    /// 损坏配置不得被迁移覆盖：迁移只针对可解析/缺文件，失败时原样保留用户文件；
+    /// 内存仍按升级信号给出生效值（升级用户保持旧行为：包含隐藏项）。
+    #[test]
+    fn load_migrating_does_not_overwrite_corrupt_config() {
+        let corrupt = "excluded = [";
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, corrupt).unwrap();
+        let c = load_migrating(&p, true);
+        assert_eq!(c.include_hidden, Some(true), "升级用户内存值保持旧行为");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            corrupt,
+            "不得覆盖损坏配置"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let p2 = dir2.path().join("config.toml");
+        std::fs::write(&p2, corrupt).unwrap();
+        let c2 = load_migrating(&p2, false);
+        assert_eq!(c2.include_hidden, Some(false), "新装用户内存值不包含");
+        assert_eq!(
+            std::fs::read_to_string(&p2).unwrap(),
+            corrupt,
+            "不得覆盖损坏配置"
+        );
+    }
+
+    /// 写盘失败不应中断迁移：内存仍按迁移值生效，只告警。
+    #[cfg(unix)]
+    #[test]
+    fn load_migrating_survives_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        // 目录只读 → save 的 tmp 创建失败。
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        // 探测：若进程/文件系统忽略目录权限（如 root），本测试无意义，提前恢复并返回。
+        let probe = dir.path().join("probe");
+        let writable = std::fs::write(&probe, "x").is_ok();
+        if writable {
+            std::fs::remove_file(&probe).ok();
+        }
+        if writable {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let c = load_migrating(&p, true);
+        // 恢复目录权限，保证 tempdir 可清理。
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(c.include_hidden, Some(true));
     }
 }

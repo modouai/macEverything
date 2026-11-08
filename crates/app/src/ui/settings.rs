@@ -209,6 +209,33 @@ fn volumes_result(outcome: anyhow::Result<client::VolumePrefsOutcome>) -> Volume
     }
 }
 
+/// 隐藏项偏好后台结果（读/写共用）。
+pub(crate) struct HiddenPrefsResult {
+    /// Some = daemon 已确认的生效值（含落盘失败但内存已生效）；None = 调用本身失败。
+    pub(crate) include: Option<bool>,
+    pub(crate) error: Option<String>,
+    /// 是否由 SetHidden 发起且 daemon 已确认写入（成功时触发视图重查）。
+    pub(crate) changed: bool,
+}
+
+fn hidden_result(
+    outcome: anyhow::Result<client::HiddenPrefsOutcome>,
+    changed: bool,
+) -> HiddenPrefsResult {
+    match outcome {
+        Ok(o) => HiddenPrefsResult {
+            include: Some(o.include),
+            error: o.message,
+            changed,
+        },
+        Err(e) => HiddenPrefsResult {
+            include: None,
+            error: Some(format!("{e:#}")),
+            changed: false,
+        },
+    }
+}
+
 /// `client::exclude` 结果 → UI 结果：仅 ok=true 覆盖列表；失败/离线保留旧列表。
 fn exclude_result(outcome: anyhow::Result<client::ExcludeOutcome>) -> ExcludeResult {
     match outcome {
@@ -416,6 +443,12 @@ pub struct SettingsState {
     pub(crate) volumes_rx: Option<Receiver<VolumePrefsResult>>,
     /// 打开设置时挂起的卷偏好刷新(隐藏期可能被 CLI/其他实例改动)。
     pub(crate) volumes_refresh_pending: bool,
+    /// 隐藏项偏好(daemon 回显)。
+    pub(crate) hidden: settings_view::HiddenData,
+    /// 隐藏项偏好后台结果通道(读/写共用,同一时刻至多一个在途)。
+    pub(crate) hidden_rx: Option<Receiver<HiddenPrefsResult>>,
+    /// 打开设置时挂起的隐藏项偏好刷新。
+    pub(crate) hidden_refresh_pending: bool,
     /// 命令行工具安装器行状态(Task 8;单飞 + generation)。
     pub(crate) cli_install: CliInstallUi,
     /// 安装器后台结果通道(one-op;不跨操作复用)。
@@ -472,6 +505,9 @@ impl SettingsState {
             volumes: settings_view::VolumesData::default(),
             volumes_rx: None,
             volumes_refresh_pending: false,
+            hidden: settings_view::HiddenData::default(),
+            hidden_rx: None,
+            hidden_refresh_pending: false,
             cli_install: CliInstallUi::default(),
             cli_rx: None,
             cli_refresh_pending: false,
@@ -504,6 +540,7 @@ impl SettingsState {
             // 每次真正打开都重取 daemon 列表（隐藏期可能被 CLI 改动）。
             self.exclude_refresh_pending = true;
             self.volumes_refresh_pending = true;
+            self.hidden_refresh_pending = true;
             // 安装器行同步补一次探测(PATH/链接状态在隐藏期可能变化)。
             self.cli_refresh_pending = true;
         }
@@ -646,6 +683,66 @@ impl SettingsState {
         }
         self.volumes.busy = true;
         self.volumes_rx = Some(rx);
+        true
+    }
+
+    /// 设置 pass 的隐藏项推进:非阻塞收结果;返回 (是否应发起加载, 刚应用过写入)。
+    pub(crate) fn advance_hidden(&mut self, open: bool) -> (bool, bool) {
+        let changed = self.tick_hidden();
+        (
+            open && self.hidden_refresh_pending && !self.hidden.busy,
+            changed,
+        )
+    }
+
+    /// 工作线程无法启动：清 busy/通道并落内联错误。
+    pub(crate) fn hidden_spawn_failed(&mut self, detail: String) {
+        log::warn!("隐藏项偏好工作线程启动失败:{detail}");
+        self.hidden.busy = false;
+        self.hidden_rx = None;
+        self.hidden.error = Some(i18n::s().hidden_worker_exited.to_owned());
+    }
+
+    /// 非阻塞收取隐藏项偏好结果；成功覆盖 include 并清错误，失败保留旧值。
+    /// 返回 true = 本次是写入成功（调用方据此触发当前查询重发）。
+    fn tick_hidden(&mut self) -> bool {
+        let Some(rx) = self.hidden_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.hidden.busy = false;
+                match result.include {
+                    Some(include) => {
+                        self.hidden.include = include;
+                        self.hidden.loaded = true;
+                        self.hidden.error = result.error;
+                        result.changed
+                    }
+                    None => {
+                        self.hidden.error = result.error;
+                        false
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.hidden_rx = Some(rx);
+                false
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.hidden.busy = false;
+                self.hidden.error = Some(i18n::s().hidden_worker_exited.to_owned());
+                false
+            }
+        }
+    }
+
+    pub(crate) fn begin_hidden(&mut self, rx: Receiver<HiddenPrefsResult>) -> bool {
+        if self.hidden.busy {
+            return false;
+        }
+        self.hidden.busy = true;
+        self.hidden_rx = Some(rx);
         true
     }
 
@@ -992,6 +1089,7 @@ impl SettingsData {
             update: update.phase().clone(),
             update_error: state.update_error,
             volumes: state.volumes.clone(),
+            hidden: state.hidden.clone(),
             cli_install: settings_view::CliInstallData {
                 // Ready 携带的观测即 last;其余阶段(探测/动作中或失败回退)
                 // 沿用 last,供动作载荷与展示。
@@ -1035,12 +1133,20 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // 与 palette/root 同模式——`maybe_apply` 按 CHECK_INTERVAL 节流探测；
     // 应用后本视口立即重绘，并在本 pass 末尾排下一帧（隐藏后不排，守 L4）。
     let focused = ctx.input(|i| i.viewport().focused);
-    let (open, theme_changed, focus_lost, load_exclude, load_volumes, load_cli) = {
+    let (open, theme_changed, focus_lost, load_exclude, load_volumes, load_hidden, load_cli) = {
         let mut s = lock_shared(shared);
         // 排除目录：先收后台结果（非阻塞），再按打开挂起位决定是否补一次 list。
         let open = s.settings.open;
         let load_exclude = s.settings.advance_exclude(open);
         let load_volumes = s.settings.advance_volumes(open);
+        let (load_hidden, hidden_changed) = s.settings.advance_hidden(open);
+        if hidden_changed {
+            let now = Instant::now();
+            s.results.session.on_hidden_change(now);
+            s.palette.session.on_hidden_change(now);
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint_of(crate::ui::palette_viewport_id());
+        }
         let load_cli = s.settings.advance_cli_install(open);
         let theme_changed = open && s.theme.maybe_apply(&ctx, now);
         let focus_lost = s.settings.observe_focus(focused, open);
@@ -1050,6 +1156,7 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             focus_lost,
             load_exclude,
             load_volumes,
+            load_hidden,
             load_cli,
         )
     };
@@ -1075,6 +1182,28 @@ pub fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         };
         if started {
             lock_shared(shared).settings.volumes_refresh_pending = false;
+        }
+        ctx.request_repaint_of(viewport_id());
+    }
+    if load_hidden {
+        let (tx, rx) = mpsc::channel::<HiddenPrefsResult>();
+        let started = {
+            let mut s = lock_shared(shared);
+            if !s.settings.begin_hidden(rx) {
+                false
+            } else {
+                let data_dir = s.settings.data_dir.clone();
+                drop(s);
+                let result = hidden_result(
+                    client::hidden_prefs(&client::DaemonPaths { data_dir }),
+                    false,
+                );
+                let _ = tx.send(result);
+                true
+            }
+        };
+        if started {
+            lock_shared(shared).settings.hidden_refresh_pending = false;
         }
         ctx.request_repaint_of(viewport_id());
     }
@@ -1255,6 +1384,10 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, action: Settin
             if save && !platform::panel_assist_trusted() {
                 crate::ui::spawn_panel_trust_watcher(ctx);
             }
+        }
+        SettingsAction::SetHidden(include) => {
+            spawn_hidden_set(ctx, shared, include);
+            ctx.request_repaint_of(viewport_id());
         }
         SettingsAction::SetVolumesAuto(auto) => {
             let excluded = {
@@ -1448,6 +1581,40 @@ fn spawn_volumes(
         lock_shared(shared)
             .settings
             .volumes_spawn_failed(err.to_string());
+        return false;
+    }
+    true
+}
+
+/// 写隐藏项偏好（后台；结果回投后由 tick_hidden 更新回显）。
+fn spawn_hidden_set(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, include: bool) -> bool {
+    let (tx, rx) = mpsc::channel::<HiddenPrefsResult>();
+    let data_dir = {
+        let mut s = lock_shared(shared);
+        if !s.settings.begin_hidden(rx) {
+            log::warn!("隐藏项偏好操作被忽略:已有操作在途");
+            return false;
+        }
+        s.settings.data_dir.clone()
+    };
+    ctx.request_repaint_of(viewport_id());
+    let thread_ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("settings-hidden".to_owned())
+        .spawn(move || {
+            let result = hidden_result(
+                client::set_hidden_prefs(&client::DaemonPaths { data_dir }, include),
+                true,
+            );
+            if let Err(err) = tx.send(result) {
+                log::warn!("隐藏项偏好结果回投失败(设置页可能已退出):{err}");
+            }
+            thread_ctx.request_repaint_of(viewport_id());
+        });
+    if let Err(err) = spawned {
+        lock_shared(shared)
+            .settings
+            .hidden_spawn_failed(err.to_string());
         return false;
     }
     true
@@ -3601,6 +3768,119 @@ mod tests {
         assert!(!data.check_updates);
         assert_eq!(data.update, crate::update::UpdatePhase::Idle);
         assert_eq!(data.update_error, None);
+    }
+
+    /// daemon 确认写入（含落盘失败但已生效）都标记 changed；调用失败不标记。
+    #[test]
+    fn hidden_result_marks_writes_as_changed() {
+        let ok = hidden_result(
+            Ok(client::HiddenPrefsOutcome {
+                include: true,
+                message: None,
+            }),
+            true,
+        );
+        assert_eq!(ok.include, Some(true));
+        assert!(ok.changed && ok.error.is_none());
+
+        let unsaved = hidden_result(
+            Ok(client::HiddenPrefsOutcome {
+                include: false,
+                message: Some("disk".into()),
+            }),
+            true,
+        );
+        assert_eq!(unsaved.include, Some(false), "落盘失败但引擎已生效");
+        assert!(unsaved.changed && unsaved.error.is_some());
+
+        let err = hidden_result(Err(anyhow::anyhow!("boom")), true);
+        assert_eq!(err.include, None);
+        assert!(!err.changed && err.error.is_some());
+    }
+
+    /// 写入成功：应用回显、标记 loaded、只触发一次 changed。
+    #[test]
+    fn tick_hidden_applies_write_and_signals_once() {
+        let mut st = test_state();
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: Some(true),
+            error: None,
+            changed: true,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, true));
+        assert!(st.hidden.include && st.hidden.loaded);
+        assert!(st.hidden.error.is_none() && !st.hidden.busy);
+        assert_eq!(st.advance_hidden(false), (false, false), "结果只消费一次");
+    }
+
+    /// 初始加载：应用回显但不触发重查。
+    #[test]
+    fn tick_hidden_load_does_not_signal_changed() {
+        let mut st = test_state();
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: Some(true),
+            error: None,
+            changed: false,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, false));
+        assert!(st.hidden.include && st.hidden.loaded);
+    }
+
+    /// 落盘失败但引擎已生效：仍应用新值并触发重查，同时保留内联错误。
+    #[test]
+    fn tick_hidden_applies_unsaved_write_and_keeps_error() {
+        let mut st = test_state();
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: Some(false),
+            error: Some("已临时生效但写入配置失败".into()),
+            changed: true,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, true));
+        assert!(!st.hidden.include && st.hidden.loaded);
+        assert_eq!(st.hidden.error.as_deref(), Some("已临时生效但写入配置失败"));
+    }
+
+    /// 调用失败：保留旧值、不重查、落错误。
+    #[test]
+    fn tick_hidden_transport_error_keeps_old_value() {
+        let mut st = test_state();
+        st.hidden.include = true;
+        st.hidden.loaded = true;
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        tx.send(HiddenPrefsResult {
+            include: None,
+            error: Some("daemon 未在运行".into()),
+            changed: false,
+        })
+        .unwrap();
+        assert_eq!(st.advance_hidden(false), (false, false));
+        assert!(st.hidden.include, "传输失败不得改开关值");
+        assert_eq!(st.hidden.error.as_deref(), Some("daemon 未在运行"));
+    }
+
+    /// busy 时不发起加载；通道断开清 busy 并落 worker 错误。
+    #[test]
+    fn advance_hidden_respects_busy_and_disconnect() {
+        let mut st = test_state();
+        st.hidden_refresh_pending = true;
+        let (tx, rx) = mpsc::channel();
+        assert!(st.begin_hidden(rx));
+        assert_eq!(st.advance_hidden(true), (false, false), "busy 中不并发加载");
+        drop(tx);
+        let (load, changed) = st.advance_hidden(true);
+        assert!(!changed && !st.hidden.busy);
+        assert!(st.hidden.error.is_some(), "断连须落错误");
+        assert!(load, "断连后下一轮可重试加载");
     }
 
     /// 视口 builder：固定尺寸、启动隐藏、无标题/标题栏 + 全尺寸内容视图

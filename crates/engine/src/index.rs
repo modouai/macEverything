@@ -523,6 +523,23 @@ pub trait IndexView: Sync {
     /// 展示形态名(原始字节,未归一)。
     fn display_name(&self, idx: u32) -> &[u8];
 
+    /// 隐藏项判定(查询层过滤):条目自身或任一祖先名称以 `.` 开头。
+    /// 根条目名为绝对路径(首字节 `/`),天然不判隐藏;父链到 NO_PARENT 止。
+    /// 合成视图覆写此方法以跨 anchor 桥接。
+    fn is_hidden(&self, idx: u32) -> bool {
+        let mut cur = idx;
+        loop {
+            if self.display_name(cur).first() == Some(&b'.') {
+                return true;
+            }
+            let p = self.parent_idx(cur);
+            if p == NO_PARENT {
+                return false;
+            }
+            cur = p;
+        }
+    }
+
     /// 目录条目的完整路径(match 形态);非目录条目返回空切片。
     fn dir_path(&self, idx: u32) -> &[u8];
 
@@ -595,6 +612,26 @@ mod tests {
 
     fn ix() -> Index {
         Index::new()
+    }
+
+    /// 隐藏判定：自身或祖先以 `.` 开头；根不判隐藏。
+    #[test]
+    fn is_hidden_checks_self_and_ancestors_not_root() {
+        let mut i = ix();
+        let root = i.insert("/tmp/root", NO_PARENT, true);
+        let hidden = i.insert(".config", root, true);
+        let nested = i.insert("init.lua", hidden, false);
+        let visible = i.insert("notes.txt", root, false);
+        assert!(!i.is_hidden(root), "根条目不参与隐藏判定");
+        assert!(i.is_hidden(hidden));
+        assert!(i.is_hidden(nested), "隐藏目录内的可见文件随祖先隐藏");
+        assert!(!i.is_hidden(visible));
+
+        // 扫描根本身路径含 `.` 组件时同样不判隐藏(根按绝对路径名判定)。
+        let dot_root = i.insert("/tmp/.hidden-root", NO_PARENT, true);
+        let child = i.insert("notes.txt", dot_root, false);
+        assert!(!i.is_hidden(dot_root), "根名含点组件也不判隐藏");
+        assert!(!i.is_hidden(child), "根下可见子项不随根路径隐藏");
     }
 
     #[test]

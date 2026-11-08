@@ -88,6 +88,20 @@ impl Session {
         }
     }
 
+    /// 隐藏项开关变化：同串重发（语义同排序变更，但不改排序/方向）。
+    /// 窗内有 pending 保持原串、刷新时刻；无 pending 按 last_fired 的串构造；
+    /// 两者皆无（空词/从未发起）→ 不动。
+    pub fn on_hidden_change(&mut self, now: Instant) {
+        let query = self
+            .pending
+            .as_ref()
+            .map(|(q, _)| q.clone())
+            .or_else(|| self.last_fired.as_ref().map(|(q, _)| q.clone()));
+        if let Some(query) = query {
+            self.pending = Some((query, now));
+        }
+    }
+
     /// 复位会话(关闭/重新打开浮层等):清 pending/last_fired,推进代际号作废在途
     /// 响应,状态回 Idle。排序/方向/防抖窗保持。
     pub fn reset(&mut self) {
@@ -335,6 +349,47 @@ mod tests {
         assert_ne!(f2.generation, f1.generation);
         assert_eq!(f2.sort, SortKey::Size);
         assert!(f2.desc, "方向与键原子随 Fire 下发(Task 19b)");
+    }
+
+    /// 隐藏项开关变化：同串重发、不改变排序；空会话不动。
+    #[test]
+    fn hidden_change_refires_same_query_without_touching_sort() {
+        let base = Instant::now();
+        let mut s = Session::new(Duration::from_millis(60));
+        s.on_input("报告", base);
+        let first = s
+            .pending_at(base + Duration::from_millis(70))
+            .expect("防抖到期应发起");
+        assert_eq!(first.query, "报告");
+        assert_eq!(first.sort, SortKey::Relevance);
+
+        s.on_hidden_change(base + Duration::from_millis(200));
+        let again = s
+            .pending_at(base + Duration::from_millis(300))
+            .expect("开关变化应重发");
+        assert_eq!(again.query, "报告");
+        assert_eq!(again.sort, SortKey::Relevance);
+        assert_eq!(again.desc, first.desc);
+        assert_ne!(again.generation, first.generation, "重发须推进代际");
+
+        // pending 存在：刷新时刻顺延窗口，原串保留
+        let mut p = Session::new(Duration::from_millis(60));
+        p.on_input("q", base);
+        p.on_hidden_change(base + Duration::from_millis(30));
+        assert!(
+            p.pending_at(base + Duration::from_millis(70)).is_none(),
+            "刷新时刻应顺延防抖窗口"
+        );
+        let f = p
+            .pending_at(base + Duration::from_millis(95))
+            .expect("顺延后应到期发起");
+        assert_eq!(f.query, "q");
+
+        let mut empty = Session::new(Duration::from_millis(60));
+        empty.on_hidden_change(base);
+        assert!(empty
+            .pending_at(base + Duration::from_millis(100))
+            .is_none());
     }
 
     #[test]

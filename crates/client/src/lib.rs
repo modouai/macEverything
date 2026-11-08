@@ -193,6 +193,7 @@ impl std::error::Error for QueryError {}
 /// desc = 反转该键的自然方向(false = 自然方向,不发该字段——与 19b 前客户端同形);
 /// 引擎在全量命中排序后按方向取前 K,total > K 时为真最大/最小 K 条。
 /// dir_only = 只返回目录(false 不过滤,与缺省同义,不发该字段——旧 daemon 兼容)。
+/// include_hidden = 单次覆盖隐藏项过滤;None = 跟随 daemon/配置(离线时读 config.toml)。
 pub fn query(
     paths: &DaemonPaths,
     q: &str,
@@ -200,6 +201,7 @@ pub fn query(
     sort: Option<&str>,
     desc: bool,
     dir_only: bool,
+    include_hidden: Option<bool>,
 ) -> Result<QueryOutcome, QueryError> {
     let limit = limit.min(RESULT_CAP);
     let no_code = |e: anyhow::Error| QueryError {
@@ -220,6 +222,7 @@ pub fn query(
                 // false 不发送:None 与 false 引擎语义相同(不过滤),
                 // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
                 dir_only: dir_only.then_some(true),
+                include_hidden,
             },
         )
         .map_err(no_code)?;
@@ -251,12 +254,33 @@ pub fn query(
             }),
         }
     } else {
-        offline_query(paths, q, limit, dir_only).map_err(no_code)
+        offline_query(
+            paths,
+            q,
+            limit,
+            dir_only,
+            offline_include_hidden(paths, include_hidden),
+        )
+        .map_err(no_code)
     }
+}
+
+/// 离线查询的隐藏项默认值：请求级覆盖优先；否则读 config.toml
+/// （经迁移入口，旧配置 + 已有索引按升级用户处理）。
+/// 仅在已有落盘索引时走迁移入口：注定失败的离线查询（无索引）不得写配置。
+fn offline_include_hidden(paths: &DaemonPaths, include_hidden: Option<bool>) -> bool {
+    include_hidden.unwrap_or_else(|| {
+        if paths.index_file().exists() {
+            engine::config::load_migrating(&paths.config_file(), true).include_hidden_effective()
+        } else {
+            engine::config::load(&paths.config_file()).include_hidden_effective()
+        }
+    })
 }
 
 /// 离线查询:直读落盘索引自答(调用方须标注离线并给出索引生成时刻)。
 /// dir_only = 只返回目录;false 不过滤。
+/// include_hidden = 是否包含隐藏项(由调用方解析为本值)。
 /// 离线路径只做 relevance(无 daemon 侧排序轮 stat 缓存),回显如实为 "relevance":
 /// 调用方请求了列排序时,可比对回显识别「排序未生效」。
 pub fn offline_query(
@@ -264,11 +288,13 @@ pub fn offline_query(
     q: &str,
     limit: u32,
     dir_only: bool,
+    include_hidden: bool,
 ) -> Result<QueryOutcome> {
     let view = persist::load_mmap(&paths.index_file())
         .map_err(|e| anyhow!("daemon 未运行,且落盘索引不可用({e});先执行 macEverything start"))?;
     let mut plan = engine::query::parse(q).map_err(|_| anyhow!("空查询"))?;
     plan.dir_only = dir_only;
+    plan.include_hidden = include_hidden;
     let out = engine::query::execute(view.as_ref(), &plan, limit as usize);
     let rows: Vec<(String, String)> = out
         .hits
@@ -588,6 +614,50 @@ pub fn set_volume_prefs(
     )
 }
 
+/// 隐藏项偏好结果：message 为落盘失败等可操作提示（成功为 None）。
+#[derive(Debug)]
+pub struct HiddenPrefsOutcome {
+    pub include: bool,
+    pub message: Option<String>,
+}
+
+/// 隐藏项偏好读/写共用管道；旧 daemon 不认识变体会断连，调用方按失败展示。
+fn hidden_call(paths: &DaemonPaths, req: Request) -> Result<HiddenPrefsOutcome> {
+    let Some(mut s) = connect(paths) else {
+        bail!("daemon 未在运行；隐藏项偏好需引擎在线，先执行 macEverything start");
+    };
+    let resp = call(&mut s, &req).map_err(|err| {
+        anyhow!(
+            "{err:#};若引擎为旧版本，请重启引擎:macEverything stop && macEverything start（或托盘拉起）"
+        )
+    })?;
+    match expect_ok(resp)? {
+        Response::HiddenPrefs { include, message } => Ok(HiddenPrefsOutcome { include, message }),
+        other => bail!("意外响应: {other:?}"),
+    }
+}
+
+/// 读当前隐藏项偏好（设置页回显）。
+pub fn hidden_prefs(paths: &DaemonPaths) -> Result<HiddenPrefsOutcome> {
+    hidden_call(
+        paths,
+        Request::HiddenPrefs {
+            v: protocol::PROTOCOL_VERSION,
+        },
+    )
+}
+
+/// 写隐藏项偏好；daemon 更新内存配置并落盘，后续查询立即生效（无需重扫）。
+pub fn set_hidden_prefs(paths: &DaemonPaths, include: bool) -> Result<HiddenPrefsOutcome> {
+    hidden_call(
+        paths,
+        Request::HiddenSet {
+            v: protocol::PROTOCOL_VERSION,
+            include,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,7 +767,7 @@ mod tests {
         let (paths, _h) = stub_daemon(
             br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"mtime","desc_echo":false}"#,
         );
-        let out = query(&paths, "x", 10, Some("mtime"), true, false).unwrap();
+        let out = query(&paths, "x", 10, Some("mtime"), true, false, None).unwrap();
         assert_eq!(out.desc_echo, Some(false));
         assert_eq!(out.sort_echo, "mtime");
     }
@@ -711,7 +781,7 @@ mod tests {
             let (paths, _h, captured) = stub_daemon_capturing(
                 br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"relevance","desc_echo":null}"#,
             );
-            let out = query(&paths, "x", 10, None, false, dir_only).unwrap();
+            let out = query(&paths, "x", 10, None, false, dir_only, None).unwrap();
             assert!(out.entries.is_empty());
             let body = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
             assert_eq!(
@@ -906,5 +976,130 @@ mod tests {
         let missing = entries.iter().find(|e| e.name == "missing.txt").unwrap();
         assert!(!missing.is_dir, "不存在路径缺省按文件");
         assert_eq!((missing.size, missing.mtime), (None, None));
+    }
+
+    /// include_hidden 线路三态：None 不发送；Some 原样上线。
+    #[test]
+    fn query_sends_include_hidden_only_when_some() {
+        for (flag, want) in [
+            (Some(true), Some(r#""include_hidden":true"#)),
+            (Some(false), Some(r#""include_hidden":false"#)),
+            (None, None),
+        ] {
+            let (paths, _h, captured) = stub_daemon_capturing(
+                br#"{"msg":"query","entries":[],"total":0,"elapsed_ms":0.0,"stat_ms":0.0,"sort_echo":"relevance","desc_echo":null}"#,
+            );
+            query(&paths, "x", 10, None, false, false, flag).unwrap();
+            let body = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            match want {
+                Some(needle) => assert!(body.contains(needle), "请求体: {body}"),
+                None => assert!(!body.contains("include_hidden"), "请求体: {body}"),
+            }
+        }
+    }
+
+    /// 离线默认值：显式覆盖优先；否则读 config.toml；旧配置 + 有索引 → 迁移为包含。
+    #[test]
+    fn offline_include_hidden_reads_config_and_applies_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            data_dir: dir.path().to_path_buf(),
+        };
+        std::fs::write(paths.config_file(), "include_hidden = false\n").unwrap();
+        assert!(!offline_include_hidden(&paths, None));
+        assert!(offline_include_hidden(&paths, Some(true)));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let paths2 = DaemonPaths {
+            data_dir: dir2.path().to_path_buf(),
+        };
+        std::fs::write(paths2.config_file(), "excluded = []\n").unwrap();
+        std::fs::write(paths2.index_file(), b"").unwrap();
+        assert!(
+            offline_include_hidden(&paths2, None),
+            "旧配置 + 已有索引应迁移为包含"
+        );
+        assert_eq!(
+            engine::config::load(&paths2.config_file()).include_hidden,
+            Some(true),
+            "迁移须写回"
+        );
+
+        // 配置为 true 时 None 取 true；显式 Some(false) 仍须覆盖为 false。
+        let dir3 = tempfile::tempdir().unwrap();
+        let paths3 = DaemonPaths {
+            data_dir: dir3.path().to_path_buf(),
+        };
+        std::fs::write(paths3.config_file(), "include_hidden = true\n").unwrap();
+        assert!(offline_include_hidden(&paths3, None));
+        assert!(
+            !offline_include_hidden(&paths3, Some(false)),
+            "请求级 false 须覆盖配置 true"
+        );
+
+        // 无索引的离线查询注定失败：不得为读取偏好而创建/迁移配置文件。
+        let dir4 = tempfile::tempdir().unwrap();
+        let paths4 = DaemonPaths {
+            data_dir: dir4.path().to_path_buf(),
+        };
+        assert!(!offline_include_hidden(&paths4, None));
+        assert!(
+            !paths4.config_file().exists(),
+            "无索引时不得写配置（离线查询将失败）"
+        );
+    }
+
+    /// 离线 query 必须把解析出的 include_hidden 真正落到查询计划：
+    /// 配置 false 时隐藏条目被过滤；请求级 Some(true) 覆盖为包含。
+    /// 突变 `plan.include_hidden = true` → 首个断言必红。
+    #[test]
+    fn offline_query_applies_include_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let mut idx = engine::index::Index::new();
+        let root = idx.insert("/tmp/root", engine::entry::NO_PARENT, true);
+        idx.insert(".hidden.txt", root, false);
+        idx.insert("visible.txt", root, false);
+        let layout = engine::persist::EntryLayout::of(&idx);
+        engine::persist::write_atomic(
+            &layout,
+            idx.entries.iter(),
+            &engine::persist::IndexMeta::default(),
+            &paths.index_file(),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file(), "include_hidden = false\n").unwrap();
+
+        // 无 socket → query() 走离线分支
+        assert_eq!(
+            query(&paths, "*", 10, None, false, false, None)
+                .unwrap()
+                .total,
+            2
+        );
+        assert_eq!(
+            query(&paths, "*", 10, None, false, false, Some(true))
+                .unwrap()
+                .total,
+            3
+        );
+    }
+
+    /// 隐藏项偏好 API：读/写应答逐字段映射（message 透传）。
+    #[test]
+    fn hidden_prefs_api_maps_responses() {
+        let (paths, _h) = stub_daemon(br#"{"msg":"hidden_prefs","include":true}"#);
+        let out = hidden_prefs(&paths).unwrap();
+        assert!(out.include);
+        assert!(out.message.is_none());
+
+        let (paths, _h) =
+            stub_daemon(br#"{"msg":"hidden_prefs","include":false,"message":"disk full"}"#);
+        let out = set_hidden_prefs(&paths, false).unwrap();
+        assert!(!out.include);
+        assert_eq!(out.message.as_deref(), Some("disk full"));
     }
 }
