@@ -267,10 +267,14 @@ pub fn query(
 
 /// 离线查询的隐藏项默认值：请求级覆盖优先；否则读 config.toml
 /// （经迁移入口，旧配置 + 已有索引按升级用户处理）。
+/// 仅在已有落盘索引时走迁移入口：注定失败的离线查询（无索引）不得写配置。
 fn offline_include_hidden(paths: &DaemonPaths, include_hidden: Option<bool>) -> bool {
     include_hidden.unwrap_or_else(|| {
-        engine::config::load_migrating(&paths.config_file(), paths.index_file().exists())
-            .include_hidden_effective()
+        if paths.index_file().exists() {
+            engine::config::load_migrating(&paths.config_file(), true).include_hidden_effective()
+        } else {
+            engine::config::load(&paths.config_file()).include_hidden_effective()
+        }
     })
 }
 
@@ -1020,5 +1024,82 @@ mod tests {
             Some(true),
             "迁移须写回"
         );
+
+        // 配置为 true 时 None 取 true；显式 Some(false) 仍须覆盖为 false。
+        let dir3 = tempfile::tempdir().unwrap();
+        let paths3 = DaemonPaths {
+            data_dir: dir3.path().to_path_buf(),
+        };
+        std::fs::write(paths3.config_file(), "include_hidden = true\n").unwrap();
+        assert!(offline_include_hidden(&paths3, None));
+        assert!(
+            !offline_include_hidden(&paths3, Some(false)),
+            "请求级 false 须覆盖配置 true"
+        );
+
+        // 无索引的离线查询注定失败：不得为读取偏好而创建/迁移配置文件。
+        let dir4 = tempfile::tempdir().unwrap();
+        let paths4 = DaemonPaths {
+            data_dir: dir4.path().to_path_buf(),
+        };
+        assert!(!offline_include_hidden(&paths4, None));
+        assert!(
+            !paths4.config_file().exists(),
+            "无索引时不得写配置（离线查询将失败）"
+        );
+    }
+
+    /// 离线 query 必须把解析出的 include_hidden 真正落到查询计划：
+    /// 配置 false 时隐藏条目被过滤；请求级 Some(true) 覆盖为包含。
+    /// 突变 `plan.include_hidden = true` → 首个断言必红。
+    #[test]
+    fn offline_query_applies_include_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let mut idx = engine::index::Index::new();
+        let root = idx.insert("/tmp/root", engine::entry::NO_PARENT, true);
+        idx.insert(".hidden.txt", root, false);
+        idx.insert("visible.txt", root, false);
+        let layout = engine::persist::EntryLayout::of(&idx);
+        engine::persist::write_atomic(
+            &layout,
+            idx.entries.iter(),
+            &engine::persist::IndexMeta::default(),
+            &paths.index_file(),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file(), "include_hidden = false\n").unwrap();
+
+        // 无 socket → query() 走离线分支
+        assert_eq!(
+            query(&paths, "*", 10, None, false, false, None)
+                .unwrap()
+                .total,
+            2
+        );
+        assert_eq!(
+            query(&paths, "*", 10, None, false, false, Some(true))
+                .unwrap()
+                .total,
+            3
+        );
+    }
+
+    /// 隐藏项偏好 API：读/写应答逐字段映射（message 透传）。
+    #[test]
+    fn hidden_prefs_api_maps_responses() {
+        let (paths, _h) = stub_daemon(br#"{"msg":"hidden_prefs","include":true}"#);
+        let out = hidden_prefs(&paths).unwrap();
+        assert!(out.include);
+        assert!(out.message.is_none());
+
+        let (paths, _h) =
+            stub_daemon(br#"{"msg":"hidden_prefs","include":false,"message":"disk full"}"#);
+        let out = set_hidden_prefs(&paths, false).unwrap();
+        assert!(!out.include);
+        assert_eq!(out.message.as_deref(), Some("disk full"));
     }
 }
