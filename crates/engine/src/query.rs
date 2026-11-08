@@ -1247,6 +1247,22 @@ mod tests {
             vec!["/tmp/root".to_string(), "notes.txt".to_string()]
         );
     }
+
+    #[test]
+    fn path_query_filters_hidden_ancestor() {
+        let mut i = Index::new();
+        let root = i.insert("/tmp/root", NO_PARENT, true);
+        let hidden_dir = i.insert(".config", root, true);
+        i.insert("init.lua", hidden_dir, false);
+        let mut plan = parse("path:.config").unwrap();
+        assert_eq!(execute(&i, &plan, 100).total, 1, "隐藏目录子项默认可见");
+        plan.include_hidden = false;
+        assert_eq!(
+            execute(&i, &plan, 100).total,
+            0,
+            "path: 查询同样过滤隐藏祖先"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -626,6 +626,12 @@ mod tests {
         assert!(i.is_hidden(hidden));
         assert!(i.is_hidden(nested), "隐藏目录内的可见文件随祖先隐藏");
         assert!(!i.is_hidden(visible));
+
+        // 扫描根本身路径含 `.` 组件时同样不判隐藏(根按绝对路径名判定)。
+        let dot_root = i.insert("/tmp/.hidden-root", NO_PARENT, true);
+        let child = i.insert("notes.txt", dot_root, false);
+        assert!(!i.is_hidden(dot_root), "根名含点组件也不判隐藏");
+        assert!(!i.is_hidden(child), "根下可见子项不随根路径隐藏");
     }
 
     #[test]

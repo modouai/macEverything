@@ -685,6 +685,8 @@ impl IndexView for CompositeView<'_> {
             }
             let e = &self.overlay.index.entries[cur as usize];
             if e.parent == NO_PARENT {
+                // 写侧不变量:活 anchor 必在 anchor_base 登记;缺失即账本腐化,
+                // 防御性返回 false 而非 panic。
                 let Some(&b) = self.overlay.anchor_base.get(&cur) else {
                     return false;
                 };
@@ -2379,6 +2381,15 @@ mod tests {
         assert!(
             view.is_hidden(out.hits[0]),
             "overlay 条目应经 anchor 链判为隐藏"
+        );
+
+        // 端到端:execute 候选层过滤同样经 CompositeView::is_hidden 生效。
+        let mut plan = query::parse("new.txt").unwrap();
+        plan.include_hidden = false;
+        assert_eq!(
+            query::execute(&view, &plan, 10).total,
+            0,
+            "CompositeView 经 execute 也必须过滤隐藏祖先"
         );
     }
 }
