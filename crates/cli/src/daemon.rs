@@ -2857,22 +2857,19 @@ fn volumes_prefs_response(state: &Arc<EngineState>) -> Response {
 
 /// 隐藏项偏好写入:更新内存 + 落盘;保存失败仍临时生效并如实告知。
 fn hidden_set(state: &Arc<EngineState>, paths: &DaemonPaths, include: bool) -> Response {
-    let (include_now, message) = {
+    let message = {
         let mut c = state.cfg.lock_recover();
         c.include_hidden = Some(include);
         match config::save(&c, &paths.config_file()) {
-            Ok(()) => (include, None),
+            Ok(()) => None,
             Err(e) => {
                 log::error!("隐藏项偏好落盘失败: {e}");
-                (include, Some(format!("已临时生效但写入配置失败: {e}")))
+                Some(format!("已临时生效但写入配置失败: {e}"))
             }
         }
     };
-    log::info!("隐藏项偏好更新:include={include_now}");
-    Response::HiddenPrefs {
-        include: include_now,
-        message,
-    }
+    log::info!("隐藏项偏好更新:include={include}");
+    Response::HiddenPrefs { include, message }
 }
 
 /// 隐藏项偏好读(设置页回显)。
@@ -6007,28 +6004,68 @@ mod tests {
             3,
             "请求级 true 覆盖配置"
         );
+
+        // 升级用户方向:配置 true 时 None 跟随 true,请求级 false 可覆盖。
+        state.cfg.lock_recover().include_hidden = Some(true);
+        assert_eq!(
+            total(run_query(&state, "*", 10, None, false, false, None)),
+            3,
+            "配置 true：三项全含"
+        );
+        assert_eq!(
+            total(run_query(&state, "*", 10, None, false, false, Some(false))),
+            2,
+            "请求级 false 覆盖配置"
+        );
     }
 
-    /// HiddenSet 更新内存 + 落盘；HiddenPrefs 读回显。
+    /// HiddenSet 真方向回环:内存/落盘/同 dispatch 查询即时生效,HiddenPrefs
+    /// 回显,请求级 Some(false) 仍可覆盖配置 true。
     #[test]
-    fn hidden_set_persists_and_prefs_echoes() {
+    fn hidden_set_roundtrip_drives_queries_and_echoes() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = DaemonPaths {
             data_dir: tmp.path().join("data"),
         };
+        let mut idx = Index::new();
+        let root = idx.insert("/tmp/r", NO_PARENT, true);
+        idx.insert(".hidden.txt", root, false);
+        idx.insert("visible.txt", root, false);
         let state = Arc::new(EngineState::new());
-        let resp = dispatch(
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+
+        let query = |include_hidden| {
+            dispatch(
+                Request::Query {
+                    v: protocol::PROTOCOL_VERSION,
+                    query: "*".into(),
+                    limit: 10,
+                    sort: None,
+                    desc: None,
+                    dir_only: None,
+                    include_hidden,
+                },
+                &state,
+                &paths,
+            )
+        };
+        let total = |r: Response| match r {
+            Response::Query { total, .. } => total,
+            other => panic!("意外响应: {other:?}"),
+        };
+
+        // false 方向:回显 + 内存 + 落盘 + 同 dispatch 查询立即生效。
+        match dispatch(
             Request::HiddenSet {
                 v: protocol::PROTOCOL_VERSION,
                 include: false,
             },
             &state,
             &paths,
-        );
-        match resp {
+        ) {
             Response::HiddenPrefs { include, message } => {
-                assert!(!include);
-                assert!(message.is_none());
+                assert!(!include, "应回显 false");
+                assert!(message.is_none(), "落盘成功不应带错误:{message:?}");
             }
             other => panic!("意外响应: {other:?}"),
         }
@@ -6038,6 +6075,29 @@ mod tests {
             Some(false),
             "偏好须落盘"
         );
+        assert_eq!(total(query(None)), 2, "查询跟随配置 false");
+
+        // true 方向:回显不得是改前默认(false)。
+        match dispatch(
+            Request::HiddenSet {
+                v: protocol::PROTOCOL_VERSION,
+                include: true,
+            },
+            &state,
+            &paths,
+        ) {
+            Response::HiddenPrefs { include, message } => {
+                assert!(include, "应回显真方向 true");
+                assert!(message.is_none());
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+        assert_eq!(state.cfg.lock_recover().include_hidden, Some(true));
+        assert_eq!(
+            config::load(&paths.config_file()).include_hidden,
+            Some(true),
+            "true 偏好须落盘"
+        );
         match dispatch(
             Request::HiddenPrefs {
                 v: protocol::PROTOCOL_VERSION,
@@ -6045,8 +6105,32 @@ mod tests {
             &state,
             &paths,
         ) {
-            Response::HiddenPrefs { include, .. } => assert!(!include),
+            Response::HiddenPrefs { include, .. } => assert!(include, "读回应回显 true"),
             other => panic!("意外响应: {other:?}"),
         }
+        assert_eq!(total(query(None)), 3, "查询跟随配置 true");
+        assert_eq!(total(query(Some(false))), 2, "请求级 false 覆盖配置 true");
+    }
+
+    /// 落盘失败:内存仍临时生效,应答如实带 message。
+    #[test]
+    fn hidden_set_save_failure_still_applies_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::write(&data, b"not a dir").unwrap();
+        let paths = DaemonPaths { data_dir: data };
+        let state = Arc::new(EngineState::new());
+        match hidden_set(&state, &paths, true) {
+            Response::HiddenPrefs { include, message } => {
+                assert!(include, "内存已生效仍回 true");
+                assert!(message.is_some(), "落盘失败须如实告知");
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+        assert_eq!(
+            state.cfg.lock_recover().include_hidden,
+            Some(true),
+            "落盘失败仍临时生效"
+        );
     }
 }
