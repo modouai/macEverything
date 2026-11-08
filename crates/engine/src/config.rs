@@ -62,26 +62,53 @@ pub fn default_config() -> Config {
     }
 }
 
-/// 读配置。缺文件 → 默认;解析失败 → 告警后用默认,不崩溃、不动用户文件(留痕不静默)。
-pub fn load(path: &Path) -> Config {
+/// [`load_detailed`] 的结果:区分「可解析」「缺文件」「失败」,供迁移入口
+/// 判断写回是否安全(失败时不得用默认值覆盖用户文件)。
+enum Loaded {
+    Ok(Config),
+    Missing,
+    Failed,
+}
+
+/// 详细读取:解析/读取失败只告警并归为 [`Loaded::Failed`],不改动用户文件。
+fn load_detailed(path: &Path) -> Loaded {
     match std::fs::read_to_string(path) {
-        Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-            log::warn!("{} 解析失败,用默认配置: {e}", path.display());
-            default_config()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_config(),
+        Ok(s) => match toml::from_str(&s) {
+            Ok(c) => Loaded::Ok(c),
+            Err(e) => {
+                log::warn!("{} 解析失败,用默认配置: {e}", path.display());
+                Loaded::Failed
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded::Missing,
         Err(e) => {
             log::warn!("{} 读取失败,用默认配置: {e}", path.display());
-            default_config()
+            Loaded::Failed
         }
+    }
+}
+
+/// 读配置。缺文件 → 默认;解析失败 → 告警后用默认,不崩溃、不动用户文件(留痕不静默)。
+pub fn load(path: &Path) -> Config {
+    match load_detailed(path) {
+        Loaded::Ok(c) => c,
+        Loaded::Missing | Loaded::Failed => default_config(),
     }
 }
 
 /// 读配置并完成旧配置迁移。
 /// `index_present` = 数据目录已有落盘索引（升级信号）：
 /// 字段缺失时写入 `Some(index_present)` 并原子落盘；写失败只告警，内存仍按迁移值。
+///
+/// 仅对「可解析」与「缺文件」迁移；解析/读取失败时返回默认配置且不回写，
+/// 避免用默认值覆盖用户的损坏/不可读文件（与 [`load`] 的「不动用户文件」契约一致）。
+/// 迁移无跨进程锁：多进程并发写回为 last-writer-wins。
 pub fn load_migrating(path: &Path, index_present: bool) -> Config {
-    let mut cfg = load(path);
+    let mut cfg = match load_detailed(path) {
+        Loaded::Ok(c) => c,
+        Loaded::Missing => default_config(),
+        Loaded::Failed => return default_config(),
+    };
     if cfg.include_hidden.is_none() {
         cfg.include_hidden = Some(index_present);
         if let Err(e) = save(&cfg, path) {
@@ -203,6 +230,7 @@ mod tests {
         std::fs::write(&p, "excluded = [\"node_modules\"]\n").unwrap();
         let c = load_migrating(&p, true);
         assert_eq!(c.include_hidden, Some(true));
+        assert_eq!(c.excluded, vec!["node_modules"], "迁移须保留其它设置");
         assert_eq!(load(&p).include_hidden, Some(true), "迁移结果须写回");
     }
 
@@ -234,5 +262,46 @@ mod tests {
         let c = load(&p);
         assert_eq!(c.include_hidden, None);
         assert!(!p.exists(), "load 不得写盘");
+    }
+
+    /// 损坏配置不得被迁移覆盖：迁移只针对可解析/缺文件，失败时原样保留用户文件。
+    #[test]
+    fn load_migrating_does_not_overwrite_corrupt_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let corrupt = "excluded = [";
+        std::fs::write(&p, corrupt).unwrap();
+        let c = load_migrating(&p, true);
+        assert!(c.include_hidden.is_none(), "失败路径不得假装已迁移");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            corrupt,
+            "不得覆盖损坏配置"
+        );
+    }
+
+    /// 写盘失败不应中断迁移：内存仍按迁移值生效，只告警。
+    #[cfg(unix)]
+    #[test]
+    fn load_migrating_survives_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        // 目录只读 → save 的 tmp 创建失败。
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        // 探测：若进程/文件系统忽略目录权限（如 root），本测试无意义，提前恢复并返回。
+        let probe = dir.path().join("probe");
+        let writable = std::fs::write(&probe, "x").is_ok();
+        if writable {
+            std::fs::remove_file(&probe).ok();
+        }
+        if writable {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let c = load_migrating(&p, true);
+        // 恢复目录权限，保证 tempdir 可清理。
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(c.include_hidden, Some(true));
     }
 }
