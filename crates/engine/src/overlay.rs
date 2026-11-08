@@ -1205,6 +1205,45 @@ mod tests {
         assert_eq!(total(&view, "path:keepdir"), 1, "deep.txt");
     }
 
+    /// 桥接 anchor 回归:增量新建在 bundle 内的深层 `.app` 不得置顶。
+    /// `CompositeView` 的桥接 anchor 父号是 `NO_PARENT`(真实父号在 `anchor_base`),
+    /// 按 `parent_idx` 上溯会在桥处断开、漏看外层 `.app`;`ranks_first` 必须改读
+    /// `dir_path` 的完整祖先段。mutation「ranks_first 改用 parent_idx 上溯」时必红。
+    #[test]
+    fn overlay_new_deep_app_inside_bundle_does_not_rank_first() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let fw = root.join("d/Outer.app/Contents/Frameworks");
+        std::fs::create_dir_all(&fw).unwrap();
+        let base = scan(root);
+        let fw_id = id_of(&base, &fw);
+
+        // 磁盘漂移:包内新建 Helpers.app 目录与普通文件;只 diff Frameworks。
+        std::fs::create_dir(fw.join("Helpers.app")).unwrap();
+        std::fs::write(fw.join("helper.txt"), "").unwrap();
+        let mut ov = Overlay::new();
+        ov.apply_diff(&base, DiffTarget::Base(fw_id), &fw, &[])
+            .unwrap();
+        let view = ov.composite_view(&base);
+
+        let out = query::execute(&view, &query::parse("helper").unwrap(), 100);
+        let got: Vec<String> = out
+            .hits
+            .iter()
+            .map(|&h| view.full_path_composite(h))
+            .collect();
+        // 同分同组:helper.txt(10B)按名长先于 Helpers.app(11B);若包内 .app
+        // 被置顶,Helpers.app 会跳到最前。
+        assert_eq!(
+            got,
+            vec![
+                fw.join("helper.txt").to_string_lossy().into_owned(),
+                fw.join("Helpers.app").to_string_lossy().into_owned(),
+            ],
+            "桥接 anchor 下新建的包内 .app 不得置顶"
+        );
+    }
+
     /// overlay 嵌套两层:路径两段拼接、全量对拍与独立枚举零差异。
     #[test]
     fn nested_two_level_overlay_matches_reference() {

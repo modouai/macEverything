@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod bundle;
 pub mod config;
 pub mod dir_map;
 pub mod entry;

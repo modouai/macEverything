@@ -14,6 +14,7 @@ crates/
 │   └── src/
 │       ├── entry.rs       Entry(24B)+ NFC/折叠归一 + 标志位
 │       ├── arena.rs       追加式名称池
+│       ├── bundle.rs      bundle 扩展名判定(ASCII 大小写不敏感后缀)
 │       ├── index.rs       索引:增删改/目录 diff/子树级联/墓碑整理/目录路径池/IndexView trait
 │       ├── query.rs       语法解析 → CPattern 预编译(Finder) → 匹配 → 打分排序
 │       ├── scanner.rs     并行扫描(work-sharing)/ 排除判定(三条路径共用)
