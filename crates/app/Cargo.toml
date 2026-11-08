@@ -135,7 +135,7 @@ raw-window-handle = "0.6"
 # Task 15 全局热键(PoC-2 实锁 0.6.4;macOS 后端 = Carbon RegisterEventHotKey)。
 # 注意 crate 文档:macOS 上 manager 必须在主线程创建,且需主线程事件循环在跑
 # (eframe 的 NSApplication::run 即此循环;事件泵细节见 src/hotkey.rs 模块注释)。
-global-hotkey = { version = "0.6", features = ["serde"] }
+global-hotkey = { version = "0.9", features = ["serde"] }
 # 系统 UI 字体(SF Pro/SF Mono)只读 mmap 载入(堆粗查易修项:替代 fs::read 的
 # ~8MB 堆拷贝;版本随 engine 已入锁文件)。
 memmap2.workspace = true
