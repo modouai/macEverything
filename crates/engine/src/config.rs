@@ -24,6 +24,17 @@ pub struct Config {
     /// 不自动索引的卷目录名列表(如 ["BackupU"];按 /Volumes/<名> 的名键控)。
     #[serde(default)]
     pub volumes_excluded: Vec<String>,
+    /// 搜索结果是否包含隐藏项（名称以 `.` 开头）。
+    /// None = 旧配置缺字段，等待 [`load_migrating`] 迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_hidden: Option<bool>,
+}
+
+impl Config {
+    /// 生效值；未迁移的纯内存路径将 None 视为不包含。
+    pub fn include_hidden_effective(&self) -> bool {
+        self.include_hidden.unwrap_or(false)
+    }
 }
 
 fn default_true() -> bool {
@@ -47,6 +58,7 @@ pub fn default_config() -> Config {
         ],
         auto_index_volumes: true,
         volumes_excluded: vec![],
+        include_hidden: None,
     }
 }
 
@@ -63,6 +75,23 @@ pub fn load(path: &Path) -> Config {
             default_config()
         }
     }
+}
+
+/// 读配置并完成旧配置迁移。
+/// `index_present` = 数据目录已有落盘索引（升级信号）：
+/// 字段缺失时写入 `Some(index_present)` 并原子落盘；写失败只告警，内存仍按迁移值。
+pub fn load_migrating(path: &Path, index_present: bool) -> Config {
+    let mut cfg = load(path);
+    if cfg.include_hidden.is_none() {
+        cfg.include_hidden = Some(index_present);
+        if let Err(e) = save(&cfg, path) {
+            log::warn!(
+                "{} 隐藏项偏好迁移写盘失败（内存仍生效）: {e}",
+                path.display()
+            );
+        }
+    }
+    cfg
 }
 
 /// 原子保存:先建父目录,写 `<目标>.tmp` 后 rename 替换,不留半写文件
@@ -164,5 +193,46 @@ mod tests {
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// 旧配置（缺字段）+ 已有落盘索引 = 升级用户：迁移为包含并写回。
+    #[test]
+    fn load_migrating_legacy_config_with_index_includes_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "excluded = [\"node_modules\"]\n").unwrap();
+        let c = load_migrating(&p, true);
+        assert_eq!(c.include_hidden, Some(true));
+        assert_eq!(load(&p).include_hidden, Some(true), "迁移结果须写回");
+    }
+
+    /// 旧配置 + 无落盘索引 = 新装：迁移为不包含并写回。
+    #[test]
+    fn load_migrating_fresh_install_excludes_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let c = load_migrating(&p, false);
+        assert_eq!(c.include_hidden, Some(false));
+        assert_eq!(load(&p).include_hidden, Some(false));
+    }
+
+    /// 显式值不被迁移覆盖（用户已关掉→升级后仍关）。
+    #[test]
+    fn load_migrating_keeps_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "include_hidden = false\n").unwrap();
+        assert_eq!(load_migrating(&p, true).include_hidden, Some(false));
+        assert_eq!(load(&p).include_hidden, Some(false));
+    }
+
+    /// 纯读入口不产生副作用：缺文件时不创建配置。
+    #[test]
+    fn load_does_not_write_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let c = load(&p);
+        assert_eq!(c.include_hidden, None);
+        assert!(!p.exists(), "load 不得写盘");
     }
 }

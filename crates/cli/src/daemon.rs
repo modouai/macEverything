@@ -685,6 +685,7 @@ impl EngineState {
                 excluded: vec![],
                 auto_index_volumes: false,
                 volumes_excluded: vec![],
+                include_hidden: None,
             }),
             exclude_op_lock: Mutex::new(()),
             rescan_lock: Mutex::new(()),
@@ -3769,6 +3770,7 @@ mod tests {
             excluded: excluded.iter().map(|e| (*e).to_string()).collect(),
             auto_index_volumes: true,
             volumes_excluded: vec![],
+            include_hidden: None,
         };
         let paths = DaemonPaths {
             data_dir: tmp.path().join("data"),
