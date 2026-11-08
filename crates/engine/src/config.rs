@@ -100,14 +100,20 @@ pub fn load(path: &Path) -> Config {
 /// `index_present` = 数据目录已有落盘索引（升级信号）：
 /// 字段缺失时写入 `Some(index_present)` 并原子落盘；写失败只告警，内存仍按迁移值。
 ///
-/// 仅对「可解析」与「缺文件」迁移；解析/读取失败时返回默认配置且不回写，
+/// 仅对「可解析」与「缺文件」迁移；解析/读取失败时不动磁盘，只在内存里按
+/// `index_present` 给出生效值（升级用户保持旧行为：包含隐藏项），
 /// 避免用默认值覆盖用户的损坏/不可读文件（与 [`load`] 的「不动用户文件」契约一致）。
 /// 迁移无跨进程锁：多进程并发写回为 last-writer-wins。
 pub fn load_migrating(path: &Path, index_present: bool) -> Config {
     let mut cfg = match load_detailed(path) {
         Loaded::Ok(c) => c,
         Loaded::Missing => default_config(),
-        Loaded::Failed => return default_config(),
+        Loaded::Failed => {
+            // 损坏/不可读：文件保持原样，内存按升级信号决定是否包含隐藏项。
+            let mut cfg = default_config();
+            cfg.include_hidden = Some(index_present);
+            return cfg;
+        }
     };
     if cfg.include_hidden.is_none() {
         cfg.include_hidden = Some(index_present);
@@ -264,17 +270,30 @@ mod tests {
         assert!(!p.exists(), "load 不得写盘");
     }
 
-    /// 损坏配置不得被迁移覆盖：迁移只针对可解析/缺文件，失败时原样保留用户文件。
+    /// 损坏配置不得被迁移覆盖：迁移只针对可解析/缺文件，失败时原样保留用户文件；
+    /// 内存仍按升级信号给出生效值（升级用户保持旧行为：包含隐藏项）。
     #[test]
     fn load_migrating_does_not_overwrite_corrupt_config() {
+        let corrupt = "excluded = [";
+
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        let corrupt = "excluded = [";
         std::fs::write(&p, corrupt).unwrap();
         let c = load_migrating(&p, true);
-        assert!(c.include_hidden.is_none(), "失败路径不得假装已迁移");
+        assert_eq!(c.include_hidden, Some(true), "升级用户内存值保持旧行为");
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
+            corrupt,
+            "不得覆盖损坏配置"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let p2 = dir2.path().join("config.toml");
+        std::fs::write(&p2, corrupt).unwrap();
+        let c2 = load_migrating(&p2, false);
+        assert_eq!(c2.include_hidden, Some(false), "新装用户内存值不包含");
+        assert_eq!(
+            std::fs::read_to_string(&p2).unwrap(),
             corrupt,
             "不得覆盖损坏配置"
         );
