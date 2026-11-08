@@ -56,6 +56,9 @@ pub fn load_migrating(path: &Path, index_present: bool) -> Config
 ```
 
 - `load()` 保持纯读语义，字段缺失返回 `None`。
+- 解析/读取失败（`Loaded::Failed`）：`load_migrating` 返回 `default_config()`，内存置
+  `include_hidden = Some(index_present)`，且**不写盘**——损坏/不可读配置保持原样；
+  升级用户保留包含语义，新装得到 false。
 - `ExcludeReset` 路径（`daemon::reset_excludes`）写 `default_config()` 前必须
   `defaults.include_hidden = current.include_hidden`，防止排除项重置连带清掉本开关。
 - 其余写配置路径（exclude add/remove、volumes_set）整份保存，自然保留该字段。
@@ -132,7 +135,7 @@ Response::HiddenPrefs { include: bool, message: Option<String> },
 
 ## 5. cli / daemon
 
-- `cold_start`：`config::load` → `config::load_migrating(&paths.config_file(), paths.index_file().exists())`。
+- `cold_start`：直接调用 `config::load_migrating(&paths.config_file(), paths.index_file().exists())`。
 - `run_query` 增加 `include_hidden: Option<bool>`：`plan.include_hidden = include_hidden.unwrap_or_else(|| state.cfg.lock_recover().include_hidden_effective())`。
 - dispatch：
   - `HiddenSet` → 更新 `state.cfg`（`Some(include)`）、`config::save`；保存失败返回
