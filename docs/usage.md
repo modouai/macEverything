@@ -57,6 +57,13 @@ App 与命令行互不依赖:装 App 不要求命令行在 PATH,反之亦然。A
 - 角标:索引状态实时可见——建索引中 N(首扫)/ 补齐中(停机重放)/ 重扫中 / 离线索引 / 引擎启动中 / 索引构建中。
 - 快捷键被其他应用占用时,悬浮条内常驻提示:已自动改用备选键(⌥⇧Space / ⌃⌥⇧Space)或「快捷键不可用,可从托盘唤起」。
 
+### 隐藏项
+
+- 设置 → **索引** →「包含隐藏项」：开启后搜索结果包含名称以 `.` 开头的文件和文件夹
+  （默认关闭；升级用户首次启动保持旧行为，即包含）。
+- 过滤在查询层完成，切换即时生效，不重建索引；隐藏目录内的可见文件同样不显示。
+- 新装默认不包含；`macEverything exclude reset` 不会重置该开关。
+
 ### 完整结果窗口
 
 入口(任一):
@@ -178,7 +185,7 @@ App 运行中时,以下命令同样可用(共用同一引擎与数据目录)。
 ```text
 macEverything [--data-dir <PATH>] start
 macEverything [--data-dir <PATH>] stop
-macEverything [--data-dir <PATH>] query [--json] [--sort <name|size|mtime|path>] [--desc] [--] <关键词>
+macEverything [--data-dir <PATH>] query [--json] [--sort <name|size|mtime|path>] [--desc] [--include-hidden] [--] <关键词>
 macEverything [--data-dir <PATH>] status [--json]
 macEverything [--data-dir <PATH>] exclude add|remove|list|reset [路径]
 ```
@@ -233,6 +240,7 @@ macEverything query --json "*.pdf" | jq '.entries[].path'
 
 - `--sort <name|size|mtime|path>` 指定排序键;`--desc` 必须与 `--sort` 同时出现,单独使用按用法错误处理。
 - **`--desc` 是绝对降序**:不加它,`--sort mtime` 输出**最旧在前**——mtime 的自然方向是降序,四个键里只有它与直觉相反;`name`/`size`/`path` 不加 `--desc` 即升序。
+- `--include-hidden`：本次查询强制包含隐藏项（不修改全局设置）；缺省遵循全局配置。
 - 选项必须出现在关键词之前;关键词以 `-` 开头时用 `--` 分隔:`query --json -- "-foo"`。关键词开始后再出现选项按意外参数处理。
 - `--json` 时 stdout 只输出一个 JSON 对象(见「--json 输出契约」),提示与日志走 stderr;人类可读输出保持不变。
 
