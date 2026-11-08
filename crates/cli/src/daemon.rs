@@ -2911,22 +2911,25 @@ enum ExcludeOp {
 ///
 /// 顺序有语义:先落盘默认配置,成功后才替换内存并重扫。保存失败时内存配置与
 /// 索引都不变(返回当前列表 + 可操作原因)——不能先改内存再赌落盘成功。
-/// 不持 `cfg` 锁跨越保存/重扫;成功后一次全量重扫使默认排除项同时生效。
+/// `cfg` 锁覆盖「读-改-写」全程(HiddenSet/volumes_set 不得插入),重扫前释放;
+/// 成功后一次全量重扫使默认排除项同时生效。
 fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
-    // 与 add/remove 共用变更锁:保存/内存替换/重扫整体串行,防配置与内存错位。
     let _op = state.exclude_op_lock.lock_recover();
-    let current_hidden = state.cfg.lock_recover().include_hidden;
+    // 持 cfg 锁跨越读-改-写:HiddenSet/volumes_set 等配置写者不得插入本序列,
+    // 否则重置会用陈旧默认值覆盖并发写入的搜索偏好。
+    let mut cfg = state.cfg.lock_recover();
     let mut defaults = config::default_config();
-    defaults.include_hidden = current_hidden;
+    defaults.include_hidden = cfg.include_hidden;
     if let Err(e) = config::save(&defaults, &paths.config_file()) {
         log::error!("恢复默认排除目录:配置保存失败: {e}");
         return Response::Exclude {
             ok: false,
-            excluded: state.cfg.lock_recover().excluded.clone(),
+            excluded: cfg.excluded.clone(),
             message: Some(format!("配置保存失败({e}),排除目录未改变")),
         };
     }
-    *state.cfg.lock_recover() = defaults.clone();
+    *cfg = defaults.clone();
+    drop(cfg); // 不放锁调用重扫(重扫内部会取 cfg)
     degrade_and_rescan(state, paths, true); // 同步:响应语义「返回时排除项已生效」
     Response::Exclude {
         ok: true,
@@ -3859,6 +3862,8 @@ mod tests {
     /// 恢复默认(E5):自定义条目清空 → 内存/落盘均为内置默认集,并按**新排除集**
     /// 重扫(原本被自定义条目剪枝的目录/文件重置后必须入索引)。状态从 BUILDING
     /// 推进到 READY;单次 reset 只触发这一次全量重扫,不为每条默认单独重扫。
+    /// 并发 HiddenSet 的丢失更新由结构排除(cfg 锁覆盖读-改-写全程),不做易抖的
+    /// 时序测试——本测只钉单线程语义。
     #[test]
     fn exclude_reset_restores_defaults_and_rescans_with_new_excludes() {
         let (_tmp, state, paths) = exclude_fixture(&["node_modules"]);
