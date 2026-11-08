@@ -124,10 +124,11 @@ Response::HiddenPrefs { include: bool, message: Option<String> },
 
 - `query(paths, q, limit, sort, desc, dir_only, include_hidden: Option<bool>)`。
   - 在线：透传 `include_hidden`（`None` 不发送）。
-  - 离线：`include_hidden.unwrap_or_else(|| load_migrating(...).include_hidden_effective())`。
+  - 离线：`offline_include_hidden(paths, include_hidden)`——请求级 `Some` 优先；否则
+    索引文件存在时 `load_migrating(config, true)`，不存在时 `config::load`（注定失败的离线查询不写配置）。
 - 新增 `HiddenPrefsOutcome { include, message }` 与 `hidden_prefs()` / `set_hidden_prefs()`，
   镜像 `volumes_call` 的连接复用、错误兜底与旧引擎文案。
-- `offline_query` 增加 `include_hidden: Option<bool>` 参数，置 `plan.include_hidden`。
+- `offline_query` 增加 `include_hidden: bool` 参数，置 `plan.include_hidden`。
 
 ## 5. cli / daemon
 
@@ -160,7 +161,7 @@ Response::HiddenPrefs { include: bool, message: Option<String> },
   有 pending 刷新时刻；否则用 `last_fired` 的串构造 pending；空会话不动。
 - i18n（`catalog.rs`）：`row_include_hidden`、`hidden_desc`
   等中英条目。
-- `client::query` 调用点（`palette.rs` 两条、`main.rs`）补 `None`。
+- `client::query` 调用点：`palette.rs` 两条传 `None`；CLI `main.rs` 传 `include_hidden.then_some(true)`。
 
 ## 7. 测试（含突变验证）
 
