@@ -592,6 +592,26 @@ mod tests {
         assert!(body.contains(r#""include_hidden":true"#));
         assert_eq!(decode_request(&bytes[4..]).unwrap(), r);
 
+        // Some(false) 与 None 区分:前者上线 JSON false(单次覆盖关闭),
+        // 后者跟随 daemon 配置(不发送该键)。
+        let some_false = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+            desc: None,
+            dir_only: None,
+            include_hidden: Some(false),
+        };
+        let bytes = encode(&some_false).unwrap();
+        let body = String::from_utf8(bytes[4..].to_vec()).unwrap();
+        assert!(body.contains(r#""include_hidden":false"#), "body: {body}");
+        assert_eq!(
+            decode_request(&bytes[4..]).unwrap(),
+            some_false,
+            "Some(false) 往返须保留"
+        );
+
         let none = Request::Query {
             v: PROTOCOL_VERSION,
             query: "a".into(),
@@ -625,6 +645,34 @@ mod tests {
             message: Some("x".into()),
         };
         assert_eq!(decode_response(&encode(&resp).unwrap()[4..]).unwrap(), resp);
+    }
+
+    #[test]
+    fn hidden_variants_wire_tags_and_version() {
+        let set = Request::HiddenSet {
+            v: PROTOCOL_VERSION,
+            include: true,
+        };
+        let body = String::from_utf8(encode(&set).unwrap()[4..].to_vec()).unwrap();
+        assert!(body.contains(r#""msg":"hidden_set""#), "wire: {body}");
+        assert_eq!(set.version(), PROTOCOL_VERSION);
+
+        let prefs = Request::HiddenPrefs {
+            v: PROTOCOL_VERSION,
+        };
+        let body = String::from_utf8(encode(&prefs).unwrap()[4..].to_vec()).unwrap();
+        assert!(body.contains(r#""msg":"hidden_prefs""#), "wire: {body}");
+        assert_eq!(prefs.version(), PROTOCOL_VERSION);
+
+        let resp = Response::HiddenPrefs {
+            include: true,
+            message: None,
+        };
+        let body = String::from_utf8(encode(&resp).unwrap()[4..].to_vec()).unwrap();
+        assert!(
+            !body.contains("message"),
+            "成功应答不得序列化 message: {body}"
+        );
     }
 
     #[test]
