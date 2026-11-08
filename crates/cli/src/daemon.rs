@@ -761,6 +761,7 @@ fn desc_echo(key: SortKey, desc: bool) -> Option<bool> {
 /// desc(定案,Task 19b)= 反转自然方向,透传引擎;缺省(旧客户端)等价 false。
 /// dir_only(保存面板助手,与 protocol 契约同源)= None/Some(false) 不过滤,
 /// 仅 Some(true) 生效;缺省(旧客户端)为 None,与现状逐位一致。
+/// include_hidden(隐藏项开关)= 请求级 Some 覆盖,None 跟随 daemon 配置。
 fn run_query(
     state: &EngineState,
     q: &str,
@@ -768,6 +769,7 @@ fn run_query(
     sort: Option<&str>,
     desc: bool,
     dir_only: bool,
+    include_hidden: Option<bool>,
 ) -> Response {
     let (key, key_str) = parse_sort_key(sort);
     let desc_echo = desc_echo(key, desc);
@@ -778,6 +780,11 @@ fn run_query(
         };
     };
     plan.dir_only = dir_only;
+    // 请求级覆盖优先;None 跟随 daemon 配置。配置读取只持锁一瞬,
+    // 不跨 with_view(查询读锁)。
+    let include_hidden =
+        include_hidden.unwrap_or_else(|| state.cfg.lock_recover().include_hidden_effective());
+    plan.include_hidden = include_hidden;
     // 排序轮 stat 缓存:条目号 → (size, mtime)。meta_of 是 `&dyn Fn`,经 Mutex
     // 取内部可变性写入(不走 FnMut 捕获);响应组装(锁外)按条目号命中优先。
     let cache: Mutex<HashMap<u32, MetaRow>> = Mutex::new(HashMap::new());
@@ -2436,7 +2443,7 @@ fn handle_diff_error(
 
 /// 冷启动编排(独立线程):有索引 → 直挂 Shared 秒开(零物化)→ 重放;无/损坏 → 首扫。
 fn cold_start(state: Arc<EngineState>, paths: DaemonPaths) -> Result<()> {
-    let cfg = config::load(&paths.config_file());
+    let cfg = config::load_migrating(&paths.config_file(), paths.index_file().exists());
     *state.cfg.lock_recover() = cfg.clone();
     // 外接卷(external-volumes):挂载中的期望卷并入初始 roots——落盘索引路径
     // 由此获得流覆盖(停机窗口重放追平卷内漂移);首扫路径一并纳入首扫。
@@ -2738,7 +2745,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
             sort,
             desc,
             dir_only,
-            include_hidden: _,
+            include_hidden,
             v: _,
         } => run_query(
             state,
@@ -2747,6 +2754,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
             sort.as_deref(),
             desc.unwrap_or(false),
             dir_only.unwrap_or(false),
+            include_hidden,
         ),
         Request::Status { .. } => {
             let name = *state.state_name.lock_recover();
@@ -2791,11 +2799,8 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         Request::ExcludeReset { .. } => reset_excludes(state, paths),
         Request::VolumesSet { auto, excluded, .. } => volumes_set(state, paths, auto, excluded),
         Request::VolumesPrefs { .. } => volumes_prefs_response(state),
-        // 占位(Task 5 接线):新变体暂未支持,避免 match 非穷尽。
-        Request::HiddenSet { .. } | Request::HiddenPrefs { .. } => Response::Error {
-            code: "unsupported".into(),
-            message: "隐藏项偏好暂未支持,请升级引擎".into(),
-        },
+        Request::HiddenSet { include, .. } => hidden_set(state, paths, include),
+        Request::HiddenPrefs { .. } => hidden_prefs_response(state),
     }
 }
 
@@ -2850,6 +2855,34 @@ fn volumes_prefs_response(state: &Arc<EngineState>) -> Response {
     }
 }
 
+/// 隐藏项偏好写入:更新内存 + 落盘;保存失败仍临时生效并如实告知。
+fn hidden_set(state: &Arc<EngineState>, paths: &DaemonPaths, include: bool) -> Response {
+    let (include_now, message) = {
+        let mut c = state.cfg.lock_recover();
+        c.include_hidden = Some(include);
+        match config::save(&c, &paths.config_file()) {
+            Ok(()) => (include, None),
+            Err(e) => {
+                log::error!("隐藏项偏好落盘失败: {e}");
+                (include, Some(format!("已临时生效但写入配置失败: {e}")))
+            }
+        }
+    };
+    log::info!("隐藏项偏好更新:include={include_now}");
+    Response::HiddenPrefs {
+        include: include_now,
+        message,
+    }
+}
+
+/// 隐藏项偏好读(设置页回显)。
+fn hidden_prefs_response(state: &Arc<EngineState>) -> Response {
+    Response::HiddenPrefs {
+        include: state.cfg.lock_recover().include_hidden_effective(),
+        message: None,
+    }
+}
+
 /// 排除变更的统一应答:失败如实回 ok=false + 可操作原因(不再恒 ok=true)。
 fn exclude_response(
     state: &Arc<EngineState>,
@@ -2885,7 +2918,9 @@ enum ExcludeOp {
 fn reset_excludes(state: &Arc<EngineState>, paths: &DaemonPaths) -> Response {
     // 与 add/remove 共用变更锁:保存/内存替换/重扫整体串行,防配置与内存错位。
     let _op = state.exclude_op_lock.lock_recover();
-    let defaults = config::default_config();
+    let current_hidden = state.cfg.lock_recover().include_hidden;
+    let mut defaults = config::default_config();
+    defaults.include_hidden = current_hidden;
     if let Err(e) = config::save(&defaults, &paths.config_file()) {
         log::error!("恢复默认排除目录:配置保存失败: {e}");
         return Response::Exclude {
@@ -3378,7 +3413,7 @@ mod tests {
             "Shared 态 rebuild_dir_map 应建立根映射"
         );
         // Shared 态查询直接可服务(冷启动秒开语义)
-        match run_query(&state, "a.txt", 10, None, false, false) {
+        match run_query(&state, "a.txt", 10, None, false, false, None) {
             Response::Query { total, .. } => assert_eq!(total, 1, "Shared 态应可查"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -3399,7 +3434,7 @@ mod tests {
             assert!(v.entry(a).is_live() && v.entry(b).is_live());
         });
         // overlay 增量可见、旧路径仍在(仅新增,无删除)
-        match run_query(&state, "c.txt", 10, None, false, false) {
+        match run_query(&state, "c.txt", 10, None, false, false, None) {
             Response::Query { total, .. } => assert_eq!(total, 1, "overlay 新增可见"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -3670,7 +3705,7 @@ mod tests {
             (None, "relevance(补 stat miss)"),
             (Some("size"), "size(缓存命中)"),
         ] {
-            let resp = run_query(&state, "hit", 10, sort, false, false);
+            let resp = run_query(&state, "hit", 10, sort, false, false, None);
             let Response::Query { entries, .. } = resp else {
                 panic!("{label} 应返回查询响应: {resp:?}");
             };
@@ -3839,6 +3874,9 @@ mod tests {
         let custom = custom_dir.to_string_lossy().into_owned();
         state.cfg.lock_recover().excluded.push(custom.clone());
         config::save(&state.cfg.lock_recover(), &paths.config_file()).unwrap();
+        // 隐藏项开关须在「恢复默认」中保留(不得随默认配置被清空)。
+        state.cfg.lock_recover().include_hidden = Some(true);
+        config::save(&state.cfg.lock_recover(), &paths.config_file()).unwrap();
 
         let resp = reset_excludes(&state, &paths);
         let defaults = config::default_config();
@@ -3865,6 +3903,16 @@ mod tests {
             config::load(&paths.config_file()).excluded,
             defaults.excluded,
             "默认配置须落盘"
+        );
+        assert_eq!(
+            state.cfg.lock_recover().include_hidden,
+            Some(true),
+            "恢复默认不得清空隐藏项开关(内存)"
+        );
+        assert_eq!(
+            config::load(&paths.config_file()).include_hidden,
+            Some(true),
+            "恢复默认不得清空隐藏项开关(落盘)"
         );
         assert!(
             *state.state_name.lock_recover() == state::READY,
@@ -4506,7 +4554,7 @@ mod tests {
             "flush 后应为 Shared(remap 完成、Overlay 清零)"
         );
         // 内存查询:增量保留(合并写不得丢更新)
-        match run_query(&state, "whole:new.txt", 10, None, false, false) {
+        match run_query(&state, "whole:new.txt", 10, None, false, false, None) {
             Response::Query { total, .. } => assert_eq!(total, 1, "flush 后增量保留"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -4944,7 +4992,7 @@ mod tests {
         // 断言 B:d 内再漂移,diff 落在正确条目上(不得挂到 2 号 new.txt 下)。
         std::fs::write(d_path.join("y.txt"), b"").unwrap();
         assert_eq!(diff_one(&state, &d_path), 1);
-        match run_query(&state, "whole:y.txt", 10, None, false, false) {
+        match run_query(&state, "whole:y.txt", 10, None, false, false, None) {
             Response::Query { entries, total, .. } => {
                 assert_eq!(total, 1);
                 // 索引内路径为字面形态(root 条目名 = 夹具插入时的 dir.path())
@@ -5037,7 +5085,7 @@ mod tests {
             0,
             "放弃替换收尾清 dirty(防密集重写风暴)"
         );
-        match run_query(&state, "whole:c.txt", 10, None, false, false) {
+        match run_query(&state, "whole:c.txt", 10, None, false, false, None) {
             Response::Query { total, .. } => {
                 assert_eq!(total, 1, "窗口增量不得随陈旧快照替换丢失")
             }
@@ -5053,7 +5101,7 @@ mod tests {
             ),
             "下轮 flush 应替换成功(世代一致)"
         );
-        match run_query(&state, "whole:c.txt", 10, None, false, false) {
+        match run_query(&state, "whole:c.txt", 10, None, false, false, None) {
             Response::Query { total, .. } => assert_eq!(total, 1, "下轮合并后增量保留"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -5132,7 +5180,7 @@ mod tests {
         let pending = end_volume_scan(&state, token);
         assert_eq!(pending.len(), 1, "被闸住的目录应登记");
         assert_eq!(diff_one(&state, &pending[0]), 1, "释放闸门后重放生效");
-        match run_query(&state, "whole:new.txt", 10, None, false, false) {
+        match run_query(&state, "whole:new.txt", 10, None, false, false, None) {
             Response::Query { total, .. } => assert_eq!(total, 1, "重放后新文件可见"),
             other => panic!("意外响应: {other:?}"),
         }
@@ -5932,5 +5980,73 @@ mod tests {
             !rescan_fire_allowed(false, true, true, false),
             "重试窗口内不得触发"
         );
+    }
+
+    /// 查询遵循 daemon 配置，请求级 Some 可覆盖；total 同口径。
+    #[test]
+    fn run_query_honors_hidden_config_and_override() {
+        let mut idx = Index::new();
+        let root = idx.insert("/tmp/r", NO_PARENT, true);
+        idx.insert(".hidden.txt", root, false);
+        idx.insert("visible.txt", root, false);
+        let state = Arc::new(EngineState::new());
+        *state.holder.write_fail_fast("holder") = IndexHolder::Mutable(idx);
+        state.cfg.lock_recover().include_hidden = Some(false);
+
+        let total = |r: Response| match r {
+            Response::Query { total, .. } => total,
+            other => panic!("意外响应: {other:?}"),
+        };
+        assert_eq!(
+            total(run_query(&state, "*", 10, None, false, false, None)),
+            2,
+            "配置 false：根 + visible.txt"
+        );
+        assert_eq!(
+            total(run_query(&state, "*", 10, None, false, false, Some(true))),
+            3,
+            "请求级 true 覆盖配置"
+        );
+    }
+
+    /// HiddenSet 更新内存 + 落盘；HiddenPrefs 读回显。
+    #[test]
+    fn hidden_set_persists_and_prefs_echoes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            data_dir: tmp.path().join("data"),
+        };
+        let state = Arc::new(EngineState::new());
+        let resp = dispatch(
+            Request::HiddenSet {
+                v: protocol::PROTOCOL_VERSION,
+                include: false,
+            },
+            &state,
+            &paths,
+        );
+        match resp {
+            Response::HiddenPrefs { include, message } => {
+                assert!(!include);
+                assert!(message.is_none());
+            }
+            other => panic!("意外响应: {other:?}"),
+        }
+        assert_eq!(state.cfg.lock_recover().include_hidden, Some(false));
+        assert_eq!(
+            config::load(&paths.config_file()).include_hidden,
+            Some(false),
+            "偏好须落盘"
+        );
+        match dispatch(
+            Request::HiddenPrefs {
+                v: protocol::PROTOCOL_VERSION,
+            },
+            &state,
+            &paths,
+        ) {
+            Response::HiddenPrefs { include, .. } => assert!(!include),
+            other => panic!("意外响应: {other:?}"),
+        }
     }
 }
