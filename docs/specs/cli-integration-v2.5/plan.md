@@ -2074,7 +2074,7 @@ git commit -m "feat(ui): add command-line tool installer row"
 
 ---
 
-# Phase C：文档、站点与发布
+# Phase C：文档与发布
 
 ## Task 10: 文档与官网
 
