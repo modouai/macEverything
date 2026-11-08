@@ -2738,6 +2738,7 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
             sort,
             desc,
             dir_only,
+            include_hidden: _,
             v: _,
         } => run_query(
             state,
@@ -2790,6 +2791,11 @@ fn dispatch(req: Request, state: &Arc<EngineState>, paths: &DaemonPaths) -> Resp
         Request::ExcludeReset { .. } => reset_excludes(state, paths),
         Request::VolumesSet { auto, excluded, .. } => volumes_set(state, paths, auto, excluded),
         Request::VolumesPrefs { .. } => volumes_prefs_response(state),
+        // 占位(Task 5 接线):新变体暂未支持,避免 match 非穷尽。
+        Request::HiddenSet { .. } | Request::HiddenPrefs { .. } => Response::Error {
+            code: "unsupported".into(),
+            message: "隐藏项偏好暂未支持,请升级引擎".into(),
+        },
     }
 }
 
@@ -3722,6 +3728,7 @@ mod tests {
                     sort: None,
                     desc: None,
                     dir_only,
+                    include_hidden: None,
                 },
                 &state,
                 &paths,

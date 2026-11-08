@@ -34,6 +34,10 @@ pub enum Request {
         /// 同 sort/desc:纯新增可选字段不 bump v,缺省不发送。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dir_only: Option<bool>,
+        /// None = 跟随 daemon 配置；Some = 单次覆盖（CLI --include-hidden）。
+        /// 同 sort/desc：纯新增可选字段不 bump v，缺省不发送。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include_hidden: Option<bool>,
     },
     Status {
         v: u32,
@@ -76,6 +80,15 @@ pub enum Request {
     VolumesPrefs {
         v: u32,
     },
+    /// 隐藏项偏好写(设置页)：daemon 更新配置并落盘，立即影响后续查询。
+    HiddenSet {
+        v: u32,
+        include: bool,
+    },
+    /// 隐藏项偏好回显。
+    HiddenPrefs {
+        v: u32,
+    },
 }
 
 impl Request {
@@ -90,7 +103,9 @@ impl Request {
             | Request::ExcludeList { v }
             | Request::ExcludeReset { v }
             | Request::VolumesSet { v, .. }
-            | Request::VolumesPrefs { v } => *v,
+            | Request::VolumesPrefs { v }
+            | Request::HiddenSet { v, .. }
+            | Request::HiddenPrefs { v } => *v,
         }
     }
 }
@@ -146,6 +161,13 @@ pub enum Response {
         auto: bool,
         excluded: Vec<String>,
         /// 失败原因(落盘失败等);成功时缺省不序列化。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// 隐藏项偏好回显（HiddenSet 的应答与 HiddenPrefs 的读应答共用）。
+    HiddenPrefs {
+        include: bool,
+        /// 失败原因（落盘失败等）；成功时缺省不序列化。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -214,6 +236,7 @@ mod tests {
             sort: None,
             desc: None,
             dir_only: None,
+            include_hidden: None,
         };
         let bytes = encode(&r).unwrap();
         assert_eq!(
@@ -312,6 +335,7 @@ mod tests {
             sort: Some("size".into()),
             desc: Some(true),
             dir_only: None,
+            include_hidden: None,
         };
         let b = encode(&r).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r);
@@ -332,6 +356,7 @@ mod tests {
             sort: Some("size".into()),
             desc: None,
             dir_only: None,
+            include_hidden: None,
         };
         let b = encode(&r).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r);
@@ -405,6 +430,7 @@ mod tests {
             sort: None,
             desc: None,
             dir_only: None,
+            include_hidden: None,
         };
         let body = serde_json::to_string(&r2).unwrap();
         assert!(!body.contains("dir_only"), "None 不应序列化:{body}");
@@ -416,6 +442,7 @@ mod tests {
             sort: None,
             desc: None,
             dir_only: Some(true),
+            include_hidden: None,
         };
         let b = encode(&r3).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r3);
@@ -435,6 +462,7 @@ mod tests {
             sort: None,
             desc: None,
             dir_only: Some(false),
+            include_hidden: None,
         };
         let b = encode(&r4).unwrap();
         assert_eq!(decode_request(&b[4..]).unwrap(), r4);
@@ -457,6 +485,7 @@ mod tests {
             sort: None,
             desc: None,
             dir_only: None,
+            include_hidden: None,
         };
         let body = serde_json::to_string(&r).unwrap();
         assert!(!body.contains("sort"), "None 不应序列化 sort 键:{body}");
@@ -534,6 +563,68 @@ mod tests {
             "线上 tag 应为 exclude_reset:{body}"
         );
         assert!(!body.contains("path"), "恢复默认不接受路径/参数:{body}");
+    }
+
+    /// Query.include_hidden 三态：缺省 None；Some 才上线；往返保留。
+    #[test]
+    fn query_include_hidden_is_optional() {
+        let old = br#"{"msg":"query","v":1,"query":"a","limit":10}"#;
+        let r: Request = serde_json::from_slice(old).unwrap();
+        assert!(matches!(
+            r,
+            Request::Query {
+                include_hidden: None,
+                ..
+            }
+        ));
+
+        let r = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+            desc: None,
+            dir_only: None,
+            include_hidden: Some(true),
+        };
+        let bytes = encode(&r).unwrap();
+        let body = String::from_utf8(bytes[4..].to_vec()).unwrap();
+        assert!(body.contains(r#""include_hidden":true"#));
+        assert_eq!(decode_request(&bytes[4..]).unwrap(), r);
+
+        let none = Request::Query {
+            v: PROTOCOL_VERSION,
+            query: "a".into(),
+            limit: 10,
+            sort: None,
+            desc: None,
+            dir_only: None,
+            include_hidden: None,
+        };
+        let body = String::from_utf8(encode(&none).unwrap()[4..].to_vec()).unwrap();
+        assert!(!body.contains("include_hidden"), "None 不得上线: {body}");
+    }
+
+    /// 隐藏项偏好消息编解码。
+    #[test]
+    fn hidden_prefs_roundtrip() {
+        let set = Request::HiddenSet {
+            v: PROTOCOL_VERSION,
+            include: true,
+        };
+        assert_eq!(decode_request(&encode(&set).unwrap()[4..]).unwrap(), set);
+        let prefs = Request::HiddenPrefs {
+            v: PROTOCOL_VERSION,
+        };
+        assert_eq!(
+            decode_request(&encode(&prefs).unwrap()[4..]).unwrap(),
+            prefs
+        );
+        let resp = Response::HiddenPrefs {
+            include: false,
+            message: Some("x".into()),
+        };
+        assert_eq!(decode_response(&encode(&resp).unwrap()[4..]).unwrap(), resp);
     }
 
     #[test]

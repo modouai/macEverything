@@ -220,6 +220,7 @@ pub fn query(
                 // false 不发送:None 与 false 引擎语义相同(不过滤),
                 // 省字段让混跑期旧 daemon 收到的消息与旧客户端完全同形
                 dir_only: dir_only.then_some(true),
+                include_hidden: None,
             },
         )
         .map_err(no_code)?;
