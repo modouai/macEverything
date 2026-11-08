@@ -36,6 +36,5 @@ cargo test -p engine --test fsevents_live -- --ignored
 - `crates/protocol` / `crates/client`：daemon 协议与客户端承载层
 - `crates/cli`：daemon 与五个子命令
 - `crates/app`：eframe/egui 图形界面
-- `site/`：静态官网（不参与 Rust 构建）
 
 更多细节见 [开发指南](docs/development.md) 与 [架构总览](docs/architecture.md)。

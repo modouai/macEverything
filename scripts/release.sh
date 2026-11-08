@@ -15,7 +15,6 @@
 #   release/macEverything-<version>.zip   （公证用中间产物，保留便于排查）
 #   release/macEverything-<version>.dmg   （分发产物，已签名/公证/staple）
 #   release/macEverything-<version>.dmg.sha256
-#   site/version.json                    （版本清单，部署站点时随 site/ 一起发布）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -113,18 +112,6 @@ spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG
 
 # 5) 摘要
 shasum -a 256 "$DMG" | tee "$DMG.sha256"
-
-# 6) 生成官网版本清单（与 Cargo / 页面 / DMG 同一版本号）
-SITE_DIR="${MCE_SITE_DIR:-$ROOT/../macEverything-site}"
-VERSION_JSON="$SITE_DIR/version.json"
-mkdir -p "$SITE_DIR"
-cat > "$VERSION_JSON.tmp" <<JSON
-{
-  "version": "${VERSION}"
-}
-JSON
-mv -f "$VERSION_JSON.tmp" "$VERSION_JSON"
-echo "版本清单: $VERSION_JSON"
 
 echo "== 完成 =="
 echo "DMG: $(cd "$(dirname "$DMG")" && pwd)/$(basename "$DMG")"

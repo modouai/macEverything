@@ -18,10 +18,8 @@
 
 - macOS 应用（`crates/app`）与命令行（`crates/cli`）
 - 搜索引擎（`crates/engine`）与 daemon 协议（`crates/protocol`）
-- 官网与下载统计函数（`site/`）
 
 ## 已知设计说明
 
 - 索引保存在本机 `~/Library/Application Support/macEverything/`，不上传
-- 应用唯一的联网行为是检查新版本（读取官网 `version.json`）
-- 官网只做国家/地区级、按日聚合的下载与访问计数；不记录原始 IP，不使用 Cookie，详见 [PRIVACY.md](PRIVACY.md)
+- 应用唯一的联网行为是检查新版本（读取 `version.json`）

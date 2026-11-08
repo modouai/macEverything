@@ -55,7 +55,7 @@ cargo test --workspace     # 全量测试
 # FSEvents 实机集成(需真实文件系统事件;CI 默认跳过)
 cargo test -p engine --test fsevents_live -- --ignored
 
-# 网络层实机校验(拉取官网首页,不校验 version.json;可选,需能访问官网)
+# 网络层实机校验(拉取公开 HTTPS 地址;可选,需要网络)
 cargo test -p macEverything-app platform::mac::tests::live_fetch_returns_bytes -- --ignored
 
 # 开发时临时覆盖清单地址(HTTPS;仅用于验收)
@@ -148,38 +148,7 @@ bash scripts/bench.sh /tmp/mce-bench 1000000   # 五项:首扫/查询 P99/增量
 - 公证凭据：优先 keychain profile（默认 `maceverything-notary`；先执行 `xcrun notarytool store-credentials`），钥匙串锁定时回落到 `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_SPECIFIC_PASSWORD`。
 - 产物：`release/macEverything-<version>.dmg`（+ `.sha256`）与 `.zip`（公证中间产物）。
 - 验收：`spctl --assess --type execute`（App）、`spctl --assess --type open --context context:primary-signature`（DMG）、`xcrun stapler validate`、`hdiutil verify`。
-- 完整发版清单（含官网版本信息、部署与验收）见 `CLAUDE.md`「发版流程」。
 
-## 官网(私有站点仓 `../macEverything-site`)
-
-官网是静态多页站，源文件在私有站点仓根目录，不参与 Rust 构建。页面清单：
-
-| 页面 | 中文 | 英文 |
-|---|---|---|
-| 首页 | `/` | `/en/` |
-| Mac 版 Everything | `/everything-for-mac/` | `/en/everything-for-mac/` |
-| Spotlight 搜不到文件 | `/spotlight-not-finding-files/` | `/en/spotlight-not-finding-files/` |
-| Mac 文件搜索指南 | `/mac-file-search-guide/` | `/en/mac-file-search-guide/` |
-| 交流与反馈 | `/community/` | `/en/community/` |
-| 更新日志 | `/changelog/` | `/en/changelog/` |
-
-- 语言：`/` 固定中文，`/en/` 固定英文；语言切换是普通链接，不再依赖 `localStorage`。
-- 共享资源：`assets/`（CSS、首页 JS、图标、吉祥物、分享图）；CSS/JS 引用带 `?v=YYYYMMDD` 版本串，资源改动时同步更新。
-- 字体：全站使用系统字体栈（SF Pro / PingFang SC / SF Mono），不加载 Web 字体。
-- 视觉：站点沿用 App 的 token（靛蓝选中色 `#5B6FD9`、深色 `#1A1D22`、12/8/6/4 圆角）；悬浮条演示为 700 宽、结果窗口为 1080×627。
-- 演示图标：`assets/file-icons/` 由 macOS `NSWorkspace` 按文件类型渲染为 PNG（与访达一致），不是图标库字形；吉祥物为 `assets/mascot.png`（透明 PNG）。
-- SEO：每页包含 canonical、hreflang、Open Graph、Twitter 卡片与 JSON-LD；`sitemap.xml` 与页面 hreflang 互指。
-- 本地预览：`cd ../macEverything-site && python3 -m http.server 8000`，打开 `http://127.0.0.1:8000/`。
-- 下载包：把 `release/macEverything-<version>.dmg` 复制到站点仓的 `downloads/`，按钮指向 `/downloads/macEverything-<version>.dmg`。该目录不入库。
-- 发布前必须运行 `python3 scripts/site/check_seo.py`（默认检查 `../macEverything-site`），退出码 0 才能部署。检查项包括 canonical/hreflang、sitemap 覆盖、JSON-LD、字体引用、站内链接、版本与 DMG 一致性。
-- `scripts/release.sh` 生成 DMG 后会同步写入站点仓的 `version.json`；`check_seo.py` 会校验它与 Cargo 版本一致。`_headers` 为它设置 `Cache-Control: no-cache`。
-- 更新日志：每次发版在 `/changelog/` 与 `/en/changelog/` 顶部追加一节（版本号、日期、2–4 条用户可感知的改动），并同步首页下载区的「最近更新」摘要。`check_seo.py` 强制每个页面包含当前版本号，漏更新会直接报错。
-- 分享图源文件：站点仓的 `scripts/og-image.html`，渲染为 `assets/og-image.png`（1200×630）。
-- 官网不写源码构建、终端安装和开发文档入口，只提供成品 DMG。
-
-### 站点仓（私有）
-
-官网内容已拆到私有仓库 `modouai/macEverything-site`；部署与托管配置见该仓 README。应用仓只保留 `scripts/site/` 下的校验与配置生成工具。
 ## v2 方向(未排期)
 
 - 图形界面:悬浮条(全局快捷键唤起)+ 完整窗口 + 设置;菜单栏常驻

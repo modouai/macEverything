@@ -31,7 +31,7 @@
 | `crates/app/src/ui/settings.rs` | 安装器 UI 状态机、generation、single-flight |
 | `crates/app/src/ui/settings_view.rs` | 「命令行工具」行；删除首屏断言 |
 | `crates/app/src/i18n/catalog.rs` | 新增文案 |
-| `docs/usage.md`、`README*.md`、`site/**` | 文档与官网支持说明 |
+| `docs/usage.md`、`README*.md` | 文档支持说明 |
 
 发布版本：`2.5.0`。A 与 B 可独立提交、独立验证，C 跟随两者。
 
@@ -2081,7 +2081,6 @@ git commit -m "feat(ui): add command-line tool installer row"
 **Files:**
 - Modify: `docs/usage.md`
 - Modify: `README.md` / `README.zh-CN.md`
-- Modify: `site/index.html` / `site/en/index.html`
 - Modify: `docs/architecture.md` / `docs/development.md`
 - Modify: `docs/specs/floatbar-visual/settings-visual.md`
 
@@ -2090,8 +2089,6 @@ git commit -m "feat(ui): add command-line tool installer row"
 - [ ] 官网中英文各加一句 CLI/JSON 支持说明（FAQ 或功能说明），不新增主视觉区块。
 - [ ] `docs/architecture.md` / `docs/development.md`：补数据目录覆盖、App 固定 `MCE_DATA_DIR`、JSON 契约入口。
 - [ ] `docs/specs/floatbar-visual/settings-visual.md`：删除首屏约束，改为固定 620×600 + 整页滚动。
-- [ ] `Cargo.toml` 版本升到 `2.5.0`；`site/version.json` 同步（release.sh 会做，但本地测试先同步）。
-- [ ] 跑 `python3 scripts/site/check_seo.py`，退出码 0。
 - [ ] 提交：
 
 ```bash

@@ -524,7 +524,7 @@ daemon 仍绑定 App 的 socket。
   「命令行工具」说明；FDA 提示；数据目录 0700/0600 说明。
 - `README.md` / `README.zh-CN.md`：把「CLI + GUI」从功能亮点列表移除，保留
   安装/使用章节的 CLI 支持说明，补一句 `--json` 可供脚本与 AI/agent 工具调用。
-- `site/index.html` / `site/en/index.html`：在功能说明或 FAQ 中加一句 CLI/JSON
+- 官网中英文页面：在功能说明或 FAQ 中加一句 CLI/JSON
   支持说明（中英各一处），不新增主视觉区块。
 - `docs/specs/v2-ui/product.md`：设置页行/分组更新。
 - `docs/specs/floatbar-visual/settings-visual.md`：删除「关于组之前内容须在首屏内」，

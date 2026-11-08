@@ -77,7 +77,7 @@
 ## S5 实机长跑（48h，挂机观察）
 
 1. 实机 48h：`mem-watch.sh` 采样 daemon/GUI；复核 A1（≤100MB）、A3（重扫 ≤2 次/24h）、A4（日志 <1MB/天）、A5（阶段线）、A6、A6b。
-2. 实机冒烟脚本（development.md）全走查；`check_seo.py` 无涉（纯 Rust 改动）。
+2. 实机冒烟脚本（development.md）全走查（纯 Rust 改动）。
 3. 全程三门禁绿收口；文档同步（architecture.md ADR-2 补 Base+Overlay 决策、development.md 陷阱表补 P0 窗口语义）。
 
 ## 风险与回滚
