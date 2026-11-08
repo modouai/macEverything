@@ -389,7 +389,7 @@ export MCE_DATA_DIR="$HOME/Library/Application Support/macEverything"
 - 不同目录 = 不同实例,可同时运行;**自定义目录的实例与 App 互不可见**(App 永远连默认目录)。
 - `stop` 只停目标实例。共用默认目录时**不要 `stop`**——那会停掉 App 正在用的引擎;要独立生命周期就开独立实例。
 
-外部集成(外部工具 等)两种接法:
+外部集成(编辑器、脚本等)两种接法:
 
 ```bash
 # 共享默认索引(省一次全盘扫描;不要对它 stop)

@@ -170,10 +170,12 @@ cargo test --workspace
 
 完整开发流程见[开发指南](docs/development.md)。FSEvents 实机集成测试标注 `#[ignore]`,仅在真实 Mac 上运行:`cargo test -p engine --test fsevents_live -- --ignored`。
 
+参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md);漏洞报告见 [SECURITY.md](SECURITY.md);数据处理说明见 [PRIVACY.md](PRIVACY.md);第三方许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
 ## 环境要求
 
 macOS 13+(Apple Silicon,不支持 Intel,发布的 DMG 仅含 arm64);源码构建需 Rust stable。数据目录 `~/Library/Application Support/macEverything/`。「完全磁盘访问权限」可选授予;不授予时未覆盖目录会显式列出,其余功能不受影响。
 
 ## 许可证
 
-[MIT](LICENSE) © zhao yonghui
+[MIT](LICENSE) © modouai

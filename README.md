@@ -172,10 +172,12 @@ cargo test --workspace
 
 See the [development guide](docs/development.md) (Chinese) for the full workflow. FSEvents integration tests are marked `#[ignore]` and need a real Mac: `cargo test -p engine --test fsevents_live -- --ignored`.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions, [SECURITY.md](SECURITY.md) for vulnerability reports and [PRIVACY.md](PRIVACY.md) for data handling. Third-party licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
 ## Requirements
 
 macOS 13 or later on Apple Silicon (Intel Macs are not supported; the released DMG is arm64-only). Rust stable for building from source. Data directory: `~/Library/Application Support/macEverything/`. Full Disk Access is optional; without it, unreadable directories are listed explicitly and everything else works.
 
 ## License
 
-[MIT](LICENSE) © zhao yonghui
+[MIT](LICENSE) © modouai
