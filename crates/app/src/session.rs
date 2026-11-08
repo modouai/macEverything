@@ -91,7 +91,7 @@ impl Session {
     /// 隐藏项开关变化：同串重发（语义同排序变更，但不改排序/方向）。
     /// 窗内有 pending 保持原串、刷新时刻；无 pending 按 last_fired 的串构造；
     /// 两者皆无（空词/从未发起）→ 不动。
-    #[allow(dead_code)] // Task 8 设置页开关写入成功后调用两视口会话。
+    #[cfg_attr(not(test), expect(dead_code))] // Task 8 设置页开关写入成功后调用两视口会话。
     pub fn on_hidden_change(&mut self, now: Instant) {
         let query = self
             .pending
@@ -371,6 +371,20 @@ mod tests {
         assert_eq!(again.query, "报告");
         assert_eq!(again.sort, SortKey::Relevance);
         assert_eq!(again.desc, first.desc);
+        assert_ne!(again.generation, first.generation, "重发须推进代际");
+
+        // pending 存在：刷新时刻顺延窗口，原串保留
+        let mut p = Session::new(Duration::from_millis(60));
+        p.on_input("q", base);
+        p.on_hidden_change(base + Duration::from_millis(30));
+        assert!(
+            p.pending_at(base + Duration::from_millis(70)).is_none(),
+            "刷新时刻应顺延防抖窗口"
+        );
+        let f = p
+            .pending_at(base + Duration::from_millis(95))
+            .expect("顺延后应到期发起");
+        assert_eq!(f.query, "q");
 
         let mut empty = Session::new(Duration::from_millis(60));
         empty.on_hidden_change(base);
