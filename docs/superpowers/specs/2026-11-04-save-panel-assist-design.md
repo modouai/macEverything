@@ -238,3 +238,42 @@ M0 结果决定策略 A/B 默认值与检测通知选型；任一风险点不可
     授权后主动唤醒 ROOT 消费启动标记；
   - 设置页开关关→开仍走 `apply_panel_assist` → pending → ROOT logic 启动
     detector，无需重启。
+
+## 10. 2026-11-12 修订（浮层持 key 期间点击浮层外 → 交还键盘）
+
+### 10.1 现象与机理
+
+浮层弹出即成 key（§3.3），此后用户点击保存面板的文件名框无法把键盘换回：
+键入继续进浮层搜索框，无法输入文件名（多 app 复现，2026-11-12 实机）。
+
+机理：nonactivating panel 的成 key 是 WindowServer 层的 key focus theft
+（`CPSStealKeyFocus`）；宿主 app 保持前台，其面板被点击时 AppKit 不发起归还，
+只有浮层自身 resign（隐藏/跳转）才释放。此前归还路径只有两条——Esc 隐藏与
+跳转后的被动形态（§9.3），「不跳转、只想改文件名」的场景无出口。
+
+### 10.2 行为契约
+
+- 浮层持 key 且可见时，落在**其他 app 窗口**的 mouse-down 触发交还：
+  - 点击点在最近面板 frame 内：让出 key + 后台恢复面板焦点（`activate_app`
+    + `focus_save_panel` 读回确认；失败仅留日志——不发合成键，不碰跳转/
+    屏蔽/handled 状态）；
+  - 点击点在 frame 外：仅让出 key（浮层保持可见，转入 §9.3 被动形态）；
+  - 浮层非 key / 不可见：不动作。
+- 交还后点击浮层可再进入搜索（被动形态既有语义）；Esc、屏蔽、Closed 语义
+  不变。
+- 跳转链路零改动：跳转期浮层已 orderOut（非 key），监听不触发；二次跳转的
+  「激活宿主 + 恢复面板焦点」与交还共用同一组函数。
+- 检测器零改动：`scan_focused` 以 AXWindows 全列表定位面板，面板失 key 不
+  产生 NoPanel/Closed（2026-11-05 已修，浮层抢 key 场景实测过）。
+
+### 10.3 实现
+
+- 纯决策器 `panel_assist::handback_action` + `click_in_panel_frame`
+  （AppKit 全局点 ↔ AX frame 换算；表驱动单测，突变验证）。
+- 平台层：全局 mouse-down 监听（`addGlobalMonitorForEventsMatchingMask`——
+  只收其他 app 的事件，自家窗口天然不触发）+ `overlay_yield_key`
+  （`resignKeyWindow`，仍持 key 时回退 orderOut→orderFrontRegardless；不改
+  UI 可见态）+ `overlay_is_key`/`primary_screen_height`/`panel_focus_restore`
+  facade。
+- 接线层（ui/mod.rs）持 Shared 判定；AX 恢复在后台线程执行。
+- 监听回调坐标取 `NSEvent::mouseLocation`（AppKit 全局坐标，主屏左下原点）。

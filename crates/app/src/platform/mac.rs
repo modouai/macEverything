@@ -49,9 +49,9 @@ use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication,
     NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBackingStoreType,
     NSBezierPath, NSBitmapImageRep, NSColor, NSCompositingOperation, NSDeviceRGBColorSpace,
-    NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext, NSImage, NSMenu,
-    NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel,
-    NSPanel, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
+    NSEvent, NSEventMask, NSEventModifierFlags, NSFloatingWindowLevel, NSGraphicsContext, NSImage,
+    NSMenu, NSMenuItem, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
+    NSOpenPanel, NSPanel, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
     NSRunningApplication, NSScreen, NSView, NSViewLayerContentsPlacement,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
@@ -1079,6 +1079,107 @@ pub fn overlay_hide() -> Result<()> {
         }
         None => Err(anyhow!("浮层窗口未就绪(视口尚未创建)")),
     }
+}
+
+// —— 浮层持 key 交还(design §10;2026-11-12)——
+//
+// 浮层弹出即成 key(§3.3),nonactivating panel 的成 key 是 WindowServer 层
+// key focus theft:宿主面板被点击不会自动归还,只有浮层自身 resign 才释放。
+// 此前出口只有 Esc 隐藏与跳转;「不跳转、只想改文件名」无出口(实机 2026-11-12,
+// 多 app 复现)。交还 = 全局 mouse-down(只收其他 app 的事件,自家窗口天然
+// 不触发)+ 按点击位置决策(纯逻辑在 panel_assist,接线在 ui/mod.rs)。
+
+/// 交还回调类型(AppKit 全局坐标点击点;接线层注入)。
+type FocusHandbackHandler = Box<dyn Fn(f64, f64) + Send + Sync>;
+/// 监听保活(系统 token + 事件 block;token 释放即停听)。
+type FocusHandbackKeep = (
+    Retained<AnyObject>,
+    RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>)>,
+);
+
+thread_local! {
+    /// 交还回调(主线程;接线层注入,参数 = AppKit 全局坐标点击点)。
+    static FOCUS_HANDBACK_HANDLER: RefCell<Option<FocusHandbackHandler>> =
+        const { RefCell::new(None) };
+    /// 监听 token + block 保活(主线程;token 释放即停听,进程生命周期保留)。
+    static FOCUS_HANDBACK_KEEP: RefCell<Option<FocusHandbackKeep>> =
+        const { RefCell::new(None) };
+}
+
+/// 注册交还回调(主线程;重复调用覆盖前值)。监听只装一次。
+pub fn install_overlay_focus_handback(handler: FocusHandbackHandler) {
+    if MainThreadMarker::new().is_none() {
+        log::warn!("install_overlay_focus_handback 非主线程调用");
+        return;
+    }
+    FOCUS_HANDBACK_HANDLER.with(|c| *c.borrow_mut() = Some(handler));
+    let installed = FOCUS_HANDBACK_KEEP.with(|c| c.borrow().is_some());
+    if installed {
+        return;
+    }
+    let mask =
+        NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
+    let block: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>)> = RcBlock::new(move |_ev| {
+        // 全局监听回调:事件投递给其他 app 时在主线程收到;坐标取 AppKit 全局
+        // 鼠标位置(与 NSEvent::mouseLocation 同源)。handler 未注入 = no-op。
+        let loc = NSEvent::mouseLocation();
+        FOCUS_HANDBACK_HANDLER.with(|c| {
+            if let Some(handler) = c.borrow().as_deref() {
+                handler(loc.x, loc.y);
+            }
+        });
+    });
+    // objc2-app-kit 0.3 将该方法生成为安全绑定(token 释放即停听);
+    // mask/block 由 FOCUS_HANDBACK_KEEP 保活到进程退出。
+    let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+    match token {
+        Some(token) => {
+            FOCUS_HANDBACK_KEEP.with(|c| *c.borrow_mut() = Some((token, block)));
+            log::info!("浮层交还监听已注册(mouse-down)");
+        }
+        None => log::warn!("浮层交还监听注册失败(交还功能不可用)"),
+    }
+}
+
+/// 浮层窗当前是否为 key window(交还判定;非主线程/未创建 → None)。
+pub fn overlay_is_key() -> Option<bool> {
+    MainThreadMarker::new()?;
+    let win = OVERLAY.with(|cell| cell.borrow().window.clone())?;
+    Some(win.isKeyWindow())
+}
+
+/// 主屏 frame 高(AX 屏幕坐标 ↔ AppKit 全局坐标的换算参照;非主线程/无屏 → None)。
+pub fn primary_screen_height() -> Option<f64> {
+    let mtm = MainThreadMarker::new()?;
+    NSScreen::screens(mtm)
+        .iter()
+        .next()
+        .map(|s| s.frame().size.height)
+}
+
+/// 交还键盘(design §10):浮层持 key 时 resign;resign 后仍持 key 则回退
+/// orderOut→orderFrontRegardless(隐藏必失 key,重排前不动 key)。浮层可见性
+/// 与 UI 状态不变(转被动形态,同跳转后)。返回交还后是否已不持 key。
+pub fn overlay_yield_key() -> Result<bool> {
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return Err(anyhow!("overlay_yield_key 非主线程调用"));
+    };
+    let Some(win) = OVERLAY.with(|cell| cell.borrow().window.clone()) else {
+        return Ok(true); // 窗未创建即未持 key
+    };
+    if !win.isKeyWindow() {
+        return Ok(true);
+    }
+    win.resignKeyWindow();
+    let mut now_key = win.isKeyWindow();
+    if now_key {
+        win.orderOut(None);
+        win.orderFrontRegardless();
+        now_key = win.isKeyWindow();
+        log::warn!("浮层交还回退:resignKeyWindow 未生效,orderOut+orderFront isKey={now_key}");
+    }
+    log::info!("浮层交还 key:isKey={now_key}");
+    Ok(!now_key)
 }
 
 /// 显示完整窗口(根窗):激活 app + 置前 + 成 key/main。

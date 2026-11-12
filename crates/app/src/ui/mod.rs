@@ -1060,6 +1060,52 @@ impl App {
                 ctx.request_repaint_of(palette_viewport_id());
             });
         }
+        // 浮层持 key 交还(design §10):全局 mouse-down(仅其他 app 的事件)时,
+        // 点击面板 frame 内 → 让出 key + 后台 AX 恢复面板焦点;frame 外 → 仅让出。
+        // 浮层非 key/不可见不动作(跳转期 orderOut 天然短路)。锁纪律:短锁取
+        // 状态,原生调用与 AX 恢复线程在锁外。
+        {
+            let shared = Arc::clone(&shared);
+            platform::install_overlay_focus_handback(Box::new(move |x, y| {
+                let key = platform::overlay_is_key().unwrap_or(false);
+                let (visible, pid, frame) = {
+                    let s = lock_shared(&shared);
+                    (s.overlay.visible, s.overlay.panel_pid, s.last_panel_frame)
+                };
+                let in_panel =
+                    frame
+                        .zip(platform::primary_screen_height())
+                        .is_some_and(|(f, h)| {
+                            platform::panel_assist::click_in_panel_frame((x, y), h, f)
+                        });
+                let action = platform::panel_assist::handback_action(key, visible, in_panel);
+                log::info!(
+                    "[overlay-focus] 外部点击 ({x:.0},{y:.0}) key={key} visible={visible} in_panel={in_panel} → {action:?}"
+                );
+                match action {
+                    platform::HandbackAction::None => {}
+                    platform::HandbackAction::ResignKey => {
+                        let _ = platform::overlay_yield_key();
+                    }
+                    platform::HandbackAction::ResignKeyAndRestore => {
+                        let _ = platform::overlay_yield_key();
+                        let Some(pid) = pid else { return };
+                        let spawned = std::thread::Builder::new()
+                            .name("overlay-focus-restore".to_owned())
+                            .spawn(move || {
+                                let activated = platform::activate_app(pid);
+                                let restored = platform::panel_focus_restore(pid);
+                                log::info!(
+                                    "[overlay-focus] 面板焦点恢复 pid={pid} activate={activated} restored={restored}"
+                                );
+                            });
+                        if let Err(err) = spawned {
+                            log::warn!("面板焦点恢复线程创建失败:{err}");
+                        }
+                    }
+                }
+            }));
+        }
         // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
         // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,
         // 动作转帧内兜底队列,不阻塞。预检通过后,实际实现内部短锁读写、

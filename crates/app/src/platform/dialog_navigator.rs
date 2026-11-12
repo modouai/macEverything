@@ -273,6 +273,14 @@ fn focus_save_panel(pid: i32) -> bool {
     confirmed
 }
 
+/// 交还键盘后的面板焦点恢复(design §10):与跳转前恢复同一实现(AXRaise/
+/// AXMain/AXFocused/AXFocusedWindow + 读回确认)。阻塞;调用方在后台线程执行。
+/// 失败 = false,调用方仅留痕——不发合成键、不碰跳转/屏蔽状态,用户再次
+/// 点击面板即可(焦点恢复失败不构成任何功能性出口,见设计 §10.2)。
+pub fn restore_panel_focus(pid: i32) -> bool {
+    focus_save_panel(pid)
+}
+
 fn goto_field(pid: i32, baseline: &super::PanelBaseline) -> Option<AXRef> {
     let app = ax_ffi::app_element(pid)?;
     let focused = ax_ffi::copy_attr(&app, attr::FOCUSED_ELEMENT);
