@@ -1107,38 +1107,59 @@ thread_local! {
 }
 
 /// 注册交还回调(主线程;重复调用覆盖前值)。监听只装一次。
-pub fn install_overlay_focus_handback(handler: FocusHandbackHandler) {
+/// 返回监听是否真正装上(false = 非主线程或系统注册失败,handler 已存但不会被
+/// 调用;调用方据此降级/提示)。
+pub fn install_overlay_focus_handback(handler: FocusHandbackHandler) -> bool {
     if MainThreadMarker::new().is_none() {
         log::warn!("install_overlay_focus_handback 非主线程调用");
-        return;
+        return false;
     }
-    FOCUS_HANDBACK_HANDLER.with(|c| *c.borrow_mut() = Some(handler));
-    let installed = FOCUS_HANDBACK_KEEP.with(|c| c.borrow().is_some());
-    if installed {
-        return;
-    }
-    let mask =
-        NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
-    let block: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>)> = RcBlock::new(move |_ev| {
-        // 全局监听回调:事件投递给其他 app 时在主线程收到;坐标取 AppKit 全局
-        // 鼠标位置(与 NSEvent::mouseLocation 同源)。handler 未注入 = no-op。
-        let loc = NSEvent::mouseLocation();
-        FOCUS_HANDBACK_HANDLER.with(|c| {
-            if let Some(handler) = c.borrow().as_deref() {
-                handler(loc.x, loc.y);
-            }
-        });
-    });
-    // objc2-app-kit 0.3 将该方法生成为安全绑定(token 释放即停听);
-    // mask/block 由 FOCUS_HANDBACK_KEEP 保活到进程退出。
-    let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
-    match token {
-        Some(token) => {
-            FOCUS_HANDBACK_KEEP.with(|c| *c.borrow_mut() = Some((token, block)));
-            log::info!("浮层交还监听已注册(mouse-down)");
+    FOCUS_HANDBACK_KEEP.with(|c| {
+        if c.borrow().is_some() {
+            // 监听已在:仅换 handler,保活槽不动。
+            FOCUS_HANDBACK_HANDLER.with(|h| *h.borrow_mut() = Some(handler));
+            return;
         }
-        None => log::warn!("浮层交还监听注册失败(交还功能不可用)"),
-    }
+        let mask =
+            NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
+        let block: RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>)> =
+            RcBlock::new(move |ev: std::ptr::NonNull<NSEvent>| {
+                // 全局监听回调在主线程收到(事件已投递给其他 app)。坐标优先取事件
+                // 自身(全局监听的 mouse 事件 locationInWindow 即屏幕坐标),主线程
+                // 繁忙时 mouseLocation 可能已漂移(评论 #6)。try_borrow 防回调内
+                // 重入 install 的借用 panic(评论 #5)。
+                let (x, y) = unsafe {
+                    // SAFETY:block 契约保证事件指针非空、调用期有效。
+                    let event: &NSEvent = ev.as_ref();
+                    let p = event.locationInWindow();
+                    (p.x, p.y)
+                };
+                FOCUS_HANDBACK_HANDLER.with(|c| match c.try_borrow() {
+                    Ok(slot) => {
+                        if let Some(handler) = slot.as_deref() {
+                            handler(x, y);
+                        }
+                    }
+                    Err(_) => log::warn!("[overlay-focus] 回调重入借用失败,本次点击忽略"),
+                });
+            });
+        // objc2-app-kit 0.3 将该方法生成为安全绑定(token 释放即停听);
+        // mask/block 由 FOCUS_HANDBACK_KEEP 保活到进程退出。
+        let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+        match token {
+            Some(token) => {
+                *c.borrow_mut() = Some((token, block));
+                FOCUS_HANDBACK_HANDLER.with(|h| *h.borrow_mut() = Some(handler));
+                log::info!("浮层交还监听已注册(mouse-down)");
+            }
+            None => {
+                log::warn!("浮层交还监听注册失败(交还功能不可用)");
+                // handler 不注入:装不上的监听不保留死回调(评论 #8)。
+                drop(handler);
+            }
+        }
+    });
+    FOCUS_HANDBACK_KEEP.with(|c| c.borrow().is_some())
 }
 
 /// 浮层窗当前是否为 key window(交还判定;非主线程/未创建 → None)。
@@ -1176,7 +1197,12 @@ pub fn overlay_yield_key() -> Result<bool> {
         win.orderOut(None);
         win.orderFrontRegardless();
         now_key = win.isKeyWindow();
-        log::warn!("浮层交还回退:resignKeyWindow 未生效,orderOut+orderFront isKey={now_key}");
+        // orderOut 不改 level/styleMask,无需重施属性;可见性与 key 一并留痕,
+        // 便于评审区分两条路径(PR #9 评审 #7)。
+        log::warn!(
+            "浮层交还回退:resignKeyWindow 未生效,orderOut+orderFront isKey={now_key} visible={}",
+            win.isVisible()
+        );
     }
     log::info!("浮层交还 key:isKey={now_key}");
     Ok(!now_key)

@@ -277,6 +277,10 @@ fn focus_save_panel(pid: i32) -> bool {
 /// AXMain/AXFocused/AXFocusedWindow + 读回确认)。阻塞;调用方在后台线程执行。
 /// 失败 = false,调用方仅留痕——不发合成键、不碰跳转/屏蔽状态,用户再次
 /// 点击面板即可(焦点恢复失败不构成任何功能性出口,见设计 §10.2)。
+///
+/// 串行化不变量(评审 #14):与 [`run_navigate`] 结构性互斥——恢复仅当浮层
+/// 持 key 且可见时触发,而跳转自 commit 起浮层已 `visible=false` 并 orderOut,
+/// 两条路径不可能并发;接线层的去重闸进一步保证同路径不并发自竞争。
 pub fn restore_panel_focus(pid: i32) -> bool {
     focus_save_panel(pid)
 }

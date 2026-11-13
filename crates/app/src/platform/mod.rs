@@ -424,18 +424,23 @@ pub fn overlay_hide() -> anyhow::Result<()> {
 
 /// 注册「浮层持 key 交还」回调(design §10;主线程;重复调用覆盖前值)。
 ///
-/// 回调参数为 AppKit 全局坐标点击点(`NSEvent::mouseLocation`);监听只收
-/// **其他 app** 窗口的 mouse-down,自家窗口不触发。决策(是否交还/是否恢复
-/// 面板焦点)由接线层持 Shared 状态判定(纯逻辑 `panel_assist::handback_action`)。
-/// 非 macOS:no-op。
-pub fn install_overlay_focus_handback(handler: Box<dyn Fn(f64, f64) + Send + Sync>) {
+/// 回调参数为 AppKit 全局坐标点击点;监听只收 **其他 app** 窗口的 mouse-down,
+/// 自家窗口不触发。决策(是否交还/是否恢复面板焦点)由接线层持 Shared 状态
+/// 判定(纯逻辑 `panel_assist::handback_action`)。
+///
+/// 返回监听是否真正装上(false = 非主线程/系统注册失败;handler 已存但不会被
+/// 调用,调用方据此降级或提示)。监听为进程生命周期,无卸载接口——功能停用时
+/// 决策门(浮层不可见/非 key)使回调空转,即事实卸载(约定,评审 #13)。
+/// 非 macOS:恒 false(无全局监听;分支仅保编译,返回值不可信,评审 #12)。
+pub fn install_overlay_focus_handback(handler: Box<dyn Fn(f64, f64) + Send + Sync>) -> bool {
     #[cfg(target_os = "macos")]
     {
-        mac::install_overlay_focus_handback(handler);
+        mac::install_overlay_focus_handback(handler)
     }
     #[cfg(not(target_os = "macos"))]
     {
         drop(handler);
+        false
     }
 }
 
@@ -465,6 +470,7 @@ pub fn primary_screen_height() -> Option<f64> {
 
 /// 交还键盘(design §10):浮层持 key 时 resign(必要时 orderOut 回退)。
 /// 浮层可见性与 UI 状态不变(转被动形态)。`Ok(true)` = 已不持 key。
+/// 非 macOS 分支仅保编译,`Ok(true)` 不可按真实语义消费(评审 #12)。
 pub fn overlay_yield_key() -> anyhow::Result<bool> {
     #[cfg(target_os = "macos")]
     {

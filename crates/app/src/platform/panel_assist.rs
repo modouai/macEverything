@@ -113,7 +113,13 @@ pub fn handback_action(
 }
 
 /// AppKit 全局坐标(主屏左下原点、y 向上)的点击点是否落在 AX frame
-/// (主屏左上原点、y 向下;`primary_h` = 主屏高,换算参照)内。边界含入。
+/// (主屏左上原点、y 向下)内。边界含入。
+///
+/// 坐标系假设(评审 #9):AX 与 AppKit 两套**全局**坐标系都锚定主屏——AX 原点
+/// = 主屏左上,AppKit 原点 = 主屏左下——因此 `primary_h` 翻转是全局仿射变换,
+/// **与点击点在哪块屏无关**(副屏/负坐标屏同样适用);mac.rs 的
+/// `ax_frame_to_appkit` 同款换算已驱动浮层多屏定位(验证清单 2.15 实机通过)。
+/// 不可改成「点击点所在屏高度」:那会破坏跨屏换算。
 pub fn click_in_panel_frame(appkit: (f64, f64), primary_h: f64, frame: [f64; 4]) -> bool {
     let (px, py) = appkit;
     let ax_y = primary_h - py;
@@ -381,6 +387,63 @@ mod tests {
         assert!(
             !click_in_panel_frame((420.0, 820.0), 800.0, frame),
             "主屏高参与换算:换参照后原顶边点越界"
+        );
+    }
+
+    /// 全 8 组合真值表(评审 #10:与「表驱动钉住全部分支」对齐)。
+    /// 突变任一门(key/visible/in_panel)→ 对应行必红。
+    #[test]
+    fn handback_action_full_truth_table() {
+        for (key, visible, in_panel, want) in [
+            (false, false, false, HandbackAction::None),
+            (false, false, true, HandbackAction::None),
+            (false, true, false, HandbackAction::None),
+            (false, true, true, HandbackAction::None),
+            (true, false, false, HandbackAction::None),
+            (true, false, true, HandbackAction::None),
+            (true, true, false, HandbackAction::ResignKey),
+            (true, true, true, HandbackAction::ResignKeyAndRestore),
+        ] {
+            assert_eq!(
+                handback_action(key, visible, in_panel),
+                want,
+                "key={key} visible={visible} in_panel={in_panel}"
+            );
+        }
+    }
+
+    /// 退化输入(评审 #11):越界 0.1 对称断言、零/负尺寸 frame、主屏高 0。
+    #[test]
+    fn click_in_panel_frame_degenerate_inputs() {
+        let frame = [100.0, 80.0, 640.0, 480.0];
+        let h = 900.0;
+        assert!(
+            !click_in_panel_frame((740.1, 580.0), h, frame),
+            "x 越右界 0.1"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 820.1), h, frame),
+            "AppKit y 越顶界外 0.1(与底界用例对称)"
+        );
+        assert!(
+            click_in_panel_frame((100.0, 400.0), h, [100.0, 80.0, 0.0, 480.0]),
+            "宽 0:边界含入语义下退化为左缘线段,恰在线上的点命中(定义内行为)"
+        );
+        assert!(
+            !click_in_panel_frame((100.1, 400.0), h, [100.0, 80.0, 0.0, 480.0]),
+            "宽 0:离线即不命中"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 400.0), h, [100.0, 80.0, 640.0, 0.0]),
+            "高 0:仅上缘线上可命中,其余点不在内"
+        );
+        assert!(
+            !click_in_panel_frame((100.0, 820.0), h, [100.0, 80.0, -5.0, 480.0]),
+            "负宽:x 区间倒置为空,任何点不在内"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 100.0), 0.0, frame),
+            "主屏高 0:ax_y 恒负,不在正 y frame 内(行为有定义)"
         );
     }
 }

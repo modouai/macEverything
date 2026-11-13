@@ -1066,8 +1066,15 @@ impl App {
         // 状态,原生调用与 AX 恢复线程在锁外。
         {
             let shared = Arc::clone(&shared);
-            platform::install_overlay_focus_handback(Box::new(move |x, y| {
-                let key = platform::overlay_is_key().unwrap_or(false);
+            // 恢复线程去重闸(PR #9 评审 #2):连点会并发多个 AX 恢复互相干扰
+            // 确认循环,同一时刻至多一个在途。
+            let restore_inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let installed = platform::install_overlay_focus_handback(Box::new(move |x, y| {
+                let key_state = platform::overlay_is_key();
+                if key_state.is_none() {
+                    log::debug!("[overlay-focus] overlay_is_key 不可用(非主线程/浮层窗未创建)");
+                }
+                let key = key_state.unwrap_or(false);
                 let (visible, pid, frame) = {
                     let s = lock_shared(&shared);
                     (s.overlay.visible, s.overlay.panel_pid, s.last_panel_frame)
@@ -1089,7 +1096,17 @@ impl App {
                     }
                     platform::HandbackAction::ResignKeyAndRestore => {
                         let _ = platform::overlay_yield_key();
-                        let Some(pid) = pid else { return };
+                        let Some(pid) = pid else {
+                            log::warn!(
+                                "[overlay-focus] key 已让出但 panel_pid 缺失,无人接管面板焦点 pid=None"
+                            );
+                            return;
+                        };
+                        if restore_inflight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            log::info!("[overlay-focus] 焦点恢复在途,跳过本次 pid={pid}");
+                            return;
+                        }
+                        let inflight = Arc::clone(&restore_inflight);
                         let spawned = std::thread::Builder::new()
                             .name("overlay-focus-restore".to_owned())
                             .spawn(move || {
@@ -1098,13 +1115,18 @@ impl App {
                                 log::info!(
                                     "[overlay-focus] 面板焦点恢复 pid={pid} activate={activated} restored={restored}"
                                 );
+                                inflight.store(false, std::sync::atomic::Ordering::Release);
                             });
                         if let Err(err) = spawned {
                             log::warn!("面板焦点恢复线程创建失败:{err}");
+                            restore_inflight.store(false, std::sync::atomic::Ordering::Release);
                         }
                     }
                 }
             }));
+            if !installed {
+                log::warn!("浮层交还监听注册失败,交还功能不可用(本次运行期)");
+            }
         }
         // 热键动作的主队列直调目标(hotkey.rs 模块注释「动作直调」):
         // 预检拿不到共享锁(帧内/嵌套 run loop 持锁,如原生菜单跟踪中)返回 false,
