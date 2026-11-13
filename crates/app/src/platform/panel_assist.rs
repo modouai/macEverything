@@ -82,6 +82,50 @@ pub fn effective_enabled(save_panel_assist: bool, trusted: bool) -> bool {
     save_panel_assist && trusted
 }
 
+/// 「浮层持 key 期间、浮层外点击」的交还动作(design §10;纯逻辑)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandbackAction {
+    /// 不动作(浮层未持 key 或不可见)。
+    None,
+    /// 仅让出 key(点击点不在面板 frame 内;浮层转被动形态,可见性不变)。
+    ResignKey,
+    /// 让出 key 并恢复面板焦点(点击点落在面板 frame 内)。
+    ResignKeyAndRestore,
+}
+
+/// 交还决策:浮层持 key **且** 可见才动作;点击在面板 frame 内时附带 AX
+/// 焦点恢复(复用跳转链路的 `focus_save_panel`),否则仅让出——把键盘还给
+/// 用户实际点击的目标,不代激活宿主。非 key/不可见一律不动作:全局监听
+/// 只看原生 key 态与 UI 可见态,跳转期(orderOut)天然短路。
+pub fn handback_action(
+    overlay_key: bool,
+    overlay_visible: bool,
+    click_in_panel: bool,
+) -> HandbackAction {
+    if !overlay_key || !overlay_visible {
+        return HandbackAction::None;
+    }
+    if click_in_panel {
+        HandbackAction::ResignKeyAndRestore
+    } else {
+        HandbackAction::ResignKey
+    }
+}
+
+/// AppKit 全局坐标(主屏左下原点、y 向上)的点击点是否落在 AX frame
+/// (主屏左上原点、y 向下)内。边界含入。
+///
+/// 坐标系假设(评审 #9):AX 与 AppKit 两套**全局**坐标系都锚定主屏——AX 原点
+/// = 主屏左上,AppKit 原点 = 主屏左下——因此 `primary_h` 翻转是全局仿射变换,
+/// **与点击点在哪块屏无关**(副屏/负坐标屏同样适用);mac.rs 的
+/// `ax_frame_to_appkit` 同款换算已驱动浮层多屏定位(验证清单 2.15 实机通过)。
+/// 不可改成「点击点所在屏高度」:那会破坏跨屏换算。
+pub fn click_in_panel_frame(appkit: (f64, f64), primary_h: f64, frame: [f64; 4]) -> bool {
+    let (px, py) = appkit;
+    let ax_y = primary_h - py;
+    px >= frame[0] && px <= frame[0] + frame[2] && ax_y >= frame[1] && ax_y <= frame[1] + frame[3]
+}
+
 /// Esc 屏蔽状态(design §4 不打扰规则:本面板存续内不再自动弹;面板关闭即清除)。
 /// 键 = 宿主 pid(同一 app 同时至多一个模态保存面板)。
 #[derive(Default)]
@@ -285,5 +329,121 @@ mod tests {
         assert!(!d.blocked(2));
         d.clear(2); // 清除未屏蔽 pid 为 no-op
         assert!(d.blocked(1));
+    }
+
+    /// 交还决策表:非 key/不可见一律不动作;点击在面板内附带恢复,frame 外仅让出。
+    /// 突变「去掉 overlay_key 门」→ 第一条必红;「去掉 overlay_visible 门」→
+    /// 第二条必红;「in_panel 恒 false」→ 第三条必红;「恒 ResignKeyAndRestore」
+    /// → 第四条必红。
+    #[test]
+    fn handback_action_table() {
+        assert_eq!(
+            handback_action(false, true, true),
+            HandbackAction::None,
+            "浮层非 key 不动作"
+        );
+        assert_eq!(
+            handback_action(true, false, true),
+            HandbackAction::None,
+            "浮层不可见不动作(跳转期 orderOut 短路)"
+        );
+        assert_eq!(
+            handback_action(true, true, true),
+            HandbackAction::ResignKeyAndRestore,
+            "点击面板 frame 内:让出 + 恢复焦点"
+        );
+        assert_eq!(
+            handback_action(true, true, false),
+            HandbackAction::ResignKey,
+            "点击面板 frame 外:仅让出,不代激活宿主"
+        );
+        assert_eq!(handback_action(false, false, false), HandbackAction::None);
+    }
+
+    /// frame 换算与边界(边界含入):AX frame 顶边 AppKit y = primary_h − ax_y。
+    /// 突变「去掉 primary_h 换算(直接比 appkit y)」→ 顶/底断言必红。
+    #[test]
+    fn click_in_panel_frame_boundaries() {
+        let frame = [100.0, 80.0, 640.0, 480.0]; // AX:x∈[100,740] y∈[80,560]
+        let h = 900.0;
+        assert!(
+            click_in_panel_frame((100.0, 820.0), h, frame),
+            "左上角(AX 顶边 y=80 ⇔ AppKit y=820)含边界"
+        );
+        assert!(
+            click_in_panel_frame((740.0, 340.0), h, frame),
+            "右下角(AX 底边 y=560 ⇔ AppKit y=340)含边界"
+        );
+        assert!(click_in_panel_frame((420.0, 580.0), h, frame), "中心点");
+        assert!(!click_in_panel_frame((99.9, 580.0), h, frame), "x 越左界");
+        assert!(
+            !click_in_panel_frame((420.0, 339.9), h, frame),
+            "AppKit y 低于底边(AX y 越下界)"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 820.1), h, frame),
+            "AppKit y 高于顶边(AX y 越上界)"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 820.0), 800.0, frame),
+            "主屏高参与换算:换参照后原顶边点越界"
+        );
+    }
+
+    /// 全 8 组合真值表(评审 #10:与「表驱动钉住全部分支」对齐)。
+    /// 突变任一门(key/visible/in_panel)→ 对应行必红。
+    #[test]
+    fn handback_action_full_truth_table() {
+        for (key, visible, in_panel, want) in [
+            (false, false, false, HandbackAction::None),
+            (false, false, true, HandbackAction::None),
+            (false, true, false, HandbackAction::None),
+            (false, true, true, HandbackAction::None),
+            (true, false, false, HandbackAction::None),
+            (true, false, true, HandbackAction::None),
+            (true, true, false, HandbackAction::ResignKey),
+            (true, true, true, HandbackAction::ResignKeyAndRestore),
+        ] {
+            assert_eq!(
+                handback_action(key, visible, in_panel),
+                want,
+                "key={key} visible={visible} in_panel={in_panel}"
+            );
+        }
+    }
+
+    /// 退化输入(评审 #11):越界 0.1 对称断言、零/负尺寸 frame、主屏高 0。
+    #[test]
+    fn click_in_panel_frame_degenerate_inputs() {
+        let frame = [100.0, 80.0, 640.0, 480.0];
+        let h = 900.0;
+        assert!(
+            !click_in_panel_frame((740.1, 580.0), h, frame),
+            "x 越右界 0.1"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 820.1), h, frame),
+            "AppKit y 越顶界外 0.1(与底界用例对称)"
+        );
+        assert!(
+            click_in_panel_frame((100.0, 400.0), h, [100.0, 80.0, 0.0, 480.0]),
+            "宽 0:边界含入语义下退化为左缘线段,恰在线上的点命中(定义内行为)"
+        );
+        assert!(
+            !click_in_panel_frame((100.1, 400.0), h, [100.0, 80.0, 0.0, 480.0]),
+            "宽 0:离线即不命中"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 400.0), h, [100.0, 80.0, 640.0, 0.0]),
+            "高 0:仅上缘线上可命中,其余点不在内"
+        );
+        assert!(
+            !click_in_panel_frame((100.0, 820.0), h, [100.0, 80.0, -5.0, 480.0]),
+            "负宽:x 区间倒置为空,任何点不在内"
+        );
+        assert!(
+            !click_in_panel_frame((420.0, 100.0), 0.0, frame),
+            "主屏高 0:ax_y 恒负,不在正 y frame 内(行为有定义)"
+        );
     }
 }

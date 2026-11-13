@@ -33,7 +33,7 @@ pub mod panel_detector;
 #[cfg(target_os = "macos")]
 pub mod panel_probe;
 
-pub use panel_assist::{Decision, Dismissals, PanelEvent};
+pub use panel_assist::{Decision, Dismissals, HandbackAction, PanelEvent};
 
 /// 跳转结果(执行层 [`dialog_navigator::NavigateOutcome`] 的唯一真相;
 /// 非 macOS 的同名 stub 只为保持 facade 可编译)。
@@ -419,6 +419,83 @@ pub fn overlay_hide() -> anyhow::Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         Ok(())
+    }
+}
+
+/// 注册「浮层持 key 交还」回调(design §10;主线程;重复调用覆盖前值)。
+///
+/// 回调参数为 AppKit 全局坐标点击点;监听只收 **其他 app** 窗口的 mouse-down,
+/// 自家窗口不触发。决策(是否交还/是否恢复面板焦点)由接线层持 Shared 状态
+/// 判定(纯逻辑 `panel_assist::handback_action`)。
+///
+/// 返回监听是否真正装上(false = 非主线程/系统注册失败;handler 已存但不会被
+/// 调用,调用方据此降级或提示)。监听为进程生命周期,无卸载接口——功能停用时
+/// 决策门(浮层不可见/非 key)使回调空转,即事实卸载(约定,评审 #13)。
+/// 非 macOS:恒 false(无全局监听;分支仅保编译,返回值不可信,评审 #12)。
+pub fn install_overlay_focus_handback(handler: Box<dyn Fn(f64, f64) + Send + Sync>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::install_overlay_focus_handback(handler)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        drop(handler);
+        false
+    }
+}
+
+/// 浮层窗当前是否为 key window(交还判定;非主线程/未创建 → None)。
+pub fn overlay_is_key() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_is_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 主屏 frame 高(AX ↔ AppKit 坐标换算参照;非主线程/无屏 → None)。
+pub fn primary_screen_height() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::primary_screen_height()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 交还键盘(design §10):浮层持 key 时 resign(必要时 orderOut 回退)。
+/// 浮层可见性与 UI 状态不变(转被动形态)。`Ok(true)` = 已不持 key。
+/// 非 macOS 分支仅保编译,`Ok(true)` 不可按真实语义消费(评审 #12)。
+pub fn overlay_yield_key() -> anyhow::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::overlay_yield_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(true)
+    }
+}
+
+/// 恢复宿主保存面板键盘焦点(阻塞;调用方在后台线程执行)。
+///
+/// 与跳转兜底共用 navigator 的 `focus_save_panel`(AXRaise/AXFocused +
+/// 读回确认);失败 = false 仅留痕,调用方不得据此重试或发合成键(设计 §10.2)。
+/// 非 macOS 恒 false。
+pub fn panel_focus_restore(pid: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        dialog_navigator::restore_panel_focus(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        false
     }
 }
 
