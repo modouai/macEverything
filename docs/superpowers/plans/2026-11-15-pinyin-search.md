@@ -965,7 +965,7 @@ Expected: 全部通过（含既有测试与 3 个新集成测试）。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `CPattern::hit` 改为只返回 `match_pattern(name, self)`（去掉拼音分支），Run: `cargo test -p engine pinyin_`，Expected: 2 个测试失败。还原，全量测试确认通过。
+临时把 `CPattern::hit` 改为只返回 `match_pattern(name, self)`（去掉拼音分支），Run: `cargo test -p engine pinyin_`，Expected: 3 个测试失败（排序、目录、字面+拼音共存；`pinyin_does_not_leak...` 断言 0，保持绿）。还原，全量测试确认通过。
 
 - [ ] **Step 6: 提交**
 
