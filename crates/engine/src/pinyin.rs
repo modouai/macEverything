@@ -85,6 +85,78 @@ impl ReverseTable {
     }
 }
 
+/// 单次查询词最多保留的切分方案数(防御组合爆炸)。
+const MAX_PARSES: usize = 8;
+
+/// 音节切分:返回全部可行切分(最多 `MAX_PARSES` 条),每条是音节子串序列。
+/// 规则:完整音节全枚举 OR、最长优先;末段可为任意音节前缀;`'` 为强制分段边界
+/// (边界内仍全枚举);无解返回空。
+fn segment(word: &str) -> Vec<Vec<&str>> {
+    let table = table();
+    let mut out: Vec<Vec<&str>> = vec![Vec::new()];
+    for run in word.split('\'').filter(|r| !r.is_empty()) {
+        let mut run_parses: Vec<Vec<&str>> = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        enumerate(run, table, 0, &mut cur, &mut run_parses);
+        if run_parses.is_empty() {
+            return Vec::new();
+        }
+        let mut next: Vec<Vec<&str>> = Vec::new();
+        for prefix in &out {
+            for p in &run_parses {
+                let mut joined = prefix.clone();
+                joined.extend(p.iter().copied());
+                next.push(joined);
+                if next.len() >= MAX_PARSES {
+                    break;
+                }
+            }
+            if next.len() >= MAX_PARSES {
+                break;
+            }
+        }
+        out = next;
+    }
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+fn enumerate<'a>(
+    run: &'a str,
+    table: &ReverseTable,
+    pos: usize,
+    cur: &mut Vec<&'a str>,
+    out: &mut Vec<Vec<&'a str>>,
+) {
+    if out.len() >= MAX_PARSES {
+        return;
+    }
+    if pos == run.len() {
+        if !cur.is_empty() {
+            out.push(cur.clone());
+        }
+        return;
+    }
+    let tail = &run[pos..];
+    // 末段:剩余串是某音节前缀、且本身不是完整音节(完整音节在下方整段消费,避免重复方案)。
+    if !table.has_syllable(tail) && table.chars_for(tail).is_some() {
+        let mut v = cur.clone();
+        v.push(tail);
+        out.push(v);
+    }
+    // 完整音节:最长优先。
+    for end in (pos + 1..=run.len()).rev() {
+        if table.has_syllable(&run[pos..end]) {
+            cur.push(&run[pos..end]);
+            enumerate(run, table, end, cur, out);
+            cur.pop();
+            if out.len() >= MAX_PARSES {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // 断言值对应 pinyin 0.11.0 数据；升级 crate 需复核。
@@ -166,5 +238,47 @@ mod tests {
                 "{prefix}: 切片非严格升序"
             );
         }
+    }
+
+    #[test]
+    fn segments_full_pinyin() {
+        assert_eq!(segment("shu"), vec![vec!["shu"]]);
+        assert_eq!(segment("shuxue")[0], vec!["shu", "xue"]);
+    }
+
+    #[test]
+    fn partial_tail_syllable_is_supported() {
+        assert_eq!(segment("shux"), vec![vec!["shu", "x"]]);
+        assert_eq!(segment("sh"), vec![vec!["sh"]]);
+    }
+
+    #[test]
+    fn ambiguous_pinyin_yields_all_parses() {
+        let p = segment("fangan");
+        assert!(p.contains(&vec!["fang", "an"]), "{p:?}");
+        assert!(p.contains(&vec!["fan", "gan"]), "{p:?}");
+        let x = segment("xian");
+        assert!(x.contains(&vec!["xian"]), "{x:?}");
+        assert!(x.contains(&vec!["xi", "an"]), "{x:?}");
+    }
+
+    #[test]
+    fn apostrophe_is_hard_boundary() {
+        let p = segment("xi'an");
+        assert!(p.contains(&vec!["xi", "an"]), "{p:?}");
+        // 边界内仍全枚举(an 可再切为 a+n),但没有任何方案跨过边界
+        assert!(p.len() >= 2, "{p:?}");
+        assert!(p.iter().all(|alt| alt.first() == Some(&"xi")), "{p:?}");
+    }
+
+    #[test]
+    fn unsegmentable_words_return_empty() {
+        assert!(segment("pdf").is_empty());
+        assert!(segment("shuxq").is_empty());
+    }
+
+    #[test]
+    fn parse_count_is_capped() {
+        assert!(segment("xianxianxianxian").len() <= MAX_PARSES);
     }
 }
