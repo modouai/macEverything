@@ -21,6 +21,7 @@ log = "0.4"
 fsevent-sys = "4"
 core-foundation-sys = "0.8"
 libc = "0.2"
+pinyin = { version = "0.11", default-features = false, features = ["plain", "heteronym"] }
 
 # 本地补丁:epaint 字体图集的增量/清空路径在滚动时持续产生大块临时分配,
 # macOS malloc 按尺寸类缓存 VM 段 → Malloc Large (empty) 无界累积(峰值 2.8GB)。

@@ -19,3 +19,4 @@ log.workspace = true
 fsevent-sys.workspace = true
 core-foundation-sys.workspace = true
 libc.workspace = true
+pinyin.workspace = true

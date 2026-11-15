@@ -19,7 +19,7 @@ macEverything builds and maintains its own index instead of relying on Spotlight
 Coverage: your home directory, `/Applications` and local external volumes (network volumes are not indexed yet).
 
 - **Million files in ~1 s**: first scan takes 1.0-1.6 s; every later launch opens instantly from the on-disk index
-- **P99 query < 4 ms**: substring/wildcard search across 1.2M+ entries
+- **P99 query < 4 ms**: literal substring/wildcard search across 1.2M+ entries (pure-letter words also match Chinese names by pinyin)
 - **Live updates**: changes become searchable in ≤ 0.3 s; 0% idle CPU
 - **Complete**: the entry set matches `find` exactly
 - **Floating bar (⌥Space)**: appears over full-screen apps, type-to-search, keyboard-driven
@@ -50,7 +50,7 @@ How macEverything differs:
 | Index management | Managed by macOS | Managed by the app |
 | Terminal | `mdfind` | `macEverything` (five subcommands, `--json`) |
 
-If a directory can't be read (e.g. Full Disk Access not granted yet), it is listed by name and reason in `status`, the tray menu and the results window — the gap is never silent. Filename search is Everything-style substring/wildcard matching with quality ranking, not fuzzy metadata search.
+If a directory can't be read (e.g. Full Disk Access not granted yet), it is listed by name and reason in `status`, the tray menu and the results window — the gap is never silent. Filename search is Everything-style literal substring/wildcard matching with quality ranking (pure-letter words also match Chinese names by pinyin), not fuzzy metadata search.
 
 Default excludes: `~/Library`, `node_modules`, `.git`, `~/.Trash` and per-volume metadata folders. Change them in Settings → Index or with `macEverything exclude`.
 
@@ -67,7 +67,7 @@ Engine:
 | Metric | Measured | Notes |
 |---|---|---|
 | First scan | **1.0-1.6 s** per million files | Parallel traversal; every later launch is instant (mmap of the on-disk index) |
-| Query | **P99 2.9-3.6 ms** | substring/wildcard over the whole index |
+| Query | **P99 2.9-3.6 ms** | literal substring/wildcard over the whole index (pure-letter words also expand to pinyin) |
 | Incremental update | **≤ 0.3 s** to searchable | Live FSEvents; 0% idle CPU |
 | Completeness | **zero diff** vs `find` | Same scan roots and excludes; parity test enforces it |
 | Downtime catch-up | seconds | On restart, events from the downtime are replayed, not a full rescan |
@@ -148,6 +148,8 @@ When the engine is offline, `query` falls back to reading the on-disk index dire
 | `case:` | case-sensitive for this query | `case:README` |
 | `whole:` | whole-word match for this query | `whole:init` |
 
+Pure-letter words (ASCII letters, optionally split with `'`) also match Chinese names by full pinyin (`shu` → 数/书/树, `shuxue` → 数学). Words containing digits, underscores or non-ASCII characters do not expand, and neither do `case:` / `whole:` rounds, wildcard words or `path:` words; full rules are in the [usage guide](docs/usage.md).
+
 <details>
 <summary><b>Full syntax rules and ranking</b></summary>
 
@@ -201,7 +203,7 @@ An FSEvents event is only a hint that something changed. The daemon re-reads tha
 | Area | Design |
 |---|---|
 | Index layout | Flat `Entry` array (24 B per entry) + two name pools + a directory path pool; deletes are tombstones |
-| Query | Each query compiles to anchored substring sequences; every needle becomes a precompiled `memchr` Finder — P99 3.6 ms over 1.2 M entries |
+| Query | Each query compiles to anchored substring sequences (pure-letter words additionally get pinyin expansion); every needle becomes a precompiled `memchr` Finder — P99 3.6 ms over 1.2 M entries |
 | Scan | Work-sharing parallel traversal; the same exclusion predicate is used by first scan, incremental updates and link repair |
 | Persistence | The file mirrors the in-memory layout; loading is `mmap` + cast, no deserialization; atomic tmp + rename |
 | FSEvents | Events are hints only — re-read the directory, diff against the index, the disk wins |
