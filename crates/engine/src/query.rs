@@ -1241,6 +1241,17 @@ mod match_tests {
         assert_eq!(execute(&i, &parse("shu xue").unwrap(), 100).total, 1);
         assert_eq!(execute(&i, &parse("whole:shu xue").unwrap(), 100).total, 0);
     }
+
+    #[test]
+    fn whole_round_disables_pinyin_scoring() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("书-shu", d, false); // 若 whole: 轮仍展开拼音,会错升到档 3(7 字节)
+        i.insert("shu-abcd", d, false); // 字面前缀档 3(8 字节)
+        let out = execute(&i, &parse("whole:shu").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "shu-abcd".as_bytes());
+    }
 }
 
 #[cfg(test)]

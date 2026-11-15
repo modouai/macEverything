@@ -482,9 +482,22 @@ mod tests {
         assert!(PinyinMatcher::compile(b"shu2").is_none());
         assert!(PinyinMatcher::compile(b"\x01").is_none()); // QMARK
         assert!(PinyinMatcher::compile(b"pdf").is_none());
+        assert!(PinyinMatcher::compile(b"dot").is_none()); // 字母但无可行切分
         assert!(PinyinMatcher::compile(b"'").is_none());
         // 混合词:词内含非字母(数xue 的 UTF-8 字节)→ 不展开
         assert!(PinyinMatcher::compile("数xue".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn word_length_boundary_is_64_bytes() {
+        assert!(!segment(&"a".repeat(64)).is_empty());
+        assert!(segment(&"a".repeat(65)).is_empty());
+    }
+
+    #[test]
+    fn hard_boundary_cannot_match_single_syllable_word() {
+        // 先=xiān 在 xi 集,但 xi'an 要求其后紧跟 an 段,单个「先」不命中
+        assert_eq!(hit_of("先.txt", "xi'an"), None);
     }
 
     #[test]
