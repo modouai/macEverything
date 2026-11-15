@@ -28,7 +28,7 @@ cargo test -p engine --test fsevents_live -- --ignored    # FSEvents 实机集�
 
 图形界面：`bash scripts/bundle.sh`（构建 + 组装 .app + ad-hoc 签名 → `release/macEverything.app`）；对外分发 `bash scripts/release.sh`（Developer ID 签名 + 公证 + DMG + 同步站点仓 `version.json`）。
 
-基准：`bash scripts/bench.sh /tmp/mce-bench 1000000`（五项基准，自动隔离环境）。
+基准：`bash scripts/bench.sh /tmp/mce-bench 1000000`（六项基准，自动隔离环境）。
 
 ## 架构（大图）
 
