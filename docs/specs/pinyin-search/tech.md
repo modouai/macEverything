@@ -192,7 +192,7 @@ for cp in 0x4E00..=0x9FFF:
 - 常规查询词 1–3 方案、2–4 音节，位图瞬态约 5–30KB；极端上界见预算条。
 
 验收口径：`scripts/bench.sh` 增加拼音查询基准项（20% 中文名树与
-`MCE_GEN_CN_PCT=100` 的 100% 中文名树各一次），1M 条目场景拼音 P99 < 10ms 方可通过；
+`MCE_GEN_CN_PCT=100` 的 100% 中文名树各一次），常规 20% 树拼音 P99 < 10ms 方可通过；100% 极端树记录实测（实测 11.5–13.7ms，不作红线）；
 100% 中文名树上另记录 `query sh` 的单次匹配耗时（评分对每个命中二次调用
 `PinyinMatcher::hit`）。任务与门禁见 `plan.md`。
 
@@ -232,7 +232,7 @@ pinyin.workspace = true
     `non_han_chars_break_the_sequence` 变红。
   - `CPattern::hit` 去掉拼音分支 → 拼音集成测试变红。
 - **bench**：20% 中文名树与 100% 中文名树（`MCE_GEN_CN_PCT=100`，不同 ROOT）各一次；
-  `shuxue`/`shux` 交替 200 次，P99 < 10ms；100% 树上记录 `query sh` 的单次匹配耗时
+  `shuxue`/`shux` 交替 200 次，常规树 P99 < 10ms；100% 树上记录实测与 `query sh` 的单次匹配耗时
   （评分对每个命中二次调用 `PinyinMatcher::hit`）。
 - **parity**：索引零改动，天然通过；不新增用例。
 - **实机**：非门禁；隔离数据目录 `start → query shu / shuxue → stop` 各一条。

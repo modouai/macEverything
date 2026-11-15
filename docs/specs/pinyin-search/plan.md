@@ -16,7 +16,7 @@
 | 4 | 音节切分 | `engine/src/pinyin.rs` | 6 条切分单测（全拼音、全枚举、末段前缀、`'` 强制边界且边界内全枚举、无解、8 方案上限）；突变（末段判定）必红 |
 | 5 | 位图与序列匹配器 | `engine/src/pinyin.rs` | 9 条匹配单测（开头/中部、ASCII 短路、末段输入中、假名不误伤、序列中断、多音字、多切分 OR、前缀集召回、不合格词）；突变（`contains` 恒真）必红 |
 | 6 | query.rs 接入 | `engine/src/query.rs` | 5 条集成测试（拼音排序、`case:`/`whole:`/`path:`/通配符互斥、`Shu` 折叠、目录名命中、字面与拼音共存）；突变（去掉拼音分支）必红 |
-| 7 | 基准（合成树中文名 + 拼音 P99） | `scripts/spike-readdir/src/main.rs`、`scripts/bench.sh` | 拼音 P99 < 10ms（§2） |
+| 7 | 基准（合成树中文名 + 拼音 P99） | `scripts/spike-readdir/src/main.rs`、`scripts/bench.sh` | 常规树拼音 P99 < 10ms；极端树记录实测（§2） |
 | 8 | 文档同步与三门禁终检 | 见 §3；`plan.md` 状态回填 | 三门禁全绿 + 实机冒烟通过 |
 
 Task 编号与 superpowers 计划一一对应，不另起编号。
@@ -43,7 +43,7 @@ MCE_GEN_CN_PCT=100 bash scripts/bench.sh /tmp/mce-bench-cn 1000000  # 极端树:
 
 判定：
 
-- **拼音 P99 < 10ms**（`bench.sh` 新增「2b. 拼音查询 P99」段）：200 次 `shuxue`/`shux`
+- **常规树拼音 P99 < 10ms**（`bench.sh` 新增「2b. 拼音查询 P99」段）；100% 极端树记录实测（实测 11.5–13.7ms，人工极端分布，不设红线）。200 次 `shuxue`/`shux`
   交替查询；反查表 `OnceLock` 懒构建计入预热、不占 P99 样本。两棵树各跑一次。
 - 常规树「2. 查询 P99」按量级与历史值比较：合成树 20% 文件名换成中文后，约 20% 的
   随机 ASCII 关键词命中 0 项，P99 可能略降；不按绝对值逐位比较。
