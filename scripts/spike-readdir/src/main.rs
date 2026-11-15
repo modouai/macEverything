@@ -26,12 +26,32 @@ fn main() {
 
 fn gen(root: &std::path::Path, total: u64) {
     let _ = fs::remove_dir_all(root);
+    // 中文名占比(百分比):拼音查询基准需要含中文名的合成树。
+    // 默认 20;0 = 纯 ASCII(旧基线)。文件名按 100 一组,每组中文名取同一词。
+    let cn_pct: u64 = std::env::var("MCE_GEN_CN_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    const CN_NAMES: &[&str] = &[
+        "数学笔记", "季度报告书", "数据分析", "项目文档", "会议记录", "照片备份", "通讯录",
+        "音乐库",
+    ];
     let dirs = total / 40; // 平均每目录 40 项
     for d in 0..dirs {
         let dir = root.join(format!("d{:07}", d / 500)).join(format!("s{:03}", d % 500));
         fs::create_dir_all(&dir).unwrap();
         for f in 0..40 {
-            fs::write(dir.join(format!("file_{:07}.txt", d * 40 + f)), "").unwrap();
+            let n = d * 40 + f;
+            let name = if n % 100 < cn_pct {
+                format!(
+                    "{}_{:07}.txt",
+                    CN_NAMES[((n / 100) as usize) % CN_NAMES.len()],
+                    n
+                )
+            } else {
+                format!("file_{:07}.txt", n)
+            };
+            fs::write(dir.join(name), "").unwrap();
         }
     }
     println!("generated {} dirs under {}", dirs, root.display());

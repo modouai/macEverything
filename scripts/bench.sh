@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 五项基准(对照 product.md 目标):首扫 / 查询 P99 / 增量时效 / 落盘 / 停机重放。
+# 六项基准(对照 product.md 目标):首扫 / 查询 P99 / 拼音查询 P99 / 增量时效 / 落盘 / 停机重放。
 # 用法:scripts/bench.sh [合成树根] [文件数]
 # 隔离:MCE_ROOTS 指向合成树(不扫真实主目录),HOME 指向临时数据目录。
 set -euo pipefail
@@ -72,6 +72,24 @@ xs = sorted(float(l) for l in open(sys.argv[1]) if l.strip())
 if xs:
     n = len(xs)
     print(f"  样本 {n} · 中位 {xs[n//2]:.1f} ms · P99 {xs[min(n-1, int(n*0.99))]:.1f} ms · 最大 {xs[-1]:.1f} ms")
+PY
+rm -f "$TIMES"
+
+echo "== 2b. 拼音查询 P99(200 次:shuxue/shux 交替,红线 P99 < 10ms) =="
+# 预热:反查表 OnceLock 懒构建计入首查,不占 P99 样本
+HOME="$BENCH_HOME" "$BIN" query "shuxue" >/dev/null 2>&1 || true
+TIMES=$(mktemp /tmp/mce-qp.XXXXXX)
+for i in $(seq 1 200); do
+  if [ $((i % 2)) -eq 0 ]; then kw="shuxue"; else kw="shux"; fi
+  HOME="$BENCH_HOME" "$BIN" query "$kw" 2>/dev/null \
+    | head -1 | grep -oE '匹配 [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' >> "$TIMES" || true
+done
+python3 - "$TIMES" <<'PY'
+import sys
+xs = sorted(float(l) for l in open(sys.argv[1]) if l.strip())
+if xs:
+    n = len(xs)
+    print(f"  拼音样本 {n} · 中位 {xs[n//2]:.1f} ms · P99 {xs[min(n-1, int(n*0.99))]:.1f} ms · 最大 {xs[-1]:.1f} ms")
 PY
 rm -f "$TIMES"
 
