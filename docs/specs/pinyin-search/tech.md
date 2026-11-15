@@ -22,8 +22,7 @@
 | `PinyinMatcher::hit(&self, name: &[u8]) -> Option<usize>` | pub | 序列匹配，返回命中起点字节位 |
 | `seq_matches(hay, alt)` | 内部 | 从一个起点逐字符匹配一组位图；序列中断即失败 |
 
-- 实现 API 为 `PinyinMatcher::{compile, hit}`，序列匹配内部函数为 `seq_matches`；
-  设计 §4.1 已同步为实际名称。
+- 实现 API 为 `PinyinMatcher::{compile, hit}`，序列匹配内部函数为 `seq_matches`。
 - 位图每次查询按需从反查表切片构建（每音节微秒级）；反查表常驻。
 
 ### 1.2 `query.rs` 集成点
@@ -41,6 +40,9 @@
 **`wildcard` 字段的由来（必须保留）**：`*shu*` 编译时 `*` 被剥掉，`parts` 与纯字面词
 `shu` 完全一致（`[b"shu"]`），仅凭 `parts` 形态无法区分通配词；拼音展开必须由解析侧
 标注排除，否则 `*shu*` 会意外获得拼音召回。
+
+`p.parts.len() == 1` 是防御性判断：只有 `*` 会拆出多段，`?` 以 QMARK 留在段内；
+无通配符的词恒为单段，通配词已由 `wildcard` 排除。
 
 ```rust
 pub struct Pattern {
@@ -112,7 +114,7 @@ for cp in 0x4E00..=0x9FFF:
 - `word.split('\'')` 切出若干 run，各 run 的可行切分做笛卡尔拼接；`'` 是强制分段边界：
   边界两侧各自单独切分，边界内仍全枚举，没有任何方案跨过边界（`xi'an` 至少产出
   `[xi][an]`，另有 `[xi][a][n]`——`a`、`n` 都是完整音节）。空 run 跳过。
-- 每个 run 递归枚举，**最长音节优先**：
+- 每个 run 递归枚举，**完整音节全枚举、最长音节优先**：
   - 位置 `pos` 处，若剩余串是某读音前缀、且本身不是完整音节 → 以该前缀作末段产出一条
     切分（末尾未打完，如 `shux` 的 `[shu][x]`；`sh` 的 `[sh]`）。
   - 再枚举 `run[pos..end]` 为完整音节的全部 `end`（从长到短）并递归。
@@ -126,8 +128,9 @@ for cp in 0x4E00..=0x9FFF:
 ### 2.4 匹配（`PinyinMatcher::hit` / `seq_matches`）
 
 - `compile` 的词级条件：合法 UTF-8、只含 ASCII 小写字母与 `'`、至少一个字母；随后
-  `segment` 有解才返回 `Some`，否则 `None`。整轮条件（`case:`/`whole:`/`path:`）与
-  通配符排除由 `query.rs` 负责，pinyin 模块不感知这些语法。
+  `segment` 有解才返回 `Some`，否则 `None`。小写与 NFC 由 `query.rs` 的
+  `compile_pattern` 归一保证，compile 侧仍防御性校验字节集合。整轮条件（`case:`/
+  `whole:`）与通配符、`path:` 排除由 `query.rs` 负责，pinyin 模块不感知这些语法。
 - `hit`：`name.is_ascii()` 直接 `None`（全 ASCII 名零开销）；否则按 `char_indices`
   逐字符起点扫描，每个起点依次试全部切分方案，首个命中即返回该起点字节位。
 - `seq_matches` 从起点逐字符推进：第 i 字须 ∈ 第 i 段位图；中途任一字不在位图
@@ -141,7 +144,7 @@ for cp in 0x4E00..=0x9FFF:
 |---|---|
 | 切分失败 | 纯字面匹配 |
 | `case:` / `whole:` / 通配符 / 含数字或符号 / `path:` / 混合词 | 不展开 |
-| 文件名含非汉字字符 | 天然不命中，不误伤（序列中断） |
+| 条目名称含非汉字字符 | 天然不命中，不误伤（序列中断） |
 | 反查表构建 | 纯内存计算，无 IO 无失败面 |
 
 ## 3. 数据事实（`pinyin 0.11.0` 实测，供后来者核对）
@@ -170,11 +173,12 @@ for cp in 0x4E00..=0x9FFF:
 
 - 编译期：切分 + 位图构建，单查询词微秒级，`execute` 一次。
 - 匹配期：
-  - 全 ASCII 文件名：`is_ascii` 短路，零开销。
+  - 全 ASCII 条目名称：`is_ascii` 短路，零开销。
   - 含中文名：位图 membership 测试。1M 条目、CJK 名占比 20%、平均 15 字符、2 音节
     ≈ 600 万次位测试，rayon 并行下增量 <1ms。
   - 最坏（全 CJK、6 音节）估算并行 <10ms；以基准实测为准。
-- 内存：反查表常驻 ~500KB（仅被拼音查询触发构建）；查询期位图瞬态 ≤100KB。
+- 内存：索引内存布局零改动；查询侧反查表懒构建，常驻 ~500KB（仅拼音查询触发）；
+  查询期位图瞬态常规 ≤100KB，极端（8 方案 × 6 音节）理论上限 ~125KB。
 - 落盘：零变化。
 
 派生核对：
@@ -182,11 +186,12 @@ for cp in 0x4E00..=0x9FFF:
 - 单个 `CharBitmap` = 20992 位 / 64 × 8B = 2.6KB。
 - 反查表主体 = 81926 个 `char`（4B）+ 每前缀 Vec 与键的开销 + 419 个音节键，
   与 ~500KB 同量级。
-- 位图瞬态理论上限（8 方案 × 6 音节 × 2.6KB ≈ 125KB）是极端组合；常规查询词
-  1–3 方案、2–4 音节，瞬态约 5–30KB。预算按设计值 ≤100KB 作为常规口径。
+- 常规查询词 1–3 方案、2–4 音节，位图瞬态约 5–30KB；极端上界见预算条。
 
-验收口径：`scripts/bench.sh` 增加拼音查询基准项，1M 条目含中文名场景，
-拼音 P99 < 10ms 方可通过（任务与门禁见 `plan.md`）。
+验收口径：`scripts/bench.sh` 增加拼音查询基准项（20% 中文名树与
+`MCE_GEN_CN_PCT=100` 的 100% 中文名树各一次），1M 条目场景拼音 P99 < 10ms 方可通过；
+100% 中文名树上另记录 `query sh` 的单次匹配耗时（评分对每个命中二次调用
+`PinyinMatcher::hit`）。任务与门禁见 `plan.md`。
 
 ## 5. 依赖
 
@@ -207,13 +212,26 @@ pinyin.workspace = true
 
 ## 6. 测试策略
 
-| 层 | 用例 |
-|---|---|
-| `pinyin.rs` 单元 | 读音归一（去声调、`ü`→`v`、多音字数/长/行）；反查表（`shu` 集含数/书/树、多音字入每个读音集、前缀集、音节集派生）；切分（全拼音、末段前缀、全枚举、`'` 强制边界且边界内全枚举、无解回退、8 方案截断）；匹配（名称开头/中部、全 ASCII 不匹配、日文假名不误伤、非汉字中断、多音字双命中、多切分 OR、不合格词不编译） |
-| `query.rs` 集成 | 拼音命中中文名且前缀先排；`case:`/`whole:`/`path:`/`*shu*` 不泄漏；`Shu` 折叠后仍展开；字面与拼音共存及档位排序 |
-| 突变验证（项目纪律） | 反查表 `reading.chars().skip(1)`（去掉单字母前缀 → `prefix_sets_cover_partial_syllables` 变红）；切分末段条件；位图 membership；`CPattern::hit` 的拼音分支——各改坏一次，确认对应测试变红 |
-| bench | 合成树含中文名（`MCE_GEN_CN_PCT`，默认 20）；`shuxue`/`shux` 交替 200 次，P99 < 10ms |
-| parity | 索引零改动，天然通过；不新增用例 |
-| 实机 | 非门禁：隔离数据目录 `start → query shu / shuxue → stop` 各一条 |
+- **`pinyin.rs` 单元**
+  - 读音归一：去声调、`ü`→`v`、多音字（数/长/行）。
+  - 反查表：`shu` 集含数/书/树；多音字入每个读音集；前缀集；完整音节集派生。
+  - 切分：全拼音、末段前缀、全枚举（完整音节全枚举、最长优先）、`'` 强制边界且
+    边界内全枚举、无解回退、8 方案截断。
+  - 匹配：名称开头/中部；全 ASCII 不匹配；日文假名不误伤；非汉字中断；多音字双命中；
+    多切分 OR；前缀集召回（水/双/说）；不合格词不编译。
+- **`query.rs` 集成**：拼音命中中文名且前缀先排；`case:`/`whole:`/`path:`/`*shu*`
+  不泄漏；`Shu` 折叠后仍展开；目录名命中；字面与拼音共存及档位排序。
+- **突变验证**（项目纪律，Task 3/4/5/6 各一条）
+  - 反查表 `reading.chars().skip(1)`（去掉单字母前缀）→
+    `prefix_sets_cover_partial_syllables` 变红。
+  - 切分末段条件改坏 → `segments_full_pinyin` 变红。
+  - `CharBitmap::contains` 恒真 → `japanese_kana_never_match` 与
+    `non_han_chars_break_the_sequence` 变红。
+  - `CPattern::hit` 去掉拼音分支 → 拼音集成测试变红。
+- **bench**：20% 中文名树与 100% 中文名树（`MCE_GEN_CN_PCT=100`，不同 ROOT）各一次；
+  `shuxue`/`shux` 交替 200 次，P99 < 10ms；100% 树上记录 `query sh` 的单次匹配耗时
+  （评分对每个命中二次调用 `PinyinMatcher::hit`）。
+- **parity**：索引零改动，天然通过；不新增用例。
+- **实机**：非门禁；隔离数据目录 `start → query shu / shuxue → stop` 各一条。
 
-- 新增测试一律做突变验证，防止「恒绿假钉」（见 `docs/development.md`）。
+新增测试一律做突变验证，防止「恒绿假钉」（见 `docs/development.md`）。
