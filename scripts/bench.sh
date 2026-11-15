@@ -11,6 +11,9 @@ BENCH_HOME=$(mktemp -d /tmp/mce-bench-home.XXXXXX)
 export MCE_ROOTS="$ROOT"
 # 合成树中文名占比:默认 20;0 = 纯 ASCII(旧基线);100 = 全中文名极端树
 export MCE_GEN_CN_PCT="${MCE_GEN_CN_PCT:-20}"
+# 非法值(非数字)与生成器同口径回落 20
+case "$MCE_GEN_CN_PCT" in ''|*[!0-9]*) MCE_GEN_CN_PCT=20 ;; esac
+TIMES=""   # 采样临时文件(cleanup trap 用)
 
 # 小目录走废纸篓(trash 不在时装提示保留,不静默);合成树体积大,不走废纸篓。
 trash_dir() {
@@ -42,8 +45,8 @@ elapsed() { python3 -c "print(f'{$2-$1:.2f}')"; }
 
 # 采样 N 次查询,输出中位/P99/最大;<label> 仅用于打印,<mode> = random | pinyin
 query_p99() { # $1=label $2=mode
-  local label=$1 mode=$2 times kw i
-  times=$(mktemp /tmp/mce-qp.XXXXXX)
+  local label=$1 mode=$2 kw i
+  TIMES=$(mktemp /tmp/mce-qp.XXXXXX)
   for i in $(seq 1 200); do
     if [ "$mode" = "pinyin" ]; then
       if [ $((i % 2)) -eq 0 ]; then kw="shuxue"; else kw="shux"; fi
@@ -51,22 +54,24 @@ query_p99() { # $1=label $2=mode
       kw="file_$(printf %07d $(( (RANDOM * 32768 + RANDOM) % TOTAL )))"
     fi
     HOME="$BENCH_HOME" "$BIN" query "$kw" 2>/dev/null \
-      | head -1 | grep -oE '匹配 [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' >> "$times" || true
+      | head -1 | grep -oE '匹配 [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' >> "$TIMES" || true
   done
   local n
-  n=$(wc -l < "$times" | tr -d ' ')
+  n=$(wc -l < "$TIMES" | tr -d ' ')
   if [ "$n" -lt 150 ]; then
     echo "  $label 样本不足($n/200),基准失败" >&2
-    rm -f "$times"
+    rm -f "$TIMES"
+    TIMES=""
     return 1
   fi
-  python3 - "$times" "$label" <<'PY'
+  python3 - "$TIMES" "$label" <<'PY'
 import sys
 xs = sorted(float(l) for l in open(sys.argv[1]) if l.strip())
 n = len(xs)
 print(f"  {sys.argv[2]}样本 {n} · 中位 {xs[n//2]:.1f} ms · P99 {xs[min(n-1, int(n*0.99))]:.1f} ms · 最大 {xs[-1]:.1f} ms")
 PY
-  rm -f "$times"
+  rm -f "$TIMES"
+  TIMES=""
 }
 
 wait_ready() { # 轮询到状态=就绪,输出耗时
@@ -104,7 +109,7 @@ if [ "$MCE_GEN_CN_PCT" -gt 0 ]; then
     exit 1
   fi
 else
-  echo "  MCE_GEN_CN_PCT=0(纯 ASCII 树),跳过拼音命中断言"
+  echo "  MCE_GEN_CN_PCT=$MCE_GEN_CN_PCT(纯 ASCII 树),跳过拼音命中断言"
   HOME="$BENCH_HOME" "$BIN" query "shuxue" >/dev/null 2>&1 || true
 fi
 query_p99 "拼音" pinyin
