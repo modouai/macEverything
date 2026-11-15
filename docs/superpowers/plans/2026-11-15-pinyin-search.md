@@ -334,7 +334,11 @@ git commit -m "feat(engine): build pinyin reverse table lazily"
 
     #[test]
     fn apostrophe_is_hard_boundary() {
-        assert_eq!(segment("xi'an"), vec![vec!["xi", "an"]]);
+        let p = segment("xi'an");
+        assert!(p.contains(&vec!["xi", "an"]), "{p:?}");
+        // 边界内仍全枚举(an 可再切为 a+n),但没有任何方案跨过边界
+        assert!(p.len() >= 2, "{p:?}");
+        assert!(p.iter().all(|alt| alt.first() == Some(&"xi")), "{p:?}");
     }
 
     #[test]

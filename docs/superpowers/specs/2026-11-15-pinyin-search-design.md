@@ -41,9 +41,9 @@
 
 ### 3.2 切分
 
-- 音节表：标准拼音 410 个无声调音节（`ü` 记作 `v`）。
+- 音节表：由读音数据派生（ASCII 完整读音约 419 个，含 `hm`/`hng`/`m`/`n` 等叹词音节；`ü` 记作 `v`）。派生而非硬编码的目的是保证切分表与字符集同源：表里没有的音节必然也匹配不到任何字。
 - 完整音节优先。枚举**全部**可行切分（每段为完整音节，末段可为任意音节前缀），全部参与命中（OR）。歧义切分是真实需求：`fangan` 同时应命中方案（fang+an）与反感（fan+gan）；`xian` 同时命中先（xian）与西安（xi+an）。
-- `'` 为硬边界：`xi'an` 只按 `[xi][an]` 切分。
+- `'` 为强制分段边界：边界两侧各自单独切分，边界内仍全枚举。`xi'an` 至少产出 `[xi][an]`，另有 `[xi][a][n]`（`a`、`n` 都是完整音节）。
 - 可行切分超过 8 种时截断取前 8 种（按最长优先顺序），防御组合爆炸。
 - 无任何可行切分（如 `pdf`、`shuxq`）→ 不展开。
 
@@ -52,12 +52,13 @@
 | 查询词 | 切分 |
 |---|---|
 | `shu` | `[shu]` |
-| `shuxue` | `[shu][xue]` |
+| `shuxue` | `[shu][xue]`、`[shu][xu][e]` 等 |
 | `shux` | `[shu][x]`（末段前缀） |
 | `sh` | `[sh]`（末段前缀） |
-| `fangan` | `[fang][an]`、`[fan][gan]` |
-| `xi'an` | `[xi][an]` |
+| `fangan` | `[fang][an]`、`[fan][gan]`、`[fa][n][gan]` 等（上限 8 种） |
+| `xi'an` | `[xi][an]`、`[xi][a][n]` 等 |
 | `pdf` | 无可行切分 → 不展开 |
+| `dot` | 无可行切分（`do` 非完整音节、`dot` 非任何读音前缀）→ 不展开 |
 
 ### 3.3 读音与字符集
 
@@ -97,7 +98,7 @@
 | `shu*.pdf` / `*shu` | ✗（含通配符） |
 | `path:shu` | ✗ |
 | `数xue`（混合词） | ✗（词含非字母） |
-| `dot` | ✓（可能命中「打通」，Spotlight 同样如此，接受） |
+| `dot` | ✗（`do` 非完整音节、`dot` 非读音前缀，切分失败） |
 | `pdf` | ✗（无可行切分） |
 
 ### 3.7 默认行为
@@ -112,14 +113,15 @@
 
 ```
 pinyin.rs（全部逻辑内聚，query.rs 只做接入）
-├── SYLLABLES          静态音节表（410 项，无声调）
-├── ReverseTable       音节前缀 → 排序字符数组；OnceLock 全局懒构建
-├── SyllableSets       Vec<CharBitmap>：一次查询词的一个切分方案
-│   └── CharBitmap     CJK 基本区位图，2.6KB/音节集
-├── PinyinSeq::compile(word) -> Option<Vec<SyllableSets>>
-│                     切分 + 展开；None = 不展开（静默回退字面）
-└── match_seq(name, sets) -> Option<usize>
-                      序列匹配，返回命中起点字节位
+├── readings(c) -> Vec<String>   单字归一化读音（去声调、ü→v、去重）
+├── ReverseTable       音节前缀 → 字符集 + 完整音节集；OnceLock 全局懒构建
+├── segment(word)      全部可行切分（上限 8），每方案是音节子串序列
+├── CharBitmap         CJK 基本区位图，2.6KB/音节集
+└── PinyinMatcher
+    ├── compile(word: &[u8]) -> Option<Self>
+    │                 词级条件 + 切分 + 位图展开；None = 不展开（静默回退字面）
+    └── hit(name: &[u8]) -> Option<usize>
+                      序列匹配，返回命中起点字节位（全 ASCII 名短路）
 ```
 
 - 反查表在 daemon 进程内首次出现可展开查询词时构建（`OnceLock`），毫秒级，常驻 ~500KB。
@@ -127,13 +129,13 @@ pinyin.rs（全部逻辑内聚，query.rs 只做接入）
 
 ### 4.2 query.rs 集成点
 
-1. `CPattern` 增加字段 `pinyin: Option<Vec<SyllableSets>>`（`query.rs:470`）。
+1. `CPattern` 增加字段 `pinyin: Option<PinyinMatcher>`（`query.rs:470`）。
 2. `CPattern::compile` 增加入参 `pinyin_ok: bool`（整轮开关判定，`query.rs:476`），词级条件为：无通配符（`Pattern` 新增 `wildcard` 字段——`*shu*` 编译后 `parts` 与纯字面词完全一致，必须由解析侧标注，不能只看 `parts`）、字节 ⊆ `a-z'` 且至少一个字母。
 3. 词命中点（`query.rs:268`）改为：
 
    ```
-   term_match(target, pt) = match_pattern(target, pt)
-                         || pt.pinyin.iter().any(|sets| match_seq(target, sets).is_some())
+   CPattern::hit(target) = match_pattern(target, self)
+                        || self.pinyin.as_ref().is_some_and(|m| m.hit(target).is_some())
    ```
 
 4. 评分（`query.rs:592`）：`score_of` 对首词额外取拼音命中起点；起点为 0 → 3，否则 1，与字面档取 max。
@@ -145,10 +147,10 @@ pinyin.rs（全部逻辑内聚，query.rs 只做接入）
 ### 4.3 匹配算法
 
 ```
-match_seq(name, sets):
+PinyinMatcher::hit(name):
   若 name 全 ASCII → None（快速路径）
   逐字符起点 s 扫描:
-    对 sets 中每个切分方案（按顺序，首个命中即返回）:
+    对每个切分方案（按顺序，首个命中即返回）:
       从 s 起逐字符推进: 该字 ∈ 方案第 i 段位图 ?
       任一段失败 → 试下一起点
       全部段完成 → Some(s)
