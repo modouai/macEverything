@@ -212,6 +212,19 @@ git commit -m "feat(engine): add pinyin dependency and reading normalization"
         assert!(!t.has_syllable("shux"));
         assert!(!t.has_syllable("p"));
     }
+
+    #[test]
+    fn prefix_lists_are_sorted_and_deduped() {
+        let t = table();
+        // 绿有 lv/lu 两个读音,落在前缀 l 上两次;没有 dedup 就会重复
+        let l = t.chars_for("l").unwrap();
+        assert_eq!(l.iter().filter(|&&c| c == '绿').count(), 1);
+        // 字段契约「升序」:没有 sort 时混合字符顺序不可保证
+        for p in ["l", "shu", "s", "z", "lv"] {
+            let v = t.chars_for(p).unwrap();
+            assert!(v.windows(2).all(|w| w[0] < w[1]), "{p} not strictly ascending");
+        }
+    }
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -256,7 +269,9 @@ impl ReverseTable {
         for cp in CJK_FIRST..=CJK_LAST {
             let Some(c) = char::from_u32(cp) else { continue };
             for reading in readings(c) {
-                syllables.insert(reading.as_str().into());
+                if !syllables.contains(reading.as_str()) {
+                    syllables.insert(reading.as_str().into());
+                }
                 let mut buf = String::new();
                 for ch in reading.chars() {
                     buf.push(ch);
@@ -265,9 +280,11 @@ impl ReverseTable {
             }
         }
         // 同字多读音会重复登记同一前缀:逐前缀排序去重。
+        // shrink_to_fit 回收 Vec 容量松弛(实测 ~158KB),常驻内存回落到 ~400KB。
         for chars in prefixes.values_mut() {
             chars.sort_unstable();
             chars.dedup();
+            chars.shrink_to_fit();
         }
         Self { prefixes, syllables }
     }
@@ -285,11 +302,16 @@ impl ReverseTable {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p engine pinyin::tests`
-Expected: 7 passed。
+Expected: 8 passed。
 
 - [ ] **Step 5: 突变验证（项目纪律）**
 
-临时把 `build` 中 `for ch in reading.chars()` 改为 `for ch in reading.chars().skip(1)`（去掉单字母前缀），Run: `cargo test -p engine pinyin::tests`，Expected: `prefix_sets_cover_partial_syllables` 失败。还原改动，再跑一遍确认 7 passed。
+三次突变，逐个还原：
+1. `build` 中 `for ch in reading.chars()` 改为 `.skip(1)`（去掉单字母前缀）→ `prefix_sets_cover_partial_syllables` 必须失败。
+2. 删除 `chars.dedup()` → `prefix_lists_are_sorted_and_deduped` 必须失败（绿重复）。
+3. 删除 `chars.sort_unstable()`（保留 dedup）→ `prefix_lists_are_sorted_and_deduped` 必须失败（非升序）。
+
+全部还原后跑 `cargo test -p engine pinyin::tests`，确认 8 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -440,11 +462,11 @@ fn enumerate<'a>(
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p engine pinyin::tests`
-Expected: 13 passed。
+Expected: 14 passed。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `enumerate` 中的末段判断 `!table.has_syllable(tail) && table.chars_for(tail).is_some()` 改为 `table.chars_for(tail).is_some()`（完整音节也走末段前缀），Run: `cargo test -p engine pinyin::tests`，Expected: `segments_full_pinyin` 失败（出现重复方案）。还原，确认 13 passed。
+临时把 `enumerate` 中的末段判断 `!table.has_syllable(tail) && table.chars_for(tail).is_some()` 改为 `table.chars_for(tail).is_some()`（完整音节也走末段前缀），Run: `cargo test -p engine pinyin::tests`，Expected: `segments_full_pinyin` 失败（出现重复方案）。还原，确认 14 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -636,14 +658,16 @@ fn seq_matches(hay: &str, alt: &[CharBitmap]) -> bool {
 }
 ```
 
+同时删除 `pinyin.rs` 顶部的 `#![cfg_attr(not(test), expect(dead_code))]`：`PinyinMatcher` 为 pub 且 `compile`/`hit` 触达 `table`/`segment`/`CharBitmap` 等全部私有项后，死代码消失，该 expect 变成 unfulfilled expectation，`-D warnings` 会失败。
+
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p engine pinyin::tests`
-Expected: 22 passed。
+Expected: 23 passed。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `CharBitmap::contains` 的返回改为恒 `true`，Run: `cargo test -p engine pinyin::tests`，Expected: `japanese_kana_never_match` 与 `non_han_chars_break_the_sequence` 失败。还原，确认 22 passed。
+临时把 `CharBitmap::contains` 的返回改为恒 `true`，Run: `cargo test -p engine pinyin::tests`，Expected: `japanese_kana_never_match` 与 `non_han_chars_break_the_sequence` 失败。还原，确认 23 passed。
 
 - [ ] **Step 6: 提交**
 
