@@ -35,7 +35,7 @@
 
 必含小节：
 1. 模块划分：`crates/engine/src/pinyin.rs`（读音归一 `readings`、反查表 `ReverseTable` + `OnceLock`、切分 `segment`、位图 `CharBitmap`、匹配器 `PinyinMatcher`）；`query.rs` 集成点（`CPattern.pinyin`、`CPattern::compile(p, pinyin_ok)`、`CPattern::hit`、`score_of` 拼音档位）。
-2. 算法：读音归一（去声调、`ü`→`v`；实测上游 `plain()` 对 j/q/x/y 已写 `u`，只有 `lü/nü` 保留 `ü`）；反查表构建（遍历 U+4E00–U+9FFF，读全部读音的字符前缀）；切分（完整音节全枚举 OR，末段可前缀，`'` 硬边界，上限 8）；匹配（全 ASCII 短路、逐字符位图、起点扫描）。
+2. 算法：读音归一（去声调、`ü`→`v`；实测上游 `plain()` 对 j/q/x/y 已写 `u`，只有 `lü/nü` 保留 `ü`）；反查表构建（遍历 U+4E00–U+9FFF，读全部读音的字符前缀）；切分（完整音节全枚举 OR、最长优先，末段可前缀，`'` 强制分段边界且边界内仍全枚举，上限 8）；匹配（全 ASCII 短路、逐字符位图、起点扫描）。
 3. 数据事实（实现时已实测，写进 tech 供后来者核对）：`pinyin 0.11`，`char::to_pinyin_multi()` 提供多读音；读音数据覆盖 CJK 基本区 20924/20992 字；完整音节 419 个（由读音数据派生）；反查前缀集 501 个、前缀-字符对 81926。
 4. 性能预算与内存：设计文档 §5 原文。
 5. 依赖：workspace + engine 增加 `pinyin = "0.11"`。
@@ -367,7 +367,8 @@ Expected: 编译错误 `cannot find function 'segment'`。
 const MAX_PARSES: usize = 8;
 
 /// 音节切分:返回全部可行切分(最多 `MAX_PARSES` 条),每条是音节子串序列。
-/// 规则:完整音节全枚举 OR;末段可为任意音节前缀;`'` 为硬边界;无解返回空。
+/// 规则:完整音节全枚举 OR、最长优先;末段可为任意音节前缀;`'` 为强制分段边界
+/// (边界内仍全枚举);无解返回空。
 /// 枚举顺序为「最长音节优先」,截断时保留贪婪切分。
 fn segment(word: &str) -> Vec<Vec<&str>> {
     let table = table();
@@ -940,7 +941,7 @@ Expected（判定口径）:
 - 「2. 查询 P99」与历史值同量级（合成树名字变化不影响 ASCII 关键词命中）；
 - `shuxue` 实际命中：`target/release/macEverything query shuxue` 的「共 N 项」应约 2.5 万（1M × 20% × 1/8）。若为 0，检查合成树是否含中文名（`ls /tmp/mce-bench/d0000000/s000`）。
 
-若 P99 超红线：先确认 `match_seq` 是否在纯 ASCII 名上被调用（应被 `is_ascii` 短路），再带着实测数字停下分析，不直接改预算。
+若 P99 超红线：先确认 `PinyinMatcher::hit` 是否在纯 ASCII 名上被调用（应被 `is_ascii` 短路），再带着实测数字停下分析，不直接改预算。
 
 - [ ] **Step 4: 提交**
 
@@ -964,7 +965,7 @@ git commit -m "bench: cover pinyin queries with chinese filenames in synthetic t
 
 1）`docs/development.md` 第 43 行「五项基准(隔离 MCE_ROOTS)」→「六项基准(隔离 MCE_ROOTS;含拼音查询)」；第 99 行注释改为「六项:首扫/查询 P99/拼音 P99/增量/落盘/停机重放」，并在基准小节补一句：`MCE_GEN_CN_PCT`（默认 20）控制合成树中文名占比。
 2）`CLAUDE.md` 第 31 行「（五项基准，自动隔离环境）」→「（六项基准，自动隔离环境）」。
-3）`docs/usage.md` 查询语法小节新增「拼音匹配」：默认开启；纯字母词按全拼音节匹配中文名（`shu` → 数/书/树，`shuxue` → 数学，`shux` 支持未打完的末音节）；`case:`/`whole:`/含通配符的词、`path:` 词不展开；`'` 作音节硬边界（`xi'an`）；`ü` 用 `v` 输入（`lv` → 绿）。
+3）`docs/usage.md` 查询语法小节新增「拼音匹配」：默认开启；纯字母词按全拼音节匹配中文名（`shu` → 数/书/树，`shuxue` → 数学，`shux` 支持未打完的末音节）；`case:`/`whole:`/含通配符的词、`path:` 词不展开；`'` 作强制分段边界（边界内仍全枚举，`xi'an` 至少匹配西安）；`ü` 用 `v` 输入（`lv` → 绿）。
 4）`docs/architecture.md` 查询管线段落补一句：查询侧拼音展开（`pinyin.rs` + `CPattern.pinyin`），索引与落盘无变化。
 5）`docs/specs/pinyin-search/plan.md` 标记实现完成（注明日期与最终门禁结果）。
 
@@ -1015,5 +1016,5 @@ git commit -m "docs: sync pinyin search usage, architecture and bench"
 | `case:`/`whole:`/通配符/`path:`/混合词不展开 | Task 6 集成测试 |
 | 索引/内存/落盘零改动 | 仅 engine 查询层改动；parity 天然通过 |
 | 性能 P99 < 10ms | Task 7 实测 |
-| 突变验证 | Task 3/5/6 各一条 |
+| 突变验证 | Task 3/4/5/6 各一条 |
 | spec-first 文档 | Task 1、Task 8 |
