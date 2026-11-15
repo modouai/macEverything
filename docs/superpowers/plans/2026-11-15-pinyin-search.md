@@ -309,7 +309,7 @@ Expected: 8 passed。
 三次突变，逐个还原：
 1. `build` 中 `for ch in reading.chars()` 改为 `.skip(1)`（去掉单字母前缀）→ `prefix_sets_cover_partial_syllables` 必须失败。
 2. 删除 `chars.dedup()` → `prefix_lists_are_sorted_and_deduped` 必须失败（绿重复）。
-3. 删除 `chars.sort_unstable()`（保留 dedup）→ `prefix_lists_are_sorted_and_deduped` 必须失败（非升序）。
+3. （等价突变，记录不追究）删除 `chars.sort_unstable()` 不会变红：build 按码点升序迭代，同一前缀的重复项来自同一字的多读音、恰好相邻，dedup 后天然严格升序。排序保留为防御性保证，测试锁定的是输出契约（升序去重），不是机制。
 
 全部还原后跑 `cargo test -p engine pinyin::tests`，确认 8 passed。
 
