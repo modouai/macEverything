@@ -32,6 +32,8 @@ fn gen(root: &std::path::Path, total: u64) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    // >100 视为 100;非法值(非数字)在上面的解析中回落默认 20。
+    let cn_pct = cn_pct.min(100);
     const CN_NAMES: &[&str] = &[
         "数学笔记", "季度报告书", "数据分析", "项目文档", "会议记录", "照片备份", "通讯录",
         "音乐库",
