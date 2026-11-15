@@ -962,17 +962,21 @@ Expected（判定口径）:
 MCE_GEN_CN_PCT=100 bash scripts/bench.sh /tmp/mce-bench-cn 1000000
 ```
 
-Expected：2b 拼音 P99 < 10ms；另在 100% 中文名树上手动记录近全量命中的单次匹配耗时（评分会对每个命中二次调用 `PinyinMatcher::hit`）。查询 `sh` 时 bench 脚本自己的临时 HOME 已随脚本退出清理，可用一条独立隔离环境验证：
+Expected：2b 拼音 P99 < 10ms；另在 100% 中文名树上手动记录高命中查询的单次匹配耗时（评分会对每个命中二次调用 `PinyinMatcher::hit`）。bench 脚本自己的临时 HOME 已随脚本退出清理，用独立隔离环境验证；就绪判定用轮询，不要固定 sleep（1M 条目首扫红线 5s）：
 
 ```bash
 export HOME=/tmp/mce-cn-home MCE_ROOTS=/tmp/mce-bench-cn
 rm -rf "$HOME" && mkdir -p "$HOME"
-target/release/macEverything start && sleep 3
+target/release/macEverything start
+for _ in $(seq 1 200); do
+  target/release/macEverything status 2>/dev/null | grep -q "状态: 就绪" && break
+  sleep 0.1
+done
 target/release/macEverything query sh | head -1
 target/release/macEverything stop && rm -rf "$HOME"
 ```
 
-Expected：`query sh` 命中约 25 万（8 组中文名里「数学笔记」「季度报告书」含 `sh` 前缀字，占 1/4），用以压测评分对每个命中二次调用 `PinyinMatcher::hit` 的成本；「匹配 X ms」记录到 Task 8 的 tech/plan 文档。
+Expected：`query sh` 命中约 37.5 万（8 组中文名里「数学笔记」「季度报告书」「数据分析」含 `sh` 前缀字，占 3/8），用以压测评分对每个命中二次调用 `PinyinMatcher::hit` 的成本；「匹配 X ms」记录到 Task 8 的 tech/plan 文档。
 
 若任一 P99 超红线：先确认 `PinyinMatcher::hit` 是否在纯 ASCII 名上被调用（应被 `is_ascii` 短路），再带着实测数字停下分析，不直接改预算。
 
