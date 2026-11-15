@@ -489,9 +489,15 @@ struct CPattern {
     pinyin: Option<PinyinMatcher>,
 }
 
+/// 该词是否编译拼音分支：整轮开关（`case:`/`whole:` 轮关闭）+
+/// 非通配词（`*`/`?` 剥掉后 parts 会与字面词混淆）+ 单段字面词。
+fn can_expand_pinyin(p: &Pattern, pinyin_ok: bool) -> bool {
+    pinyin_ok && !p.wildcard && p.parts.len() == 1
+}
+
 impl CPattern {
     fn compile(p: &Pattern, pinyin_ok: bool) -> Self {
-        let pinyin = if pinyin_ok && !p.wildcard && p.parts.len() == 1 {
+        let pinyin = if can_expand_pinyin(p, pinyin_ok) {
             PinyinMatcher::compile(&p.parts[0])
         } else {
             None
@@ -630,6 +636,7 @@ fn score_of(target: &[u8], name_terms: &[CPattern]) -> u8 {
     } else if part.finder.is_some() && word_boundary_hit(target, part) {
         score = 2;
     }
+    // 与上方 match_at 同口径:`hit` 返回名称字节偏移,0 即名称首字符。
     if score < 3
         && term
             .pinyin
@@ -1251,6 +1258,44 @@ mod match_tests {
         let out = execute(&i, &parse("whole:shu").unwrap(), 100);
         assert_eq!(out.total, 2);
         assert_eq!(i.display_name(out.hits[0]), "shu-abcd".as_bytes());
+    }
+
+    #[test]
+    fn unsegmentable_word_falls_back_to_literal() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        i.insert("pdf-notes.txt", d, false);
+        // pdf 不可切分 → 不展开拼音,只按字面命中
+        assert_eq!(execute(&i, &parse("pdf").unwrap(), 100).total, 1);
+        // 同一索引上可切分的查询仍走拼音
+        assert_eq!(execute(&i, &parse("shuxue").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn path_term_and_pinyin_word_coexist() {
+        let mut i = Index::new();
+        let d = i.insert("projects", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        // path 词按字面命中目录;名称词按拼音 AND
+        assert_eq!(
+            execute(&i, &parse("path:projects shu").unwrap(), 100).total,
+            1
+        );
+        // path 词自身不展开拼音
+        assert_eq!(execute(&i, &parse("path:shu").unwrap(), 100).total, 0);
+    }
+
+    #[test]
+    fn dir_only_with_pinyin_counts_directories() {
+        let mut i = Index::new();
+        i.insert("数学资料", NO_PARENT, true);
+        i.insert("数学笔记.txt", NO_PARENT, false);
+        let mut plan = parse("shu").unwrap();
+        plan.dir_only = true;
+        let out = execute(&i, &plan, 100);
+        assert_eq!(out.total, 1);
+        assert_eq!(i.display_name(out.hits[0]), "数学资料".as_bytes());
     }
 }
 

@@ -233,7 +233,14 @@ impl PinyinMatcher {
             .map(|parse| {
                 parse
                     .iter()
-                    .map(|syl| CharBitmap::from_chars(table.chars_for(syl).unwrap_or(&[])))
+                    .map(|syl| {
+                        // segment 产出的音节必在反查表:派生同源。空集是数据不一致的信号,debug 下显式暴露。
+                        debug_assert!(
+                            table.chars_for(syl).is_some(),
+                            "syllable {syl:?} missing from reverse table"
+                        );
+                        CharBitmap::from_chars(table.chars_for(syl).unwrap_or(&[]))
+                    })
                     .collect()
             })
             .collect();
@@ -376,6 +383,24 @@ mod tests {
         let x = segment("xian");
         assert!(x.contains(&vec!["xian"]), "{x:?}");
         assert!(x.contains(&vec!["xi", "an"]), "{x:?}");
+    }
+
+    #[test]
+    fn parses_are_unique() {
+        for w in [
+            "shuxue",
+            "xian",
+            "fangan",
+            "xi'an",
+            "xianxian",
+            "nihaoshijie",
+        ] {
+            let mut ps = segment(w);
+            let n = ps.len();
+            ps.sort();
+            ps.dedup();
+            assert_eq!(ps.len(), n, "{w} produced duplicate parses");
+        }
     }
 
     #[test]

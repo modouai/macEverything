@@ -8,7 +8,7 @@ pub mod index;
 pub mod malloc_pressure;
 pub mod overlay;
 pub mod persist;
-pub mod pinyin;
+mod pinyin;
 pub mod query;
 pub mod reconcile;
 pub mod scanner;
