@@ -511,6 +511,14 @@ git commit -m "feat(engine): segment pinyin words into syllables"
     }
 
     #[test]
+    fn prefix_set_recall_covers_longer_syllables() {
+        // 完整音节段也使用前缀集:shu 集含 shui/shuang/shuo 开头的字
+        assert_eq!(hit_of("水果.txt", "shu"), Some(0));
+        assert_eq!(hit_of("双方.txt", "shu"), Some(0));
+        assert_eq!(hit_of("说话.txt", "shu"), Some(0));
+    }
+
+    #[test]
     fn ineligible_words_do_not_compile() {
         assert!(PinyinMatcher::compile(b"shu*").is_none());
         assert!(PinyinMatcher::compile(b"shu2").is_none());
@@ -631,11 +639,11 @@ fn seq_matches(hay: &str, alt: &[CharBitmap]) -> bool {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p engine pinyin::tests`
-Expected: 21 passed。
+Expected: 22 passed。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `CharBitmap::contains` 的返回改为恒 `true`，Run: `cargo test -p engine pinyin::tests`，Expected: `japanese_kana_never_match` 与 `non_han_chars_break_the_sequence` 失败。还原，确认 21 passed。
+临时把 `CharBitmap::contains` 的返回改为恒 `true`，Run: `cargo test -p engine pinyin::tests`，Expected: `japanese_kana_never_match` 与 `non_han_chars_break_the_sequence` 失败。还原，确认 22 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -687,6 +695,13 @@ git commit -m "feat(engine): match pinyin sequences via CJK bitmaps"
         let d = i.insert("d", NO_PARENT, true);
         i.insert("数学笔记.txt", d, false);
         assert_eq!(execute(&i, &parse("Shu").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn pinyin_matches_directory_names_too() {
+        let mut i = Index::new();
+        i.insert("数学资料", NO_PARENT, true);
+        assert_eq!(execute(&i, &parse("shu").unwrap(), 100).total, 1);
     }
 
     #[test]
@@ -938,10 +953,28 @@ bash scripts/bench.sh /tmp/mce-bench 1000000
 
 Expected（判定口径）:
 - 「2b. 拼音查询 P99」输出样本 200，P99 < 10ms；
-- 「2. 查询 P99」与历史值同量级（合成树名字变化不影响 ASCII 关键词命中）；
+- 「2. 查询 P99」与历史值同量级。注意：合成树 20% 文件名换成中文后，随机 ASCII 关键词约 20% 命中 0 项，P99 可能略降；按量级比较，不按绝对值逐位比较；
 - `shuxue` 实际命中：`target/release/macEverything query shuxue` 的「共 N 项」应约 2.5 万（1M × 20% × 1/8）。若为 0，检查合成树是否含中文名（`ls /tmp/mce-bench/d0000000/s000`）。
 
-若 P99 超红线：先确认 `PinyinMatcher::hit` 是否在纯 ASCII 名上被调用（应被 `is_ascii` 短路），再带着实测数字停下分析，不直接改预算。
+极端场景（设计的最坏情况，必跑一次，用不同 ROOT 避免复用 20% 树）：
+
+```bash
+MCE_GEN_CN_PCT=100 bash scripts/bench.sh /tmp/mce-bench-cn 1000000
+```
+
+Expected：2b 拼音 P99 < 10ms；另在 100% 中文名树上手动记录近全量命中的单次匹配耗时（评分会对每个命中二次调用 `PinyinMatcher::hit`）。查询 `sh` 时 bench 脚本自己的临时 HOME 已随脚本退出清理，可用一条独立隔离环境验证：
+
+```bash
+export HOME=/tmp/mce-cn-home MCE_ROOTS=/tmp/mce-bench-cn
+rm -rf "$HOME" && mkdir -p "$HOME"
+target/release/macEverything start && sleep 3
+target/release/macEverything query sh | head -1
+target/release/macEverything stop && rm -rf "$HOME"
+```
+
+Expected：`query sh` 命中约 25 万（8 组中文名里「数学笔记」「季度报告书」含 `sh` 前缀字，占 1/4），用以压测评分对每个命中二次调用 `PinyinMatcher::hit` 的成本；「匹配 X ms」记录到 Task 8 的 tech/plan 文档。
+
+若任一 P99 超红线：先确认 `PinyinMatcher::hit` 是否在纯 ASCII 名上被调用（应被 `is_ascii` 短路），再带着实测数字停下分析，不直接改预算。
 
 - [ ] **Step 4: 提交**
 
@@ -968,6 +1001,7 @@ git commit -m "bench: cover pinyin queries with chinese filenames in synthetic t
 3）`docs/usage.md` 查询语法小节新增「拼音匹配」：默认开启；纯字母词按全拼音节匹配中文名（`shu` → 数/书/树，`shuxue` → 数学，`shux` 支持未打完的末音节）；`case:`/`whole:`/含通配符的词、`path:` 词不展开；`'` 作强制分段边界（边界内仍全枚举，`xi'an` 至少匹配西安）；`ü` 用 `v` 输入（`lv` → 绿）。
 4）`docs/architecture.md` 查询管线段落补一句：查询侧拼音展开（`pinyin.rs` + `CPattern.pinyin`），索引与落盘无变化。
 5）`docs/specs/pinyin-search/plan.md` 标记实现完成（注明日期与最终门禁结果）。
+6）把 Task 7 两次基准（20% 与 100% 中文名树）的 2b 拼音 P99、`query sh` 单次匹配耗时、常规树 ASCII P99 记入 `docs/specs/pinyin-search/tech.md` §4 测量结果表。
 
 - [ ] **Step 2: 三门禁**
 
@@ -1010,11 +1044,14 @@ git commit -m "docs: sync pinyin search usage, architecture and bench"
 | 设计条目 | 落地 |
 |---|---|
 | 仅全拼、默认开启 | Task 2–6；无配置面 |
-| 切分（全枚举、`'` 边界、末段前缀、上限 8） | Task 4 |
-| 多音字任一读音 | Task 2/3 测试钉死 |
+| 切分（全枚举、`'` 强制边界、末段前缀、上限 8） | Task 4 |
+| 多音字任一读音（长/行） | Task 2/3 测试钉死 |
+| 歧义切分 OR（`xian`、`fangan`） | Task 4/5 测试 |
+| 前缀集召回（`shu` → 数/书/水/双/说） | Task 5 测试 |
 | 任意位置命中 + 前缀档评分 | Task 5/6 |
+| 文件与目录同名口径 | Task 6 测试 |
 | `case:`/`whole:`/通配符/`path:`/混合词不展开 | Task 6 集成测试 |
-| 索引/内存/落盘零改动 | 仅 engine 查询层改动；parity 天然通过 |
-| 性能 P99 < 10ms | Task 7 实测 |
+| 索引布局/落盘零改动；反查表懒构建常驻 ~500KB | 仅 engine 查询层改动；parity 天然通过 |
+| 性能：常规树与 100% 中文名树 P99 < 10ms | Task 7 两次实测 |
 | 突变验证 | Task 3/4/5/6 各一条 |
 | spec-first 文档 | Task 1、Task 8 |
