@@ -1184,7 +1184,7 @@ target/release/macEverything query shuxue
 target/release/macEverything stop
 ```
 
-Expected: `query shu` 共 3 项（`shu.txt` 字面 + 两个中文名的拼音命中，中文前缀排前）；`query shuxue` 共 1 项（数学笔记）。结束后 `rm -rf /tmp/mce-pinyin-smoke`。
+Expected: `query shu` 共 3 项（`shu.txt` 字面 + 两个中文名的拼音命中，中文前缀排前）；`query shuxue` 共 1 项（数学笔记）。注意 daemon 会合并已挂载外置卷：有外置卷时 `query shu` 会多于 3 项（本机实测 7 项，其中 4 条来自外置卷），合成树内 3 条的排序才是判据。结束后 `rm -rf /tmp/mce-pinyin-smoke`。
 
 - [ ] **Step 4: 提交**
 
