@@ -1113,7 +1113,7 @@ Expected（判定口径）:
 MCE_GEN_CN_PCT=100 bash scripts/bench.sh /tmp/mce-bench-cn 1000000
 ```
 
-Expected：常规树 2b P99 < 10ms（实测 4.0ms）；100% 极端树记录实测（实测 11.5–13.7ms，超红线系已接受的人工极端分布，见设计 §5）；另在 100% 中文名树上手动记录高命中查询的单次匹配耗时（评分会对每个命中二次调用 `PinyinMatcher::hit`）。bench 脚本自己的临时 HOME 已随脚本退出清理，用独立隔离环境验证；就绪判定用轮询，不要固定 sleep（1M 条目首扫红线 5s）：
+Expected：常规树 2b P99 < 10ms（实测 4.0ms）；100% 极端树记录实测（中位 9.6ms / P99 13.7ms，复跑中位 11.5ms；超红线系已接受的人工极端分布，见设计 §5）；另在 100% 中文名树上手动记录高命中查询的单次匹配耗时（评分会对每个命中二次调用 `PinyinMatcher::hit`）。bench 脚本自己的临时 HOME 已随脚本退出清理，用独立隔离环境验证；就绪判定用轮询，不要固定 sleep（1M 条目首扫红线 5s）：
 
 ```bash
 export HOME=/tmp/mce-cn-home MCE_ROOTS=/tmp/mce-bench-cn
