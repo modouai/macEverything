@@ -28,9 +28,10 @@ fn readings(c: char) -> Vec<String> {
 const CJK_FIRST: u32 = 0x4E00;
 const CJK_LAST: u32 = 0x9FFF;
 
-/// 读音反查表 + 完整音节集。进程内首次拼音查询时构建一次,常驻约 500KB。
+/// 读音反查表 + 完整音节集。进程内首次拼音查询时构建一次,常驻约 400KB(shrink 后)。
 struct ReverseTable {
-    /// 音节前缀 → 读音以它开头的全部汉字(升序去重)。前缀长度 1..=最长读音。
+    /// 音节前缀 → 读音以它开头的全部汉字(升序去重)。前缀长度 1..=最长读音;非 ASCII
+    /// 前缀仅 `ê`(2 字节)。
     prefixes: HashMap<Box<str>, Vec<char>>,
     /// 完整音节集(切分表)。由读音数据派生,与字符集天然一致。
     syllables: BTreeSet<Box<str>>,
@@ -52,7 +53,9 @@ impl ReverseTable {
                 continue;
             };
             for reading in readings(c) {
-                syllables.insert(reading.as_str().into());
+                if !syllables.contains(reading.as_str()) {
+                    syllables.insert(reading.as_str().into());
+                }
                 let mut buf = String::new();
                 for ch in reading.chars() {
                     buf.push(ch);
@@ -64,6 +67,8 @@ impl ReverseTable {
         for chars in prefixes.values_mut() {
             chars.sort_unstable();
             chars.dedup();
+            // Vec 容量按插入次数增长,去重后普遍留有大量松弛;收缩压低常驻内存。
+            chars.shrink_to_fit();
         }
         Self {
             prefixes,
@@ -146,5 +151,20 @@ mod tests {
         assert!(t.has_syllable("xue"));
         assert!(!t.has_syllable("shux"));
         assert!(!t.has_syllable("p"));
+    }
+
+    #[test]
+    fn prefix_lists_are_sorted_and_deduped() {
+        let t = table();
+        let l = t.chars_for("l").unwrap();
+        // 绿读 lv/lu,同一字符经两个读音重复登记前缀 l;去重后应恰好一次。
+        assert_eq!(l.iter().filter(|&&c| c == '绿').count(), 1);
+        for prefix in ["l", "shu", "s", "z", "lv"] {
+            let v = t.chars_for(prefix).unwrap();
+            assert!(
+                v.windows(2).all(|w| w[0] < w[1]),
+                "{prefix}: 切片非严格升序"
+            );
+        }
     }
 }
