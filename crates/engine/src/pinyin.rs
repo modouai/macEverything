@@ -2,7 +2,6 @@
 //! 纯查询侧展开,索引/内存布局/落盘格式零改动(设计见
 //! docs/superpowers/specs/2026-11-15-pinyin-search-design.md;技术规格见
 //! docs/specs/pinyin-search/tech.md)。
-#![cfg_attr(not(test), expect(dead_code))] // 公开接入前仅测试使用;接入后移除本属性
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
@@ -182,6 +181,96 @@ fn enumerate<'a>(
     }
 }
 
+const CJK_COUNT: usize = (CJK_LAST - CJK_FIRST + 1) as usize;
+const BITMAP_WORDS: usize = CJK_COUNT.div_ceil(64);
+
+/// CJK 基本区位图:一个音节字符集摊平为位图,membership O(1)。2.6KB/集。
+struct CharBitmap {
+    words: Box<[u64]>,
+}
+
+impl CharBitmap {
+    fn from_chars(chars: &[char]) -> Self {
+        let mut words = vec![0u64; BITMAP_WORDS].into_boxed_slice();
+        for &c in chars {
+            let cp = c as u32;
+            if (CJK_FIRST..=CJK_LAST).contains(&cp) {
+                let bit = (cp - CJK_FIRST) as usize;
+                words[bit / 64] |= 1 << (bit % 64);
+            }
+        }
+        Self { words }
+    }
+
+    fn contains(&self, c: char) -> bool {
+        let cp = c as u32;
+        if !(CJK_FIRST..=CJK_LAST).contains(&cp) {
+            return false;
+        }
+        let bit = (cp - CJK_FIRST) as usize;
+        self.words[bit / 64] & (1 << (bit % 64)) != 0
+    }
+}
+
+/// 一个查询词的拼音匹配器:全部可行切分方案(每方案一组字符集位图)。
+pub struct PinyinMatcher {
+    alts: Vec<Vec<CharBitmap>>,
+}
+
+impl PinyinMatcher {
+    /// 词级条件:仅 ASCII 小写字母与 `'`、至少一个字母、且能切分;否则 None(静默回退字面)。
+    /// 大小写/`whole:`/通配符的整轮判定由调用方(query.rs)负责。
+    pub fn compile(word: &[u8]) -> Option<Self> {
+        let word = std::str::from_utf8(word).ok()?;
+        if !word.bytes().any(|b| b.is_ascii_lowercase())
+            || !word.bytes().all(|b| b.is_ascii_lowercase() || b == b'\'')
+        {
+            return None;
+        }
+        let table = table();
+        let alts: Vec<Vec<CharBitmap>> = segment(word)
+            .into_iter()
+            .map(|parse| {
+                parse
+                    .iter()
+                    .map(|syl| CharBitmap::from_chars(table.chars_for(syl).unwrap_or(&[])))
+                    .collect()
+            })
+            .collect();
+        if alts.is_empty() {
+            None
+        } else {
+            Some(Self { alts })
+        }
+    }
+
+    /// 命中起点(字节位)。全 ASCII 名称快速短路;多种切分任一命中即返回。
+    pub fn hit(&self, name: &[u8]) -> Option<usize> {
+        if name.is_ascii() {
+            return None;
+        }
+        let s = std::str::from_utf8(name).ok()?;
+        s.char_indices()
+            .map(|(start, _)| start)
+            .find(|&start| self.alts.iter().any(|alt| seq_matches(&s[start..], alt)))
+    }
+}
+
+/// 从 hay 起点逐字符匹配一组位图;序列中断即失败。
+fn seq_matches(hay: &str, alt: &[CharBitmap]) -> bool {
+    let mut idx = 0;
+    for ch in hay.chars() {
+        if !alt[idx].contains(ch) {
+            return false;
+        }
+        idx += 1;
+        if idx == alt.len() {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     // 断言值对应 pinyin 0.11.0 数据；升级 crate 需复核。
@@ -330,5 +419,69 @@ mod tests {
         assert!(segment("''").is_empty());
         assert_eq!(segment("'shu'")[0], vec!["shu"]);
         assert_eq!(segment("shu''xue")[0], vec!["shu", "xue"]);
+    }
+
+    fn hit_of(name: &str, query: &str) -> Option<usize> {
+        PinyinMatcher::compile(query.as_bytes())
+            .unwrap_or_else(|| panic!("{query} should compile"))
+            .hit(name.as_bytes())
+    }
+
+    #[test]
+    fn full_pinyin_hits_chinese_name() {
+        assert_eq!(hit_of("数学笔记.txt", "shuxue"), Some(0));
+        assert_eq!(hit_of("季度报告书.docx", "shu"), Some("季度报告".len()));
+    }
+
+    #[test]
+    fn ascii_names_never_pinyin_match() {
+        assert_eq!(hit_of("shu.txt", "shu"), None);
+    }
+
+    #[test]
+    fn partial_tail_matches_as_typing() {
+        assert_eq!(hit_of("数学.pdf", "shux"), Some(0));
+        assert_eq!(hit_of("数学.pdf", "shuxu"), Some(0));
+    }
+
+    #[test]
+    fn japanese_kana_never_match() {
+        assert_eq!(hit_of("しゅうがく.txt", "shu"), None);
+    }
+
+    #[test]
+    fn non_han_chars_break_the_sequence() {
+        assert_eq!(hit_of("数-学", "shuxue"), None);
+    }
+
+    #[test]
+    fn polyphonic_readings_both_match() {
+        assert_eq!(hit_of("长沙.txt", "chang"), Some(0));
+        assert_eq!(hit_of("长沙.txt", "zhang"), Some(0));
+    }
+
+    #[test]
+    fn ambiguous_segmentation_is_or() {
+        assert_eq!(hit_of("方案.txt", "fangan"), Some(0));
+        assert_eq!(hit_of("反感.txt", "fangan"), Some(0));
+    }
+
+    #[test]
+    fn prefix_set_recall_covers_longer_syllables() {
+        // 完整音节段也使用前缀集:shu 集含 shui/shuang/shuo 开头的字
+        assert_eq!(hit_of("水果.txt", "shu"), Some(0));
+        assert_eq!(hit_of("双方.txt", "shu"), Some(0));
+        assert_eq!(hit_of("说话.txt", "shu"), Some(0));
+    }
+
+    #[test]
+    fn ineligible_words_do_not_compile() {
+        assert!(PinyinMatcher::compile(b"shu*").is_none());
+        assert!(PinyinMatcher::compile(b"shu2").is_none());
+        assert!(PinyinMatcher::compile(b"\x01").is_none()); // QMARK
+        assert!(PinyinMatcher::compile(b"pdf").is_none());
+        assert!(PinyinMatcher::compile(b"'").is_none());
+        // 混合词:词内含非字母(数xue 的 UTF-8 字节)→ 不展开
+        assert!(PinyinMatcher::compile("数xue".as_bytes()).is_none());
     }
 }
