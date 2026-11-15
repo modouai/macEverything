@@ -2,6 +2,7 @@
 use crate::bundle::is_bundle_name;
 use crate::entry::{normalize_for_match, normalize_for_match_case_sensitive, Entry, NO_PARENT};
 use crate::index::IndexView;
+use crate::pinyin::PinyinMatcher;
 use memchr::memmem::Finder;
 use rayon::prelude::*;
 use unicode_normalization::is_nfc;
@@ -23,6 +24,9 @@ pub struct Pattern {
     /// 词含通配符且串尾非 `*`:末段必须命中到名称结尾(`?` 消耗定长字符,同样产生尾锚;
     /// 纯字面词恒 false)。
     pub suffix_anchor: bool,
+    /// 词含 `*`/`?`。`*` 在编译时被剥掉,`*shu*` 的 parts 与纯字面词相同,
+    /// 拼音展开必须靠此标志排除通配词。
+    pub wildcard: bool,
 }
 
 /// 一次查询的完整匹配计划:文件名词 + 路径词 + 两个解析开关 + 调用方级目录过滤。
@@ -138,6 +142,7 @@ fn compile_pattern(term: &str, case_sensitive: bool) -> Pattern {
         parts,
         prefix_anchor: has_wildcard && !bytes.starts_with(b"*"),
         suffix_anchor: has_wildcard && !bytes.ends_with(b"*"),
+        wildcard: has_wildcard,
     }
 }
 
@@ -158,8 +163,17 @@ pub struct QueryOutcome {
 pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOutcome {
     let t = std::time::Instant::now();
     // 预编译:Finder 构建一次,百万条目匹配零重建(主开销消除)。
-    let c_name: Vec<CPattern> = plan.name_terms.iter().map(CPattern::compile).collect();
-    let c_path: Vec<CPattern> = plan.path_terms.iter().map(CPattern::compile).collect();
+    let pinyin_ok = !plan.case_sensitive && !plan.whole_word;
+    let c_name: Vec<CPattern> = plan
+        .name_terms
+        .iter()
+        .map(|p| CPattern::compile(p, pinyin_ok))
+        .collect();
+    let c_path: Vec<CPattern> = plan
+        .path_terms
+        .iter()
+        .map(|p| CPattern::compile(p, false))
+        .collect();
 
     // 分段 → 定长块:(块起始条目号, 块切片)。16k 条/块:百万级单段切成 ~77 块,
     // 负载均衡足够;块内串行逐条(条目号 = 块起始号 + 块内下标)。
@@ -265,7 +279,7 @@ pub fn execute(view: &dyn IndexView, plan: &QueryPlan, limit: usize) -> QueryOut
                 } else {
                     std::borrow::Cow::Borrowed(view.match_name(idx))
                 };
-                if !c_name.is_empty() && !c_name.iter().all(|pt| match_pattern(&target, pt)) {
+                if !c_name.is_empty() && !c_name.iter().all(|pt| pt.hit(&target)) {
                     return None;
                 }
                 if plan.whole_word && !all_parts_word_bounded(&target, &c_name) {
@@ -471,10 +485,17 @@ struct CPattern {
     parts: Vec<CPart>,
     prefix_anchor: bool,
     suffix_anchor: bool,
+    /// 拼音匹配分支(纯字母词);`case:`/`whole:`/含通配符/`path:` 词不编译。
+    pinyin: Option<PinyinMatcher>,
 }
 
 impl CPattern {
-    fn compile(p: &Pattern) -> Self {
+    fn compile(p: &Pattern, pinyin_ok: bool) -> Self {
+        let pinyin = if pinyin_ok && !p.wildcard && p.parts.len() == 1 {
+            PinyinMatcher::compile(&p.parts[0])
+        } else {
+            None
+        };
         Self {
             parts: p
                 .parts
@@ -490,7 +511,13 @@ impl CPattern {
                 .collect(),
             prefix_anchor: p.prefix_anchor,
             suffix_anchor: p.suffix_anchor,
+            pinyin,
         }
+    }
+
+    /// 词命中:字面 OR 拼音。
+    fn hit(&self, name: &[u8]) -> bool {
+        match_pattern(name, self) || self.pinyin.as_ref().is_some_and(|m| m.hit(name).is_some())
     }
 }
 
@@ -586,20 +613,32 @@ fn utf8_char_len(b: u8) -> usize {
 }
 
 /// 打分:首个 name_term 的首 part 在名上的位置——前缀命中 3 > 词边界命中 2 > 子串命中 1。
+/// 拼音命中在名首(偏移 0)同样升到 3,不设 2 档。
 /// 多词查询打分只取首词首段(其余词只参与命中判定;product/tech 未定义多词打分,
 /// 以首词为准是已文档化的决策)。无名词(纯 path)或首 part 缺失(纯 `*`)一律 3,
 /// 排序退化为按名长升序。
 fn score_of(target: &[u8], name_terms: &[CPattern]) -> u8 {
-    let Some(part) = name_terms.first().and_then(|p| p.parts.first()) else {
+    let Some(term) = name_terms.first() else {
         return 3;
     };
-    if match_at(target, 0, &part.bytes).is_some() {
+    let Some(part) = term.parts.first() else {
         return 3;
+    };
+    let mut score = 1;
+    if match_at(target, 0, &part.bytes).is_some() {
+        score = 3;
+    } else if part.finder.is_some() && word_boundary_hit(target, part) {
+        score = 2;
     }
-    if part.finder.is_some() && word_boundary_hit(target, part) {
-        return 2;
+    if score < 3
+        && term
+            .pinyin
+            .as_ref()
+            .is_some_and(|m| m.hit(target) == Some(0))
+    {
+        score = 3;
     }
-    1
+    score
 }
 
 /// `whole:` 语义:name_terms 每个非空、不含 QMARK 的 part 都须整词出现
@@ -1115,6 +1154,59 @@ mod match_tests {
         let path_split = execute(&split, &parse("path:docs").unwrap(), 10);
         assert_eq!(path_split.total, path_full.total);
         assert_eq!(path_split.hits, path_full.hits);
+    }
+
+    #[test]
+    fn pinyin_hits_chinese_names_and_ranks_prefix_first() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        i.insert("季度报告书.txt", d, false);
+        let out = execute(&i, &parse("shu").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "数学笔记.txt".as_bytes()); // 拼音前缀档 3
+    }
+
+    #[test]
+    fn pinyin_does_not_leak_into_case_whole_path_or_wildcard() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        assert_eq!(execute(&i, &parse("case:shu").unwrap(), 100).total, 0);
+        assert_eq!(execute(&i, &parse("whole:shu").unwrap(), 100).total, 0);
+        assert_eq!(execute(&i, &parse("path:shu").unwrap(), 100).total, 0);
+        assert_eq!(execute(&i, &parse("shu*").unwrap(), 100).total, 0);
+        // `*shu*` 编译后 parts 与纯字面词 shu 完全相同,必须靠 wildcard 标志排除
+        assert_eq!(execute(&i, &parse("*shu*").unwrap(), 100).total, 0);
+    }
+
+    #[test]
+    fn uppercase_still_expands_after_folding() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        assert_eq!(execute(&i, &parse("Shu").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn pinyin_matches_directory_names_too() {
+        let mut i = Index::new();
+        i.insert("数学资料", NO_PARENT, true);
+        assert_eq!(execute(&i, &parse("shu").unwrap(), 100).total, 1);
+    }
+
+    #[test]
+    fn pinyin_and_literal_hits_coexist() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("shu.txt", d, false);
+        i.insert("数学.txt", d, false);
+        i.insert("季度报告书.txt", d, false);
+        let out = execute(&i, &parse("shu").unwrap(), 100);
+        assert_eq!(out.total, 3);
+        // 字面前缀与拼音前缀同档 3,子串档 1;同档按名长升序
+        assert_eq!(i.display_name(out.hits[0]), "shu.txt".as_bytes());
+        assert_eq!(i.display_name(out.hits[2]), "季度报告书.txt".as_bytes());
     }
 }
 
