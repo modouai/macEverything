@@ -99,8 +99,8 @@ HOME=/tmp/mce-dev ./target/release/macEverything stop
 bash scripts/bench.sh /tmp/mce-bench 1000000   # 六项:首扫/查询 P99/拼音 P99/增量/落盘/停机重放
 ```
 
-- 自动隔离(`MCE_ROOTS` 指向合成树 + 临时 HOME),测后清理;合成树由 `scripts/spike-readdir` 生成。
-- 合成树中文名占比由 `MCE_GEN_CN_PCT` 控制(默认 20,100 = 全中文名极端树);daemon 会合并已挂载外置卷,bench 的 `MCE_ROOTS` 并非绝对隔离(既有行为)。
+- 隔离与合成树:`MCE_ROOTS` 指向合成树 + 临时 HOME,但并非绝对隔离——daemon 会合并已挂载外置卷;合成树由 `scripts/spike-readdir` 生成,默认保留(`BENCH_PURGE_TREE=1` 才删除)。
+- 合成树中文名占比由 `MCE_GEN_CN_PCT` 控制(默认 20,0 = 纯 ASCII(旧基线),100 = 全中文名极端树);极端树:`MCE_GEN_CN_PCT=100 bash scripts/bench.sh /tmp/mce-bench-cn 1000000`。
 - 单轮测量受系统负载影响(实测偶见 40ms 噪声样本);判定以多轮中位为准。
 - 引擎级查询分布(不经过 daemon):`cargo run --release -p engine --example bench_query -- <index.bin> <总数>`。
 

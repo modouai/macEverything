@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 六项基准(对照 product.md 目标):首扫 / 查询 P99 / 拼音查询 P99 / 增量时效 / 落盘 / 停机重放。
 # 用法:scripts/bench.sh [合成树根] [文件数]
-# 隔离:MCE_ROOTS 指向合成树(不扫真实主目录),HOME 指向临时数据目录。
+# 隔离:MCE_ROOTS 指向合成树(不扫真实主目录),HOME 指向临时数据目录;daemon 会合并已挂载外置卷,非绝对隔离(见 docs/development.md)。
 set -euo pipefail
 
 ROOT=${1:-/tmp/mce-bench}
