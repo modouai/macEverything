@@ -13,6 +13,8 @@ export MCE_ROOTS="$ROOT"
 export MCE_GEN_CN_PCT="${MCE_GEN_CN_PCT:-20}"
 # 非法值(非数字)与生成器同口径回落 20
 case "$MCE_GEN_CN_PCT" in ''|*[!0-9]*) MCE_GEN_CN_PCT=20 ;; esac
+# 与生成器语义对齐:>100 视为 100,回显真实值
+if [ "$MCE_GEN_CN_PCT" -gt 100 ]; then MCE_GEN_CN_PCT=100; fi
 TIMES=""   # 采样临时文件(cleanup trap 用)
 
 # 小目录走废纸篓(trash 不在时装提示保留,不静默);合成树体积大,不走废纸篓。
@@ -59,6 +61,8 @@ query_p99() { # $1=label $2=mode
   local n
   n=$(wc -l < "$TIMES" | tr -d ' ')
   if [ "$n" -lt 150 ]; then
+    # 原样回放一次,便于定位是解析失败还是查询本身无输出
+    echo "  样例输出: $(HOME="$BENCH_HOME" "$BIN" query "$kw" 2>/dev/null | head -1 || true)" >&2
     echo "  $label 样本不足($n/200),基准失败" >&2
     rm -f "$TIMES"
     TIMES=""
@@ -97,10 +101,13 @@ printf "  首扫: %ss\n" "$(wait_ready)"
 HOME="$BENCH_HOME" "$BIN" status | grep -E "条目数|索引生成" | sed 's/^/  /'
 
 echo "== 2. 查询 P99(200 次随机关键词,红线 P99 < 10ms) =="
+# 红线为人工判读,脚本只在样本不足/拼音零命中时失败
 # 只取「匹配」段:输出含「匹配 X ms · 读取信息 Y ms」两段,泛取会混入 stat 耗时
 query_p99 "查询" random
 
 echo "== 2b. 拼音查询 P99(200 次:shuxue/shux 交替,红线 P99 < 10ms) =="
+# 红线为人工判读,脚本只在样本不足/拼音零命中时失败
+# shuxue 覆盖完整音节、shux 覆盖末段前缀,两者的命中规模与匹配路径不同。
 # 预热:反查表 OnceLock 懒构建计入首查,不占 P99 样本;命中也兼作功能性断言
 if [ "$MCE_GEN_CN_PCT" -gt 0 ]; then
   HITS=$(HOME="$BENCH_HOME" "$BIN" query "shuxue" 2>/dev/null | head -1 || true)
