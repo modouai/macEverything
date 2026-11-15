@@ -818,9 +818,50 @@ git commit -m "feat(engine): match pinyin sequences via CJK bitmaps"
         i.insert("季度报告书.txt", d, false);
         let out = execute(&i, &parse("shu").unwrap(), 100);
         assert_eq!(out.total, 3);
-        // 字面前缀与拼音前缀同档 3,子串档 1;同档按名长升序
+        // 字面前缀档 3;拼音中部档 1;同档按名长升序
         assert_eq!(i.display_name(out.hits[0]), "shu.txt".as_bytes());
         assert_eq!(i.display_name(out.hits[2]), "季度报告书.txt".as_bytes());
+    }
+
+    #[test]
+    fn pinyin_prefix_score_beats_shorter_literal_substring() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("xshu.txt", d, false); // 字面子串,档 1,8 字节
+        i.insert("数学.txt", d, false); // 拼音前缀,档 3,10 字节
+        let out = execute(&i, &parse("shu").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "数学.txt".as_bytes());
+    }
+
+    #[test]
+    fn pinyin_mid_name_never_gets_boundary_score() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("x-shu.txt", d, false); // 字面整词边界,档 2,9 字节
+        i.insert("a书", d, false);       // 拼音中部,档 1,4 字节
+        let out = execute(&i, &parse("shu").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "x-shu.txt".as_bytes());
+    }
+
+    #[test]
+    fn multi_word_mixes_pinyin_and_literal() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        assert_eq!(execute(&i, &parse("shu txt").unwrap(), 100).total, 1);
+        assert_eq!(execute(&i, &parse("shu pdf").unwrap(), 100).total, 0);
+        assert_eq!(execute(&i, &parse("shu xue").unwrap(), 100).total, 1);
+        assert_eq!(execute(&i, &parse("whole:shu xue").unwrap(), 100).total, 0);
+    }
+
+    #[test]
+    fn pattern_wildcard_flag_is_explicit() {
+        assert!(parse("shu*").unwrap().name_terms[0].wildcard);
+        assert!(parse("*shu*").unwrap().name_terms[0].wildcard);
+        assert!(parse("shu?").unwrap().name_terms[0].wildcard);
+        assert!(!parse("shu").unwrap().name_terms[0].wildcard);
     }
 ```
 
@@ -965,7 +1006,12 @@ Expected: 全部通过（含既有测试与 3 个新集成测试）。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `CPattern::hit` 改为只返回 `match_pattern(name, self)`（去掉拼音分支），Run: `cargo test -p engine pinyin_`，Expected: 3 个测试失败（排序、目录、字面+拼音共存；`pinyin_does_not_leak...` 断言 0，保持绿）。还原，全量测试确认通过。
+三次突变，逐个还原：
+1. `CPattern::hit` 改为只返回 `match_pattern(name, self)`（去掉拼音分支）→ `cargo test -p engine pinyin_` 3 个测试失败（排序、目录、字面+拼音共存；`pinyin_does_not_leak...` 断言 0，保持绿）。
+2. 删除 `score_of` 的拼音升档块（`score < 3 && ... == Some(0)`）→ `pinyin_prefix_score_beats_shorter_literal_substring` 必须失败。
+3. 把拼音中部命中临时按档 2 处理（`score = 2`）→ `pinyin_mid_name_never_gets_boundary_score` 必须失败。
+
+还原后跑 `cargo test -p engine`，确认全绿（预计 201 个 lib 测试）。
 
 - [ ] **Step 6: 提交**
 
