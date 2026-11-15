@@ -1204,9 +1204,42 @@ mod match_tests {
         i.insert("季度报告书.txt", d, false);
         let out = execute(&i, &parse("shu").unwrap(), 100);
         assert_eq!(out.total, 3);
-        // 字面前缀与拼音前缀同档 3,子串档 1;同档按名长升序
+        // 首条字面前缀档 3,末条拼音中部档 1;同档按名长升序
         assert_eq!(i.display_name(out.hits[0]), "shu.txt".as_bytes());
         assert_eq!(i.display_name(out.hits[2]), "季度报告书.txt".as_bytes());
+    }
+
+    #[test]
+    fn pinyin_prefix_score_beats_shorter_literal_substring() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("xshu.txt", d, false); // 字面子串,档 1,8 字节
+        i.insert("数学.txt", d, false); // 拼音前缀,档 3,10 字节
+        let out = execute(&i, &parse("shu").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "数学.txt".as_bytes());
+    }
+
+    #[test]
+    fn pinyin_mid_name_never_gets_boundary_score() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("x-shu.txt", d, false); // 字面整词边界,档 2,9 字节
+        i.insert("a书", d, false); // 拼音中部,档 1,4 字节
+        let out = execute(&i, &parse("shu").unwrap(), 100);
+        assert_eq!(out.total, 2);
+        assert_eq!(i.display_name(out.hits[0]), "x-shu.txt".as_bytes());
+    }
+
+    #[test]
+    fn multi_word_mixes_pinyin_and_literal() {
+        let mut i = Index::new();
+        let d = i.insert("d", NO_PARENT, true);
+        i.insert("数学笔记.txt", d, false);
+        assert_eq!(execute(&i, &parse("shu txt").unwrap(), 100).total, 1);
+        assert_eq!(execute(&i, &parse("shu pdf").unwrap(), 100).total, 0);
+        assert_eq!(execute(&i, &parse("shu xue").unwrap(), 100).total, 1);
+        assert_eq!(execute(&i, &parse("whole:shu xue").unwrap(), 100).total, 0);
     }
 }
 
@@ -1254,6 +1287,14 @@ mod tests {
         assert!(star.name_terms[0].parts.is_empty());
         assert!(!star.name_terms[0].prefix_anchor);
         assert!(!star.name_terms[0].suffix_anchor);
+    }
+
+    #[test]
+    fn pattern_wildcard_flag_is_explicit() {
+        assert!(parse("shu*").unwrap().name_terms[0].wildcard);
+        assert!(parse("*shu*").unwrap().name_terms[0].wildcard);
+        assert!(parse("shu?").unwrap().name_terms[0].wildcard);
+        assert!(!parse("shu").unwrap().name_terms[0].wildcard);
     }
 
     #[test]
