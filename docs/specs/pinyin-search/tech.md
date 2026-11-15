@@ -22,8 +22,8 @@
 | `PinyinMatcher::hit(&self, name: &[u8]) -> Option<usize>` | pub | 序列匹配，返回命中起点字节位 |
 | `seq_matches(hay, alt)` | 内部 | 从一个起点逐字符匹配一组位图；序列中断即失败 |
 
-- 设计稿 §4.1 的 `PinyinSeq::compile` / `match_seq` 是模块示意；实现定名为
-  `PinyinMatcher::{compile, hit}` + `seq_matches`，语义不变。
+- 实现 API 为 `PinyinMatcher::{compile, hit}`，序列匹配内部函数为 `seq_matches`；
+  设计 §4.1 已同步为实际名称。
 - 位图每次查询按需从反查表切片构建（每音节微秒级）；反查表常驻。
 
 ### 1.2 `query.rs` 集成点
