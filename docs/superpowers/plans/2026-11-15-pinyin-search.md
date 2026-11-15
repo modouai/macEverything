@@ -219,7 +219,7 @@ git commit -m "feat(engine): add pinyin dependency and reading normalization"
         // 绿有 lv/lu 两个读音,落在前缀 l 上两次;没有 dedup 就会重复
         let l = t.chars_for("l").unwrap();
         assert_eq!(l.iter().filter(|&&c| c == '绿').count(), 1);
-        // 字段契约「升序」:没有 sort 时混合字符顺序不可保证
+        // 字段契约「升序」:输出必须严格升序(build 按码点序迭代、dedup 后天然升序;sort 为防御性保证)
         for p in ["l", "shu", "s", "z", "lv"] {
             let v = t.chars_for(p).unwrap();
             assert!(v.windows(2).all(|w| w[0] < w[1]), "{p} not strictly ascending");
