@@ -1162,7 +1162,7 @@ git commit -m "docs: sync pinyin search usage, architecture and bench"
 | 任意位置命中 + 前缀档评分 | Task 5/6 |
 | 文件与目录同名口径 | Task 6 测试 |
 | `case:`/`whole:`/通配符/`path:`/混合词不展开 | Task 6 集成测试 |
-| 索引布局/落盘零改动；反查表懒构建常驻 ~500KB | 仅 engine 查询层改动；parity 天然通过 |
+| 索引布局/落盘零改动；反查表懒构建常驻 ~400KB | 仅 engine 查询层改动；parity 天然通过 |
 | 性能：常规树与 100% 中文名树 P99 < 10ms | Task 7 两次实测 |
 | 突变验证 | Task 3/4/5/6 各一条 |
 | spec-first 文档 | Task 1、Task 8 |

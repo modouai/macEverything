@@ -131,11 +131,11 @@ for cp in 0x4E00..=0x9FFF:
   `segment` 有解才返回 `Some`，否则 `None`。小写与 NFC 由 `query.rs` 的
   `compile_pattern` 归一保证，compile 侧仍防御性校验字节集合。整轮条件（`case:`/
   `whole:`）与通配符、`path:` 排除由 `query.rs` 负责，pinyin 模块不感知这些语法。
-- `hit`：`name.is_ascii()` 直接 `None`（全 ASCII 名零开销）；否则按 `char_indices`
+- `hit`：`name.is_ascii()` 直接 `None`（全 ASCII 名 O(n) 扫描后直接判不命中，无位图测试）；否则按 `char_indices`
   逐字符起点扫描，每个起点依次试全部切分方案，首个命中即返回该起点字节位。
 - `seq_matches` 从起点逐字符推进：第 i 字须 ∈ 第 i 段位图；中途任一字不在位图
   （非 CJK、标点、另一音节的字）即序列中断，换下一起点。
-- 复杂度：`O(名字字符数 × 方案数 × 音节数)`，全 ASCII 名短路为 O(1)；
+- 复杂度：`O(名字字符数 × 方案数 × 音节数)`，全 ASCII 名 O(n) 快速拒绝；
   位图 membership 为 O(1)。
 
 ### 2.5 降级（全部静默，无用户可见错误）
