@@ -35,6 +35,8 @@ struct ReverseTable {
     prefixes: HashMap<Box<str>, Vec<char>>,
     /// 完整音节集(切分表)。由读音数据派生,与字符集天然一致。
     syllables: BTreeSet<Box<str>>,
+    /// 最长读音的字节长度(实测 6,如 shuang/chuang/zhuang);用于收敛切分扫描上界。
+    max_reading_len: usize,
 }
 
 static TABLE: OnceLock<ReverseTable> = OnceLock::new();
@@ -48,11 +50,13 @@ impl ReverseTable {
     fn build() -> Self {
         let mut prefixes: HashMap<Box<str>, Vec<char>> = HashMap::new();
         let mut syllables: BTreeSet<Box<str>> = BTreeSet::new();
+        let mut max_reading_len = 0usize;
         for cp in CJK_FIRST..=CJK_LAST {
             let Some(c) = char::from_u32(cp) else {
                 continue;
             };
             for reading in readings(c) {
+                max_reading_len = max_reading_len.max(reading.len());
                 if !syllables.contains(reading.as_str()) {
                     syllables.insert(reading.as_str().into());
                 }
@@ -73,6 +77,7 @@ impl ReverseTable {
         Self {
             prefixes,
             syllables,
+            max_reading_len,
         }
     }
 
@@ -87,18 +92,29 @@ impl ReverseTable {
 
 /// 单次查询词最多保留的切分方案数(防御组合爆炸)。
 const MAX_PARSES: usize = 8;
+/// 查询词字节上限:真实拼音查询远低于此;上限同时兜住递归深度与组合爆炸。
+const MAX_WORD_LEN: usize = 64;
+/// 单次切分的搜索步数上限:超出即整体放弃展开(回退纯字面),保证最坏耗时有界。
+const MAX_SEARCH_STEPS: usize = 10_000;
 
 /// 音节切分:返回全部可行切分(最多 `MAX_PARSES` 条),每条是音节子串序列。
 /// 规则:完整音节全枚举 OR、最长优先;末段可为任意音节前缀;`'` 为强制分段边界
 /// (边界内仍全枚举);无解返回空。
+/// 仅接受 ASCII 且不超过 `MAX_WORD_LEN` 字节的词;搜索步数超过 `MAX_SEARCH_STEPS`
+/// 即返回空(调用方回退纯字面),保证最坏耗时有界。
+/// 枚举顺序为最长音节优先,截断时保留贪婪切分。
 fn segment(word: &str) -> Vec<Vec<&str>> {
+    if !word.is_ascii() || word.len() > MAX_WORD_LEN {
+        return Vec::new();
+    }
     let table = table();
+    let mut steps = 0usize;
     let mut out: Vec<Vec<&str>> = vec![Vec::new()];
     for run in word.split('\'').filter(|r| !r.is_empty()) {
         let mut run_parses: Vec<Vec<&str>> = Vec::new();
         let mut cur: Vec<&str> = Vec::new();
-        enumerate(run, table, 0, &mut cur, &mut run_parses);
-        if run_parses.is_empty() {
+        enumerate(run, table, 0, &mut cur, &mut run_parses, &mut steps);
+        if steps >= MAX_SEARCH_STEPS || run_parses.is_empty() {
             return Vec::new();
         }
         let mut next: Vec<Vec<&str>> = Vec::new();
@@ -127,10 +143,15 @@ fn enumerate<'a>(
     pos: usize,
     cur: &mut Vec<&'a str>,
     out: &mut Vec<Vec<&'a str>>,
+    steps: &mut usize,
 ) {
     if out.len() >= MAX_PARSES {
         return;
     }
+    if *steps >= MAX_SEARCH_STEPS {
+        return;
+    }
+    *steps += 1;
     if pos == run.len() {
         if !cur.is_empty() {
             out.push(cur.clone());
@@ -139,16 +160,20 @@ fn enumerate<'a>(
     }
     let tail = &run[pos..];
     // 末段:剩余串是某音节前缀、且本身不是完整音节(完整音节在下方整段消费,避免重复方案)。
-    if !table.has_syllable(tail) && table.chars_for(tail).is_some() {
+    if tail.len() <= table.max_reading_len
+        && !table.has_syllable(tail)
+        && table.chars_for(tail).is_some()
+    {
         let mut v = cur.clone();
         v.push(tail);
         out.push(v);
     }
     // 完整音节:最长优先。
-    for end in (pos + 1..=run.len()).rev() {
+    let max_end = (pos + table.max_reading_len).min(run.len());
+    for end in (pos + 1..=max_end).rev() {
         if table.has_syllable(&run[pos..end]) {
             cur.push(&run[pos..end]);
-            enumerate(run, table, end, cur, out);
+            enumerate(run, table, end, cur, out, steps);
             cur.pop();
             if out.len() >= MAX_PARSES {
                 return;
@@ -279,6 +304,31 @@ mod tests {
 
     #[test]
     fn parse_count_is_capped() {
-        assert!(segment("xianxianxianxian").len() <= MAX_PARSES);
+        assert_eq!(segment("xianxianxianxian").len(), MAX_PARSES);
+    }
+
+    #[test]
+    fn pathological_input_terminates_empty() {
+        // 无解尾缀 + 高歧义前缀:步数预算必须兜住组合爆炸
+        assert!(segment(&("xian".repeat(12) + "vv")).is_empty());
+    }
+
+    #[test]
+    fn overlong_input_is_rejected() {
+        assert!(segment(&"a".repeat(100_000)).is_empty());
+    }
+
+    #[test]
+    fn non_ascii_input_is_rejected() {
+        assert!(segment("学").is_empty());
+        assert!(segment("shu学").is_empty());
+    }
+
+    #[test]
+    fn apostrophe_edge_cases() {
+        assert!(segment("'").is_empty());
+        assert!(segment("''").is_empty());
+        assert_eq!(segment("'shu'")[0], vec!["shu"]);
+        assert_eq!(segment("shu''xue")[0], vec!["shu", "xue"]);
     }
 }
