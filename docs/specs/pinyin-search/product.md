@@ -1,7 +1,7 @@
 # 拼音搜索（全拼）产品规格
 
 - 日期：2026-11-15
-- 状态：已确认（待实现）
+- 状态：已实现（2026-11-15）
 - 关联：设计 `docs/superpowers/specs/2026-11-15-pinyin-search-design.md`；实现计划
   `docs/superpowers/plans/2026-11-15-pinyin-search.md`
 

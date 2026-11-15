@@ -43,7 +43,7 @@ MCE_GEN_CN_PCT=100 bash scripts/bench.sh /tmp/mce-bench-cn 1000000  # 极端树:
 
 判定：
 
-- **常规树拼音 P99 < 10ms**（`bench.sh` 新增「2b. 拼音查询 P99」段）；100% 极端树记录实测（实测 11.5–13.7ms，人工极端分布，不设红线）。200 次 `shuxue`/`shux`
+- **常规树拼音 P99 < 10ms**（`bench.sh` 新增「2b. 拼音查询 P99」段）；100% 极端树记录实测（中位 9.6ms / P99 13.7ms，复跑中位 11.5ms，人工极端分布，不设红线）。200 次 `shuxue`/`shux`
   交替查询；反查表 `OnceLock` 懒构建计入预热、不占 P99 样本。两棵树各跑一次。
 - 常规树「2. 查询 P99」按量级与历史值比较：合成树 20% 文件名换成中文后，约 20% 的
   随机 ASCII 关键词命中 0 项，P99 可能略降；不按绝对值逐位比较。
@@ -81,10 +81,11 @@ bench 脚本头部与 `docs/development.md` 的「五项基准」描述同步改
 ## 5. 完成判定
 
 - [x] 三门禁全绿（2026-11-15）：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
-      `cargo test --workspace`（1023 passed / 0 failed / 4 ignored 实机用例）
+      `cargo test --workspace`（1023 passed / 0 failed / 10 ignored：4 条 fsevents_live +
+      6 条 app 实机用例）
 - [x] 常规树（20% 中文名）拼音 P99 < 10ms（实测 4.0ms）；极端树（`MCE_GEN_CN_PCT=100`）
-      实测 11.5–13.7ms，人工极端分布，记录不设红线；常规树 ASCII P99 与历史同量级
-      （按量级比较）
+      实测中位 9.6ms / P99 13.7ms（复跑中位 11.5ms），人工极端分布，记录不设红线；
+      常规树 ASCII P99 与历史同量级（按量级比较）
 - [x] 100% 中文名树 `query sh` 单次匹配耗时已记录，并与其他测量一并回填 `tech.md` §4
 - [x] 实机冒烟：`query shu` 命中合成树内 `shu.txt` 与两个中文名（`数学笔记` 前缀命中排在
       `季度报告书` 中部命中之前）；`query shuxue` 命中「数学笔记」。daemon 合并了已挂载
