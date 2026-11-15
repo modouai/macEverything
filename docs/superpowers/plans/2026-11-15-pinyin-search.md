@@ -521,9 +521,10 @@ Expected: 18 passed。
 
 - [ ] **Step 5: 突变验证**
 
-两次突变，逐个还原：
+三次突变，逐个还原：
 1. 末段判断去掉 `!table.has_syllable(tail) &&`（完整音节也走末段前缀）→ `segments_full_pinyin` 必须失败（出现重复方案）。
-2. 删除 `*steps += 1;`（步数预算失效）→ `pathological_input_terminates_empty` 必须失败。
+2. 末段判断去掉 `table.chars_for(tail).is_some()` → `pathological_input_terminates_empty` 必须失败（证明该测试非空转）。
+3. （挂起型突变，记录不追究）删除 `*steps += 1;` → 测试不变红而是挂起：无解输入的死端搜索输出恒为空，预算失效只表现为无界耗时（CI 以超时暴露）。步数预算的可观察保证是「有界耗时」而非输出，断言级证据不可构造。
 
 还原后跑 `cargo test -p engine pinyin::tests`，确认 18 passed。
 
