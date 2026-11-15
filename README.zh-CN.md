@@ -146,7 +146,7 @@ macEverything stop
 | `case:` | 本轮区分大小写 | `case:README` |
 | `whole:` | 本轮整词匹配 | `whole:init` |
 
-纯字母词默认按全拼匹配中文名(`shu` → 数/书/树,`shuxue` → 数学),完整规则见[使用指南](docs/usage.md)。
+纯字母词(ASCII 字母,可含 `'` 分段)默认按全拼匹配中文名(`shu` → 数/书/树,`shuxue` → 数学);含数字、下划线或非 ASCII 字符的词,以及 `case:`/`whole:` 轮、通配符词、`path:` 词不展开。完整规则见[使用指南](docs/usage.md)。
 
 <details>
 <summary><b>完整语法规则与排序</b></summary>

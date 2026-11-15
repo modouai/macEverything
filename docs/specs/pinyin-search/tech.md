@@ -72,6 +72,8 @@ struct CPattern {
   CJK 字节不受小写折叠影响，无需二次取名字。
 - 打分对已命中候选二次调用 `hit`（只发生在通过匹配的条目上）；成本随命中集大小，
   已纳入 bench P99 口径。
+- 非折叠路径（`case:` 轮）不编译拼音，因此候选过滤与 `score_of` 使用的 target 差异不影响
+  拼音分支；除 `execute` 外无其他 `CPattern` 构造路径。
 
 ## 2. 算法
 
@@ -121,11 +123,12 @@ for cp in 0x4E00..=0x9FFF:
 - 去重来源：剩余串本身是完整音节时只走「完整音节」分支，避免同一解析既作末段前缀又
   作完整音节重复产出。
 - 任一 run 无可行切分 → 整个词不展开（返回空）。
-- 方案数上限 `MAX_PARSES = 8`，按最长优先顺序截断，防御组合爆炸
-  （`xianxianxianxian` 之类的多解词）。
+- 方案数上限 `MAX_PARSES = 8`：按最长优先顺序尽力保留贪婪切分；`'` 各段的笛卡尔拼接
+  按先到先得截断到 8 条，防御组合爆炸（`xianxianxianxian` 之类的多解词）。
 - 输入防护：`segment` 只接受 ASCII 且 ≤64 字节的词（`MAX_WORD_LEN`）；整词切分搜索步数
-  上限 10000（`MAX_SEARCH_STEPS`，跨 `'` 段共享），超限立即整体放弃展开。任一触发回退
-  纯字面，不报错。
+  上限 10000（`MAX_SEARCH_STEPS`，跨 `'` 段共享），超限立即整体放弃展开（整词粒度，
+  非单 run）。`'` 各段共享同一预算；笛卡尔拼接阶段不再累加步数，拼接结果仅受
+  `MAX_PARSES` 限制。任一触发回退纯字面，不报错。
 - 产物是音节子串序列；`PinyinMatcher::compile` 再把每段换成 `CharBitmap`。
 
 ### 2.4 匹配（`PinyinMatcher::hit` / `seq_matches`）
@@ -153,7 +156,9 @@ for cp in 0x4E00..=0x9FFF:
 ## 3. 数据事实（`pinyin 0.11.0` 实测，供后来者核对）
 
 测量方式与本实现的 `readings` 完全一致（`to_pinyin_multi` → `plain()` → `ü`→`v` →
-按字符去重），遍历 U+4E00–U+9FFF：
+按字符去重），遍历 U+4E00–U+9FFF。以下数字为参考值，强绑定 `pinyin 0.11.0`；可复现
+测试：`cjk_basic_block_coverage_is_near_complete`、`reverse_table_maps_syllables_to_hanzi`、
+`prefix_lists_are_sorted_and_deduped`、`parses_are_unique` 等（`crates/engine/src/pinyin.rs`）。
 
 | 项 | 值 | 说明 |
 |---|---|---|
@@ -205,11 +210,13 @@ for cp in 0x4E00..=0x9FFF:
 `shuxue`/`shux` 交替，预热排除）。来源：1M 条目合成树；daemon 合并了已挂载外置卷，
 实际条目约 1,030,134，其中 5,083 条来自外置卷（既有行为）。
 
-反查表冷构建（进程内首个纯字母查询词）实测约 11ms，一次性；后续查询命中预热后的表。
+冷启动口径：反查表冷构建（进程内首个纯字母查询词）microbench 约 11ms，一次性，后续
+查询命中预热后的表；1M 常规树上首个 `query shuxue` 9.3ms 是另一次测量（含构建 +
+全量扫描，批次不同）；P99 样本已排除首查。
 
 | 场景 | 首扫 | ASCII 查询 P99 | 拼音中位 / P99 | 备注 |
 |---|---|---|---|---|
-| 常规树（20% 中文名） | 0.70 s | 2.2 ms | 3.7 / 4.0 ms | `query shuxue` 25,000 命中；首个拼音查询 9.3 ms（含反查表懒构建，预热已排除） |
+| 常规树（20% 中文名） | 0.70 s | 2.2 ms | 3.7 / 4.0 ms | `query shuxue` 25,000 命中；首个拼音查询 9.3 ms（含反查表构建 + 全量扫描，另一次测量；P99 样本已排除首查） |
 | 极端树（100% 中文名） | 0.96 s | 2.9 ms | 中位 9.6 / P99 13.7 ms（复跑：中位 11.5 / P99 11.6） | `shuxue` 单次匹配 10.4、11.6 ms；`shux` 单次匹配 8.9、9.2 ms；`query sh` 375,108 命中、单次匹配 8.3–8.8 ms；人工极端分布，记录不设红线 |
 
 ## 5. 依赖

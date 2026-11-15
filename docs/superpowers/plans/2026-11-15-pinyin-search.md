@@ -432,7 +432,7 @@ const MAX_SEARCH_STEPS: usize = 10_000;
 /// 规则:完整音节全枚举 OR、最长优先;末段可为任意音节前缀;`'` 为强制分段边界
 /// (边界内仍全枚举)。仅接受 ASCII 且 ≤`MAX_WORD_LEN` 字节,搜索不超过
 /// `MAX_SEARCH_STEPS` 步;无解或超限返回空(回退纯字面)。
-/// 枚举顺序为「最长音节优先」,截断时保留贪婪切分。
+/// 枚举顺序为「最长音节优先」,尽力保留贪婪切分(跨 `'` 段按先到先得截断)。
 fn segment(word: &str) -> Vec<Vec<&str>> {
     if !word.is_ascii() || word.len() > MAX_WORD_LEN {
         return Vec::new();
@@ -1002,12 +1002,18 @@ fn score_of(target: &[u8], name_terms: &[CPattern]) -> u8 {
 - [ ] **Step 4: 运行全量测试**
 
 Run: `cargo test -p engine`
-Expected: 全部通过（含既有测试与 3 个新集成测试）。
+Expected: 全部通过（含既有测试与 9 个新集成测试）。
 
 - [ ] **Step 5: 突变验证**
 
 三次突变，逐个还原：
-1. `CPattern::hit` 改为只返回 `match_pattern(name, self)`（去掉拼音分支）→ `cargo test -p engine pinyin_` 3 个测试失败（排序、目录、字面+拼音共存；`pinyin_does_not_leak...` 断言 0，保持绿）。
+1. `CPattern::hit` 改为只返回 `match_pattern(name, self)`（去掉拼音分支）→ 预期以下三个测试失败：
+   `pinyin_hits_chinese_names_and_ranks_prefix_first`、
+   `pinyin_matches_directory_names_too`、
+   `pinyin_and_literal_hits_coexist`。
+   注意 `cargo test -p engine pinyin_` 会同时选中其它拼音测试（如
+   `pinyin_does_not_leak_into_case_whole_path_or_wildcard` 断言 0，保持绿；
+   `pinyin_prefix_score_beats_shorter_literal_substring` 等走字面仍绿），以失败集为准。
 2. 删除 `score_of` 的拼音升档块（`score < 3 && ... == Some(0)`）→ `pinyin_prefix_score_beats_shorter_literal_substring` 必须失败。
 3. 把拼音中部命中临时按档 2 处理（`score = 2`）→ `pinyin_mid_name_never_gets_boundary_score` 必须失败。
 

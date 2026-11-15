@@ -148,7 +148,7 @@ When the engine is offline, `query` falls back to reading the on-disk index dire
 | `case:` | case-sensitive for this query | `case:README` |
 | `whole:` | whole-word match for this query | `whole:init` |
 
-Pure-letter words also match Chinese names by full pinyin (`shu` → 数/书/树, `shuxue` → 数学); full rules are in the [usage guide](docs/usage.md).
+Pure-letter words (ASCII letters, optionally split with `'`) also match Chinese names by full pinyin (`shu` → 数/书/树, `shuxue` → 数学). Words containing digits, underscores or non-ASCII characters do not expand, and neither do `case:` / `whole:` rounds, wildcard words or `path:` words; full rules are in the [usage guide](docs/usage.md).
 
 <details>
 <summary><b>Full syntax rules and ranking</b></summary>

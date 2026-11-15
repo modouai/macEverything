@@ -28,13 +28,13 @@ cargo test -p engine --test fsevents_live -- --ignored    # FSEvents 实机集�
 
 图形界面：`bash scripts/bundle.sh`（构建 + 组装 .app + ad-hoc 签名 → `release/macEverything.app`）；对外分发 `bash scripts/release.sh`（Developer ID 签名 + 公证 + DMG + 同步站点仓 `version.json`）。
 
-基准：`bash scripts/bench.sh /tmp/mce-bench 1000000`（六项基准，自动隔离环境）。
+基准：`bash scripts/bench.sh /tmp/mce-bench 1000000`（六项基准（含拼音 P99），自动隔离环境）。
 
 ## 架构（大图）
 
 单 daemon 模型：`cli` 的 daemon 是引擎宿主；`cli` 与 `app`（GUI）是它的两个**独立**客户端，经 Unix socket + 长度前缀 JSON 通信，互不依赖。五个 crate：
 
-- `engine` — 全部业务逻辑的纯逻辑库，对 GUI 零依赖：扁平 Entry 索引（24B/条 + 双名称池）、查询预编译（Finder）、并行扫描、mmap 落盘（内存布局镜像，零反序列化）、FSEvents 直调与停机事件重放、目录级 diff 增量。
+- `engine` — 全部业务逻辑的纯逻辑库，对 GUI 零依赖：扁平 Entry 索引（24B/条 + 双名称池）、查询预编译（Finder）、并行扫描、mmap 落盘（内存布局镜像，零反序列化）、FSEvents 直调与停机事件重放、目录级 diff 增量；查询侧拼音展开（`pinyin.rs`：音节切分 + CJK 位图序列匹配，索引零改动）。
 - `protocol` — 协议契约的唯一真相（消息/编解码/校验/版本），cli 与 app 共用。
 - `client` — 客户端承载层的唯一行为真相（连接/按需 stat/离线降级/状态常量），cli 与 app 共用。
 - `cli` — daemon（冷启动编排/增量循环/落盘锁）+ 五子命令 `start/stop/query/status/exclude`（含离线降级）。
