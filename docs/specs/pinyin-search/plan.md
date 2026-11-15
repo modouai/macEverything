@@ -13,7 +13,7 @@
 | 1 | 规格档案（spec-first） | `docs/specs/pinyin-search/{product,tech,plan}.md` | 三份契约先于代码合入 |
 | 2 | 依赖与读音归一 | `Cargo.toml`、`crates/engine/Cargo.toml`、`engine/src/{lib,pinyin}.rs` | `readings` 3 条单测通过（多音字全保留、覆盖率 > 20000） |
 | 3 | 反查表与音节表 | `engine/src/pinyin.rs` | 前缀/多音字/音节集 4 条单测；突变（去掉单字母前缀）必红 |
-| 4 | 音节切分 | `engine/src/pinyin.rs` | 6 条切分单测（全枚举、末段前缀、`'` 硬边界、无解、8 方案上限）；突变（末段判定）必红 |
+| 4 | 音节切分 | `engine/src/pinyin.rs` | 6 条切分单测（全枚举、末段前缀、`'` 强制边界且边界内全枚举、无解、8 方案上限）；突变（末段判定）必红 |
 | 5 | 位图与序列匹配器 | `engine/src/pinyin.rs` | 8 条匹配单测（开头/中部、ASCII 短路、假名不误伤、序列中断、多音字、多切分 OR、不合格词）；突变（`contains` 恒真）必红 |
 | 6 | query.rs 接入 | `engine/src/query.rs` | 4 条集成测试（拼音排序、`case:`/`whole:`/`path:`/通配符互斥、`Shu` 折叠、字面与拼音共存）；突变（去掉拼音分支）必红 |
 | 7 | 基准（合成树中文名 + 拼音 P99） | `scripts/spike-readdir/src/main.rs`、`scripts/bench.sh` | 拼音 P99 < 10ms（§2） |
@@ -56,7 +56,7 @@ bench 脚本头部与 `docs/development.md` 的「五项基准」描述同步改
 
 | 文件 | 改动 |
 |---|---|
-| `docs/usage.md` | 「搜索语法」新增「拼音匹配」：默认开启；纯字母词按全拼音节匹配中文名（`shu` → 数/书/树，`shuxue` → 数学，`shux` 支持未打完的末音节）；`case:`/`whole:`/含通配符的词、`path:` 词不展开；`'` 作音节硬边界（`xi'an`）；`ü` 用 `v` 输入（`lv` → 绿） |
+| `docs/usage.md` | 「搜索语法」新增「拼音匹配」：默认开启；纯字母词按全拼音节匹配中文名（`shu` → 数/书/树，`shuxue` → 数学，`shux` 支持未打完的末音节）；`case:`/`whole:`/含通配符的词、`path:` 词不展开；`'` 作强制分段边界（`xi'an`，边界内仍全枚举）；`ü` 用 `v` 输入（`lv` → 绿） |
 | `docs/architecture.md` | 查询管线段落补一句：查询侧拼音展开（`pinyin.rs` + `CPattern.pinyin`），索引与落盘无变化 |
 | `docs/development.md` | 基准项「五项」→「六项」（含拼音查询）；补 `MCE_GEN_CN_PCT`（默认 20）控制合成树中文名占比 |
 | `CLAUDE.md` | 常用命令 bench 行「（五项基准，自动隔离环境）」→「（六项基准，自动隔离环境）」 |
