@@ -247,12 +247,15 @@ use std::sync::OnceLock;
 const CJK_FIRST: u32 = 0x4E00;
 const CJK_LAST: u32 = 0x9FFF;
 
-/// 读音反查表 + 完整音节集。进程内首次拼音查询时构建一次,常驻约 500KB。
+/// 读音反查表 + 完整音节集。进程内首次拼音查询时构建一次,常驻约 400KB(shrink 后)。
 struct ReverseTable {
     /// 音节前缀 → 读音以它开头的全部汉字(升序去重)。前缀长度 1..=最长读音。
+    /// 非 ASCII 前缀仅 `ê`(2 字节)。
     prefixes: HashMap<Box<str>, Vec<char>>,
     /// 完整音节集(切分表)。由读音数据派生,与字符集天然一致。
     syllables: BTreeSet<Box<str>>,
+    /// 最长读音字节数(实测 6,如 shuang/chuang/zhuang);切分扫描上界用。
+    max_reading_len: usize,
 }
 
 static TABLE: OnceLock<ReverseTable> = OnceLock::new();
@@ -266,12 +269,14 @@ impl ReverseTable {
     fn build() -> Self {
         let mut prefixes: HashMap<Box<str>, Vec<char>> = HashMap::new();
         let mut syllables: BTreeSet<Box<str>> = BTreeSet::new();
+        let mut max_reading_len = 0usize;
         for cp in CJK_FIRST..=CJK_LAST {
             let Some(c) = char::from_u32(cp) else { continue };
             for reading in readings(c) {
                 if !syllables.contains(reading.as_str()) {
                     syllables.insert(reading.as_str().into());
                 }
+                max_reading_len = max_reading_len.max(reading.len());
                 let mut buf = String::new();
                 for ch in reading.chars() {
                     buf.push(ch);
@@ -286,7 +291,11 @@ impl ReverseTable {
             chars.dedup();
             chars.shrink_to_fit();
         }
-        Self { prefixes, syllables }
+        Self {
+            prefixes,
+            syllables,
+            max_reading_len,
+        }
     }
 
     fn has_syllable(&self, s: &str) -> bool {
@@ -371,7 +380,32 @@ git commit -m "feat(engine): build pinyin reverse table lazily"
 
     #[test]
     fn parse_count_is_capped() {
-        assert!(segment("xianxianxianxian").len() <= MAX_PARSES);
+        assert_eq!(segment("xianxianxianxian").len(), MAX_PARSES);
+    }
+
+    #[test]
+    fn pathological_input_terminates_empty() {
+        // 无解尾缀 + 高歧义前缀:步数预算必须兜住组合爆炸
+        assert!(segment(&("xian".repeat(12) + "vv")).is_empty());
+    }
+
+    #[test]
+    fn overlong_input_is_rejected() {
+        assert!(segment(&"a".repeat(100_000)).is_empty());
+    }
+
+    #[test]
+    fn non_ascii_input_is_rejected() {
+        assert!(segment("学").is_empty());
+        assert!(segment("shu学").is_empty());
+    }
+
+    #[test]
+    fn apostrophe_edge_cases() {
+        assert!(segment("'").is_empty());
+        assert!(segment("''").is_empty());
+        assert_eq!(segment("'shu'")[0], vec!["shu"]);
+        assert_eq!(segment("shu''xue")[0], vec!["shu", "xue"]);
     }
 ```
 
@@ -388,18 +422,29 @@ Expected: 编译错误 `cannot find function 'segment'`。
 /// 单次查询词最多保留的切分方案数(防御组合爆炸)。
 const MAX_PARSES: usize = 8;
 
+/// 查询词字节上限:真实拼音查询远低于此;上限同时兜住递归深度与组合爆炸。
+const MAX_WORD_LEN: usize = 64;
+
+/// 单次切分的搜索步数上限:超出即整体放弃展开(回退纯字面),保证最坏耗时有界。
+const MAX_SEARCH_STEPS: usize = 10_000;
+
 /// 音节切分:返回全部可行切分(最多 `MAX_PARSES` 条),每条是音节子串序列。
 /// 规则:完整音节全枚举 OR、最长优先;末段可为任意音节前缀;`'` 为强制分段边界
-/// (边界内仍全枚举);无解返回空。
+/// (边界内仍全枚举)。仅接受 ASCII 且 ≤`MAX_WORD_LEN` 字节,搜索不超过
+/// `MAX_SEARCH_STEPS` 步;无解或超限返回空(回退纯字面)。
 /// 枚举顺序为「最长音节优先」,截断时保留贪婪切分。
 fn segment(word: &str) -> Vec<Vec<&str>> {
+    if !word.is_ascii() || word.len() > MAX_WORD_LEN {
+        return Vec::new();
+    }
     let table = table();
+    let mut steps = 0usize;
     let mut out: Vec<Vec<&str>> = vec![Vec::new()];
     for run in word.split('\'').filter(|r| !r.is_empty()) {
         let mut run_parses: Vec<Vec<&str>> = Vec::new();
         let mut cur: Vec<&str> = Vec::new();
-        enumerate(run, table, 0, &mut cur, &mut run_parses);
-        if run_parses.is_empty() {
+        enumerate(run, table, 0, &mut cur, &mut run_parses, &mut steps);
+        if steps >= MAX_SEARCH_STEPS || run_parses.is_empty() {
             return Vec::new();
         }
         let mut next: Vec<Vec<&str>> = Vec::new();
@@ -428,10 +473,15 @@ fn enumerate<'a>(
     pos: usize,
     cur: &mut Vec<&'a str>,
     out: &mut Vec<Vec<&'a str>>,
+    steps: &mut usize,
 ) {
     if out.len() >= MAX_PARSES {
         return;
     }
+    if *steps >= MAX_SEARCH_STEPS {
+        return;
+    }
+    *steps += 1;
     if pos == run.len() {
         if !cur.is_empty() {
             out.push(cur.clone());
@@ -440,16 +490,21 @@ fn enumerate<'a>(
     }
     let tail = &run[pos..];
     // 末段:剩余串是某音节前缀、且本身不是完整音节(完整音节在下方整段消费,避免重复方案)。
-    if !table.has_syllable(tail) && table.chars_for(tail).is_some() {
+    // 长度短路:超过最长读音的尾串不可能是任何读音前缀。
+    if tail.len() <= table.max_reading_len
+        && !table.has_syllable(tail)
+        && table.chars_for(tail).is_some()
+    {
         let mut v = cur.clone();
         v.push(tail);
         out.push(v);
     }
-    // 完整音节:最长优先。
-    for end in (pos + 1..=run.len()).rev() {
+    // 完整音节:最长优先,扫描上界收在最长读音长度。
+    let max_end = (pos + table.max_reading_len).min(run.len());
+    for end in (pos + 1..=max_end).rev() {
         if table.has_syllable(&run[pos..end]) {
             cur.push(&run[pos..end]);
-            enumerate(run, table, end, cur, out);
+            enumerate(run, table, end, cur, out, steps);
             cur.pop();
             if out.len() >= MAX_PARSES {
                 return;
@@ -462,11 +517,15 @@ fn enumerate<'a>(
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p engine pinyin::tests`
-Expected: 14 passed。
+Expected: 18 passed。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `enumerate` 中的末段判断 `!table.has_syllable(tail) && table.chars_for(tail).is_some()` 改为 `table.chars_for(tail).is_some()`（完整音节也走末段前缀），Run: `cargo test -p engine pinyin::tests`，Expected: `segments_full_pinyin` 失败（出现重复方案）。还原，确认 14 passed。
+两次突变，逐个还原：
+1. 末段判断去掉 `!table.has_syllable(tail) &&`（完整音节也走末段前缀）→ `segments_full_pinyin` 必须失败（出现重复方案）。
+2. 删除 `*steps += 1;`（步数预算失效）→ `pathological_input_terminates_empty` 必须失败。
+
+还原后跑 `cargo test -p engine pinyin::tests`，确认 18 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -663,11 +722,11 @@ fn seq_matches(hay: &str, alt: &[CharBitmap]) -> bool {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p engine pinyin::tests`
-Expected: 23 passed。
+Expected: 27 passed。
 
 - [ ] **Step 5: 突变验证**
 
-临时把 `CharBitmap::contains` 的返回改为恒 `true`，Run: `cargo test -p engine pinyin::tests`，Expected: `japanese_kana_never_match` 与 `non_han_chars_break_the_sequence` 失败。还原，确认 23 passed。
+临时把 `CharBitmap::contains` 的返回改为恒 `true`，Run: `cargo test -p engine pinyin::tests`，Expected: `japanese_kana_never_match` 与 `non_han_chars_break_the_sequence` 失败。还原，确认 27 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -1030,6 +1089,7 @@ git commit -m "bench: cover pinyin queries with chinese filenames in synthetic t
 4）`docs/architecture.md` 查询管线段落补一句：查询侧拼音展开（`pinyin.rs` + `CPattern.pinyin`），索引与落盘无变化。
 5）`docs/specs/pinyin-search/plan.md` 标记实现完成（注明日期与最终门禁结果）。
 6）把 Task 7 两次基准（20% 与 100% 中文名树）的 2b 拼音 P99、`query sh` 单次匹配耗时、常规树 ASCII P99 记入 `docs/specs/pinyin-search/tech.md` §4 测量结果表。
+7）把输入防护（仅 ASCII、≤64 字节、10000 搜索步）同步进 `product.md` 已知局限与 `tech.md` §2.3。
 
 - [ ] **Step 2: 三门禁**
 
@@ -1073,6 +1133,7 @@ git commit -m "docs: sync pinyin search usage, architecture and bench"
 |---|---|
 | 仅全拼、默认开启 | Task 2–6；无配置面 |
 | 切分（全枚举、`'` 强制边界、末段前缀、上限 8） | Task 4 |
+| 输入防护（仅 ASCII、≤64 字节、10000 搜索步） | Task 4 测试 |
 | 多音字任一读音（长/行） | Task 2/3 测试钉死 |
 | 歧义切分 OR（`xian`、`fangan`） | Task 4/5 测试 |
 | 前缀集召回（`shu` → 数/书/水/双/说） | Task 5 测试 |
