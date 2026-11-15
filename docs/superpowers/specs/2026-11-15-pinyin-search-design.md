@@ -128,7 +128,7 @@ pinyin.rs（全部逻辑内聚，query.rs 只做接入）
 ### 4.2 query.rs 集成点
 
 1. `CPattern` 增加字段 `pinyin: Option<Vec<SyllableSets>>`（`query.rs:470`）。
-2. `CPattern::compile` 增加入参 `pinyin_ok: bool`（整轮开关判定，`query.rs:476`），词级条件在 `compile` 内按 `parts` 判定：单段、无 QMARK、字节 ⊆ `a-z'`。
+2. `CPattern::compile` 增加入参 `pinyin_ok: bool`（整轮开关判定，`query.rs:476`），词级条件为：无通配符（`Pattern` 新增 `wildcard` 字段——`*shu*` 编译后 `parts` 与纯字面词完全一致，必须由解析侧标注，不能只看 `parts`）、字节 ⊆ `a-z'` 且至少一个字母。
 3. 词命中点（`query.rs:268`）改为：
 
    ```
