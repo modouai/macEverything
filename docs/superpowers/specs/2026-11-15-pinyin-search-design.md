@@ -91,7 +91,7 @@
 | `shu` | ✓ |
 | `shuxue` | ✓ |
 | `shux` | ✓（末段前缀） |
-| `xi'an` | ✓（硬边界） |
+| `xi'an` | ✓（强制分段边界） |
 | `Shu` | ✓（折叠后纯字母） |
 | `case:shu` / `case:README` | ✗（整轮） |
 | `whole:shu` | ✗ |
