@@ -258,6 +258,8 @@ impl PinyinMatcher {
 
 /// 从 hay 起点逐字符匹配一组位图;序列中断即失败。
 fn seq_matches(hay: &str, alt: &[CharBitmap]) -> bool {
+    // 不变量:每方案至少一段(segment 只保留非空方案,compile 拒绝空 alts)
+    debug_assert!(!alt.is_empty());
     let mut idx = 0;
     for ch in hay.chars() {
         if !alt[idx].contains(ch) {
@@ -483,5 +485,24 @@ mod tests {
         assert!(PinyinMatcher::compile(b"'").is_none());
         // 混合词:词内含非字母(数xue 的 UTF-8 字节)→ 不展开
         assert!(PinyinMatcher::compile("数xue".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn multi_syllable_hit_at_nonzero_offset() {
+        // 起点 0 的「书」在 shu 集但第二个字不在 xue 集;最早成功起点应为 3
+        assert_eq!(hit_of("书数学", "shuxue"), Some("书".len()));
+        // 多个起点均可命中时返回最早
+        assert_eq!(hit_of("数数", "shu"), Some(0));
+    }
+
+    #[test]
+    fn invalid_utf8_name_returns_none() {
+        let m = PinyinMatcher::compile(b"shu").unwrap();
+        assert_eq!(m.hit(b"\xff"), None);
+    }
+
+    #[test]
+    fn apostrophe_query_matches_end_to_end() {
+        assert_eq!(hit_of("西安.txt", "xi'an"), Some(0));
     }
 }
