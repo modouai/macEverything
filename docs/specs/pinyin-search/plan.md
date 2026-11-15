@@ -81,7 +81,7 @@ bench 脚本头部与 `docs/development.md` 的「五项基准」描述同步改
 ## 5. 完成判定
 
 - [x] 三门禁全绿（2026-11-15）：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
-      `cargo test --workspace`（1023 passed / 0 failed / 10 ignored：4 条 fsevents_live +
+      `cargo test --workspace`（1026 passed / 0 failed / 10 ignored：4 条 fsevents_live +
       6 条 app 实机用例）
 - [x] 常规树（20% 中文名）拼音 P99 < 10ms（实测 4.0ms）；极端树（`MCE_GEN_CN_PCT=100`）
       实测中位 9.6ms / P99 13.7ms（复跑中位 11.5ms），人工极端分布，记录不设红线；
